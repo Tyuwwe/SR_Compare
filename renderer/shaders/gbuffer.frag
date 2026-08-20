@@ -2,9 +2,9 @@
 // Deferred GBuffer fragment shader (upscaler input path).  Writes the material
 // properties; lighting happens in lighting.frag.
 //   RT0 albedo   RGBA8_SRGB  rgb = base color (linear->sRGB on write), a = alpha
-//   RT1 normal   RGBA16F     xyz = world normal
+//   RT1 normal   A2B10G10R10 xyz = world normal * 0.5 + 0.5 (packed [0,1])
 //   RT2 material RGBA8_UNORM r = metallic, g = roughness, b = AO
-//   RT3 emissive RGBA16F     rgb = emissive
+//   RT3 emissive B10G11R11UF rgb = emissive (unsigned float, no alpha)
 //   RT4 motion   RG16F       pixel units, cur - prev, no jitter (unchanged
 //                            upscaler contract)
 
@@ -27,7 +27,7 @@ layout(location = 4) in vec2 vMotion;
 layout(location = 0) out vec4 outAlbedo;
 layout(location = 1) out vec4 outNormal;
 layout(location = 2) out vec4 outMaterial;
-layout(location = 3) out vec4 outEmissive;
+layout(location = 3) out vec3 outEmissive; // B10G11R11_UFLOAT: no alpha channel
 layout(location = 4) out vec2 outMotion;
 
 // floor() so that texIndex == -1 (untextured) rounds to -1, not 0.
@@ -70,9 +70,9 @@ void main() {
     if (emTex >= 0) emissive *= texture(uTextures[emTex], vUV).rgb;
 
     outAlbedo = vec4(base.rgb, base.a);
-    outNormal = vec4(N, 0.0);
+    outNormal = vec4(N * 0.5 + 0.5, 1.0); // A2B10G10R10 is unsigned: remap [-1,1] to [0,1]
     outMaterial = vec4(clamp(metallic, 0.0, 1.0), clamp(roughness, 0.0, 1.0),
                        clamp(ao, 0.0, 1.0), 1.0);
-    outEmissive = vec4(emissive, 1.0);
+    outEmissive = emissive;
     outMotion = vMotion;
 }

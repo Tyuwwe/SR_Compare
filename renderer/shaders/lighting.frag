@@ -100,7 +100,8 @@ void main() {
 
     vec4 albedoA = texelFetch(gbAlbedo, pix, 0);
     vec3 albedo = albedoA.rgb;
-    vec3 N = normalize(texelFetch(gbNormal, pix, 0).xyz);
+    // A2B10G10R10 stores the normal remapped to [0,1]; unpack back to [-1,1].
+    vec3 N = normalize(texelFetch(gbNormal, pix, 0).xyz * 2.0 - 1.0);
     vec4 matParams = texelFetch(gbMaterial, pix, 0);
     float metallic = matParams.r;
     float roughness = max(matParams.g, 0.04); // floor: avoids GGX singularity

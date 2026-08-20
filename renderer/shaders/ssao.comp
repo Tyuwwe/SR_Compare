@@ -49,7 +49,8 @@ void main() {
     vec2 uv = (vec2(pix) + 0.5) * invSize;
     vec4 wp4 = invViewProj * vec4(uv * 2.0 - 1.0, depth, 1.0);
     vec3 P = wp4.xyz / wp4.w;
-    vec3 N = normalize(texelFetch(gbNormal, pix, 0).xyz);
+    // A2B10G10R10 stores the normal remapped to [0,1]; unpack back to [-1,1].
+    vec3 N = normalize(texelFetch(gbNormal, pix, 0).xyz * 2.0 - 1.0);
 
     const float radius = pc.params.x;
     const float bias = pc.params.y;

@@ -33,9 +33,9 @@ constexpr VkFormat kHdrColorFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
 constexpr VkFormat kMotionFormat = VK_FORMAT_R16G16_SFLOAT;
 constexpr VkFormat kDepthFormat = VK_FORMAT_D32_SFLOAT;
 constexpr VkFormat kAlbedoFormat = VK_FORMAT_R8G8B8A8_SRGB;   // rgb sRGB-encoded, a = alpha
-constexpr VkFormat kNormalFormat = VK_FORMAT_R16G16B16A16_SFLOAT; // xyz = world normal
+constexpr VkFormat kNormalFormat = VK_FORMAT_A2B10G10R10_UNORM_PACK32; // xyz = world normal * 0.5 + 0.5 (unsigned: remap on read)
 constexpr VkFormat kMaterialFormat = VK_FORMAT_R8G8B8A8_UNORM;    // r/g/b = metallic/rough/AO
-constexpr VkFormat kEmissiveFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+constexpr VkFormat kEmissiveFormat = VK_FORMAT_B10G11R11_UFLOAT_PACK32; // rgb = emissive (no alpha; max ~65004 covers emissive strength)
 constexpr VkFormat kReactiveFormat = VK_FORMAT_R16_SFLOAT; // translucent coverage mask
 constexpr uint32_t kMaxTextures = 1024;
 } // namespace deferred

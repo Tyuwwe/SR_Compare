@@ -22,7 +22,7 @@ layout(location = 4) in vec2 vMotion; // unused (GT has no motion attachment)
 layout(location = 0) out vec4 outAlbedo;
 layout(location = 1) out vec4 outNormal;
 layout(location = 2) out vec4 outMaterial;
-layout(location = 3) out vec4 outEmissive;
+layout(location = 3) out vec3 outEmissive; // B10G11R11_UFLOAT: no alpha channel
 
 int texIndex(float f) { return int(floor(f + 0.5)); }
 
@@ -62,8 +62,8 @@ void main() {
     if (emTex >= 0) emissive *= texture(uTextures[emTex], vUV).rgb;
 
     outAlbedo = vec4(base.rgb, base.a);
-    outNormal = vec4(N, 0.0);
+    outNormal = vec4(N * 0.5 + 0.5, 1.0); // A2B10G10R10 is unsigned: remap [-1,1] to [0,1]
     outMaterial = vec4(clamp(metallic, 0.0, 1.0), clamp(roughness, 0.0, 1.0),
                        clamp(ao, 0.0, 1.0), 1.0);
-    outEmissive = vec4(emissive, 1.0);
+    outEmissive = emissive;
 }
