@@ -36,4 +36,15 @@ std::string resolveSceneArg(const std::string& arg) {
     return resolveAssetPath(arg);  // treat as a glTF path (may still be CWD-relative)
 }
 
+bool initialCameraPose(const std::string& scenePath, Vec3& pos, Vec3& fwd) {
+    // BistroExterior: on the street looking into the patisserie block.
+    // (Reported repro location; the generic glTF start pose sits in a wall.)
+    if (scenePath.find("BistroExterior") != std::string::npos) {
+        pos = {-11.2f, 4.6f, 12.0f};
+        fwd = {0.198f, -0.015f, -0.980f};
+        return true;
+    }
+    return false;
+}
+
 } // namespace sr

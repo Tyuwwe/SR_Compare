@@ -5,6 +5,8 @@
 //   --scene sponza      bundled Sponza glTF (assets/sponza/Sponza.gltf)
 //   --scene <path>      any glTF file path (passed through unchanged)
 // ============================================================================
+#include "renderer/math/Math.h"
+
 #include <string>
 #include <vector>
 
@@ -24,5 +26,11 @@ std::vector<SceneEntry> listScenes();
 // anything else is treated as a glTF path and returned unchanged.
 // Prints a warning to stderr when a known alias's asset is missing.
 std::string resolveSceneArg(const std::string& arg);
+
+// Per-scene free-fly starting pose.  Returns false when the scene has no
+// registered pose (callers then use their generic default).  The generic
+// default sits outside the Bistro street geometry (inside a wall), which is
+// why BistroExterior has an explicit one.
+bool initialCameraPose(const std::string& scenePath, Vec3& pos, Vec3& fwd);
 
 } // namespace sr

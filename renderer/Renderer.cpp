@@ -1,9 +1,12 @@
 #include "renderer/Renderer.h"
 
+#include "app/CliUtils.h"
+
 #include "renderer/Screenshot.h"
 #include "renderer/core/MemoryBudget.h"
 #include "renderer/core/PathUtil.h"
 #include "renderer/core/VkUtil.h"
+#include "renderer/scene/SceneRegistry.h"
 #include "upscalers/UpscalerFactory.h"
 
 #include <algorithm>
@@ -68,6 +71,7 @@ void Renderer::ImageResource::destroy(const VulkanContext& ctx) {
 
 bool Renderer::init(const RendererOptions& opts) {
     opts_ = opts;
+    diagNoJitter_ = sr::envFlag("SR_NO_JITTER");
 
     if (!window_.create("sr_compare", static_cast<int>(opts.displayWidth),
                         static_cast<int>(opts.displayHeight)))
@@ -139,6 +143,15 @@ bool Renderer::init(const RendererOptions& opts) {
     } else if (opts.frames >= 0) {
         // Orbit stays inside the procedural room (walls at |x| = 10, z = -10).
         path_ = generateOrbitPath(opts.frames, {0.f, 2.f, 0.f}, 6.5f, 2.f, 5.5f, 1.f);
+    }
+
+    if (path_.empty()) {
+        // Interactive free-fly start: per-scene pose when registered (the
+        // generic default sits inside Bistro's outer wall), else the Camera
+        // constructor default.
+        Vec3 pos, fwd;
+        if (initialCameraPose(opts_.scenePath, pos, fwd))
+            camera_.setPose(pos, fwd, {0.f, 1.f, 0.f});
     }
 
     return true;
@@ -664,8 +677,10 @@ void Renderer::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     prevJitterY_ = jitterY_;
     if (jitter) {
         const Vec2 h = halton23(frameIndex + 1);
-        jitterX_ = h.x - 0.5f;
-        jitterY_ = h.y - 0.5f;
+        // SR_NO_JITTER keeps the low-res path but zeroes the offsets (and the
+        // jitter reported to the upscaler) to isolate jitter from resolution.
+        jitterX_ = diagNoJitter_ ? 0.f : h.x - 0.5f;
+        jitterY_ = diagNoJitter_ ? 0.f : h.y - 0.5f;
         // Sub-pixel jitter must shift NDC by a constant (every temporal
         // upscaler assumes: jittered pixel pos = unjittered pos + jitter),
         // i.e. clip.xy += offset * clip.w.  clip.w = -z_view comes from row 3
