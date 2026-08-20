@@ -284,6 +284,7 @@ private:
 
     // --- UI ---------------------------------------------------------------------
     void drawUi();
+    void drawCameraPose(); // bottom-left overlay: camera position + view angles
     void drawReferenceSection();
     void drawSharedControls();
     void drawViewerTab();

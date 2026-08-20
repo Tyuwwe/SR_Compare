@@ -1,5 +1,7 @@
 #include "compare/CompareApp.h"
 
+#include "app/CliUtils.h"
+
 #include "compare/Font5x7.h"
 #include "renderer/Screenshot.h"
 #include "renderer/core/PathUtil.h"
@@ -135,6 +137,10 @@ bool CompareApp::init(const CompareOptions& opts) {
     // renderScale feeds a float->uint32 cast below; keep it in (0,1] so the
     // cast stays well-defined even if the caller passed an out-of-range value.
     opts_.renderScale = std::clamp(opts_.renderScale, 0.01f, 1.f);
+
+    // Diagnostic env switches (see CompareApp.h for their meaning).
+    diagNoJitter_ = sr::envFlag("SR_NO_JITTER");
+    diagMetricStdout_ = sr::envFlag("SR_METRIC_STDOUT");
 
     if (!window_.create("sr_compare — compare", static_cast<int>(opts.displayWidth),
                         static_cast<int>(opts.displayHeight)))
@@ -1095,7 +1101,16 @@ void CompareApp::harvestMetrics(uint32_t slot) {
         algos_[i].psnr = psnr;
         algos_[i].ssim = ssim;
         algos_[i].hasMetric = true;
+        if (diagMetricStdout_) {
+            // The metric for frame k*metricInterval is harvested
+            // kFramesInFlight frames later; k = metricHarvestCount_.
+            std::fprintf(stdout, "metric: frame=%u algo=%-8s PSNR=%.2f SSIM=%.4f\n",
+                         metricHarvestCount_ * static_cast<uint32_t>(opts_.metricInterval),
+                         algos_[i].upscaler->name(), static_cast<double>(psnr),
+                         static_cast<double>(ssim));
+        }
     }
+    ++metricHarvestCount_;
     refreshOverlayText();
 }
 
@@ -1153,9 +1168,11 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     prevJitterX_ = jitterX_;
     prevJitterY_ = jitterY_;
     // Shared Halton jitter for the GBuffer pass; the GT pass stays un-jittered.
+    // SR_NO_JITTER keeps the low-res path but zeroes the offsets (and hence
+    // the jitter reported to the upscalers) to isolate jitter from resolution.
     const Vec2 h = halton23(frameIndex + 1);
-    jitterX_ = h.x - 0.5f;
-    jitterY_ = h.y - 0.5f;
+    jitterX_ = diagNoJitter_ ? 0.f : h.x - 0.5f;
+    jitterY_ = diagNoJitter_ ? 0.f : h.y - 0.5f;
     // Uniform NDC shift: clip.xy += offset * clip.w (clip.w = -z_view via
     // m[11] = -1), so the offset belongs in column 2 with a negative sign —
     // see Renderer.cpp for the full rationale.

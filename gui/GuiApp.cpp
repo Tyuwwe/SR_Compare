@@ -8,6 +8,7 @@
 #include "renderer/core/MemoryBudget.h"
 #include "renderer/core/PathUtil.h"
 #include "renderer/core/VkUtil.h"
+#include "renderer/scene/SceneRegistry.h"
 #include "upscalers/UpscalerFactory.h"
 #include "upscalers/dlss/SlContext.h"
 
@@ -856,12 +857,18 @@ bool GuiApp::buildStackTail() {
     }
 
     // glTF scenes (sponza & co.) are centered on the origin; the raw default
-    // free-fly pose sits inside their outer wall and shows only black.  Start
-    // from the CLI automation orbit's first keyframe instead.
+    // free-fly pose sits inside their outer wall and shows only black.  Prefer
+    // a registered per-scene start pose, else the CLI automation orbit's
+    // first keyframe.
     if (!active_.scenePath.empty()) {
-        camera_.position = {6.5f, 2.f, 0.f};
-        camera_.up = {0.f, 1.f, 0.f};
-        camera_.lookAt({0.f, 2.f, 0.f});
+        Vec3 pos, fwd;
+        if (initialCameraPose(active_.scenePath, pos, fwd)) {
+            camera_.setPose(pos, fwd, {0.f, 1.f, 0.f});
+        } else {
+            camera_.position = {6.5f, 2.f, 0.f};
+            camera_.up = {0.f, 1.f, 0.f};
+            camera_.lookAt({0.f, 2.f, 0.f});
+        }
     } else {
         // Built-in box scene: reset to the Camera constructor default pose
         // (same as a fresh app start) so switching back from a glTF scene
@@ -2417,6 +2424,26 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     };
     const Mat4 cullViewProj = Mat4::multiply(proj, view); // un-jittered (sub-pixel)
 
+    // --- Shadow pass (sun CSM, one 2048^2 layer per cascade) -------------------
+    // Must run BEFORE any lighting pass: the LR lighting below samples the map
+    // while the LightingUBO already carries this frame's cascade VPs, so a map
+    // rendered later in the frame would be sampled with a one-frame-stale
+    // content/VP pairing (false occlusion on lit surfaces whenever the camera
+    // moves).  CompareApp/Renderer place this pass ahead of lighting for the
+    // same reason.  It only needs scene geometry, so it runs before the GBuffer
+    // pass and also covers the gbuffer-less (GT-only) configuration.
+    if (shadow) {
+        imageBarrier(cmd, shadow_.image, shadow_.layout,
+                     VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT,
+                     0, 1, 0, kShadowCascadeCount);
+        shadow_.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        deferred_.recordShadowPass(cmd, shadow_, scene_, shadow->cascadeVp, fr.sceneSetGb,
+                                   textureSet_, materialStride_);
+        imageBarrier(cmd, shadow_.image, shadow_.layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                     VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, kShadowCascadeCount);
+        shadow_.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    }
+
     // --- 1) shared low-resolution GBuffer pass (jittered) ----------------------
     timestamps_.sceneBegin(cmd, slot);
     if (gbuffer) {
@@ -2524,21 +2551,6 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
 
         transition(gbColor_.image, gbColorLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                    VK_IMAGE_ASPECT_COLOR_BIT);
-    }
-
-    // --- Shadow pass (sun CSM, one 2048^2 layer per cascade) -------------------
-    // Runs once per frame (also when the LR pass is skipped) and feeds the
-    // LR, GT and SSAA lighting paths alike.
-    if (shadow) {
-        imageBarrier(cmd, shadow_.image, shadow_.layout,
-                     VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT,
-                     0, 1, 0, kShadowCascadeCount);
-        shadow_.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-        deferred_.recordShadowPass(cmd, shadow_, scene_, shadow->cascadeVp, fr.sceneSetGb,
-                                   textureSet_, materialStride_);
-        imageBarrier(cmd, shadow_.image, shadow_.layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                     VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, kShadowCascadeCount);
-        shadow_.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     }
 
     // --- 2) per-algorithm dispatch ---------------------------------------------
@@ -3704,6 +3716,33 @@ void GuiApp::drawReferenceSection() {
     ImGui::TextDisabled("SSAA: GT at 2x, downsampled.\nApply scale: GT at the low input res,\nno AA/upscale. Metrics compare against it.");
 }
 
+void GuiApp::drawCameraPose() {
+    // Bottom-left readout of the camera pose, drawn on top of the render area
+    // (after the side panel so the panel does not cover it).  The user reports
+    // repro locations with these numbers.  NoInputs: never eats mouse look.
+    const ImGuiIO& io = ImGui::GetIO();
+    const Vec3& p = camera_.position;
+    const Vec3& f = camera_.forward;
+    const float deg = 57.2957795f;
+    // Camera looks down -Z: yaw 0 faces -Z, positive yaw turns right (+X).
+    const float yawDeg = std::atan2(f.x, -f.z) * deg;
+    const float pitchDeg = std::asin(std::clamp(f.y, -1.f, 1.f)) * deg;
+    const float x = panelCollapsed_ ? 8.f : kPanelWidth + 8.f;
+    ImGui::SetNextWindowPos(ImVec2(x, io.DisplaySize.y - 8.f), ImGuiCond_Always,
+                            ImVec2(0.f, 1.f));
+    ImGui::SetNextWindowBgAlpha(0.55f);
+    if (ImGui::Begin("##campose", nullptr,
+                     ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+                         ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
+                         ImGuiWindowFlags_AlwaysAutoResize |
+                         ImGuiWindowFlags_NoFocusOnAppearing)) {
+        ImGui::Text("pos (%.1f, %.1f, %.1f)   yaw %.1f° pitch %.1f°", p.x, p.y, p.z,
+                    yawDeg, pitchDeg);
+        ImGui::Text("fwd (%.3f, %.3f, %.3f)", f.x, f.y, f.z);
+    }
+    ImGui::End();
+}
+
 void GuiApp::drawUi() {
     const ImGuiIO& io = ImGui::GetIO();
 
@@ -3729,6 +3768,7 @@ void GuiApp::drawUi() {
             if (ImGui::Button(">>", ImVec2(-1.f, 0.f))) panelCollapsed_ = false;
         }
         ImGui::End();
+        drawCameraPose();
         return;
     }
 
@@ -3787,6 +3827,8 @@ void GuiApp::drawUi() {
     ImGui::Separator();
     ImGui::TextWrapped("%s", statusLine_.c_str());
     ImGui::End();
+
+    drawCameraPose();
 }
 
 } // namespace sr

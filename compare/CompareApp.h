@@ -132,6 +132,13 @@ private:
     float prevJitterY_ = 0.f;
     bool hasTransparency_ = false; // any alphaMode BLEND material in the scene
 
+    // Diagnostic switches (env): SR_NO_JITTER=1 zeroes the Halton sub-pixel
+    // jitter while keeping the low-res path (isolates jitter from resolution);
+    // SR_METRIC_STDOUT=1 prints the per-harvest PSNR/SSIM time series.
+    bool diagNoJitter_ = false;
+    bool diagMetricStdout_ = false;
+    uint32_t metricHarvestCount_ = 0;
+
     ImageResource gbColor_;
     ImageResource gbMotion_;
     ImageResource gbReactive_; // translucent coverage mask (reactive/TC input)

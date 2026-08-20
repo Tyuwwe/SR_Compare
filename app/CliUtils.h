@@ -60,4 +60,18 @@ inline bool parseRenderScale(const char* s, float& out) {
     return true;
 }
 
+// True when environment variable `name` is set (any value).  Uses _dupenv_s
+// on MSVC: plain getenv trips C4996 and this project builds /W4 zero-warning.
+inline bool envFlag(const char* name) {
+#ifdef _MSC_VER
+    char* value = nullptr;
+    size_t len = 0;
+    const bool set = _dupenv_s(&value, &len, name) == 0 && value != nullptr;
+    std::free(value);
+    return set;
+#else
+    return std::getenv(name) != nullptr;
+#endif
+}
+
 } // namespace sr

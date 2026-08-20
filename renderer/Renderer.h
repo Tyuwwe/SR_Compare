@@ -96,6 +96,9 @@ private:
     float prevJitterX_ = 0.f;
     float prevJitterY_ = 0.f;
     bool hasTransparency_ = false; // any alphaMode BLEND material in the scene
+    // Diagnostic env switch: SR_NO_JITTER=1 zeroes the Halton sub-pixel jitter
+    // while keeping the low-res path (isolates jitter from resolution).
+    bool diagNoJitter_ = false;
     // Wall-clock delta time (seconds) fed to the upscaler.  Interactive mode
     // updates it every frame; bench mode keeps the 1/60 default for
     // reproducible, machine-independent results.
