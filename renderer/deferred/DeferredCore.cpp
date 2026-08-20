@@ -1267,6 +1267,19 @@ void DeferredCore::computeCascadeVPs(const Camera& cam, float aspect, const Vec3
     Vec3 up{0.f, 1.f, 0.f};
     if (std::fabs(dot(sunDir, up)) > 0.99f) up = {1.f, 0.f, 0.f};
 
+    // Light orientation only (pure rotation, gluLookAt basis layout, no
+    // translation).  A lookAt(eye = centre + ...) would bake the
+    // camera-dependent slice centre into the basis; keeping the frame
+    // translation-free is what allows the cascade origin to be snapped to a
+    // constant light-space texel grid below.
+    const Vec3 lightFwd = sunDir * (-1.f);
+    const Vec3 lightRight = normalize(cross(lightFwd, up));
+    const Vec3 lightUp = cross(lightRight, lightFwd);
+    Mat4 lightRot;
+    lightRot.m[0] = lightRight.x; lightRot.m[4] = lightRight.y; lightRot.m[8]  = lightRight.z;
+    lightRot.m[1] = lightUp.x;    lightRot.m[5] = lightUp.y;    lightRot.m[9]  = lightUp.z;
+    lightRot.m[2] = -lightFwd.x;  lightRot.m[6] = -lightFwd.y;  lightRot.m[10] = -lightFwd.z;
+
     float sliceNear = nearZ;
     for (uint32_t i = 0; i < kShadowCascadeCount; ++i) {
         // Unproject the 8 corners of this depth slice to world space.
@@ -1285,52 +1298,53 @@ void DeferredCore::computeCascadeVPs(const Camera& cam, float aspect, const Vec3
         for (const Vec3& c : corners) center += c;
         center = center / 8.f;
 
-        // Light view placed far enough behind the slice that every corner is
-        // in front of the eye (ortho clips nothing behind the near plane).
+        // Bounding sphere of the slice.  The radius is rotation-invariant (it
+        // depends only on the split distances, fov and aspect); rounding it
+        // up to a fixed 1/kShadowRadiusSnap-metre grid additionally kills
+        // float noise, so the world size of a shadow texel stays constant
+        // frame-to-frame for a given split distance.  Coverage is slightly
+        // larger than the old tight light-space AABB (a sphere wastes the
+        // corners of the map), which is the accepted cost of stability.
         float radius = 0.f;
         for (const Vec3& c : corners) radius = std::max(radius, length(c - center));
-        const Vec3 eye = center + sunDir * (radius + 1.f);
-        const Mat4 lightView = Mat4::lookAt(eye, center, up);
+        radius = std::ceil(radius * kShadowRadiusSnap) / kShadowRadiusSnap;
 
-        // Tight AABB of the slice in light space.  The sun side (larger z,
-        // closer to the eye) is extended so casters between the slice and the
-        // sun still land in the map; the far side needs no margin (a caster
-        // deeper than a receiver cannot shadow it).
-        Vec3 mn{1e30f, 1e30f, 1e30f}, mx{-1e30f, -1e30f, -1e30f};
-        for (const Vec3& c : corners) {
-            const Vec3 ls = transformPoint(lightView, c);
-            mn.x = std::min(mn.x, ls.x); mn.y = std::min(mn.y, ls.y); mn.z = std::min(mn.z, ls.z);
-            mx.x = std::max(mx.x, ls.x); mx.y = std::max(mx.y, ls.y); mx.z = std::max(mx.z, ls.z);
-        }
-        mx.z += kShadowCasterMargin;
-
-        // Texel snapping: align the ortho origin to the shadow-map texel grid
-        // so the map does not shimmer when the camera moves.  floor(min) /
-        // ceil(max) keeps the snapped box a superset of the tight one.
-        const float worldPerTexel = (mx.x - mn.x) / static_cast<float>(kShadowMapSize);
+        // Sphere centre in light space, snapped to the (now constant) texel
+        // grid.  The ortho window below is symmetric around the snapped
+        // centre, so the whole sphere stays covered (snapping shifts it by
+        // less than one texel).
+        Vec3 centerLS = transformPoint(lightRot, center);
+        const float worldPerTexel = 2.f * radius / static_cast<float>(kShadowMapSize);
         if (worldPerTexel > 1e-6f) {
-            mn.x = std::floor(mn.x / worldPerTexel) * worldPerTexel;
-            mx.x = std::ceil(mx.x / worldPerTexel) * worldPerTexel;
-        }
-        const float worldPerTexelY = (mx.y - mn.y) / static_cast<float>(kShadowMapSize);
-        if (worldPerTexelY > 1e-6f) {
-            mn.y = std::floor(mn.y / worldPerTexelY) * worldPerTexelY;
-            mx.y = std::ceil(mx.y / worldPerTexelY) * worldPerTexelY;
+            centerLS.x = std::floor(centerLS.x / worldPerTexel) * worldPerTexel;
+            centerLS.y = std::floor(centerLS.y / worldPerTexel) * worldPerTexel;
         }
 
-        // Right-handed Vulkan ortho (y-flipped, depth [0,1]).  In light view
-        // space the scene sits at z < 0; n/f are positive distances.
-        const float nz = -mx.z, fz = -mn.z;
+        // Depth range around the sphere.  The sun side (larger z, closer to
+        // the eye) is extended so casters between the slice and the sun still
+        // land in the map; the far side needs no margin (a caster deeper than
+        // a receiver cannot shadow it).  Both ends are quantized to a fixed
+        // step so the depth remap does not drift frame-to-frame.
+        float mnZ = centerLS.z - radius;
+        float mxZ = centerLS.z + radius + kShadowCasterMargin;
+        mnZ = std::floor(mnZ / kShadowZSnap) * kShadowZSnap;
+        mxZ = std::ceil(mxZ / kShadowZSnap) * kShadowZSnap;
+
+        // Right-handed Vulkan ortho (y-flipped, depth [0,1]), symmetric
+        // around the snapped sphere centre.  In light view space the scene
+        // sits at z < 0; n/f are positive distances.
+        const float invR = 1.f / radius;
+        const float nz = -mxZ, fz = -mnZ;
         Mat4 ortho;
-        ortho.m[0] = 2.f / (mx.x - mn.x);
-        ortho.m[12] = -(mx.x + mn.x) / (mx.x - mn.x);
-        ortho.m[5] = -2.f / (mx.y - mn.y);            // y flip for Vulkan NDC
-        ortho.m[13] = (mx.y + mn.y) / (mx.y - mn.y);
+        ortho.m[0] = invR;
+        ortho.m[12] = -centerLS.x * invR;
+        ortho.m[5] = -invR;                       // y flip for Vulkan NDC
+        ortho.m[13] = centerLS.y * invR;
         ortho.m[10] = 1.f / (nz - fz);
         ortho.m[14] = nz / (nz - fz);
         ortho.m[15] = 1.f;
 
-        outVP[i] = Mat4::multiply(ortho, lightView);
+        outVP[i] = Mat4::multiply(ortho, lightRot);
         sliceNear = splits[i];
     }
 }

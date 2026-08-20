@@ -87,6 +87,17 @@ constexpr float kShadowMaxDistance = 200.f;
 // Light-space margin (m) pulling each cascade's near plane back towards the
 // sun so casters between the slice and the sun still land in the map.
 constexpr float kShadowCasterMargin = 150.f;
+// CSM stabilization (bounding-sphere cascades, per MSFT "Common Techniques to
+// Improve Shadow Depth Maps"): the cascade radius is quantized to a 1/N-metre
+// grid (N = kShadowRadiusSnap) so the world size of a shadow texel stays
+// constant for a given split distance regardless of camera position, rotation
+// or TAA jitter — a drifting texel size is what makes the snap grid itself
+// swim and the shadow edges shimmer.
+constexpr float kShadowRadiusSnap = 16.f;
+// The light-space depth range [minZ, maxZ] is quantized to this fixed step
+// (m) so the depth remap does not resample against a drifting near/far range
+// frame-to-frame (which would shimmer even with stable XY texels).
+constexpr float kShadowZSnap = 0.25f;
 // Rasterizer-side depth bias (vkCmdSetDepthBias, dynamic state) of the shadow
 // pass; mirrored into LightingUBO::shadowParams.xy for reference.
 constexpr float kShadowDepthBiasConstant = 1.25f;
@@ -256,10 +267,12 @@ public:
     void destroyShadowTargets(const VulkanContext& ctx, ShadowTargets& targets) const;
     // Computes the 4 cascade view-projections for the given camera/sun.
     // Practical split (lambda = kShadowSplitLambda) over [near, min(far,
-    // kShadowMaxDistance)]; each cascade gets a tight, texel-snapped ortho box
-    // around its frustum slice.  outSplitViewDepth[i] = far boundary of
-    // cascade i (positive view-space metres).  Vulkan conventions throughout
-    // (y-flipped projection, [0,1] depth).
+    // kShadowMaxDistance)]; each cascade covers the bounding sphere of its
+    // frustum slice with a quantized radius, and the sphere centre is snapped
+    // to a constant light-space texel grid (kShadowRadiusSnap / kShadowZSnap)
+    // so the shadow map does not shimmer when the camera moves.  outSplitViewDepth[i]
+    // = far boundary of cascade i (positive view-space metres).  Vulkan
+    // conventions throughout (y-flipped projection, [0,1] depth).
     static void computeCascadeVPs(const Camera& cam, float aspect, const Vec3& sunDirTowardLight,
                                   Mat4 outVP[kShadowCascadeCount],
                                   float outSplitViewDepth[kShadowCascadeCount]);
