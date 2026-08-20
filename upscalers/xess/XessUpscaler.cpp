@@ -24,6 +24,7 @@
 #include "upscalers/xess/XessUpscaler.h"
 
 #include "upscalers/UpscalerFactory.h"
+#include "upscalers/VkHelpers.h"
 
 #include <xess/xess.h>
 #include <xess/xess_vk.h>
@@ -137,17 +138,6 @@ xess_vk_image_view_info makeTextureInfo(VkImageView view, VkImage image, VkForma
     info.width = width;
     info.height = height;
     return info;
-}
-
-uint32_t findMemoryType(VkPhysicalDevice physicalDevice, uint32_t typeBits,
-                        VkMemoryPropertyFlags required) {
-    VkPhysicalDeviceMemoryProperties mp;
-    vkGetPhysicalDeviceMemoryProperties(physicalDevice, &mp);
-    for (uint32_t i = 0; i < mp.memoryTypeCount; ++i) {
-        if ((typeBits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & required) == required)
-            return i;
-    }
-    return 0xFFFFFFFFu;
 }
 
 // Fallback responsive pixel mask: a render-resolution R16_SFLOAT image cleared

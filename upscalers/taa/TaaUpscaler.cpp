@@ -3,6 +3,7 @@
 #include "upscalers/UpscalerFactory.h"
 #include "renderer/core/PathUtil.h"
 #include "upscalers/taa/TaaUpscaler.h"
+#include "upscalers/VkHelpers.h"
 
 #include <cstdio>
 #include <fstream>
@@ -32,17 +33,6 @@ struct TaaPush {
     float pad1[2];
 };
 static_assert(sizeof(TaaPush) == 48, "TaaPush size mismatch");
-
-uint32_t findMemoryType(VkPhysicalDevice physicalDevice, uint32_t typeBits,
-                        VkMemoryPropertyFlags required) {
-    VkPhysicalDeviceMemoryProperties mp;
-    vkGetPhysicalDeviceMemoryProperties(physicalDevice, &mp);
-    for (uint32_t i = 0; i < mp.memoryTypeCount; ++i) {
-        if ((typeBits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & required) == required)
-            return i;
-    }
-    return 0xFFFFFFFFu;
-}
 
 bool createHistoryImage(const VulkanEnv& env, uint32_t width, uint32_t height, HistoryImage& out) {
     VkImageCreateInfo ci = {};
@@ -112,27 +102,6 @@ VkSampler createSamplerLocal(VkDevice device) {
     VkSampler sampler = VK_NULL_HANDLE;
     vkCreateSampler(device, &ci, nullptr, &sampler);
     return sampler;
-}
-
-VkShaderModule loadShader(const VulkanEnv& env, const char* path) {
-    std::ifstream file(path, std::ios::binary | std::ios::ate);
-    if (!file) {
-        std::fprintf(stderr, "TAA: failed to open shader %s\n", path);
-        return VK_NULL_HANDLE;
-    }
-    const std::streamoff size = file.tellg();
-    if (size <= 0 || size % 4 != 0) return VK_NULL_HANDLE;
-    file.seekg(0);
-    std::vector<uint32_t> code(static_cast<size_t>(size) / 4);
-    file.read(reinterpret_cast<char*>(code.data()), size);
-
-    VkShaderModuleCreateInfo ci = {};
-    ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-    ci.codeSize = static_cast<size_t>(size);
-    ci.pCode = code.data();
-    VkShaderModule module = VK_NULL_HANDLE;
-    if (vkCreateShaderModule(env.device, &ci, nullptr, &module) != VK_SUCCESS) return VK_NULL_HANDLE;
-    return module;
 }
 
 void historyBarrier(VkCommandBuffer cmd, VkImage image, VkImageLayout oldLayout, VkImageLayout newLayout) {
@@ -264,7 +233,7 @@ bool TaaUpscaler::init(const VulkanEnv& env, const UpscalerDesc& desc) {
         return false;
     }
 
-    VkShaderModule module = loadShader(env, sr::resolveShaderPath(SR_SHADER_DIR, "taa.comp.spv").c_str());
+    VkShaderModule module = loadShader(env.device, sr::resolveShaderPath(SR_SHADER_DIR, "taa.comp.spv").c_str());
     if (!module) { shutdown(); return false; }
 
     VkPushConstantRange pushRange = {};

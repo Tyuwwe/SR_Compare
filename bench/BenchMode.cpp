@@ -12,6 +12,7 @@
 //   frame_ms_avg,fps_avg,fps_p50,fps_1pct_low,vram_algo_bytes,
 //   vram_total_bytes,gpu_name,driver_version,notes
 // ============================================================================
+#include "app/CliUtils.h"
 #include "bench/BenchMode.h"
 #include "upscalers/UpscalerFactory.h"
 
@@ -29,14 +30,6 @@
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#else
-#include <limits.h>
-#include <spawn.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <unistd.h>
-extern char** environ;
 #endif
 
 namespace sr {
@@ -83,14 +76,6 @@ struct FrameSample {
     uint64_t vramAlgoBytes = 0;
     uint64_t vramTotalBytes = 0;
 };
-
-bool parseResolution(const char* s, uint32_t& w, uint32_t& h) {
-    int iw = 0, ih = 0;
-    if (::sscanf_s(s, "%dx%d", &iw, &ih) != 2 || iw <= 0 || ih <= 0) return false;
-    w = static_cast<uint32_t>(iw);
-    h = static_cast<uint32_t>(ih);
-    return true;
-}
 
 std::string dirnameOf(const std::string& path) {
     const size_t pos = path.find_last_of("/\\");
@@ -188,40 +173,6 @@ int runChild(const std::string& exe, const std::vector<std::string>& args, std::
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
     return static_cast<int>(code);
-#else
-    int fds[2];
-    if (pipe(fds) != 0) return -1;
-
-    std::vector<std::string> storage;
-    storage.push_back(exe);
-    storage.insert(storage.end(), args.begin(), args.end());
-    std::vector<char*> argv;
-    for (std::string& s : storage) argv.push_back(s.data());
-    argv.push_back(nullptr);
-
-    posix_spawn_file_actions_t fa;
-    posix_spawn_file_actions_init(&fa);
-    posix_spawn_file_actions_adddup2(&fa, fds[1], STDOUT_FILENO);
-    posix_spawn_file_actions_adddup2(&fa, fds[1], STDERR_FILENO);
-    posix_spawn_file_actions_addclose(&fa, fds[0]);
-    posix_spawn_file_actions_addclose(&fa, fds[1]);
-
-    pid_t pid = -1;
-    const int rc = posix_spawnp(&pid, exe.c_str(), &fa, nullptr, argv.data(), environ);
-    posix_spawn_file_actions_destroy(&fa);
-    close(fds[1]);
-    if (rc != 0) {
-        close(fds[0]);
-        return -1;
-    }
-    char chunk[4096];
-    ssize_t got = 0;
-    while ((got = read(fds[0], chunk, sizeof(chunk))) > 0)
-        log.append(chunk, static_cast<size_t>(got));
-    close(fds[0]);
-    int status = 0;
-    waitpid(pid, &status, 0);
-    return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
 #endif
 }
 
@@ -397,32 +348,26 @@ int runBenchMode(int argc, char** argv) {
     BenchOptions opts;
     for (int i = 0; i < argc; ++i) {
         const std::string a = argv[i];
-        const auto next = [&](const char* name) -> const char* {
-            if (i + 1 >= argc) {
-                std::fprintf(stderr, "missing value for %s\n", name);
-                std::exit(1);
-            }
-            return argv[++i];
-        };
         if (a == "--upscalers") {
-            opts.upscalersArg = next("--upscalers");
+            opts.upscalersArg = nextArg(i, argc, argv, "--upscalers");
         } else if (a == "--output") {
-            if (!parseResolution(next("--output"), opts.displayW, opts.displayH)) {
+            if (!parseResolution(nextArg(i, argc, argv, "--output"),
+                                 opts.displayW, opts.displayH)) {
                 std::fprintf(stderr, "invalid --output resolution\n");
                 return 1;
             }
         } else if (a == "--render-scale") {
-            opts.renderScale = static_cast<float>(std::atof(next("--render-scale")));
+            opts.renderScale = static_cast<float>(std::atof(nextArg(i, argc, argv, "--render-scale")));
         } else if (a == "--frames") {
-            opts.frames = std::atoi(next("--frames"));
+            opts.frames = std::atoi(nextArg(i, argc, argv, "--frames"));
         } else if (a == "--warmup") {
-            opts.warmup = std::atoi(next("--warmup"));
+            opts.warmup = std::atoi(nextArg(i, argc, argv, "--warmup"));
         } else if (a == "--scene") {
-            opts.scene = next("--scene");
+            opts.scene = nextArg(i, argc, argv, "--scene");
         } else if (a == "--out") {
-            opts.outPath = next("--out");
+            opts.outPath = nextArg(i, argc, argv, "--out");
         } else if (a == "--exe") {
-            opts.exePath = next("--exe");
+            opts.exePath = nextArg(i, argc, argv, "--exe");
         } else if (a == "--help" || a == "-h") {
             printUsage();
             return 0;
@@ -451,15 +396,7 @@ int runBenchMode(int argc, char** argv) {
         algos = listUpscalers();
         algos.push_back("native");
     } else {
-        size_t begin = 0;
-        while (begin <= opts.upscalersArg.size()) {
-            const size_t comma = opts.upscalersArg.find(',', begin);
-            const std::string name = opts.upscalersArg.substr(
-                begin, comma == std::string::npos ? std::string::npos : comma - begin);
-            if (!name.empty()) algos.push_back(name);
-            if (comma == std::string::npos) break;
-            begin = comma + 1;
-        }
+        algos = splitCsv(opts.upscalersArg.c_str());
     }
     if (algos.empty()) {
         std::fprintf(stderr, "no upscalers selected\n");

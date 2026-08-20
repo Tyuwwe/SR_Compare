@@ -33,6 +33,30 @@ UA = {"User-Agent": "sr_compare-fetch-sdks/1.0 (python-urllib)"}
 
 ALL_TASKS = ["fsr", "xess", "streamline", "sgsr", "nss", "sponza"]
 
+# --------------------------------------------------------------------------- #
+# pinned versions
+# --------------------------------------------------------------------------- #
+# Release tags / commit SHAs that sr_compare is validated against, so re-running
+# this script reproduces the same third-party trees instead of drifting to
+# whatever "latest" / default HEAD happens to be today.  Sources (read from the
+# fetched third_party/ trees on 2026-08-18 unless noted otherwise):
+#   XESS_TAG          intel/xess latest release tag (GitHub API /releases/latest
+#                     on 2026-08-20; the SDK zip ships no version header).
+#   STREAMLINE_TAG    NVIDIA-RTX/Streamline, matches include/sl_version.h 2.12.0.
+#   SGSR_REF          SnapdragonGameStudios/snapdragon-gsr origin/main commit
+#                     (.git/shallow; README version history says 2.0.0).
+#   NSS_SDK_REF       arm/neural-graphics-sdk-for-game-engines origin/main
+#                     (.git/shallow; RELEASE-NOTES.md says v1.1.0).
+#   NSS_MODELS_REF    Arm/neural-super-sampling origin/main (.git/shallow).
+#   NSS_EMULATION_REF arm/ai-ml-emulation-layer-for-vulkan origin/main
+#                     (.git/shallow).
+XESS_TAG = "v3.0.2"
+STREAMLINE_TAG = "v2.12.0"
+SGSR_REF = "d926f074bcb9d714e179f1ce0fcb9ee2eeb5074e"
+NSS_SDK_REF = "aba0d109ffcfb97e380ac0a68fb11683e5561c6e"
+NSS_MODELS_REF = "3dd6c4f054827a3d018330d5dfcd0b92e7d37974"
+NSS_EMULATION_REF = "00e9d81f8545bd6a4c3662909e42370708adfac1"
+
 
 # --------------------------------------------------------------------------- #
 # small utilities
@@ -163,6 +187,7 @@ def git_clone(
     dest: Path,
     shallow: bool = True,
     sparse_paths: list[str] | None = None,
+    ref: str | None = None,
 ) -> None:
     dest = Path(dest)
     if dest.exists() and (dest / ".git").exists():
@@ -180,6 +205,12 @@ def git_clone(
     run(cmd)
     if sparse_paths:
         run(["git", "-C", str(dest), "sparse-checkout", "set", *sparse_paths])
+    if ref:
+        # Pin the clone to an exact tag or commit instead of the default HEAD.
+        # ``fetch --depth 1 origin <ref>`` works for both tags and raw SHAs;
+        # the following checkout detaches HEAD at that ref.
+        run(["git", "-C", str(dest), "fetch", "--depth", "1", "origin", ref])
+        run(["git", "-C", str(dest), "checkout", ref])
 
 
 def _norm_zpath(name: str) -> str:
@@ -331,10 +362,10 @@ def task_xess(force: bool = False) -> dict:
     marker = dest / "bin"
     if marker.exists() and not force:
         log("[xess] already present, skip")
-        return _done("xess", dest, "?", "skipped (present)")
+        return _done("xess", dest, XESS_TAG, "skipped (present)")
 
     repo = "intel/xess"
-    tag, asset = find_asset(repo, name_regex=r"XeSS_SDK_.*\.zip")
+    tag, asset = find_asset(repo, tag=XESS_TAG, name_regex=r"XeSS_SDK_.*\.zip")
     zip_path = TMP / "xess.zip"
     log(f"[xess] downloading {asset['name']} ({human(asset['size'])}) from {repo} {tag}")
     download(asset["browser_download_url"], zip_path)
@@ -366,10 +397,10 @@ def task_streamline(force: bool = False) -> dict:
     marker = dest / "bin"
     if marker.exists() and not force:
         log("[streamline] already present, skip")
-        return _done("streamline", dest, "?", "skipped (present)")
+        return _done("streamline", dest, STREAMLINE_TAG, "skipped (present)")
 
     repo = "NVIDIA-RTX/Streamline"
-    tag, asset = find_asset(repo, name_regex=r"streamline-sdk.*\.zip")
+    tag, asset = find_asset(repo, tag=STREAMLINE_TAG, name_regex=r"streamline-sdk.*\.zip")
     zip_path = TMP / "streamline.zip"
     log(f"[streamline] downloading {asset['name']} ({human(asset['size'])}) from {repo} {tag}")
     download(asset["browser_download_url"], zip_path)
@@ -403,9 +434,13 @@ def task_sgsr(force: bool = False) -> dict:
     dest = THIRD_PARTY / "snapdragon-gsr"
     if dest.exists() and any(dest.iterdir()) and not force:
         log("[sgsr] already present, skip")
-        return _done("sgsr", dest, "git main", "skipped (present)")
+        return _done("sgsr", dest, f"git {SGSR_REF[:8]}", "skipped (present)")
     log("[sgsr] git clone (shallow) SnapdragonGameStudios/snapdragon-gsr")
-    git_clone("https://github.com/SnapdragonGameStudios/snapdragon-gsr", dest)
+    git_clone(
+        "https://github.com/SnapdragonGameStudios/snapdragon-gsr",
+        dest,
+        ref=SGSR_REF,
+    )
     sha = _git_head(dest)
     report_verify("sgsr", dest, ["*.hlsl", "*.h", "*.fx", "*.cs", "README*", "LICENSE*"])
     return _done("sgsr", dest, f"git {sha[:8] if sha else 'main'}", "ok")
@@ -422,7 +457,11 @@ def task_nss(force: bool = False) -> dict:
         log("[nss] SDK already present, skip")
     else:
         log("[nss] git clone (shallow) arm/neural-graphics-sdk-for-game-engines")
-        git_clone("https://github.com/arm/neural-graphics-sdk-for-game-engines", sdk_dest)
+        git_clone(
+            "https://github.com/arm/neural-graphics-sdk-for-game-engines",
+            sdk_dest,
+            ref=NSS_SDK_REF,
+        )
 
     # 2) HuggingFace prebuilt VGF models (git-lfs)
     models_dest = dest / "models"
@@ -430,7 +469,11 @@ def task_nss(force: bool = False) -> dict:
         log("[nss] models already present, skip")
     else:
         log("[nss] git clone (shallow, lfs) huggingface.co/Arm/neural-super-sampling")
-        git_clone("https://huggingface.co/Arm/neural-super-sampling", models_dest)
+        git_clone(
+            "https://huggingface.co/Arm/neural-super-sampling",
+            models_dest,
+            ref=NSS_MODELS_REF,
+        )
 
     # 3) Vulkan ML emulation layer
     emu_dest = dest / "emulation-layer"
@@ -438,7 +481,11 @@ def task_nss(force: bool = False) -> dict:
         log("[nss] emulation-layer already present, skip")
     else:
         log("[nss] git clone (shallow) arm/ai-ml-emulation-layer-for-vulkan")
-        git_clone("https://github.com/arm/ai-ml-emulation-layer-for-vulkan", emu_dest)
+        git_clone(
+            "https://github.com/arm/ai-ml-emulation-layer-for-vulkan",
+            emu_dest,
+            ref=NSS_EMULATION_REF,
+        )
 
     report_verify(
         "nss/models",

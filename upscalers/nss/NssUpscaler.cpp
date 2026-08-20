@@ -2,6 +2,7 @@
 
 #include "upscalers/UpscalerFactory.h"
 #include "renderer/core/PathUtil.h"
+#include "upscalers/VkHelpers.h"
 
 // Arm Neural Graphics SDK public headers (FFX-style API).
 #define FFX_CPU
@@ -155,17 +156,6 @@ VulkanDeviceNeeds g_nssNeeds = {&nssAppendDeviceExtensions, &nssFeatureChain, nu
 // ---------------------------------------------------------------------------
 // Small Vulkan helpers (same patterns as the TAA baseline).
 // ---------------------------------------------------------------------------
-uint32_t findMemoryType(VkPhysicalDevice physicalDevice, uint32_t typeBits,
-                        VkMemoryPropertyFlags required) {
-    VkPhysicalDeviceMemoryProperties mp;
-    vkGetPhysicalDeviceMemoryProperties(physicalDevice, &mp);
-    for (uint32_t i = 0; i < mp.memoryTypeCount; ++i) {
-        if ((typeBits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & required) == required)
-            return i;
-    }
-    return 0xFFFFFFFFu;
-}
-
 struct Image {
     VkImage        image          = VK_NULL_HANDLE;
     VkImageView    view           = VK_NULL_HANDLE;
@@ -260,27 +250,6 @@ void transitionImage(VkCommandBuffer cmd, Image& img, VkImageLayout newLayout) {
         barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
     vkCmdPipelineBarrier(cmd, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &barrier);
     img.layout = newLayout;
-}
-
-VkShaderModule loadShader(VkDevice device, const char* path) {
-    std::ifstream file(path, std::ios::binary | std::ios::ate);
-    if (!file) {
-        std::fprintf(stderr, "NSS: failed to open shader %s\n", path);
-        return VK_NULL_HANDLE;
-    }
-    const std::streamoff size = file.tellg();
-    if (size <= 0 || size % 4 != 0) return VK_NULL_HANDLE;
-    file.seekg(0);
-    std::vector<uint32_t> code(static_cast<size_t>(size) / 4);
-    file.read(reinterpret_cast<char*>(code.data()), size);
-
-    VkShaderModuleCreateInfo ci = {};
-    ci.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-    ci.codeSize = static_cast<size_t>(size);
-    ci.pCode    = code.data();
-    VkShaderModule module = VK_NULL_HANDLE;
-    vkCreateShaderModule(device, &ci, nullptr, &module);
-    return module;
 }
 
 void nssMessageCallback(uint32_t type, const char* message) {

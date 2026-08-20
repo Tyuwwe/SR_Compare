@@ -23,6 +23,7 @@
 #include "upscalers/fsr/FsrUpscaler.h"
 
 #include "upscalers/UpscalerFactory.h"
+#include "upscalers/VkHelpers.h"
 
 #include <FidelityFX/host/backends/vk/ffx_vk.h>
 #include <FidelityFX/host/ffx_fsr1.h>
@@ -127,15 +128,6 @@ struct OwnedImage {
     VkDeviceMemory memory = VK_NULL_HANDLE;
     uint64_t bytes = 0;
 };
-
-uint32_t findMemoryType(VkPhysicalDevice physicalDevice, uint32_t typeBits, VkMemoryPropertyFlags required) {
-    VkPhysicalDeviceMemoryProperties mp;
-    vkGetPhysicalDeviceMemoryProperties(physicalDevice, &mp);
-    for (uint32_t i = 0; i < mp.memoryTypeCount; ++i) {
-        if ((typeBits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & required) == required) return i;
-    }
-    return 0xFFFFFFFFu;
-}
 
 bool createStorageImage(const VulkanEnv& env, uint32_t width, uint32_t height, VkFormat format,
                         OwnedImage& out) {

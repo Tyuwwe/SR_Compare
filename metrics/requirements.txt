@@ -3,11 +3,12 @@
 #   - torch/torchvision 使用 PyPI 默认源（Windows 下即为 CPU 构建），体积较大。
 #   - torchvision 是 lpips 的运行时依赖（lpips 内部 import torchvision.transforms）。
 #   - flip_evaluator 为 NVlabs FLIP 的 Python 包；若安装失败请见 setup_venv 脚本注释。
-numpy
-scikit-image
-pandas
-Pillow
-torch
-torchvision
-lpips
-flip_evaluator
+#   - 以下版本号钉自 metrics/venv 的 `pip freeze` 实测输出，仅列出直接依赖。
+numpy==2.5.2
+scikit-image==0.26.0
+pandas==3.0.5
+pillow==12.3.0
+torch==2.13.0
+torchvision==0.28.0
+lpips==0.1.4
+flip-evaluator==1.7

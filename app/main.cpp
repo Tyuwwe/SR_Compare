@@ -6,6 +6,7 @@
 //                     [--camera-path path.json] [--frames N] [--screenshot out.png]
 //   sr_compare gui    interactive Dear ImGui front end (all modes)
 // ============================================================================
+#include "app/CliUtils.h"
 #include "bench/BenchMode.h"
 #include "compare/CompareMode.h"
 #include "gui/GuiApp.h"
@@ -43,27 +44,12 @@ void printUsage() {
                  "  --screenshot <out.png>           save the final frame as PNG\n");
 }
 
-bool parseResolution(const char* s, uint32_t& w, uint32_t& h) {
-    int iw = 0, ih = 0;
-    if (::sscanf_s(s, "%dx%d", &iw, &ih) != 2 || iw <= 0 || ih <= 0) return false;
-    w = static_cast<uint32_t>(iw);
-    h = static_cast<uint32_t>(ih);
-    return true;
-}
-
 int runViewer(int argc, char** argv) {
     sr::RendererOptions opts;
     for (int i = 0; i < argc; ++i) {
         const std::string a = argv[i];
-        const auto next = [&](const char* name) -> const char* {
-            if (i + 1 >= argc) {
-                std::fprintf(stderr, "missing value for %s\n", name);
-                std::exit(1);
-            }
-            return argv[++i];
-        };
         if (a == "--scene") {
-            opts.scenePath = sr::resolveSceneArg(next("--scene"));
+            opts.scenePath = sr::resolveSceneArg(sr::nextArg(i, argc, argv, "--scene"));
         } else if (a == "--list-scenes") {
             std::printf("available scenes:\n");
             for (const sr::SceneEntry& s : sr::listScenes()) {
@@ -72,32 +58,33 @@ int runViewer(int argc, char** argv) {
             }
             return 0;
         } else if (a == "--upscaler") {
-            opts.upscalerName = next("--upscaler");
+            opts.upscalerName = sr::nextArg(i, argc, argv, "--upscaler");
         } else if (a == "--list-upscalers") {
             std::printf("registered upscalers:\n");
             for (const std::string& n : sr::listUpscalers()) std::printf("  %s\n", n.c_str());
             return 0;
         } else if (a == "--render-scale") {
-            opts.renderScale = static_cast<float>(std::atof(next("--render-scale")));
-            if (opts.renderScale <= 0.0f || opts.renderScale > 1.0f) {
+            if (!sr::parseRenderScale(sr::nextArg(i, argc, argv, "--render-scale"),
+                                      opts.renderScale)) {
                 std::fprintf(stderr, "invalid --render-scale value\n");
                 return 1;
             }
         } else if (a == "--output") {
-            if (!parseResolution(next("--output"), opts.displayWidth, opts.displayHeight)) {
+            if (!sr::parseResolution(sr::nextArg(i, argc, argv, "--output"),
+                                     opts.displayWidth, opts.displayHeight)) {
                 std::fprintf(stderr, "invalid --output resolution\n");
                 return 1;
             }
         } else if (a == "--camera-path") {
-            opts.cameraPath = next("--camera-path");
+            opts.cameraPath = sr::nextArg(i, argc, argv, "--camera-path");
         } else if (a == "--env-map") {
-            opts.envMapPath = next("--env-map");
+            opts.envMapPath = sr::nextArg(i, argc, argv, "--env-map");
         } else if (a == "--frames") {
-            opts.frames = std::atoi(next("--frames"));
+            opts.frames = std::atoi(sr::nextArg(i, argc, argv, "--frames"));
         } else if (a == "--screenshot") {
-            opts.screenshotPath = next("--screenshot");
+            opts.screenshotPath = sr::nextArg(i, argc, argv, "--screenshot");
         } else if (a == "--frame-times") {
-            opts.frameTimesPath = next("--frame-times");
+            opts.frameTimesPath = sr::nextArg(i, argc, argv, "--frame-times");
         } else if (a == "--vsync") {
             opts.vsync = true;
         } else {
@@ -123,42 +110,36 @@ int runGui(int argc, char** argv) {
     sr::GuiOptions opts;
     for (int i = 0; i < argc; ++i) {
         const std::string a = argv[i];
-        const auto next = [&](const char* name) -> const char* {
-            if (i + 1 >= argc) {
-                std::fprintf(stderr, "missing value for %s\n", name);
-                std::exit(1);
-            }
-            return argv[++i];
-        };
         if (a == "--scene") {
-            opts.sceneArg = next("--scene");
+            opts.sceneArg = sr::nextArg(i, argc, argv, "--scene");
         } else if (a == "--upscaler") {
-            opts.upscalerName = next("--upscaler");
+            opts.upscalerName = sr::nextArg(i, argc, argv, "--upscaler");
         } else if (a == "--compare") {
-            opts.compareList = next("--compare");
+            opts.compareList = sr::nextArg(i, argc, argv, "--compare");
         } else if (a == "--compare-zoom") {
-            opts.compareZoom = static_cast<float>(std::atof(next("--compare-zoom")));
+            opts.compareZoom = static_cast<float>(std::atof(sr::nextArg(i, argc, argv, "--compare-zoom")));
         } else if (a == "--compare-gt-ssaa") {
             opts.compareGtSsaa = true;
         } else if (a == "--env-map") {
-            opts.envMapPath = next("--env-map");
+            opts.envMapPath = sr::nextArg(i, argc, argv, "--env-map");
         } else if (a == "--bench") {
-            opts.benchList = next("--bench");
+            opts.benchList = sr::nextArg(i, argc, argv, "--bench");
         } else if (a == "--render-scale") {
-            opts.renderScale = static_cast<float>(std::atof(next("--render-scale")));
-            if (opts.renderScale <= 0.0f || opts.renderScale > 1.0f) {
+            if (!sr::parseRenderScale(sr::nextArg(i, argc, argv, "--render-scale"),
+                                      opts.renderScale)) {
                 std::fprintf(stderr, "invalid --render-scale value\n");
                 return 1;
             }
         } else if (a == "--output") {
-            if (!parseResolution(next("--output"), opts.displayW, opts.displayH)) {
+            if (!sr::parseResolution(sr::nextArg(i, argc, argv, "--output"),
+                                     opts.displayW, opts.displayH)) {
                 std::fprintf(stderr, "invalid --output resolution\n");
                 return 1;
             }
         } else if (a == "--frames") {
-            opts.frames = std::atoi(next("--frames"));
+            opts.frames = std::atoi(sr::nextArg(i, argc, argv, "--frames"));
         } else if (a == "--screenshot") {
-            opts.screenshotPath = next("--screenshot");
+            opts.screenshotPath = sr::nextArg(i, argc, argv, "--screenshot");
         } else {
             std::fprintf(stderr, "unknown gui option: %s\n", a.c_str());
             return 1;
