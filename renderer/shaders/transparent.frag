@@ -1,7 +1,10 @@
 #version 450
 // Forward transparency pass (upscaler input path).  Shades alpha-blended
 // surfaces (glass, bottles) with the same Cook-Torrance GGX + point lights +
-// IBL split-sum as the deferred lighting pass, then:
+// IBL split-sum as the deferred lighting pass, combined through an
+// energy-conserving dielectric glass model (see main): specular lobes keep
+// full strength while only the transmitted/tinted terms scale with opacity.
+// Outputs:
 //   RT0 color   RGBA16F  blended over the lit scene (srcAlpha, 1-srcAlpha)
 //   RT1 motion  RG16F    overwrites the background MV (blend disabled);
 //                        static glass -> camera motion, matching what UE calls
@@ -92,8 +95,16 @@ vec3 fresnelSchlickRoughness(float cosTheta, vec3 F0, float roughness) {
     return F0 + (F1 - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
 }
 
-vec3 shadePointLight(vec3 N, vec3 V, vec3 worldPos, vec3 albedo, float metallic,
-                     float roughness, vec3 F0, vec3 lightPos, vec3 lightColor) {
+// Returns the point-light BRDF split into its diffuse and specular lobes.
+// The glass model weights them differently: specular is surface reflection,
+// whose energy does not depend on transmission (opacity), while the diffuse
+// lobe approximates the transmitted/tinted term and scales with opacity.
+void shadePointLight(vec3 N, vec3 V, vec3 worldPos, vec3 albedo, float metallic,
+                     float roughness, vec3 F0, vec3 lightPos, vec3 lightColor,
+                     out vec3 diffuse, out vec3 specular) {
+    diffuse = vec3(0.0);
+    specular = vec3(0.0);
+
     vec3 toLight = lightPos - worldPos;
     float dist = length(toLight);
     vec3 L = toLight / dist;
@@ -101,15 +112,15 @@ vec3 shadePointLight(vec3 N, vec3 V, vec3 worldPos, vec3 albedo, float metallic,
 
     vec3 H = normalize(V + L);
     float NdL = max(dot(N, L), 0.0);
-    if (NdL <= 0.0) return vec3(0.0);
+    if (NdL <= 0.0) return;
 
     float D = distributionGGX(N, H, roughness);
     float G = geometrySmith(N, V, L, roughness);
     vec3 F = fresnelSchlick(max(dot(H, V), 0.0), F0);
-    vec3 specular = (D * G * F) / max(4.0 * max(dot(N, V), 0.0) * NdL, 1e-4);
+    specular = (D * G * F) / max(4.0 * max(dot(N, V), 0.0) * NdL, 1e-4) * radiance * NdL;
 
     vec3 kd = (vec3(1.0) - F) * (1.0 - metallic);
-    return (kd * albedo / PI + specular) * radiance * NdL;
+    diffuse = kd * albedo / PI * radiance * NdL;
 }
 
 void main() {
@@ -150,11 +161,15 @@ void main() {
     vec3 F0 = mix(vec3(0.04), albedo, metallic);
     roughness = max(roughness, 0.04);
 
-    vec3 color =
-        shadePointLight(N, V, vWorldPos, albedo, metallic, roughness, F0, ubo.light0Pos.xyz,
-                        ubo.light0Color.rgb * ubo.light0Color.w) +
-        shadePointLight(N, V, vWorldPos, albedo, metallic, roughness, F0, ubo.light1Pos.xyz,
-                        ubo.light1Color.rgb * ubo.light1Color.w);
+    vec3 lightDiffuse = vec3(0.0);
+    vec3 lightSpecular = vec3(0.0);
+    vec3 ld, ls;
+    shadePointLight(N, V, vWorldPos, albedo, metallic, roughness, F0, ubo.light0Pos.xyz,
+                    ubo.light0Color.rgb * ubo.light0Color.w, ld, ls);
+    lightDiffuse += ld; lightSpecular += ls;
+    shadePointLight(N, V, vWorldPos, albedo, metallic, roughness, F0, ubo.light1Pos.xyz,
+                    ubo.light1Color.rgb * ubo.light1Color.w, ld, ls);
+    lightDiffuse += ld; lightSpecular += ls;
 
     float NdV = max(dot(N, V), 0.0);
     vec3 F = fresnelSchlickRoughness(NdV, F0, roughness);
@@ -168,15 +183,25 @@ void main() {
     float ssao = texelFetch(ssaoTex, ivec2(gl_FragCoord.xy), 0).r;
     float ambientScale = ao * ssao * lighting.iblParams.x;
 
-    // Dielectric glass model: the diffuse/ambient part is a transmitted-term
-    // approximation, so it is scaled by opacity (glass albedo is a tint, not
-    // a milky diffuse lobe); only the specular response is kept at full
-    // strength.  Opacity rises with the Fresnel term so panes turn reflective
-    // at grazing angles instead of becoming a constant white veil.
+    // Energy-conserving dielectric glass model:
+    //  - Specular lobes (direct + IBL) are surface reflections: their energy
+    //    is independent of transmission, so they are NOT scaled by opacity.
+    //    Scaling them by base.a (~0.1-0.4 for glass) would crush point-light
+    //    highlights and leave only the IBL mirror, reading as metal.
+    //  - specularIbl is weighted by the un-roughened Fresnel Fg so head-on
+    //    reflections stay near F0 (~4%) and only grow toward grazing angles;
+    //    an unweighted full-strength sample of the sharpest prefilter mip
+    //    (roughness ~0.04) would mirror the sky's sun disk almost losslessly.
+    //  - The diffuse/emissive terms approximate the transmitted, tinted part
+    //    (glass albedo is a tint, not a milky diffuse lobe) and keep the
+    //    opacity scale.
+    //  - Opacity is max(base.a, Fg): Fresnel reflection still turns panes
+    //    more opaque at grazing angles, but moderate angles no longer
+    //    saturate to a fully opaque mirror.
     vec3 Fg = fresnelSchlick(NdV, F0);
-    float alpha = clamp(base.a + Fg.r * (1.0 - base.a), 0.0, 1.0);
-    vec3 glassColor = (color + emissive + kd * diffuseIbl * ambientScale) * base.a +
-                      specularIbl * ambientScale;
+    float alpha = clamp(max(base.a, Fg.r), 0.0, 1.0);
+    vec3 glassColor = (lightDiffuse + emissive + kd * diffuseIbl * ambientScale) * base.a +
+                      lightSpecular + specularIbl * Fg * ambientScale;
 
     outColor = vec4(glassColor, alpha);
     outMotion = vMotion;
