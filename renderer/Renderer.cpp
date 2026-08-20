@@ -666,8 +666,16 @@ void Renderer::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         const Vec2 h = halton23(frameIndex + 1);
         jitterX_ = h.x - 0.5f;
         jitterY_ = h.y - 0.5f;
-        projJittered.m[12] += jitterX_ * 2.f / static_cast<float>(renderWidth_);
-        projJittered.m[13] += jitterY_ * 2.f / static_cast<float>(renderHeight_);
+        // Sub-pixel jitter must shift NDC by a constant (every temporal
+        // upscaler assumes: jittered pixel pos = unjittered pos + jitter),
+        // i.e. clip.xy += offset * clip.w.  clip.w = -z_view comes from row 3
+        // (m[11] = -1), so the offset lands in column 2 (m[8]/m[9]) with a
+        // negative sign.  Writing the translation column (m[12]/m[13])
+        // instead would add a constant clip-space term, making the pixel
+        // shift depth-dependent (jitterX / viewDepth) and breaking the
+        // uniform-jitter contract the upscalers are told about.
+        projJittered.m[8] -= jitterX_ * 2.f / static_cast<float>(renderWidth_);
+        projJittered.m[9] -= jitterY_ * 2.f / static_cast<float>(renderHeight_);
     } else {
         jitterX_ = 0.f;
         jitterY_ = 0.f;

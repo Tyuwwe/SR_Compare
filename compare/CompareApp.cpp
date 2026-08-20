@@ -1156,8 +1156,11 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     const Vec2 h = halton23(frameIndex + 1);
     jitterX_ = h.x - 0.5f;
     jitterY_ = h.y - 0.5f;
-    projJittered.m[12] += jitterX_ * 2.f / static_cast<float>(renderWidth_);
-    projJittered.m[13] += jitterY_ * 2.f / static_cast<float>(renderHeight_);
+    // Uniform NDC shift: clip.xy += offset * clip.w (clip.w = -z_view via
+    // m[11] = -1), so the offset belongs in column 2 with a negative sign —
+    // see Renderer.cpp for the full rationale.
+    projJittered.m[8] -= jitterX_ * 2.f / static_cast<float>(renderWidth_);
+    projJittered.m[9] -= jitterY_ * 2.f / static_cast<float>(renderHeight_);
 
     updateSceneUBO(fr.uboGbMapped, true, renderWidth_, renderHeight_, view, proj, projJittered,
                    prevViewProj_);

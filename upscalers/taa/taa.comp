@@ -33,7 +33,13 @@ void main() {
     if (px.x >= int(ds.x) || px.y >= int(ds.y)) return;
 
     vec2 uv = (vec2(px) + 0.5) / ds;
-    vec3 current = sampleColor(uv);
+    // Un-jitter the current frame: jittered content sits at unjittered_pos +
+    // jitter, so the unjittered sample for uv lives at uv + jitter/renderSize
+    // in the color (and motion) buffer.  History stays in unjittered space;
+    // without this the per-frame Halton offset leaks into the blend and
+    // high-contrast edges (e.g. shadow boundaries) wobble frame to frame.
+    vec2 juv = pc.jitter.xy / pc.sizes.xy;
+    vec3 current = sampleColor(uv + juv);
 
     if (pc.params.y > 0.5) {
         imageStore(uOutput, px, vec4(current, 1.0));
@@ -41,7 +47,7 @@ void main() {
         return;
     }
 
-    vec2 motionPx = texture(uMotion, uv).xy;         // render-res pixels
+    vec2 motionPx = texture(uMotion, uv + juv).xy;   // render-res pixels
     vec2 scale = ds / pc.sizes.xy;                   // display/render
     vec2 historyUV = uv - motionPx * scale / ds;
 
@@ -59,7 +65,7 @@ void main() {
     for (int dy = -1; dy <= 1; ++dy) {
         for (int dx = -1; dx <= 1; ++dx) {
             if (dx == 0 && dy == 0) continue;
-            vec3 c = sampleColor(uv + vec2(dx, dy) * renderRcp);
+            vec3 c = sampleColor(uv + juv + vec2(dx, dy) * renderRcp);
             mean += c;
             sq += c * c;
         }
