@@ -17,6 +17,11 @@
 //             {-1/renderW, -1/renderH}; in our static-geometry scenes DLSS
 //             reprojects via clipToPrevClip, so the sign is untestable here.
 //   * NSS   : backward pixel motion -> motionVectorScale {-1,-1}.
+//             jitterOffset is negated (NssUpscaler.cpp): NSS wants the
+//             unjitter sampling offset, not the content displacement —
+//             Arm's reference sample applies jitter with proj[2][0/1] +=
+//             on a clip.w = -z projection (content moves by -jitter
+//             pixels) and reports the positive value.
 //   * SGSR2 : shader computes prev = uv - 0.5*clipMV -> takes cur->prev
 //             clip-space MV, correct as-is (encode pass multiplies by
 //             2/renderSize).

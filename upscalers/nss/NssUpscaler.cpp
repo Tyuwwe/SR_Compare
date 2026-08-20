@@ -615,8 +615,19 @@ void NssUpscaler::dispatch(VkCommandBuffer cmd, const UpscalerResources& res, co
                                 impl->desc.displayHeight, FFX_API_RESOURCE_USAGE_UAV,
                                 FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
 
-        desc.jitterOffset.x = cam.jitterX;
-        desc.jitterOffset.y = cam.jitterY;
+        // NSS jitterOffset convention is the NEGATIVE of the actual
+        // framebuffer pixel displacement (the sampling offset that undoes
+        // the jitter) — opposite sign to FSR2/XeSS.  Derivation: Arm's
+        // reference sample applies jitter with projection[2][0/1] += ndc on
+        // a clip.w = -z view space, which displaces content by -jitter
+        // pixels, then reports +jitter (temporal_forward_subpass.cpp:171,
+        // nss.cpp:701).  Our projection (m[8]/m[9] -= jitter*2/size, same
+        // clip.w = -z convention) displaces content by +jitter pixels, so
+        // the value reported here must be negated.  Empirical evidence: with
+        // the un-negated value the converged output showed phase-doubled
+        // edges and sat ~3.8 dB PSNR below FSR2 vs GT on a static camera.
+        desc.jitterOffset.x = -cam.jitterX;
+        desc.jitterOffset.y = -cam.jitterY;
         desc.renderSize.width    = impl->desc.renderWidth;
         desc.renderSize.height   = impl->desc.renderHeight;
         desc.upscaleSize.width   = impl->desc.displayWidth;
