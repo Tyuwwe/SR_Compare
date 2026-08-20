@@ -194,7 +194,11 @@ void transitionToGeneral(const VulkanEnv& env, const OwnedImage* images, uint32_
     VkCommandBufferBeginInfo begin = {};
     begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cmd, &begin);
+    if (vkBeginCommandBuffer(cmd, &begin) != VK_SUCCESS) {
+        std::fprintf(stderr, "FSR3.1: vkBeginCommandBuffer failed\n");
+        vkFreeCommandBuffers(env.device, env.commandPool, 1, &cmd);
+        return;
+    }
 
     VkImageMemoryBarrier barriers[8];
     for (uint32_t i = 0; i < count && i < 8; ++i) {
@@ -214,16 +218,26 @@ void transitionToGeneral(const VulkanEnv& env, const OwnedImage* images, uint32_
     }
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0,
                          nullptr, 0, nullptr, count, barriers);
-    vkEndCommandBuffer(cmd);
+    if (vkEndCommandBuffer(cmd) != VK_SUCCESS) {
+        std::fprintf(stderr, "FSR3.1: vkEndCommandBuffer failed\n");
+        vkFreeCommandBuffers(env.device, env.commandPool, 1, &cmd);
+        return;
+    }
 
     VkSubmitInfo submit = {};
     submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submit.commandBufferCount = 1;
     submit.pCommandBuffers = &cmd;
-    if (env.queueMutex) env.queueMutex->lock();
-    vkQueueSubmit(env.graphicsQueue, 1, &submit, VK_NULL_HANDLE);
-    vkQueueWaitIdle(env.graphicsQueue);
-    if (env.queueMutex) env.queueMutex->unlock();
+    if (env.queueMutex) {
+        std::lock_guard<std::mutex> lk(*env.queueMutex);
+        if (vkQueueSubmit(env.graphicsQueue, 1, &submit, VK_NULL_HANDLE) != VK_SUCCESS)
+            std::fprintf(stderr, "FSR3.1: vkQueueSubmit failed\n");
+        vkQueueWaitIdle(env.graphicsQueue);
+    } else {
+        if (vkQueueSubmit(env.graphicsQueue, 1, &submit, VK_NULL_HANDLE) != VK_SUCCESS)
+            std::fprintf(stderr, "FSR3.1: vkQueueSubmit failed\n");
+        vkQueueWaitIdle(env.graphicsQueue);
+    }
     vkFreeCommandBuffers(env.device, env.commandPool, 1, &cmd);
 }
 

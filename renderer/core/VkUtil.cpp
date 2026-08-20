@@ -1,5 +1,7 @@
 #include "renderer/core/VkUtil.h"
 
+#include <cstdio>
+
 namespace sr {
 
 uint32_t findMemoryType(const VulkanContext& ctx, uint32_t typeBits, VkMemoryPropertyFlags required) {
@@ -208,14 +210,25 @@ void submitOneShot(const VulkanContext& ctx, const std::function<void(VkCommandB
     alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     alloc.commandBufferCount = 1;
     VkCommandBuffer cmd = VK_NULL_HANDLE;
-    if (vkAllocateCommandBuffers(ctx.device, &alloc, &cmd) != VK_SUCCESS || !cmd) return;
+    if (vkAllocateCommandBuffers(ctx.device, &alloc, &cmd) != VK_SUCCESS || !cmd) {
+        std::fprintf(stderr, "submitOneShot: vkAllocateCommandBuffers failed\n");
+        return;
+    }
 
     VkCommandBufferBeginInfo begin = {};
     begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cmd, &begin);
+    if (vkBeginCommandBuffer(cmd, &begin) != VK_SUCCESS) {
+        std::fprintf(stderr, "submitOneShot: vkBeginCommandBuffer failed\n");
+        vkFreeCommandBuffers(ctx.device, cmdPool, 1, &cmd);
+        return;
+    }
     fn(cmd);
-    vkEndCommandBuffer(cmd);
+    if (vkEndCommandBuffer(cmd) != VK_SUCCESS) {
+        std::fprintf(stderr, "submitOneShot: vkEndCommandBuffer failed\n");
+        vkFreeCommandBuffers(ctx.device, cmdPool, 1, &cmd);
+        return;
+    }
 
     VkSubmitInfo submit = {};
     submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
@@ -225,12 +238,28 @@ void submitOneShot(const VulkanContext& ctx, const std::function<void(VkCommandB
     VkFenceCreateInfo fenceInfo = {};
     fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
     VkFence fence = VK_NULL_HANDLE;
-    vkCreateFence(ctx.device, &fenceInfo, nullptr, &fence);
+    if (vkCreateFence(ctx.device, &fenceInfo, nullptr, &fence) != VK_SUCCESS) {
+        std::fprintf(stderr, "submitOneShot: vkCreateFence failed\n");
+        vkFreeCommandBuffers(ctx.device, cmdPool, 1, &cmd);
+        return;
+    }
+    VkResult submitResult = VK_SUCCESS;
     {
         std::lock_guard<std::mutex> lk(ctx.queueMutex);
-        vkQueueSubmit(ctx.graphicsQueue, 1, &submit, fence);
+        submitResult = vkQueueSubmit(ctx.graphicsQueue, 1, &submit, fence);
     }
-    vkWaitForFences(ctx.device, 1, &fence, VK_TRUE, UINT64_MAX);
+    if (submitResult != VK_SUCCESS) {
+        std::fprintf(stderr, "submitOneShot: vkQueueSubmit failed\n");
+        vkDestroyFence(ctx.device, fence, nullptr);
+        vkFreeCommandBuffers(ctx.device, cmdPool, 1, &cmd);
+        return;
+    }
+    if (vkWaitForFences(ctx.device, 1, &fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) {
+        // Log and fall through to the cleanup below; the fence/cmd are torn down
+        // unconditionally here regardless of the wait result, matching the prior
+        // behavior (a failed wait is fatal and leaves the device unusable).
+        std::fprintf(stderr, "submitOneShot: vkWaitForFences failed\n");
+    }
     vkDestroyFence(ctx.device, fence, nullptr);
     vkFreeCommandBuffers(ctx.device, cmdPool, 1, &cmd);
 }

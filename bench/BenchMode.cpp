@@ -264,6 +264,12 @@ double medianOf(std::vector<double> v) {
     if (v.empty()) return 0.0;
     const size_t mid = v.size() / 2;
     std::nth_element(v.begin(), v.begin() + mid, v.end());
+    if (v.size() % 2 == 0) {
+        // Even count: average the two middle values. nth_element places the
+        // upper middle at v[mid]; the lower middle is the max of the lower half.
+        const double lower = *std::max_element(v.begin(), v.begin() + mid);
+        return 0.5 * (lower + v[mid]);
+    }
     return v[mid];
 }
 
@@ -282,10 +288,22 @@ void aggregate(const std::vector<FrameSample>& samples, int warmup, BenchRow& ro
         row.notes = "failed: no frames left after warmup";
         return;
     }
+    // Require a minimum number of post-warmup frames so the aggregate stats
+    // (mean/median/1% low) are statistically meaningful.
+    constexpr size_t kMinSamples = 30;
+    if (frameMs.size() < kMinSamples) {
+        row.failed = true;
+        row.notes = "failed: insufficient samples after warmup (" +
+                    std::to_string(frameMs.size()) + " < " +
+                    std::to_string(kMinSamples) + ")";
+        return;
+    }
     row.upscaleMsAvg = meanOf(upscaleMs);
     row.upscaleMsP50 = medianOf(upscaleMs);
     row.frameMsAvg = meanOf(frameMs);
-    row.fpsAvg = meanOf(fps);
+    // fpsAvg is the reciprocal of frameMsAvg so the two stay consistent;
+    // mean(1000/frameMs) is not equal to 1000/mean(frameMs).
+    row.fpsAvg = row.frameMsAvg > 0.0 ? 1000.0 / row.frameMsAvg : 0.0;
     row.fpsP50 = medianOf(fps);
 
     // 1% low: mean of the slowest 1% frame times, converted to fps.

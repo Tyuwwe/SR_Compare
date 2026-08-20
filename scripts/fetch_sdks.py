@@ -570,7 +570,11 @@ def main() -> int:
             f"{human(size):>10s}  files={r.get('n_files','-')}"
         )
     log(f"  {'TOTAL':12s} {'':28s} {'':16s} {human(total):>10s}")
-    return 0
+
+    failed = [r for r in results if str(r.get("status", "")).startswith("FAILED")]
+    if failed:
+        log(f"{len(failed)} task(s) FAILED")
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

@@ -837,7 +837,7 @@ void Renderer::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
 
         FrameParams frame;
         frame.frameIndex = static_cast<int>(frameIndex);
-        frame.deltaTime = 1.f / 60.f;
+        frame.deltaTime = deltaTime_;
         frame.preExposure = 1.f;
         frame.resetHistory = (frameIndex == 0);
 
@@ -905,6 +905,10 @@ void Renderer::run() {
         const auto now = std::chrono::steady_clock::now();
         const float dt = std::chrono::duration<float>(now - lastTime).count();
         lastTime = now;
+        // Bench mode (opts_.frames >= 0) keeps the fixed 1/60 default so the
+        // upscaler's frame-to-frame integration is reproducible across machines
+        // and runs; interactive mode tracks real wall-clock time.
+        if (opts_.frames < 0) deltaTime_ = dt;
         updateCamera(frameIndex, dt);
 
         const uint32_t slot = frameIndex % kFramesInFlight;

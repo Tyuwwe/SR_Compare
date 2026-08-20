@@ -213,7 +213,15 @@ bool createFallbackMask(const VulkanEnv& env, uint32_t width, uint32_t height, V
     allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     allocInfo.commandBufferCount = 1;
     VkCommandBuffer cmd = VK_NULL_HANDLE;
-    if (vkAllocateCommandBuffers(env.device, &allocInfo, &cmd) != VK_SUCCESS) return false;
+    if (vkAllocateCommandBuffers(env.device, &allocInfo, &cmd) != VK_SUCCESS) {
+        vkDestroyImageView(env.device, view, nullptr);
+        vkFreeMemory(env.device, memory, nullptr);
+        vkDestroyImage(env.device, image, nullptr);
+        image = VK_NULL_HANDLE;
+        memory = VK_NULL_HANDLE;
+        view = VK_NULL_HANDLE;
+        return false;
+    }
 
     VkCommandBufferBeginInfo begin = {};
     begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
@@ -249,10 +257,14 @@ bool createFallbackMask(const VulkanEnv& env, uint32_t width, uint32_t height, V
     submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submit.commandBufferCount = 1;
     submit.pCommandBuffers = &cmd;
-    if (env.queueMutex) env.queueMutex->lock();
-    vkQueueSubmit(env.graphicsQueue, 1, &submit, VK_NULL_HANDLE);
-    vkQueueWaitIdle(env.graphicsQueue);
-    if (env.queueMutex) env.queueMutex->unlock();
+    if (env.queueMutex) {
+        std::lock_guard<std::mutex> lk(*env.queueMutex);
+        vkQueueSubmit(env.graphicsQueue, 1, &submit, VK_NULL_HANDLE);
+        vkQueueWaitIdle(env.graphicsQueue);
+    } else {
+        vkQueueSubmit(env.graphicsQueue, 1, &submit, VK_NULL_HANDLE);
+        vkQueueWaitIdle(env.graphicsQueue);
+    }
     vkFreeCommandBuffers(env.device, env.commandPool, 1, &cmd);
     return true;
 }

@@ -170,12 +170,22 @@ def discover_algorithms(run_dir):
     return algos
 
 
-def compute_run_quality(run_dir, metrics=DEFAULT_METRICS, max_frames=None, flip_ppd=67.0):
+def compute_run_quality(run_dir, metrics=DEFAULT_METRICS, max_frames=None, flip_ppd=67.0,
+                        flip_maps_root=None):
     """对 run 目录逐算法逐帧计算指标，返回长表记录列表。
 
     每条记录：algo, metric, mean, median, p5, num_frames。
+
+    flip_maps_root 是 FLIP error map（派生数据）的输出根；缺省时放在 run 目录
+    的上级目录，避免把中间产物写回输入捕获目录。
     """
     run_dir = os.path.abspath(run_dir)
+    run_name = os.path.basename(run_dir)
+    # FLIP error maps are derived artifacts, not inputs: keep them out of the
+    # capture directory so re-running never contaminates the source frames.
+    if flip_maps_root is None:
+        flip_maps_root = os.path.dirname(run_dir)
+    flip_maps_root = os.path.abspath(flip_maps_root)
     gt_dir = os.path.join(run_dir, "GT")
     if not os.path.isdir(gt_dir):
         raise FileNotFoundError(f"未找到 GT 目录: {gt_dir}")
@@ -201,6 +211,8 @@ def compute_run_quality(run_dir, metrics=DEFAULT_METRICS, max_frames=None, flip_
         if max_frames is not None:
             common = common[: int(max_frames)]
 
+        flip_maps_dir = (os.path.join(flip_maps_root, run_name + "_flip_maps", algo)
+                         if "flip" in metrics else None)
         per_metric = {m: [] for m in metrics}
         for name in common:
             ref = load_srgb(os.path.join(gt_dir, name))
@@ -217,7 +229,7 @@ def compute_run_quality(run_dir, metrics=DEFAULT_METRICS, max_frames=None, flip_
             if "lpips" in metrics:
                 per_metric["lpips"].append(lpips_score(ref, img))
             if "flip" in metrics:
-                map_path = os.path.join(algo_dir, "flip_maps", name)
+                map_path = os.path.join(flip_maps_dir, name)
                 per_metric["flip"].append(flip_score(ref, img, ppd=flip_ppd, out_map_path=map_path))
 
         for m in metrics:
@@ -284,10 +296,14 @@ def main(argv=None):
         raise SystemExit("--metrics 不能为空")
     check_metrics_available(metrics)
 
-    records = compute_run_quality(args.run, metrics=metrics,
-                                  max_frames=args.max_frames, flip_ppd=args.flip_ppd)
     run_name = os.path.basename(os.path.abspath(args.run))
     out = args.out or os.path.join("output", f"quality_{run_name}.csv")
+    # FLIP error maps are derived data: write them under the CSV output root
+    # (<out_dir>/<run_name>_flip_maps/...) instead of the input capture dir.
+    flip_maps_root = os.path.dirname(os.path.abspath(out))
+    records = compute_run_quality(args.run, metrics=metrics,
+                                  max_frames=args.max_frames, flip_ppd=args.flip_ppd,
+                                  flip_maps_root=flip_maps_root)
     out = write_quality_csv(records, out)
     print(f"完成：{len(records)} 条指标记录 -> {out}")
 

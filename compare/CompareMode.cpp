@@ -75,6 +75,10 @@ int runCompareMode(int argc, char** argv) {
             return 0;
         } else if (a == "--render-scale") {
             opts.renderScale = static_cast<float>(std::atof(next("--render-scale")));
+            if (opts.renderScale <= 0.0f || opts.renderScale > 1.0f) {
+                std::fprintf(stderr, "invalid --render-scale value\n");
+                return 1;
+            }
         } else if (a == "--output") {
             if (!parseResolution(next("--output"), opts.displayWidth, opts.displayHeight)) {
                 std::fprintf(stderr, "invalid --output resolution\n");

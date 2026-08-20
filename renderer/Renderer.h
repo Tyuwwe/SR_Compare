@@ -94,6 +94,10 @@ private:
     float prevJitterX_ = 0.f;
     float prevJitterY_ = 0.f;
     bool hasTransparency_ = false; // any alphaMode BLEND material in the scene
+    // Wall-clock delta time (seconds) fed to the upscaler.  Interactive mode
+    // updates it every frame; bench mode keeps the 1/60 default for
+    // reproducible, machine-independent results.
+    float deltaTime_ = 1.0f / 60.0f;
 
     ImageResource gbColor_;
     ImageResource gbMotion_;

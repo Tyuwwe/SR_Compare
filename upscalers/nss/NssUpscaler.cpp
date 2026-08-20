@@ -194,13 +194,21 @@ bool createImage2D(const VulkanEnv& env, uint32_t width, uint32_t height, VkForm
     vkGetImageMemoryRequirements(env.device, out.image, &req);
     const uint32_t type =
         findMemoryType(env.physicalDevice, req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    if (type == 0xFFFFFFFFu) return false;
+    if (type == 0xFFFFFFFFu) {
+        vkDestroyImage(env.device, out.image, nullptr);
+        out.image = VK_NULL_HANDLE;
+        return false;
+    }
 
     VkMemoryAllocateInfo ai = {};
     ai.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     ai.allocationSize  = req.size;
     ai.memoryTypeIndex = type;
-    if (vkAllocateMemory(env.device, &ai, nullptr, &out.memory) != VK_SUCCESS) return false;
+    if (vkAllocateMemory(env.device, &ai, nullptr, &out.memory) != VK_SUCCESS) {
+        vkDestroyImage(env.device, out.image, nullptr);
+        out.image = VK_NULL_HANDLE;
+        return false;
+    }
     vkBindImageMemory(env.device, out.image, out.memory, 0);
     out.allocationSize = req.size;
 
@@ -212,7 +220,13 @@ bool createImage2D(const VulkanEnv& env, uint32_t width, uint32_t height, VkForm
     vi.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     vi.subresourceRange.levelCount = 1;
     vi.subresourceRange.layerCount = 1;
-    if (vkCreateImageView(env.device, &vi, nullptr, &out.view) != VK_SUCCESS) return false;
+    if (vkCreateImageView(env.device, &vi, nullptr, &out.view) != VK_SUCCESS) {
+        vkFreeMemory(env.device, out.memory, nullptr);
+        vkDestroyImage(env.device, out.image, nullptr);
+        out.image = VK_NULL_HANDLE;
+        out.memory = VK_NULL_HANDLE;
+        return false;
+    }
     return true;
 }
 

@@ -25,21 +25,10 @@ Idempotent.
 import json
 import os
 
+from bistro_gltf_common import OPAQUE_ALPHA_THRESHOLD, ZERO_ALPHA_FRAC, glass_alpha
+
 ASSETS = os.path.join(os.path.dirname(__file__), "..", "assets", "bistro")
 SCENES = ["BistroExterior", "BistroInterior"]
-
-OPAQUE_ALPHA_THRESHOLD = 0.95
-
-
-def glass_alpha(name):
-    n = name.lower()
-    if "frosted" in n or "frozen" in n:
-        return 0.45
-    if "paintings" in n:
-        return 0.10
-    if "liquorbottle" in n or "wine" in n:
-        return 0.25
-    return 0.18
 
 
 def main():
@@ -48,7 +37,8 @@ def main():
         report_path = os.path.join(ASSETS, scene + "_report.json")
         report = json.load(open(report_path, encoding="utf-8"))
         zero_alpha = {m["material"] for m in report["materials"]
-                      if m.get("alpha_lt_0.5_frac") == 1.0}
+                      if m.get("alpha_lt_0.5_frac") is not None
+                      and m.get("alpha_lt_0.5_frac") >= ZERO_ALPHA_FRAC}
 
         j = json.load(open(gltf_path, encoding="utf-8"))
         n_opaque = n_blend = n_rescue = 0

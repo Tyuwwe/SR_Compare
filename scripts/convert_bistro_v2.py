@@ -32,6 +32,16 @@ import sys
 import bpy
 import numpy as np
 
+# bistro_gltf_common.py lives next to this script. Blender --python does not
+# always put the script directory on sys.path, so add it explicitly before
+# importing the shared (non-bpy) helpers.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from bistro_gltf_common import (  # noqa: E402
+    OPAQUE_ALPHA_THRESHOLD,
+    ZERO_ALPHA_FRAC,
+    glass_alpha,
+)
+
 
 def parse_args():
     argv = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
@@ -123,18 +133,6 @@ def set_input(node, name, value):
     return False
 
 
-def glass_alpha(name):
-    """Constant alpha for BLEND glass (textures carry no usable opacity)."""
-    n = name.lower()
-    if "frosted" in n or "frozen" in n:
-        return 0.45
-    if "paintings" in n:
-        return 0.10
-    if "liquorbottle" in n or "wine" in n:
-        return 0.25
-    return 0.18
-
-
 def process_material(mat, tex_idx, stats, clip_mats, blend_mats, normal_img_names,
                      orm_img_names):
     if not mat.use_nodes or not mat.node_tree:
@@ -217,7 +215,7 @@ def process_material(mat, tex_idx, stats, clip_mats, blend_mats, normal_img_name
         blend_mats[mat.name] = glass_alpha(mat.name)
         entry["alpha_mode"] = "BLEND"
         stats["blend"] += 1
-    elif frac is not None and frac >= 0.999:
+    elif frac is not None and frac >= ZERO_ALPHA_FRAC:
         # Uniform-zero alpha carries no cutout information (16x16 constant or
         # zeroed channel); MASK would discard the entire mesh.
         entry["alpha_mode"] = "OPAQUE"
@@ -342,7 +340,7 @@ def postprocess_gltf(gltf_path, clip_mats, blend_mats, zero_alpha_mats, out_dir)
             # FBX/Blender export artifact (blended in name only, alpha == 1):
             # such meshes must stay in the opaque pass.
             pbr = m.get("pbrMetallicRoughness", {})
-            if pbr.get("baseColorFactor", [1, 1, 1, 1])[3] >= 0.95:
+            if pbr.get("baseColorFactor", [1, 1, 1, 1])[3] >= OPAQUE_ALPHA_THRESHOLD:
                 m.pop("alphaMode", None)
     # Verify every referenced image file exists.
     for img in j.get("images", []):
@@ -404,7 +402,7 @@ def main():
     ao_neutral, ao_kept = fix_orm_ao_channel(args.output, orm_img_names)
     zero_alpha_mats = {e["material"] for e in stats["materials"]
                        if e.get("alpha_lt_0.5_frac") is not None
-                       and e["alpha_lt_0.5_frac"] >= 0.999}
+                       and e["alpha_lt_0.5_frac"] >= ZERO_ALPHA_FRAC}
     occ, mask, blend, missing_uri = postprocess_gltf(out_path, clip_mats, blend_mats,
                                                      zero_alpha_mats, args.output)
 

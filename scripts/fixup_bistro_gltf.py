@@ -29,8 +29,18 @@ import struct
 import zlib
 
 
+def _srgb_to_linear(c):
+    """Convert an sRGB channel value in [0,1] to linear light."""
+    return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+
+
 def png_average_rgb(path):
-    """Average RGB of a PNG (handles 8-bit RGB/RGBA, non-interlaced)."""
+    """Average RGB of a PNG (8-bit RGB/RGBA, non-interlaced), linear light.
+
+    PNG bytes are sRGB-encoded; returns the mean converted to linear so it can
+    be multiplied directly into a glTF baseColorFactor (which the renderer
+    applies in linear space).
+    """
     if not os.path.exists(path):
         return None
     data = open(path, "rb").read()
@@ -87,7 +97,14 @@ def png_average_rgb(path):
         prev = line
     if count == 0:
         return None
-    return (rs / count / 255.0, gs / count / 255.0, bs / count / 255.0)
+    r = rs / count / 255.0
+    g = gs / count / 255.0
+    b = bs / count / 255.0
+    # PNG stores sRGB-encoded values, but baseColorFactor is multiplied in
+    # linear space by the renderer (the SRGB texture format decodes the dropped
+    # texture to linear). Convert so the baked color matches what the texture
+    # would have contributed.
+    return (_srgb_to_linear(r), _srgb_to_linear(g), _srgb_to_linear(b))
 
 
 def process(gltf_path, max_textures):

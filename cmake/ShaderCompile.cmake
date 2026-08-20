@@ -17,18 +17,32 @@ endif()
 set(SR_SHADER_OUT_DIR "${CMAKE_BINARY_DIR}/shaders" CACHE INTERNAL "SPIR-V output directory")
 file(MAKE_DIRECTORY "${SR_SHADER_OUT_DIR}")
 
-# sr_compile_shader(<out_var> <glsl_source>)
+# sr_compile_shader(<out_var> <glsl_source> [extra_depends...])
 # Creates a custom command that compiles <glsl_source> to
 # ${SR_SHADER_OUT_DIR}/<basename>.spv and returns the .spv path in <out_var>.
 # Callers collect the outputs and add_dependencies() their target on them.
+#
+# GLSL #include'd headers are NOT discovered automatically: callers must pass
+# them as extra arguments after <glsl_source> so they appear in the custom
+# command's DEPENDS and trigger a recompile when a header changes.
 function(sr_compile_shader OUT_VAR GLSL_SOURCE)
     get_filename_component(SRC_ABS "${GLSL_SOURCE}" ABSOLUTE)
     get_filename_component(FNAME "${GLSL_SOURCE}" NAME)
     set(SPV "${SR_SHADER_OUT_DIR}/${FNAME}.spv")
+
+    # Outputs are flattened to a basename, so two source directories can map to
+    # the same .spv; reject that collision instead of silently overwriting.
+    get_property(_sr_used_outputs GLOBAL PROPERTY SR_SHADER_OUTPUTS)
+    list(FIND _sr_used_outputs "${SPV}" _sr_dup)
+    if(_sr_dup GREATER_EQUAL 0)
+        message(FATAL_ERROR "Shader output collision on ${SPV}: two sources share the same basename. Rename one of them.")
+    endif()
+    set_property(GLOBAL APPEND PROPERTY SR_SHADER_OUTPUTS "${SPV}")
+
     add_custom_command(
         OUTPUT "${SPV}"
         COMMAND "${SR_GLSLANG_VALIDATOR}" -V "${SRC_ABS}" -o "${SPV}" --target-env vulkan1.3
-        DEPENDS "${SRC_ABS}"
+        DEPENDS "${SRC_ABS}" ${ARGN}
         COMMENT "Compiling shader ${FNAME} -> SPIR-V"
         VERBATIM)
     set(${OUT_VAR} "${SPV}" PARENT_SCOPE)

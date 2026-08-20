@@ -624,6 +624,11 @@ void GuiApp::discardLoadResult() {
 
 void GuiApp::finishAsyncRebuild() {
     if (loadThread_.joinable()) loadThread_.join();
+    // The worker may have left GPU work in flight (scene uploads and
+    // upscaler-SDK internal submits that we cannot verify); drain it before
+    // the worker-private command pool is destroyed or failed worker products
+    // are discarded, on both the success and failure paths.
+    vkDeviceWaitIdle(ctx_.device);
     if (loadPool_) {
         vkDestroyCommandPool(ctx_.device, loadPool_, nullptr);
         loadPool_ = VK_NULL_HANDLE;
@@ -641,7 +646,6 @@ void GuiApp::finishAsyncRebuild() {
     // Exclusive safe point: the worker has finished (joined) and the GPU is
     // idle, so teardown/swap can happen without racing in-flight frames.
     active_ = loadConfig_;
-    vkDeviceWaitIdle(ctx_.device);
     const std::string note = loadResult_.note;
     loadResult_.note.clear();
     loadResult_.error.clear();
@@ -2908,8 +2912,11 @@ void GuiApp::collectScreenshotPixels() {
     const std::string path = screenshotPathPending_;
     screenshotPathPending_.clear();
     const bool swizzle = uiShot_; // UI-shot target is BGRA
-    ++screenshotThreads_;
-    std::thread([this, pixels, path, dw, dh, swizzle]() {
+    ++screenshotShared_->threads;
+    // Capture a shared_ptr copy, not `this`: the worker is detached and may
+    // outlive the GuiApp on an abnormal exit.
+    auto shot = screenshotShared_;
+    std::thread([pixels, path, dw, dh, swizzle, shot]() {
         if (swizzle) {
             uint8_t* p = pixels->data();
             const size_t n = static_cast<size_t>(dw) * dh;
@@ -2917,11 +2924,11 @@ void GuiApp::collectScreenshotPixels() {
         }
         const bool ok = savePngFromRgba8(path.c_str(), pixels->data(), dw, dh);
         {
-            std::lock_guard<std::mutex> lk(screenshotMsgMutex_);
-            screenshotMsg_ = (ok ? "screenshot saved -> " : "screenshot FAILED -> ") + path;
+            std::lock_guard<std::mutex> lk(shot->msgMutex);
+            shot->msg = (ok ? "screenshot saved -> " : "screenshot FAILED -> ") + path;
         }
-        ++screenshotFinished_;
-        --screenshotThreads_;
+        ++shot->finished;
+        --shot->threads;
     }).detach();
 }
 
@@ -2954,7 +2961,7 @@ void GuiApp::saveScreenshot(const char* path) {
 // worker thread still PNG-encoding).
 void GuiApp::drawScreenshotBusy() {
     if (!screenshotPending_ && !screenshotInFlight_ &&
-        screenshotThreads_.load(std::memory_order_relaxed) == 0)
+        screenshotShared_->threads.load(std::memory_order_relaxed) == 0)
         return;
     ImGui::SameLine();
     static const char* kDots[] = {"", ".", "..", "..."};
@@ -3160,7 +3167,14 @@ void GuiApp::run() {
             historyHead_ = (historyHead_ + 1) % kHistoryLen;
             if (historyCount_ < kHistoryLen) ++historyCount_;
             frameTimesLog_.push_back(lastTimings_);
-            if (frameTimesLog_.size() > 100000) frameTimesLog_.clear(); // runaway guard
+            // Cap the log but keep the most recent half, so a CSV export never
+            // loses the entire history when the runaway guard fires.
+            if (frameTimesLog_.size() > 100000) {
+                const auto drop =
+                    static_cast<std::vector<TimestampQuery::Timings>::difference_type>(
+                        frameTimesLog_.size() / 2);
+                frameTimesLog_.erase(frameTimesLog_.begin(), frameTimesLog_.begin() + drop);
+            }
             if (active_.mode == Mode::Viewer && frameIndex % 15 == 0) refreshOverlayText();
         }
         if (metricPending_[slot]) {
@@ -3220,13 +3234,13 @@ void GuiApp::run() {
             vkGetFenceStatus(ctx_.device, frames_[screenshotSlot_].fence) == VK_SUCCESS) {
             collectScreenshotPixels();
         }
-        if (screenshotFinished_.load(std::memory_order_relaxed) > 0) {
-            std::lock_guard<std::mutex> lk(screenshotMsgMutex_);
-            if (!screenshotMsg_.empty()) {
-                statusLine_ = screenshotMsg_;
-                screenshotMsg_.clear();
+        if (screenshotShared_->finished.load(std::memory_order_relaxed) > 0) {
+            std::lock_guard<std::mutex> lk(screenshotShared_->msgMutex);
+            if (!screenshotShared_->msg.empty()) {
+                statusLine_ = screenshotShared_->msg;
+                screenshotShared_->msg.clear();
             }
-            screenshotFinished_ = 0;
+            screenshotShared_->finished = 0;
         }
 
         ++renderFrameIndex_;
@@ -3236,7 +3250,7 @@ void GuiApp::run() {
     // Drain a pending screenshot (automation --screenshot exits right after
     // the capture frame; the device is idle so the copy has completed).
     if (screenshotInFlight_) collectScreenshotPixels();
-    while (screenshotThreads_.load(std::memory_order_relaxed) > 0)
+    while (screenshotShared_->threads.load(std::memory_order_relaxed) > 0)
         std::this_thread::yield();
     if (dbgInputEnabled())
         std::fprintf(stderr, "[run] loop exited (shouldClose=%d)\n",

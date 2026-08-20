@@ -535,10 +535,16 @@ private:
     // for a noticeable time at 1080p+).
     bool screenshotInFlight_ = false; // capture recorded, waiting for the fence
     uint32_t screenshotSlot_ = 0;
-    std::atomic<int> screenshotThreads_{0};
-    std::atomic<int> screenshotFinished_{0}; // incremented by worker threads
-    std::mutex screenshotMsgMutex_;
-    std::string screenshotMsg_;
+    // Detached PNG-encoder threads may outlive the GuiApp on abnormal exits;
+    // keep the state they touch in a shared block so a worker holding a copy
+    // never dereferences a dangling `this`.
+    struct ScreenshotShared {
+        std::mutex msgMutex;
+        std::string msg;
+        std::atomic<int> threads{0};
+        std::atomic<int> finished{0};
+    };
+    std::shared_ptr<ScreenshotShared> screenshotShared_ = std::make_shared<ScreenshotShared>();
 
     // Compare-tab view state (reset on rebuild; not part of RenderConfig).
     float compareZoom_ = 1.f;      // 1..16

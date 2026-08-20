@@ -77,6 +77,11 @@ def _fmt_metric(m, v):
     return f"{v:.4f}"
 
 
+def _esc(s):
+    """Escape pipe characters so a cell value cannot break the Markdown table."""
+    return str(s).replace("|", "\\|")
+
+
 def _res_num(res):
     s = str(res).strip().lower()
     m = re.match(r"(\d+)\s*k", s)
@@ -148,9 +153,9 @@ def build_perf_detail(df):
     lines = ["| " + " | ".join(header) + " |", "|---" * len(header) + "|"]
     for _, row in df.iterrows():
         cells = [
-            str(row.get("algo", "")),
-            str(row.get("resolution", "")),
-            str(row.get("upscale_factor", "")),
+            _esc(row.get("algo", "")),
+            _esc(row.get("resolution", "")),
+            _esc(row.get("upscale_factor", "")),
             fmt_num(row.get("upscale_pass_ms_avg"), 2),
             fmt_num(row.get("upscale_pass_ms_p50"), 2),
             fmt_num(row.get("frame_ms_avg"), 2),
@@ -159,9 +164,9 @@ def build_perf_detail(df):
             fmt_num(row.get("fps_1pct_low"), 1),
             human_bytes(row.get("vram_algo_bytes")),
             human_bytes(row.get("vram_total_bytes")),
-            str(row.get("gpu_name", "")),
-            str(row.get("driver_version", "")),
-            str(row.get("notes", "")),
+            _esc(row.get("gpu_name", "")),
+            _esc(row.get("driver_version", "")),
+            _esc(row.get("notes", "")),
         ]
         lines.append("| " + " | ".join(cells) + " |")
     return "\n".join(lines)
@@ -191,10 +196,12 @@ def build_quality_detail(df):
              "|---|---|---|---|---|---|"]
     for _, row in df.iterrows():
         m = str(row.get("metric", ""))
+        num_frames = row.get("num_frames")
+        num_frames_s = "" if pd.isna(num_frames) else str(int(num_frames))
         lines.append(
             f"| {row.get('algo', '')} | {m} | {_fmt_metric(m, row.get('mean'))} "
             f"| {_fmt_metric(m, row.get('median'))} | {_fmt_metric(m, row.get('p5'))} "
-            f"| {int(row.get('num_frames', 0))} |"
+            f"| {num_frames_s} |"
         )
     return "\n".join(lines)
 

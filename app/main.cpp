@@ -79,6 +79,10 @@ int runViewer(int argc, char** argv) {
             return 0;
         } else if (a == "--render-scale") {
             opts.renderScale = static_cast<float>(std::atof(next("--render-scale")));
+            if (opts.renderScale <= 0.0f || opts.renderScale > 1.0f) {
+                std::fprintf(stderr, "invalid --render-scale value\n");
+                return 1;
+            }
         } else if (a == "--output") {
             if (!parseResolution(next("--output"), opts.displayWidth, opts.displayHeight)) {
                 std::fprintf(stderr, "invalid --output resolution\n");
@@ -102,8 +106,8 @@ int runViewer(int argc, char** argv) {
         }
     }
 
-    // Interactive keeps vsync; automated runs render as fast as possible.
-    opts.vsync = opts.frames < 0;
+    // Explicit --vsync wins; automated runs default to vsync off.
+    opts.vsync = opts.vsync || (opts.frames < 0);
 
     sr::Renderer renderer;
     if (!renderer.init(opts)) {
@@ -142,6 +146,10 @@ int runGui(int argc, char** argv) {
             opts.benchList = next("--bench");
         } else if (a == "--render-scale") {
             opts.renderScale = static_cast<float>(std::atof(next("--render-scale")));
+            if (opts.renderScale <= 0.0f || opts.renderScale > 1.0f) {
+                std::fprintf(stderr, "invalid --render-scale value\n");
+                return 1;
+            }
         } else if (a == "--output") {
             if (!parseResolution(next("--output"), opts.displayW, opts.displayH)) {
                 std::fprintf(stderr, "invalid --output resolution\n");

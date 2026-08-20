@@ -132,6 +132,9 @@ bool CompareApp::init(const CompareOptions& opts) {
     opts_.zoom = std::clamp(opts_.zoom, 1.f, 16.f);
     opts_.zoomCenterU = std::clamp(opts_.zoomCenterU, 0.f, 1.f);
     opts_.zoomCenterV = std::clamp(opts_.zoomCenterV, 0.f, 1.f);
+    // renderScale feeds a float->uint32 cast below; keep it in (0,1] so the
+    // cast stays well-defined even if the caller passed an out-of-range value.
+    opts_.renderScale = std::clamp(opts_.renderScale, 0.01f, 1.f);
 
     if (!window_.create("sr_compare — compare", static_cast<int>(opts.displayWidth),
                         static_cast<int>(opts.displayHeight)))
@@ -139,8 +142,8 @@ bool CompareApp::init(const CompareOptions& opts) {
     if (!ctx_.create(window_)) return false;
     if (!swapchain_.create(ctx_, opts.displayWidth, opts.displayHeight, opts.vsync)) return false;
 
-    renderWidth_ = std::max(1u, static_cast<uint32_t>(static_cast<float>(opts.displayWidth) * opts.renderScale));
-    renderHeight_ = std::max(1u, static_cast<uint32_t>(static_cast<float>(opts.displayHeight) * opts.renderScale));
+    renderWidth_ = std::max(1u, static_cast<uint32_t>(static_cast<float>(opts_.displayWidth) * opts_.renderScale));
+    renderHeight_ = std::max(1u, static_cast<uint32_t>(static_cast<float>(opts_.displayHeight) * opts_.renderScale));
 
     bool sceneOk = false;
     if (!opts.scenePath.empty()) sceneOk = scene_.loadGltf(ctx_, opts.scenePath.c_str());
