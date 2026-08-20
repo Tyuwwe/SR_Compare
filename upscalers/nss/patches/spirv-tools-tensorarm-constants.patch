@@ -1,0 +1,127 @@
+diff --git a/source/opt/constants.cpp b/source/opt/constants.cpp
+index f443e2a..f13626f 100644
+--- a/source/opt/constants.cpp
++++ b/source/opt/constants.cpp
+@@ -287,6 +287,10 @@ std::unique_ptr<Constant> ConstantManager::CreateConstant(
+     auto components = GetConstantsFromIds(literal_words_or_ids);
+     if (components.empty()) return nullptr;
+     return MakeUnique<ArrayConstant>(at, components);
++  } else if (auto* tt = type->AsTensorARM()) {
++    auto components = GetConstantsFromIds(literal_words_or_ids);
++    if (components.empty()) return nullptr;
++    return MakeUnique<TensorConstant>(tt, components);
+   } else {
+     return nullptr;
+   }
+@@ -302,8 +306,6 @@ const Constant* ConstantManager::GetConstantFromInst(const Instruction* inst) {
+                                 inst->GetInOperand(i).words.end());
+   }
+ 
+-  const Type* type = GetType(inst);
+-
+   switch (inst->opcode()) {
+     // OpConstant{True|False} have the value embedded in the opcode. So they
+     // are not handled by the for-loop above. Here we add the value explicitly.
+@@ -316,22 +318,15 @@ const Constant* ConstantManager::GetConstantFromInst(const Instruction* inst) {
+     case spv::Op::OpConstantNull:
+     case spv::Op::OpConstant:
+     case spv::Op::OpConstantComposite:
+-    case spv::Op::OpSpecConstantComposite:
+-      break;
+-    // Replicated composite constant instructions have a single operand for the
+-    // value. We need to replicate it as many times as there are components.
+     case spv::Op::OpConstantCompositeReplicateEXT:
+-    case spv::Op::OpSpecConstantCompositeReplicateEXT: {
+-      uint32_t value = literal_words_or_ids[0];
+-      literal_words_or_ids.assign(
+-          static_cast<size_t>(type->NumberOfComponents()), value);
++    case spv::Op::OpSpecConstantComposite:
++    case spv::Op::OpSpecConstantCompositeReplicateEXT:
+       break;
+-    }
+     default:
+       return nullptr;
+   }
+ 
+-  return GetConstant(type, literal_words_or_ids);
++  return GetConstant(GetType(inst), literal_words_or_ids);
+ }
+ 
+ std::unique_ptr<Instruction> ConstantManager::CreateInstruction(
+@@ -376,6 +371,10 @@ std::unique_ptr<Instruction> ConstantManager::CreateCompositeInstruction(
+       component_type_id = type_inst->GetSingleWordInOperand(component_index);
+     } else if (type_inst && type_inst->opcode() == spv::Op::OpTypeArray) {
+       component_type_id = type_inst->GetSingleWordInOperand(0);
++    } else if (type_inst && type_inst->opcode() == spv::Op::OpTypeTensorARM) {
++      // TODO tensor, handle nesting for higher rank tensors?
++      assert(false && "Unhandled composite tensor constant");
++      return nullptr;
+     }
+     uint32_t id = FindDeclaredConstant(component_const, component_type_id);
+ 
+@@ -431,6 +430,9 @@ const Constant* ConstantManager::GetNullCompositeConstant(const Type* type) {
+     for (uint32_t i = 0; i < element_count; i++) {
+       literal_words_or_id.push_back(null_id);
+     }
++  } else if (type->AsTensorARM()) {
++    assert(false && "Unhandled null composite tensor");
++    return nullptr;
+   } else {
+     return nullptr;
+   }
+diff --git a/source/opt/constants.h b/source/opt/constants.h
+index 534afa6..d63031e 100644
+--- a/source/opt/constants.h
++++ b/source/opt/constants.h
+@@ -50,6 +50,7 @@ class StructConstant;
+ class VectorConstant;
+ class MatrixConstant;
+ class ArrayConstant;
++class TensorConstant;
+ class NullConstant;
+ class ConstantManager;
+ 
+@@ -73,6 +74,7 @@ class Constant {
+   virtual VectorConstant* AsVectorConstant() { return nullptr; }
+   virtual MatrixConstant* AsMatrixConstant() { return nullptr; }
+   virtual ArrayConstant* AsArrayConstant() { return nullptr; }
++  virtual TensorConstant* AsTensorConstant() { return nullptr; }
+   virtual NullConstant* AsNullConstant() { return nullptr; }
+ 
+   virtual const ScalarConstant* AsScalarConstant() const { return nullptr; }
+@@ -86,6 +88,7 @@ class Constant {
+   virtual const VectorConstant* AsVectorConstant() const { return nullptr; }
+   virtual const MatrixConstant* AsMatrixConstant() const { return nullptr; }
+   virtual const ArrayConstant* AsArrayConstant() const { return nullptr; }
++  virtual const TensorConstant* AsTensorConstant() const { return nullptr; }
+   virtual const NullConstant* AsNullConstant() const { return nullptr; }
+ 
+   // Returns the float representation of the constant. Must be a 32 bit
+@@ -426,6 +429,27 @@ class ArrayConstant : public CompositeConstant {
+   }
+ };
+ 
++// Tensor type constant.
++class TensorConstant : public CompositeConstant {
++ public:
++  TensorConstant(const TensorARM* ty) : CompositeConstant(ty) {}
++  TensorConstant(const TensorARM* ty, const std::vector<const Constant*>& components)
++      : CompositeConstant(ty, components) {}
++  TensorConstant(const TensorARM* ty, std::vector<const Constant*>&& components)
++      : CompositeConstant(ty, std::move(components)) {}
++
++  TensorConstant* AsTensorConstant() override { return this; }
++  const TensorConstant* AsTensorConstant() const override { return this; }
++
++  // Make a copy of this TensorConstant instance.
++  std::unique_ptr<TensorConstant> CopyTensorConstant() const {
++    return MakeUnique<TensorConstant>(type_->AsTensorARM(), components_);
++  }
++  std::unique_ptr<Constant> Copy() const override {
++    return std::unique_ptr<Constant>(CopyTensorConstant().release());
++  }
++};
++
+ // Null type constant.
+ class NullConstant : public Constant {
+  public:

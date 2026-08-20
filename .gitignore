@@ -1,0 +1,14 @@
+build/
+build-nss-emu/
+out/
+third_party/*/
+!third_party/.gitkeep
+assets/*/
+!assets/.gitkeep
+metrics/venv/
+metrics/__pycache__/
+*.user
+.vs/
+*.pyc
+output/
+captures/

@@ -1,0 +1,15 @@
+#version 460
+// Convert renderer HDR color (R16G16B16A16_SFLOAT, render resolution) into the
+// R11G11B10 float image that the NSS SDK mandates as its color input.
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0) uniform sampler2D srcColor;
+layout(binding = 1, r11f_g11f_b10f) uniform writeonly image2D dstColor;
+
+void main() {
+    ivec2 dstSize = imageSize(dstColor);
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= dstSize.x || p.y >= dstSize.y) return;
+    vec3 c = texelFetch(srcColor, p, 0).rgb;
+    imageStore(dstColor, p, vec4(c, 1.0));
+}

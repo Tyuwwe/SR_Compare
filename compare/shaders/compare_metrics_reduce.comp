@@ -1,0 +1,41 @@
+#version 450
+// Metrics pass 2: reduce the per-block records from pass 1 into 8 floats:
+//   [0..2] total squared difference (R,G,B)
+//   [3]    total pixel count
+//   [4..6] summed block SSIM (R,G,B)
+//   [7]    block count
+// The CPU converts these to PSNR = 10*log10(3*N / sumD2) and
+// SSIM = sumSSIM / (3*blocks).
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 2) readonly buffer Blocks { float data[]; } uBlocks;
+layout(std430, set = 0, binding = 3) writeonly buffer Result { float data[]; } uResult;
+
+layout(push_constant) uniform Push {
+    uvec4 p; // x = number of blocks
+} pc;
+
+shared float sAcc[8][256];
+
+void main() {
+    const uint lane = gl_LocalInvocationIndex;
+    float acc[8];
+    for (int k = 0; k < 8; ++k) acc[k] = 0.0;
+    for (uint b = lane; b < pc.p.x; b += 256) {
+        for (int k = 0; k < 8; ++k) acc[k] += uBlocks.data[b * 8 + k];
+    }
+    for (int k = 0; k < 8; ++k) sAcc[k][lane] = acc[k];
+    barrier();
+
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (lane < s) {
+            for (int k = 0; k < 8; ++k) sAcc[k][lane] += sAcc[k][lane + s];
+        }
+        barrier();
+    }
+
+    if (lane == 0) {
+        for (int k = 0; k < 8; ++k) uResult.data[k] = sAcc[k][0];
+    }
+}

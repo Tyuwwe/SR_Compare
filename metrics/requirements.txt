@@ -1,0 +1,13 @@
+# metrics 离线画质/性能指标管线依赖
+# 说明：
+#   - torch/torchvision 使用 PyPI 默认源（Windows 下即为 CPU 构建），体积较大。
+#   - torchvision 是 lpips 的运行时依赖（lpips 内部 import torchvision.transforms）。
+#   - flip_evaluator 为 NVlabs FLIP 的 Python 包；若安装失败请见 setup_venv 脚本注释。
+numpy
+scikit-image
+pandas
+Pillow
+torch
+torchvision
+lpips
+flip_evaluator

@@ -1,0 +1,26 @@
+#version 450
+// SSAO blur: 9-tap cross box filter (center + arms at +-1/+-2 px) over the raw
+// AO texture, matching the classic SSAO pipeline (per-pixel noise rotation in
+// ssao.comp turns into soft AO here).  Input and output are the same
+// resolution; sky pixels carry AO = 1 through the filter.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D rawAO;
+layout(set = 0, binding = 1, r16f) uniform writeonly image2D outAO;
+
+void main() {
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(outAO);
+    if (pix.x >= size.x || pix.y >= size.y) return;
+
+    const ivec2 taps[9] = ivec2[9](ivec2(0, 0),
+                                   ivec2(1, 0), ivec2(-1, 0), ivec2(0, 1), ivec2(0, -1),
+                                   ivec2(2, 0), ivec2(-2, 0), ivec2(0, 2), ivec2(0, -2));
+    float sum = 0.0;
+    for (int i = 0; i < 9; ++i) {
+        ivec2 p = clamp(pix + taps[i], ivec2(0), size - 1);
+        sum += texelFetch(rawAO, p, 0).r;
+    }
+    imageStore(outAO, pix, vec4(sum / 9.0));
+}

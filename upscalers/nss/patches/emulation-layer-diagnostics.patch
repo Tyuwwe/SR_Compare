@@ -1,0 +1,86 @@
+diff --git a/graph/graph_layer.cpp b/graph/graph_layer.cpp
+index 667ab8a..ca6b9d4 100644
+--- a/graph/graph_layer.cpp
++++ b/graph/graph_layer.cpp
+@@ -826,6 +826,25 @@ class GraphLayer : public VulkanLayerImpl {
+                                                              const VkDataGraphPipelineCreateInfoARM *createInfos,
+                                                              const VkAllocationCallbacks *callbacks,
+                                                              VkPipeline *pipelines) {
++        // DIAGNOSTIC PATCH (sr_test NSS integration): log exceptions escaping
++        // pipeline creation instead of terminating the host process.
++        try {
++            return vkCreateDataGraphPipelinesARMImpl(device, pipelineCache, createInfoCount, createInfos, callbacks,
++                                                     pipelines);
++        } catch (const std::exception &e) {
++            graphLog(Severity::Error) << "vkCreateDataGraphPipelinesARM threw: " << e.what() << std::endl;
++            return VK_ERROR_UNKNOWN;
++        } catch (...) {
++            graphLog(Severity::Error) << "vkCreateDataGraphPipelinesARM threw unknown exception" << std::endl;
++            return VK_ERROR_UNKNOWN;
++        }
++    }
++
++    static VkResult vkCreateDataGraphPipelinesARMImpl(VkDevice device,
++                                                             VkPipelineCache pipelineCache, uint32_t createInfoCount,
++                                                             const VkDataGraphPipelineCreateInfoARM *createInfos,
++                                                             const VkAllocationCallbacks *callbacks,
++                                                             VkPipeline *pipelines) {
+         auto deviceHandle = VulkanLayerImpl::getHandle(device);
+         auto pipelineCacheHandle = getHandle(pipelineCache);
+ 
+@@ -943,6 +962,16 @@ class GraphLayer : public VulkanLayerImpl {
+                     return VK_ERROR_UNKNOWN;
+                 }
+ 
++                // DIAGNOSTIC PATCH (sr_test NSS integration): dump the graph
++                // SPIR-V handed to the layer for offline inspection.
++                if (const char *dumpPath = std::getenv("VMEL_DUMP_GRAPH_SPV")) {
++                    if (FILE *f = fopen(dumpPath, "wb")) {
++                        fwrite(spirvCode, sizeof(uint32_t), spirvSize, f);
++                        fclose(f);
++                        graphLog(Severity::Error) << "Dumped graph SPIR-V to " << dumpPath << std::endl;
++                    }
++                }
++
+                 // Create optimizer
+                 spvtools::Optimizer optimizer{SPV_ENV_UNIVERSAL_1_6};
+ 
+@@ -1332,8 +1361,18 @@ class GraphLayer : public VulkanLayerImpl {
+             graphLog(Severity::Error) << "OF sessions currently require OF cache create flag" << std::endl;
+             return VK_ERROR_UNKNOWN;
+         }
+-        *session = reinterpret_cast<VkDataGraphPipelineSessionARM>(
+-            allocateObject<DataGraphPipelineSessionARM>(callbacks, deviceHandle, pipelineImpl, createInfo->flags));
++        // DIAGNOSTIC PATCH (sr_test NSS integration): log exceptions escaping
++        // the session constructor instead of terminating the host process.
++        try {
++            *session = reinterpret_cast<VkDataGraphPipelineSessionARM>(
++                allocateObject<DataGraphPipelineSessionARM>(callbacks, deviceHandle, pipelineImpl, createInfo->flags));
++        } catch (const std::exception &e) {
++            graphLog(Severity::Error) << "DataGraphPipelineSessionARM ctor threw: " << e.what() << std::endl;
++            return VK_ERROR_UNKNOWN;
++        } catch (...) {
++            graphLog(Severity::Error) << "DataGraphPipelineSessionARM ctor threw unknown exception" << std::endl;
++            return VK_ERROR_UNKNOWN;
++        }
+ 
+         return VK_SUCCESS;
+     }
+diff --git a/graph/spirv_pass_tosaspv_v100.cpp b/graph/spirv_pass_tosaspv_v100.cpp
+index 45f8e14..ecbfdee 100644
+--- a/graph/spirv_pass_tosaspv_v100.cpp
++++ b/graph/spirv_pass_tosaspv_v100.cpp
+@@ -42,6 +42,13 @@ void GraphPassTosaSpv100::handleGraph(const Graph *graph) {
+         const auto *importInstr = get_def_use_mgr()->GetDef(resultId.AsId());
+         const auto &importName = importInstr->GetInOperand(0).AsString();
+ 
++        // DIAGNOSTIC PATCH (sr_test NSS integration): log each graph op so a
++        // lowering failure can be attributed to a specific instruction.
++        graphLog(Severity::Info) << "graph op: import=" << importName
++                                 << " inst=" << opExtInst->GetInOperand(1).words[0]
++                                 << " result=%" << (opExtInst->HasResultId() ? opExtInst->result_id() : 0)
++                                 << std::endl;
++
+         if (importName == tosaSpv100) {
+             handleTosaInst(opExtInst.get());
+         } else if (importName == motionEngine100) {
