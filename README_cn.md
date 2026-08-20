@@ -39,6 +39,10 @@ Arm NSS 在 PC 上经 Vulkan ML Emulation Layer 软件模拟推理，性能数�
 - **bench** — 固定相机路径固定帧数；超分 pass GPU 耗时、整帧耗时/FPS（均值/中位数
   /1% low）、显存占用（VK_EXT_memory_budget），导出 CSV/JSON。
 
+![Viewer](docs/screenshot_viewer.png)
+
+![Compare](docs/screenshot_compare.png)
+
 ```bat
 sr_compare gui
 sr_compare viewer --scene sponza --upscaler fsr2
@@ -50,10 +54,66 @@ sr_compare viewer --list-upscalers
 ## 场景（`--scene`）
 
 - `boxes`（别名 `procedural`）：内置程序化盒子房间，无需外部资产
-- `sponza`：Sponza 中庭（Khronos glTF 样例）
-- `bistro_exterior` / `bistro_interior`：Amazon Lumberyard Bistro（由原始 FBX+DDS
-  经 `scripts/convert_bistro_v2.py` + `scripts/fixup_bistro_alpha.py` 转换，全 PBR 通道）
+- `sponza`：Sponza 中庭 — Crytek Sponza 的 Khronos glTF 样例
+- `bistro_exterior` / `bistro_interior`：Amazon Lumberyard Bistro（NVIDIA ORCA）
 - `<任意 glTF 路径>`：加载自定义场景
+
+`assets/` 不入库。新克隆后按下面获取 Sponza，需要 Bistro 时再转换。
+
+### Sponza
+
+来源：[KhronosGroup/glTF-Sample-Assets](https://github.com/KhronosGroup/glTF-Sample-Assets)
+的 `Models/Sponza/glTF/`。模型文件为 Cryengine Limited License Agreement；
+文档/metadata 为 CC-BY-4.0。
+
+已经是可加载 glTF，无需转换。在仓库根目录：
+
+```bat
+python scripts/fetch_sdks.py --only sponza
+```
+
+脚本会浅克隆 Khronos 仓库，并把 glTF 目录拷到 `assets/sponza/`
+（`Sponza.gltf` + `Sponza.bin` + 贴图 + 许可证文件）。
+
+### Bistro
+
+来源：[Amazon Lumberyard Bistro，NVIDIA ORCA](https://developer.nvidia.com/orca/amazon-lumberyard-bistro)
+（CC-BY 4.0）。从该页下载 FBX 包并解压，本仓库假定的目录结构为：
+
+```
+Bistro_v5_2/
+  BistroExterior.fbx
+  BistroInterior.fbx
+  Textures/          :: DDS：*_BaseColor、*_Normal（DirectX Y-）、
+                     ::       *_Specular（实际是 ORM：R=AO，G=Roughness，B=Metalness）、
+                     ::       *_Emissive
+```
+
+需要 **Blender 5.1+**（原生 C++ FBX 导入器；旧 Python 插件遇到该文件里的灯会崩溃）
+及其自带的 NumPy。在仓库根目录执行（Git Bash 示例，按本机 Blender / 解压路径改）：
+
+```bash
+blender=/c/Program\ Files/Blender\ Foundation/Blender\ 5.1/blender.exe
+src=D:/Code/Bistro_v5_2
+
+"$blender" --background --factory-startup --python scripts/convert_bistro_v2.py -- \
+    --input "$src/BistroExterior.fbx" --textures "$src/Textures" \
+    --output assets/bistro --name BistroExterior
+
+"$blender" --background --factory-startup --python scripts/convert_bistro_v2.py -- \
+    --input "$src/BistroInterior.fbx" --textures "$src/Textures" \
+    --output assets/bistro --name BistroInterior
+
+python scripts/fixup_bistro_alpha.py
+```
+
+`convert_bistro_v2.py` 导出 `GLTF_SEPARATE`（`.gltf` + `.bin` + PNG），带全 PBR
+通道：baseColor+alpha、法线 G 通道翻转（DirectX → glTF）、ORM 写成
+metallicRoughness + occlusion、自发光、MASK 镂空。随后
+`fixup_bistro_alpha.py`（普通 Python，不需要 Blender）修正残留的 alphaMode：
+全零 MASK 改回 OPAQUE、真正的玻璃改成带常数 alpha 的 BLEND、被 FBX 标成
+BLEND 的不透明材质改回 OPAQUE。结果是 `assets/bistro/BistroExterior.gltf` 与
+`BistroInterior.gltf`。
 
 ## 构建
 
@@ -96,8 +156,12 @@ Python 3）。缺失时主工程照常编译，NSS 插件自动禁用。
 - `compare/`、`bench/`、`gui/`、`app/` — 各前端与入口
 - `metrics/` — Python 离线指标复核与 Markdown 报告生成
 - `scripts/` — SDK 下载、Bistro 转换、NSS 模拟层构建
-- `tools/probes/` — 调试探针（不随主工程构建）
 - `third_party/` — 各 SDK（脚本下载，不入库）
+
+## 许可证
+
+本仓库原创源码为 MIT（见 `LICENSE`）。`third_party/` 下的 SDK 与 `assets/`
+下的场景资源仍按各自原许可，详见 `third_party/README.md` 与上文场景说明。
 
 ## 注意
 

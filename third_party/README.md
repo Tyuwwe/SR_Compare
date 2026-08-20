@@ -11,8 +11,10 @@
 | `snapdragon-gsr/` | Snapdragon SGSR 1/2（shader 源码） | git `d926f07`（main，浅克隆） | BSD-3-Clause |
 | `arm-nss/` | Arm Neural Super Sampling（SDK + 模型 + Vulkan ML 模拟层） | 见下 | SDK MIT + 模型 Arm AI Model Community License |
 | `../assets/sponza/` | Sponza glTF 测试场景 | Khronos glTF-Sample-Assets `main` | 模型文件 Cryengine Limited License Agreement；文档 CC-BY-4.0 |
+| `../assets/bistro/` | Amazon Lumberyard Bistro | NVIDIA ORCA 2017（FBX 转 glTF） | CC-BY 4.0 |
 
-> 注：`../assets/sponza/` 在 `assets/` 下，不属于 `third_party/`，为方便对照一并列出。
+> 注：`../assets/sponza/` 与 `../assets/bistro/` 在 `assets/` 下，不属于
+> `third_party/`，为方便对照一并列出。场景获取/转换步骤见仓库根 `README.md`。
 
 ---
 
@@ -147,6 +149,29 @@
   - 文档/metadata：CC-BY-4.0（`assets/sponza/LICENSE.md`）
 - 直接可加载入口：`assets/sponza/Sponza.gltf`（配套 `Sponza.bin` + 若干
   `.jpg`/`.png` 贴图）
+- 获取：`python scripts/fetch_sdks.py --only sponza`（无需转换）
+
+---
+
+## Amazon Lumberyard Bistro — `assets/bistro/`
+
+- 来源：https://developer.nvidia.com/orca/amazon-lumberyard-bistro
+  （NVIDIA Open Research Content Archive）
+- 许可证：Creative Commons CC-BY 4.0
+- 引用（ORCA 要求）：
+
+  ```
+  Amazon Lumberyard Bistro, Open Research Content Archive (ORCA)
+  Amazon Lumberyard, July 2017
+  http://developer.nvidia.com/orca/amazon-lumberyard-bistro
+  ```
+
+- 原始素材为 FBX + DDS。本仓库用 Blender 5.1+ 经
+  `scripts/convert_bistro_v2.py` 转成全 PBR glTF，再用
+  `scripts/fixup_bistro_alpha.py` 修正 alphaMode。步骤见仓库根 `README.md`
+  的 Scenes / Bistro 一节。
+- 可加载入口：`assets/bistro/BistroExterior.gltf`、
+  `assets/bistro/BistroInterior.gltf`
 
 ---
 

@@ -46,6 +46,10 @@ its performance numbers are not representative of real hardware.
   pass, frame time/FPS (avg/median/1% low), VRAM (VK_EXT_memory_budget);
   CSV/JSON export.
 
+![Viewer](docs/screenshot_viewer.png)
+
+![Compare](docs/screenshot_compare.png)
+
 ```bat
 sr_compare gui
 sr_compare viewer --scene sponza --upscaler fsr2
@@ -57,11 +61,69 @@ sr_compare viewer --list-upscalers
 ## Scenes (`--scene`)
 
 - `boxes` (alias `procedural`): built-in procedural box room, no assets needed
-- `sponza`: Sponza atrium (Khronos glTF sample)
-- `bistro_exterior` / `bistro_interior`: Amazon Lumberyard Bistro (converted
-  from the original FBX + DDS with full PBR channels by
-  `scripts/convert_bistro_v2.py` + `scripts/fixup_bistro_alpha.py`)
+- `sponza`: Sponza atrium — Khronos glTF sample of Crytek Sponza
+- `bistro_exterior` / `bistro_interior`: Amazon Lumberyard Bistro (NVIDIA ORCA)
 - `<any glTF path>`: load a custom scene
+
+Assets under `assets/` are not committed. After a fresh clone, fetch Sponza
+and (optionally) convert Bistro as below.
+
+### Sponza
+
+Source: [KhronosGroup/glTF-Sample-Assets](https://github.com/KhronosGroup/glTF-Sample-Assets)
+`Models/Sponza/glTF/`. Model files: Cryengine Limited License Agreement;
+docs/metadata: CC-BY-4.0.
+
+Already a loadable glTF — no conversion. From the repo root:
+
+```bat
+python scripts/fetch_sdks.py --only sponza
+```
+
+That sparse-clones the Khronos repo and copies the glTF folder into
+`assets/sponza/` (`Sponza.gltf` + `Sponza.bin` + textures + license files).
+
+### Bistro
+
+Source: [Amazon Lumberyard Bistro, NVIDIA ORCA](https://developer.nvidia.com/orca/amazon-lumberyard-bistro)
+(CC-BY 4.0). Download the FBX package from that page and unpack it. The
+layout this repo expects is:
+
+```
+Bistro_v5_2/
+  BistroExterior.fbx
+  BistroInterior.fbx
+  Textures/          :: DDS: *_BaseColor, *_Normal (DirectX Y-),
+                     ::       *_Specular (actually ORM: R=AO, G=Roughness, B=Metalness),
+                     ::       *_Emissive
+```
+
+Needs **Blender 5.1+** (native C++ FBX importer; the old Python addon crashes
+on this file's lights) and its bundled NumPy. From the repo root (Git Bash
+example; adjust the Blender and unpack paths):
+
+```bash
+blender=/c/Program\ Files/Blender\ Foundation/Blender\ 5.1/blender.exe
+src=D:/Code/Bistro_v5_2
+
+"$blender" --background --factory-startup --python scripts/convert_bistro_v2.py -- \
+    --input "$src/BistroExterior.fbx" --textures "$src/Textures" \
+    --output assets/bistro --name BistroExterior
+
+"$blender" --background --factory-startup --python scripts/convert_bistro_v2.py -- \
+    --input "$src/BistroInterior.fbx" --textures "$src/Textures" \
+    --output assets/bistro --name BistroInterior
+
+python scripts/fixup_bistro_alpha.py
+```
+
+`convert_bistro_v2.py` writes `GLTF_SEPARATE` (`.gltf` + `.bin` + PNG) with
+full PBR: baseColor+alpha, G-flipped normals (DirectX → glTF), ORM as
+metallicRoughness + occlusion, emissive, MASK cutouts. Then
+`fixup_bistro_alpha.py` (plain Python, no Blender) corrects the remaining
+alpha-mode mistakes: uniform-zero MASK → OPAQUE, real glass → BLEND with a
+constant alpha, and false BLEND (opaque FBX flags) → OPAQUE. The result is
+`assets/bistro/BistroExterior.gltf` and `BistroInterior.gltf`.
 
 ## Building
 
@@ -110,8 +172,13 @@ an RTX 20+ GPU (other algorithms are unaffected without one).
 - `compare/`, `bench/`, `gui/`, `app/` — front ends and entry point
 - `metrics/` — offline metric verification + Markdown reports (Python)
 - `scripts/` — SDK download, Bistro conversion, NSS emu layer builds
-- `tools/probes/` — small diagnostic probes (not part of the main build)
 - `third_party/` — SDKs (fetched by script, not committed)
+
+## License
+
+This repository's original source is MIT (see `LICENSE`). Third-party SDKs
+under `third_party/` and scene assets under `assets/` keep their own
+licenses — see `third_party/README.md` and the scene notes above.
 
 ## Notes
 
