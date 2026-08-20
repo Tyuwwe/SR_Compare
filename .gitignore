@@ -7,6 +7,7 @@ assets/*/
 !assets/.gitkeep
 metrics/venv/
 metrics/__pycache__/
+metrics/selftest_out/
 *.user
 .vs/
 *.pyc

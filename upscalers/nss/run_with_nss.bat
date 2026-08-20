@@ -14,7 +14,7 @@ rem   e.g. run_with_nss.bat viewer --upscaler nss --frames 30 --render-scale 0.5
 rem ==========================================================================
 setlocal
 set "ROOT=%~dp0..\.."
-set "BUILD_DIR=%ROOT%\build-nss"
+set "BUILD_DIR=%ROOT%\build"
 if defined SR_BUILD_DIR set "BUILD_DIR=%ROOT%\%SR_BUILD_DIR%"
 
 set "VK_ADD_LAYER_PATH=%ROOT%\build-nss-emu\build\graph;%ROOT%\build-nss-emu\build\tensor"

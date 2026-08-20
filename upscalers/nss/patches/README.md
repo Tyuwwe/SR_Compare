@@ -31,7 +31,7 @@ the logging is opt-in via env vars.
 Target: `build-nss-emu/deps/SPIRV-Tools` (KhronosGroup/SPIRV-Tools @0539c81).
 Apply with `git -C build-nss-emu/deps/SPIRV-Tools apply <this file>` after
 re-fetching dependencies, then rebuild the emulation layer
-(`build-nss-emu/build_emu.bat`).
+(`scripts/nss_emu_configure.bat` + `scripts/nss_emu_build.bat`).
 
 Backports the TensorARM constant handling from the Arm fork of SPIRV-Tools
 (`github.com/arm/SPIRV-Tools`, branch `staging`), which the NSS SDK expects
