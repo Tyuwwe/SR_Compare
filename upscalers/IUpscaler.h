@@ -105,4 +105,10 @@ public:
     virtual uint64_t gpuMemoryBytes() const = 0;
 };
 
+// Spatial-only plugins (FSR1 / SGSR1) must not receive Halton jitter: they
+// have no history to converge, so a per-frame sub-pixel offset just shakes.
+inline bool upscalerNeedsJitter(const IUpscaler* u) {
+    return u && (u->capabilities() & Cap_Temporal) != 0;
+}
+
 } // namespace sr

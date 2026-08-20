@@ -968,6 +968,13 @@ bool GuiApp::createRenderTargets() {
                       VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                   VK_IMAGE_ASPECT_COLOR_BIT))
         return false;
+    // Unjittered LR color for spatial plugins when mixed with temporal ones
+    // (raster jitter cannot be undone by resampling).
+    if (!createRT(gbColorSpatial_, renderWidth_, renderHeight_, deferred::kHdrColorFormat,
+                  VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                      VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                  VK_IMAGE_ASPECT_COLOR_BIT))
+        return false;
     if (!createRT(gbAlbedo_, renderWidth_, renderHeight_, deferred::kAlbedoFormat,
                   VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
                   VK_IMAGE_ASPECT_COLOR_BIT))
@@ -1257,13 +1264,13 @@ bool GuiApp::createDescriptors() {
     VkDescriptorPoolSize sizes[5] = {};
     sizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     sizes[0].descriptorCount =
-        deferred::kMaxTextures + numColumns * 2 + 2 + numAlgos * 2 + 11 * kFramesInFlight * 3 +
-        5 * kFramesInFlight * 3 + 3 * 3;
+        deferred::kMaxTextures + numColumns * 2 + 2 + numAlgos * 2 + 11 * kFramesInFlight * 4 +
+        5 * kFramesInFlight * 4 + 3 * 3;
     sizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    sizes[1].descriptorCount = kFramesInFlight * 2 + numColumns + kFramesInFlight * 3 +
-                               kFramesInFlight * 3;
+    sizes[1].descriptorCount = kFramesInFlight * 3 + numColumns + kFramesInFlight * 4 +
+                               kFramesInFlight * 4;
     sizes[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
-    sizes[2].descriptorCount = kFramesInFlight * 2;
+    sizes[2].descriptorCount = kFramesInFlight * 3;
     sizes[3].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     sizes[3].descriptorCount = numAlgos * 2;
     sizes[4].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
@@ -1271,8 +1278,8 @@ bool GuiApp::createDescriptors() {
     VkDescriptorPoolCreateInfo poolCi = {};
     poolCi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     poolCi.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-    poolCi.maxSets = kFramesInFlight * 2 + 2 + numColumns + 1 + numAlgos + kFramesInFlight * 3 +
-                     kFramesInFlight * 3 + // transparent sets (GB/GT/SSAA)
+    poolCi.maxSets = kFramesInFlight * 3 + 2 + numColumns + 1 + numAlgos + kFramesInFlight * 4 +
+                     kFramesInFlight * 4 + // transparent sets (GB/GT/SSAA/spatial)
                      6;                     // ssao sets (GB/GT/SSAA, static)
     poolCi.poolSizeCount = 5;
     poolCi.pPoolSizes = sizes;
@@ -1308,11 +1315,15 @@ bool GuiApp::createDescriptors() {
 
     for (uint32_t i = 0; i < kFramesInFlight; ++i) {
         if (!allocSet(deferred_.sceneSetLayout(), frames_[i].sceneSetGb)) return false;
+        if (!allocSet(deferred_.sceneSetLayout(), frames_[i].sceneSetGbSpatial)) return false;
         if (!allocSet(deferred_.sceneSetLayout(), frames_[i].sceneSetGt)) return false;
         if (!allocSet(deferred_.lightingSetLayout(), frames_[i].lightingSetGb)) return false;
+        if (!allocSet(deferred_.lightingSetLayout(), frames_[i].lightingSetGbSpatial)) return false;
         if (!allocSet(deferred_.lightingSetLayout(), frames_[i].lightingSetGt)) return false;
         if (!allocSet(deferred_.lightingSetLayout(), frames_[i].lightingSetSsaa)) return false;
         if (!allocSet(deferred_.transparentSetLayout(), frames_[i].transparentSetGb)) return false;
+        if (!allocSet(deferred_.transparentSetLayout(), frames_[i].transparentSetGbSpatial))
+            return false;
         if (!allocSet(deferred_.transparentSetLayout(), frames_[i].transparentSetGt)) return false;
         if (!allocSet(deferred_.transparentSetLayout(), frames_[i].transparentSetSsaa))
             return false;
@@ -1659,11 +1670,11 @@ bool GuiApp::createSyncResources() {
         if (vkCreateSemaphore(ctx_.device, &semCi, nullptr, &fr.imageAvailable) != VK_SUCCESS) return false;
         if (vkCreateFence(ctx_.device, &fenceCi, nullptr, &fr.fence) != VK_SUCCESS) return false;
 
-        VkBuffer ubos[2] = {};
-        VkDeviceMemory uboMems[2] = {};
-        void* uboMaps[2] = {};
-        VkDescriptorSet sets[2] = {fr.sceneSetGb, fr.sceneSetGt};
-        for (int k = 0; k < 2; ++k) {
+        VkBuffer ubos[3] = {};
+        VkDeviceMemory uboMems[3] = {};
+        void* uboMaps[3] = {};
+        VkDescriptorSet sets[3] = {fr.sceneSetGb, fr.sceneSetGbSpatial, fr.sceneSetGt};
+        for (int k = 0; k < 3; ++k) {
             if (createBuffer(ctx_, uboSize, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
                              VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                              ubos[k], uboMems[k]) != VK_SUCCESS)
@@ -1695,7 +1706,9 @@ bool GuiApp::createSyncResources() {
             vkUpdateDescriptorSets(ctx_.device, 2, writes, 0, nullptr);
         }
         fr.uboGb = ubos[0]; fr.uboGbMemory = uboMems[0]; fr.uboGbMapped = uboMaps[0];
-        fr.uboGt = ubos[1]; fr.uboGtMemory = uboMems[1]; fr.uboGtMapped = uboMaps[1];
+        fr.uboGbSpatial = ubos[1]; fr.uboGbSpatialMemory = uboMems[1];
+        fr.uboGbSpatialMapped = uboMaps[1];
+        fr.uboGt = ubos[2]; fr.uboGtMemory = uboMems[2]; fr.uboGtMapped = uboMaps[2];
 
         // Lighting UBOs (GB jittered / GT+SSAA un-jittered) + lighting sets.
         const VkDeviceSize lightingSize = sizeof(LightingUBO);
@@ -1705,6 +1718,12 @@ bool GuiApp::createSyncResources() {
             return false;
         vkMapMemory(ctx_.device, fr.lightingUboGbMemory, 0, lightingSize, 0,
                     &fr.lightingUboGbMapped);
+        if (createBuffer(ctx_, lightingSize, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                         fr.lightingUboGbSpatial, fr.lightingUboGbSpatialMemory) != VK_SUCCESS)
+            return false;
+        vkMapMemory(ctx_.device, fr.lightingUboGbSpatialMemory, 0, lightingSize, 0,
+                    &fr.lightingUboGbSpatialMapped);
         if (createBuffer(ctx_, lightingSize, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                          fr.lightingUboGt, fr.lightingUboGtMemory) != VK_SUCCESS)
@@ -1720,6 +1739,9 @@ bool GuiApp::createSyncResources() {
         deferred_.writeLightingSet(ctx_, fr.lightingSetGb, fr.lightingUboGb, gbAlbedo_.view,
                                    gbNormal_.view, gbMaterial_.view, gbEmissive_.view,
                                    gbDepth_.view, gbAo_.view, shadowView);
+        deferred_.writeLightingSet(ctx_, fr.lightingSetGbSpatial, fr.lightingUboGbSpatial,
+                                   gbAlbedo_.view, gbNormal_.view, gbMaterial_.view,
+                                   gbEmissive_.view, gbDepth_.view, gbAo_.view, shadowView);
         deferred_.writeLightingSet(ctx_, fr.lightingSetGt, fr.lightingUboGt, gtAlbedo_.view,
                                    gtNormal_.view, gtMaterial_.view, gtEmissive_.view,
                                    gtDepth_.view, gtAo_.view, shadowView);
@@ -1735,6 +1757,8 @@ bool GuiApp::createSyncResources() {
         // UBOs) plus the path's own SSAO texture: one set per path.
         deferred_.writeTransparentSet(ctx_, fr.transparentSetGb, fr.lightingUboGb, gbAo_.view,
                                       shadowView);
+        deferred_.writeTransparentSet(ctx_, fr.transparentSetGbSpatial, fr.lightingUboGbSpatial,
+                                      gbAo_.view, shadowView);
         deferred_.writeTransparentSet(ctx_, fr.transparentSetGt, fr.lightingUboGb, gtAo_.view,
                                       shadowView);
         if (active_.gtSsaa) {
@@ -1859,6 +1883,13 @@ void GuiApp::destroyStackResources() {
             fr.uboGbMemory = VK_NULL_HANDLE;
             fr.uboGbMapped = nullptr;
         }
+        if (fr.uboGbSpatial) {
+            vkDestroyBuffer(ctx_.device, fr.uboGbSpatial, nullptr);
+            vkFreeMemory(ctx_.device, fr.uboGbSpatialMemory, nullptr);
+            fr.uboGbSpatial = VK_NULL_HANDLE;
+            fr.uboGbSpatialMemory = VK_NULL_HANDLE;
+            fr.uboGbSpatialMapped = nullptr;
+        }
         if (fr.uboGt) {
             vkDestroyBuffer(ctx_.device, fr.uboGt, nullptr);
             vkFreeMemory(ctx_.device, fr.uboGtMemory, nullptr);
@@ -1873,6 +1904,13 @@ void GuiApp::destroyStackResources() {
             fr.lightingUboGbMemory = VK_NULL_HANDLE;
             fr.lightingUboGbMapped = nullptr;
         }
+        if (fr.lightingUboGbSpatial) {
+            vkDestroyBuffer(ctx_.device, fr.lightingUboGbSpatial, nullptr);
+            vkFreeMemory(ctx_.device, fr.lightingUboGbSpatialMemory, nullptr);
+            fr.lightingUboGbSpatial = VK_NULL_HANDLE;
+            fr.lightingUboGbSpatialMemory = VK_NULL_HANDLE;
+            fr.lightingUboGbSpatialMapped = nullptr;
+        }
         if (fr.lightingUboGt) {
             vkDestroyBuffer(ctx_.device, fr.lightingUboGt, nullptr);
             vkFreeMemory(ctx_.device, fr.lightingUboGtMemory, nullptr);
@@ -1881,11 +1919,14 @@ void GuiApp::destroyStackResources() {
             fr.lightingUboGtMapped = nullptr;
         }
         fr.sceneSetGb = VK_NULL_HANDLE;
+        fr.sceneSetGbSpatial = VK_NULL_HANDLE;
         fr.sceneSetGt = VK_NULL_HANDLE;
         fr.lightingSetGb = VK_NULL_HANDLE;
+        fr.lightingSetGbSpatial = VK_NULL_HANDLE;
         fr.lightingSetGt = VK_NULL_HANDLE;
         fr.lightingSetSsaa = VK_NULL_HANDLE;
         fr.transparentSetGb = VK_NULL_HANDLE;
+        fr.transparentSetGbSpatial = VK_NULL_HANDLE;
         fr.transparentSetGt = VK_NULL_HANDLE;
         fr.transparentSetSsaa = VK_NULL_HANDLE;
         if (fr.imageAvailable) { vkDestroySemaphore(ctx_.device, fr.imageAvailable, nullptr); fr.imageAvailable = VK_NULL_HANDLE; }
@@ -1933,6 +1974,7 @@ void GuiApp::destroyStackResources() {
     }
 
     gbColor_.destroy(ctx_);
+    gbColorSpatial_.destroy(ctx_);
     gbAlbedo_.destroy(ctx_);
     gbNormal_.destroy(ctx_);
     gbMaterial_.destroy(ctx_);
@@ -1964,6 +2006,7 @@ void GuiApp::destroyStackResources() {
     fontAtlas_.destroy(ctx_);
 
     gbColorLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+    gbColorSpatialLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     gbAlbedoLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     gbNormalLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     gbMaterialLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -2371,6 +2414,18 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     const uint32_t dh = active_.displayH;
     const bool compareMode = active_.mode == Mode::Compare;
     const bool gbuffer = !algos_.empty();
+    bool hasTemporal = false;
+    bool hasSpatial = false;
+    for (const AlgoColumn& a : algos_) {
+        if (!a.upscaler) continue;
+        if (upscalerNeedsJitter(a.upscaler.get())) hasTemporal = true;
+        else hasSpatial = true;
+    }
+    // Raster jitter cannot be undone by resampling.  Temporal plugins still
+    // get a jittered GBuffer; mixed sets render a second unjittered LR pass
+    // for spatial plugins (FSR1 / SGSR1).
+    const bool temporal = hasTemporal;
+    const bool mixedSpatial = hasTemporal && hasSpatial;
     const float aspect = static_cast<float>(dw) / static_cast<float>(dh);
     const Mat4 view = camera_.view();
     const Mat4 proj = camera_.proj(aspect);
@@ -2378,16 +2433,20 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     prevJitterX_ = jitterX_;
     prevJitterY_ = jitterY_;
     const Vec2 h = halton23(frameIndex + 1);
-    jitterX_ = gbuffer ? (h.x - 0.5f) : 0.f;
-    jitterY_ = gbuffer ? (h.y - 0.5f) : 0.f;
+    jitterX_ = (gbuffer && temporal) ? (h.x - 0.5f) : 0.f;
+    jitterY_ = (gbuffer && temporal) ? (h.y - 0.5f) : 0.f;
     // Uniform NDC shift: clip.xy += offset * clip.w (clip.w = -z_view via
     // m[11] = -1), so the offset belongs in column 2 with a negative sign —
     // see Renderer.cpp for the full rationale.
     projJittered.m[8] -= jitterX_ * 2.f / static_cast<float>(renderWidth_);
     projJittered.m[9] -= jitterY_ * 2.f / static_cast<float>(renderHeight_);
 
-    updateSceneUBO(fr.uboGbMapped, true, renderWidth_, renderHeight_, view, proj, projJittered,
+    updateSceneUBO(fr.uboGbMapped, temporal, renderWidth_, renderHeight_, view, proj, projJittered,
                    prevViewProj_);
+    if (mixedSpatial) {
+        updateSceneUBO(fr.uboGbSpatialMapped, false, renderWidth_, renderHeight_, view, proj, proj,
+                       prevViewProj_);
+    }
     const uint32_t gtW = active_.gtSsaa ? dw * 2 : (active_.gtApplyScale ? renderWidth_ : dw);
     const uint32_t gtH = active_.gtSsaa ? dh * 2 : (active_.gtApplyScale ? renderHeight_ : dh);
     updateSceneUBO(fr.uboGtMapped, false, gtW, gtH, view, proj, proj, prevViewProj_);
@@ -2414,6 +2473,10 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     }
     updateLightingUBO(fr.lightingUboGbMapped,
                       Mat4::inverse(Mat4::multiply(projJittered, view)), lights, shadow);
+    if (mixedSpatial) {
+        updateLightingUBO(fr.lightingUboGbSpatialMapped, Mat4::inverse(Mat4::multiply(proj, view)),
+                          lights, shadow);
+    }
     updateLightingUBO(fr.lightingUboGtMapped, Mat4::inverse(Mat4::multiply(proj, view)),
                       lights, shadow);
 
@@ -2444,9 +2507,11 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         shadow_.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     }
 
-    // --- 1) shared low-resolution GBuffer pass (jittered) ----------------------
+    // --- 1) low-resolution GBuffer (jittered for temporal; extra unjittered
+    //     pass when mixed with spatial plugins) --------------------------------
     timestamps_.sceneBegin(cmd, slot);
-    if (gbuffer) {
+    auto recordLrDeferred = [&](VkDescriptorSet sceneSet, VkDescriptorSet lightingSet,
+                                VkDescriptorSet transparentSet, const Mat4& ssaoViewProj) {
         transition(gbAlbedo_.image, gbAlbedoLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                    VK_IMAGE_ASPECT_COLOR_BIT);
         transition(gbNormal_.image, gbNormalLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
@@ -2475,7 +2540,7 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                 makeDepthAttachment(gbDepth_.view, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
                                     VK_ATTACHMENT_LOAD_OP_CLEAR);
             beginRendering(cmd, renderWidth_, renderHeight_, 5, colors, &depth);
-            deferred_.recordGBufferDraws(cmd, scene_, false, fr.sceneSetGb, textureSet_,
+            deferred_.recordGBufferDraws(cmd, scene_, false, sceneSet, textureSet_,
                                          materialStride_, renderWidth_, renderHeight_,
                                          cullViewProj);
             vkCmdEndRendering(cmd);
@@ -2493,11 +2558,10 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         transition(gbDepth_.image, gbDepthLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                    VK_IMAGE_ASPECT_DEPTH_BIT);
 
-        // SSAO (depth + normal -> raw AO -> cross-box blur), jittered LR view-proj.
         transition(gbAoRaw_.image, gbAoRawLayout_, VK_IMAGE_LAYOUT_GENERAL,
                    VK_IMAGE_ASPECT_COLOR_BIT);
-        deferred_.recordSsaoPass(cmd, ssaoSetGb_, Mat4::multiply(projJittered, view), frameIndex,
-                                 renderWidth_, renderHeight_);
+        deferred_.recordSsaoPass(cmd, ssaoSetGb_, ssaoViewProj, frameIndex, renderWidth_,
+                                 renderHeight_);
         transition(gbAoRaw_.image, gbAoRawLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                    VK_IMAGE_ASPECT_COLOR_BIT);
         transition(gbAo_.image, gbAoLayout_, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT);
@@ -2505,16 +2569,10 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         transition(gbAo_.image, gbAoLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                    VK_IMAGE_ASPECT_COLOR_BIT);
 
-        // Deferred lighting (PBR direct + IBL, skybox on far-plane pixels) -> gbColor_.
         transition(gbColor_.image, gbColorLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                    VK_IMAGE_ASPECT_COLOR_BIT);
-        deferred_.recordLightingPass(cmd, fr.lightingSetGb, gbColor_.view, renderWidth_,
-                                     renderHeight_);
+        deferred_.recordLightingPass(cmd, lightingSet, gbColor_.view, renderWidth_, renderHeight_);
 
-        // --- Transparency pass (alpha-blended surfaces over the lit scene) -----
-        // Overwrites motion (static glass = camera motion, the "Output Velocity"
-        // equivalent) and accumulates the translucent coverage mask consumed by
-        // the upscalers as the reactive / TC / bias mask.
         if (hasTransparency_) {
             transition(gbMotion_.image, gbMotionLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                        VK_IMAGE_ASPECT_COLOR_BIT);
@@ -2535,10 +2593,9 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                                         VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
                                         VK_ATTACHMENT_LOAD_OP_LOAD);
                 beginRendering(cmd, renderWidth_, renderHeight_, 3, tColors, &tDepth);
-                deferred_.recordTransparentDraws(cmd, scene_, false, fr.sceneSetGb, textureSet_,
-                                                 fr.transparentSetGb, materialStride_,
-                                                 renderWidth_, renderHeight_, cullViewProj,
-                                                 camera_.position);
+                deferred_.recordTransparentDraws(cmd, scene_, false, sceneSet, textureSet_,
+                                                 transparentSet, materialStride_, renderWidth_,
+                                                 renderHeight_, cullViewProj, camera_.position);
                 vkCmdEndRendering(cmd);
             }
             transition(gbMotion_.image, gbMotionLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
@@ -2551,6 +2608,28 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
 
         transition(gbColor_.image, gbColorLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                    VK_IMAGE_ASPECT_COLOR_BIT);
+    };
+
+    if (gbuffer) {
+        if (mixedSpatial) {
+            recordLrDeferred(fr.sceneSetGbSpatial, fr.lightingSetGbSpatial,
+                             fr.transparentSetGbSpatial, Mat4::multiply(proj, view));
+            transition(gbColor_.image, gbColorLayout_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       VK_IMAGE_ASPECT_COLOR_BIT);
+            transition(gbColorSpatial_.image, gbColorSpatialLayout_,
+                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+            VkImageCopy copy = {};
+            copy.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            copy.srcSubresource.layerCount = 1;
+            copy.dstSubresource = copy.srcSubresource;
+            copy.extent = {renderWidth_, renderHeight_, 1};
+            vkCmdCopyImage(cmd, gbColor_.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           gbColorSpatial_.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+            transition(gbColorSpatial_.image, gbColorSpatialLayout_,
+                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+        }
+        recordLrDeferred(fr.sceneSetGb, fr.lightingSetGb, fr.transparentSetGb,
+                         Mat4::multiply(projJittered, view));
     }
 
     // --- 2) per-algorithm dispatch ---------------------------------------------
@@ -2568,6 +2647,9 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         cam.cameraNear = camera_.nearPlane;
         cam.cameraFar = camera_.farPlane;
         cam.fovY = camera_.fovY;
+        CameraParams camSpatial = cam;
+        camSpatial.jitterX = camSpatial.jitterY = 0.f;
+        camSpatial.prevJitterX = camSpatial.prevJitterY = 0.f;
 
         FrameParams frame;
         frame.frameIndex = static_cast<int>(frameIndex);
@@ -2579,9 +2661,11 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
             transition(algo.output.image, algo.outputLayout, VK_IMAGE_LAYOUT_GENERAL,
                        VK_IMAGE_ASPECT_COLOR_BIT);
 
+            const bool spatialAlgo = !upscalerNeedsJitter(algo.upscaler.get());
+            const bool useSpatialColor = mixedSpatial && spatialAlgo;
             UpscalerResources res;
-            res.color = gbColor_.image;
-            res.colorView = gbColor_.view;
+            res.color = useSpatialColor ? gbColorSpatial_.image : gbColor_.image;
+            res.colorView = useSpatialColor ? gbColorSpatial_.view : gbColor_.view;
             res.depth = gbDepth_.image;
             res.depthView = gbDepth_.view;
             res.motion = gbMotion_.image;
@@ -2592,7 +2676,7 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
             }
             res.output = algo.output.image;
             res.outputView = algo.output.view;
-            algo.upscaler->dispatch(cmd, res, cam, frame);
+            algo.upscaler->dispatch(cmd, res, spatialAlgo ? camSpatial : cam, frame);
 
             transition(algo.output.image, algo.outputLayout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                        VK_IMAGE_ASPECT_COLOR_BIT);

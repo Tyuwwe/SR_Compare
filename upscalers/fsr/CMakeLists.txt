@@ -21,6 +21,11 @@ add_library(upscaler_fsr STATIC
     ${FFX_DIR}/src/backends/vk/ffx_vk.cpp
 )
 sr_common_setup(upscaler_fsr)
+target_compile_definitions(upscaler_fsr PRIVATE SR_SHADER_DIR="${SR_SHADER_OUT_DIR}/")
+
+sr_compile_shader(FSR1_UNJITTER_SPV fsr1_unjitter.comp)
+add_custom_target(fsr_shaders DEPENDS ${FSR1_UNJITTER_SPV})
+add_dependencies(upscaler_fsr fsr_shaders)
 
 # Select the compiled-in effects for ffx_shader_blobs.cpp dispatch.
 target_compile_definitions(upscaler_fsr PRIVATE FFX_FSR1 FFX_FSR2 FFX_FSR3UPSCALER)

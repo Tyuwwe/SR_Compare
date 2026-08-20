@@ -22,6 +22,7 @@
 // ============================================================================
 #include "upscalers/fsr/FsrUpscaler.h"
 
+#include "renderer/core/PathUtil.h"
 #include "upscalers/UpscalerFactory.h"
 #include "upscalers/VkHelpers.h"
 
@@ -31,6 +32,7 @@
 #include <FidelityFX/host/ffx_fsr3upscaler.h>
 
 #include <cfloat>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -173,6 +175,167 @@ void destroyStorageImage(const VulkanEnv& env, OwnedImage& img) {
     if (img.memory) { vkFreeMemory(env.device, img.memory, nullptr); img.memory = VK_NULL_HANDLE; }
 }
 
+void transitionToGeneral(const VulkanEnv& env, const OwnedImage* images, uint32_t count);
+
+// Spatial FSR1 has no history, so a shared Halton-jittered GBuffer would
+// shake.  This pass resamples color at uv + jitter/size into a stable copy.
+struct UnjitterPass {
+    OwnedImage color;
+    VkImageView view = VK_NULL_HANDLE;
+    VkSampler sampler = VK_NULL_HANDLE;
+    VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
+    VkPipelineLayout pipeLayout = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkDescriptorPool pool = VK_NULL_HANDLE;
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    bool inited = false;
+};
+
+void destroyUnjitter(const VulkanEnv& env, UnjitterPass& p) {
+    if (p.pipeline) { vkDestroyPipeline(env.device, p.pipeline, nullptr); p.pipeline = VK_NULL_HANDLE; }
+    if (p.pipeLayout) { vkDestroyPipelineLayout(env.device, p.pipeLayout, nullptr); p.pipeLayout = VK_NULL_HANDLE; }
+    if (p.pool) { vkDestroyDescriptorPool(env.device, p.pool, nullptr); p.pool = VK_NULL_HANDLE; }
+    if (p.setLayout) { vkDestroyDescriptorSetLayout(env.device, p.setLayout, nullptr); p.setLayout = VK_NULL_HANDLE; }
+    if (p.sampler) { vkDestroySampler(env.device, p.sampler, nullptr); p.sampler = VK_NULL_HANDLE; }
+    if (p.view) { vkDestroyImageView(env.device, p.view, nullptr); p.view = VK_NULL_HANDLE; }
+    destroyStorageImage(env, p.color);
+    p.inited = false;
+}
+
+bool initUnjitter(const VulkanEnv& env, uint32_t w, uint32_t h, UnjitterPass& p) {
+    destroyUnjitter(env, p);
+    if (!createStorageImage(env, w, h, VK_FORMAT_R16G16B16A16_SFLOAT, p.color)) return false;
+    VkImageViewCreateInfo vi = {};
+    vi.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    vi.image = p.color.image;
+    vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vi.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+    vi.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    vi.subresourceRange.levelCount = 1;
+    vi.subresourceRange.layerCount = 1;
+    if (vkCreateImageView(env.device, &vi, nullptr, &p.view) != VK_SUCCESS) return false;
+
+    VkSamplerCreateInfo si = {};
+    si.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    si.magFilter = si.minFilter = VK_FILTER_LINEAR;
+    si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    if (vkCreateSampler(env.device, &si, nullptr, &p.sampler) != VK_SUCCESS) return false;
+
+    VkDescriptorSetLayoutBinding b[2] = {};
+    b[0].binding = 0;
+    b[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    b[0].descriptorCount = 1;
+    b[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    b[1].binding = 1;
+    b[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    b[1].descriptorCount = 1;
+    b[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    VkDescriptorSetLayoutCreateInfo lci = {};
+    lci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    lci.bindingCount = 2;
+    lci.pBindings = b;
+    if (vkCreateDescriptorSetLayout(env.device, &lci, nullptr, &p.setLayout) != VK_SUCCESS)
+        return false;
+
+    VkPushConstantRange pc = {};
+    pc.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    pc.size = 16;
+    VkPipelineLayoutCreateInfo pl = {};
+    pl.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    pl.setLayoutCount = 1;
+    pl.pSetLayouts = &p.setLayout;
+    pl.pushConstantRangeCount = 1;
+    pl.pPushConstantRanges = &pc;
+    if (vkCreatePipelineLayout(env.device, &pl, nullptr, &p.pipeLayout) != VK_SUCCESS)
+        return false;
+
+    VkShaderModule mod = loadShader(env.device,
+        resolveShaderPath(SR_SHADER_DIR, "fsr1_unjitter.comp.spv").c_str());
+    if (!mod) return false;
+    VkPipelineShaderStageCreateInfo st = {};
+    st.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    st.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    st.module = mod;
+    st.pName = "main";
+    VkComputePipelineCreateInfo ci = {};
+    ci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    ci.stage = st;
+    ci.layout = p.pipeLayout;
+    const VkResult pr = vkCreateComputePipelines(env.device, VK_NULL_HANDLE, 1, &ci, nullptr,
+                                                 &p.pipeline);
+    vkDestroyShaderModule(env.device, mod, nullptr);
+    if (pr != VK_SUCCESS) return false;
+
+    VkDescriptorPoolSize ps[2] = {};
+    ps[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    ps[0].descriptorCount = 1;
+    ps[1].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    ps[1].descriptorCount = 1;
+    VkDescriptorPoolCreateInfo pci = {};
+    pci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    pci.maxSets = 1;
+    pci.poolSizeCount = 2;
+    pci.pPoolSizes = ps;
+    if (vkCreateDescriptorPool(env.device, &pci, nullptr, &p.pool) != VK_SUCCESS) return false;
+    VkDescriptorSetAllocateInfo ai = {};
+    ai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    ai.descriptorPool = p.pool;
+    ai.descriptorSetCount = 1;
+    ai.pSetLayouts = &p.setLayout;
+    if (vkAllocateDescriptorSets(env.device, &ai, &p.set) != VK_SUCCESS) return false;
+
+    transitionToGeneral(env, &p.color, 1);
+    p.inited = true;
+    return true;
+}
+
+void recordUnjitter(VkCommandBuffer cmd, VkDevice device, UnjitterPass& p, VkImageView srcView,
+                    float jx, float jy, uint32_t w, uint32_t h) {
+    VkDescriptorImageInfo in = {};
+    in.sampler = p.sampler;
+    in.imageView = srcView;
+    in.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    VkDescriptorImageInfo out = {};
+    out.imageView = p.view;
+    out.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    VkWriteDescriptorSet wr[2] = {};
+    wr[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    wr[0].dstSet = p.set;
+    wr[0].dstBinding = 0;
+    wr[0].descriptorCount = 1;
+    wr[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    wr[0].pImageInfo = &in;
+    wr[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    wr[1].dstSet = p.set;
+    wr[1].dstBinding = 1;
+    wr[1].descriptorCount = 1;
+    wr[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    wr[1].pImageInfo = &out;
+    vkUpdateDescriptorSets(device, 2, wr, 0, nullptr);
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeLayout, 0, 1, &p.set, 0,
+                            nullptr);
+    const float push[4] = {jx, jy, static_cast<float>(w), static_cast<float>(h)};
+    vkCmdPushConstants(cmd, p.pipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), push);
+    vkCmdDispatch(cmd, (w + 7) / 8, (h + 7) / 8, 1);
+
+    VkImageMemoryBarrier b = {};
+    b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    b.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    b.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = p.color.image;
+    b.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    b.subresourceRange.levelCount = 1;
+    b.subresourceRange.layerCount = 1;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+}
+
 // One-shot UNDEFINED -> GENERAL transitions via the renderer's command pool.
 void transitionToGeneral(const VulkanEnv& env, const OwnedImage* images, uint32_t count) {
     VkCommandBufferAllocateInfo allocInfo = {};
@@ -290,6 +453,7 @@ struct Fsr1Upscaler::Impl {
     FfxFsr1Context context = {};
     bool contextCreated = false;
     uint64_t memoryBytes = 0;
+    UnjitterPass unjitter;
 };
 
 Fsr1Upscaler::~Fsr1Upscaler() { shutdown(); }
@@ -322,16 +486,32 @@ bool Fsr1Upscaler::init(const VulkanEnv& env, const UpscalerDesc& desc) {
     FfxEffectMemoryUsage usage = {};
     if (ffxFsr1ContextGetGpuMemoryUsage(&impl_->context, &usage) == FFX_OK)
         impl_->memoryBytes = usage.totalUsageInBytes;
+    if (!initUnjitter(env, desc.renderWidth, desc.renderHeight, impl_->unjitter)) {
+        std::fprintf(stderr, "FSR1: unjitter pass init failed\n");
+        shutdown();
+        return false;
+    }
+    impl_->memoryBytes += impl_->unjitter.color.bytes;
     return true;
 }
 
 void Fsr1Upscaler::dispatch(VkCommandBuffer cmd, const UpscalerResources& res, const CameraParams& cam,
                             const FrameParams& frame) {
-    (void)cam;
     (void)frame;
     if (!impl_ || !impl_->contextCreated) return;
 
     FrameFfxResources f = wrapFrameResources(res, impl_->desc);
+    const bool needUnjitter = impl_->unjitter.inited &&
+                              (std::fabs(cam.jitterX) > 1e-6f || std::fabs(cam.jitterY) > 1e-6f);
+    if (needUnjitter) {
+        recordUnjitter(cmd, impl_->env.device, impl_->unjitter, res.colorView, cam.jitterX,
+                       cam.jitterY, impl_->desc.renderWidth, impl_->desc.renderHeight);
+        f.color = ffxGetResourceVK(
+            impl_->unjitter.color.image,
+            imageDesc(FFX_SURFACE_FORMAT_R16G16B16A16_FLOAT, impl_->desc.renderWidth,
+                      impl_->desc.renderHeight, FFX_RESOURCE_USAGE_READ_ONLY),
+            L"SR_FSR1_UnjitteredColor", FFX_RESOURCE_STATE_COMPUTE_READ);
+    }
 
     FfxFsr1DispatchDescription dd = {};
     dd.commandList = ffxGetCommandListVK(cmd);
@@ -349,6 +529,7 @@ void Fsr1Upscaler::shutdown() {
         ffxFsr1ContextDestroy(&impl_->context);
         impl_->contextCreated = false;
     }
+    destroyUnjitter(impl_->env, impl_->unjitter);
     impl_->backend.destroy();
     delete impl_;
     impl_ = nullptr;

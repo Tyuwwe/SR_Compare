@@ -1,0 +1,18 @@
+#version 450
+// Undo Halton jitter on a shared temporal GBuffer so FSR1 (spatial) does not
+// shake.  Content sits at unjittered_uv + jitter/size; sample there.
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D uIn;
+layout(rgba16f, set = 0, binding = 1) uniform writeonly image2D uOut;
+
+layout(push_constant) uniform Push {
+    vec4 p; // xy = jitter pixels, zw = render size
+} pc;
+
+void main() {
+    ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    if (px.x >= int(pc.p.z) || px.y >= int(pc.p.w)) return;
+    vec2 uv = (vec2(px) + 0.5 + pc.p.xy) / pc.p.zw;
+    imageStore(uOut, px, textureLod(uIn, uv, 0.0));
+}

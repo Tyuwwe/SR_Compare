@@ -42,11 +42,11 @@ precision highp int;
 #if defined(UseUniformBlock)
 layout (set=0, binding = 0) uniform UniformBlock
 {
-	highp vec4 ViewportInfo[1];
+	highp vec4 ViewportInfo[2]; // [0]=rcpSize.xy / size.zw; [1].xy = jitter pixels
 };
 layout(set = 0, binding = 1) uniform mediump sampler2D ps0;
 #else
-uniform highp vec4 ViewportInfo[1];
+uniform highp vec4 ViewportInfo[2];
 uniform mediump sampler2D ps0;
 #endif
 
@@ -73,22 +73,25 @@ void main()
 	float edgeThreshold = EdgeThreshold;
 	float edgeSharpness = EdgeSharpness;
 
+	// Unjitter: temporal GBuffer content sits at unjittered_uv + jitter/size.
+	highp vec2 uv = in_TEXCOORD0.xy + ViewportInfo[0].xy * ViewportInfo[1].xy;
+
 	vec4 color;
 	if(mode == 1)
-		color.xyz = textureLod(ps0,in_TEXCOORD0.xy,0.0).xyz;
+		color.xyz = textureLod(ps0,uv,0.0).xyz;
 	else
-		color.xyzw = textureLod(ps0,in_TEXCOORD0.xy,0.0).xyzw;
+		color.xyzw = textureLod(ps0,uv,0.0).xyzw;
 
 	highp float xCenter;
-	xCenter = abs(in_TEXCOORD0.x+-0.5);
+	xCenter = abs(uv.x+-0.5);
 	highp float yCenter;
-	yCenter = abs(in_TEXCOORD0.y+-0.5);
+	yCenter = abs(uv.y+-0.5);
 
 	//todo: config the SR region based on needs
 	//if ( mode!=4 && xCenter*xCenter+yCenter*yCenter<=0.4 * 0.4)
 	if ( mode!=4)
 	{
-		highp vec2 imgCoord = ((in_TEXCOORD0.xy*ViewportInfo[0].zw)+vec2(-0.5,0.5));
+		highp vec2 imgCoord = ((uv*ViewportInfo[0].zw)+vec2(-0.5,0.5));
 		highp vec2 imgCoordPixel = floor(imgCoord);
 		highp vec2 coord = (imgCoordPixel*ViewportInfo[0].xy);
 		vec2 pl = (imgCoord+(-imgCoordPixel));

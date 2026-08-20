@@ -99,7 +99,7 @@ bool Sgsr1Upscaler::init(const VulkanEnv& env, const UpscalerDesc& desc) {
     if (!impl_->sampler) { shutdown(); return false; }
 
     for (int i = 0; i < kFrameSlots; ++i) {
-        if (!createUbo(env, 16 /* one vec4 ViewportInfo */, impl_->ubo[i])) {
+        if (!createUbo(env, 32 /* two vec4 ViewportInfo */, impl_->ubo[i])) {
             shutdown();
             return false;
         }
@@ -154,7 +154,7 @@ bool Sgsr1Upscaler::init(const VulkanEnv& env, const UpscalerDesc& desc) {
         VkDescriptorBufferInfo bi = {};
         bi.buffer = impl_->ubo[i].buffer;
         bi.offset = 0;
-        bi.range = 16;
+        bi.range = 32;
         VkWriteDescriptorSet write = {};
         write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         write.dstSet = impl_->set[i];
@@ -260,15 +260,16 @@ bool Sgsr1Upscaler::init(const VulkanEnv& env, const UpscalerDesc& desc) {
 
 void Sgsr1Upscaler::dispatch(VkCommandBuffer cmd, const UpscalerResources& res,
                              const CameraParams& cam, const FrameParams& frame) {
-    (void)cam;
     if (!impl_) return;
     const int slot = frame.frameIndex % kFrameSlots;
 
-    // ViewportInfo: xy = 1/renderSize, zw = renderSize.
-    float viewportInfo[4] = {1.f / static_cast<float>(impl_->desc.renderWidth),
+    // ViewportInfo[0]: xy = 1/renderSize, zw = renderSize.
+    // ViewportInfo[1].xy: Halton jitter in pixels (undo a shared temporal GBuffer).
+    float viewportInfo[8] = {1.f / static_cast<float>(impl_->desc.renderWidth),
                              1.f / static_cast<float>(impl_->desc.renderHeight),
                              static_cast<float>(impl_->desc.renderWidth),
-                             static_cast<float>(impl_->desc.renderHeight)};
+                             static_cast<float>(impl_->desc.renderHeight),
+                             cam.jitterX, cam.jitterY, 0.f, 0.f};
     std::memcpy(impl_->ubo[slot].mapped, viewportInfo, sizeof(viewportInfo));
 
     // Refresh the input binding (the view may change across resizes).

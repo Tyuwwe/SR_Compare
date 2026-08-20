@@ -272,6 +272,13 @@ bool CompareApp::createRenderTargets() {
                       VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                   VK_IMAGE_ASPECT_COLOR_BIT))
         return false;
+    // Unjittered LR color for spatial plugins when mixed with temporal ones
+    // (raster jitter cannot be undone by resampling).
+    if (!createRT(gbColorSpatial_, renderWidth_, renderHeight_, deferred::kHdrColorFormat,
+                  VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                      VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                  VK_IMAGE_ASPECT_COLOR_BIT))
+        return false;
     if (!createRT(gbMotion_, renderWidth_, renderHeight_, deferred::kMotionFormat,
                   VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
                       VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
@@ -539,15 +546,16 @@ bool CompareApp::createDescriptors() {
     VkDescriptorPoolSize sizes[5] = {};
     sizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     sizes[0].descriptorCount = deferred::kMaxTextures + numColumns * 2 + 2 + numAlgos * 2 +
-                               11 * kFramesInFlight * 3 + // lighting sets (GB/GT/SSAA), +1 shadow
-                               5 * kFramesInFlight * 3 +  // transparent sets (GB/GT/SSAA), +1 shadow
+                               11 * kFramesInFlight * 4 + // lighting sets (GB/GT/SSAA/spatial), +1 shadow
+                               5 * kFramesInFlight * 4 +  // transparent sets (GB/GT/SSAA/spatial), +1 shadow
                                3 * 3;                     // ssao + blur samplers (per path)
     sizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     sizes[1].descriptorCount = kFramesInFlight * 2 + numColumns +
                                kFramesInFlight * 2 + // lighting UBOs
-                               kFramesInFlight * 3;  // transparent UBOs (GB/GT/SSAA)
+                               kFramesInFlight * 3 +  // transparent UBOs (GB/GT/SSAA)
+                               3 * kFramesInFlight;   // spatial scene + lighting + transparent
     sizes[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
-    sizes[2].descriptorCount = kFramesInFlight * 2;
+    sizes[2].descriptorCount = kFramesInFlight * 3; // Gb + Gt + spatial scene sets
     sizes[3].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     sizes[3].descriptorCount = numAlgos * 2;
     sizes[4].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
@@ -556,7 +564,8 @@ bool CompareApp::createDescriptors() {
     poolCi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     poolCi.maxSets = kFramesInFlight * 2 + 2 + numColumns + 1 + numAlgos + kFramesInFlight * 3 +
                      kFramesInFlight * 3 + // transparent sets (GB/GT/SSAA)
-                     6;                     // ssao sets (GB/GT/SSAA, static)
+                     6 +                    // ssao sets (GB/GT/SSAA, static)
+                     3 * kFramesInFlight;   // spatial scene + lighting + transparent
     poolCi.poolSizeCount = 5;
     poolCi.pPoolSizes = sizes;
     if (vkCreateDescriptorPool(ctx_.device, &poolCi, nullptr, &descriptorPool_) != VK_SUCCESS)
@@ -591,12 +600,16 @@ bool CompareApp::createDescriptors() {
 
     for (uint32_t i = 0; i < kFramesInFlight; ++i) {
         if (!allocSet(deferred_.sceneSetLayout(), frames_[i].sceneSetGb)) return false;
+        if (!allocSet(deferred_.sceneSetLayout(), frames_[i].sceneSetGbSpatial)) return false;
         if (!allocSet(deferred_.sceneSetLayout(), frames_[i].sceneSetGt)) return false;
         if (!allocSet(deferred_.lightingSetLayout(), frames_[i].lightingSetGb)) return false;
+        if (!allocSet(deferred_.lightingSetLayout(), frames_[i].lightingSetGbSpatial)) return false;
         if (!allocSet(deferred_.lightingSetLayout(), frames_[i].lightingSetGt)) return false;
         if (opts_.gtSsaa && !allocSet(deferred_.lightingSetLayout(), frames_[i].lightingSetSsaa))
             return false;
         if (!allocSet(deferred_.transparentSetLayout(), frames_[i].transparentSetGb)) return false;
+        if (!allocSet(deferred_.transparentSetLayout(), frames_[i].transparentSetGbSpatial))
+            return false;
         if (!allocSet(deferred_.transparentSetLayout(), frames_[i].transparentSetGt)) return false;
         if (opts_.gtSsaa &&
             !allocSet(deferred_.transparentSetLayout(), frames_[i].transparentSetSsaa))
@@ -919,12 +932,12 @@ bool CompareApp::createSyncResources() {
         if (vkCreateSemaphore(ctx_.device, &semCi, nullptr, &fr.imageAvailable) != VK_SUCCESS) return false;
         if (vkCreateFence(ctx_.device, &fenceCi, nullptr, &fr.fence) != VK_SUCCESS) return false;
 
-        // Two scene UBOs per frame slot: jittered (GBuffer) / un-jittered (GT).
-        VkBuffer ubos[2] = {};
-        VkDeviceMemory uboMems[2] = {};
-        void* uboMaps[2] = {};
-        VkDescriptorSet sets[2] = {fr.sceneSetGb, fr.sceneSetGt};
-        for (int k = 0; k < 2; ++k) {
+        // Scene UBOs per frame slot: jittered GB / unjittered spatial GB / unjittered GT.
+        VkBuffer ubos[3] = {};
+        VkDeviceMemory uboMems[3] = {};
+        void* uboMaps[3] = {};
+        VkDescriptorSet sets[3] = {fr.sceneSetGb, fr.sceneSetGbSpatial, fr.sceneSetGt};
+        for (int k = 0; k < 3; ++k) {
             if (createBuffer(ctx_, uboSize, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
                              VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                              ubos[k], uboMems[k]) != VK_SUCCESS)
@@ -956,16 +969,24 @@ bool CompareApp::createSyncResources() {
             vkUpdateDescriptorSets(ctx_.device, 2, writes, 0, nullptr);
         }
         fr.uboGb = ubos[0]; fr.uboGbMemory = uboMems[0]; fr.uboGbMapped = uboMaps[0];
-        fr.uboGt = ubos[1]; fr.uboGtMemory = uboMems[1]; fr.uboGtMapped = uboMaps[1];
+        fr.uboGbSpatial = ubos[1]; fr.uboGbSpatialMemory = uboMems[1];
+        fr.uboGbSpatialMapped = uboMaps[1];
+        fr.uboGt = ubos[2]; fr.uboGtMemory = uboMems[2]; fr.uboGtMapped = uboMaps[2];
 
-        // Two lighting UBOs per frame slot: GB (jittered invViewProj) and GT
-        // (un-jittered; shared by the 1x and 2x SSAA GT lighting passes).
+        // Lighting UBOs: GB (jittered invViewProj), spatial GB (unjittered),
+        // GT (un-jittered; shared by the 1x and 2x SSAA GT lighting passes).
         if (createBuffer(ctx_, sizeof(LightingUBO), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                          fr.lightingUboGb, fr.lightingUboGbMemory) != VK_SUCCESS)
             return false;
         vkMapMemory(ctx_.device, fr.lightingUboGbMemory, 0, sizeof(LightingUBO), 0,
                     &fr.lightingUboGbMapped);
+        if (createBuffer(ctx_, sizeof(LightingUBO), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                         fr.lightingUboGbSpatial, fr.lightingUboGbSpatialMemory) != VK_SUCCESS)
+            return false;
+        vkMapMemory(ctx_.device, fr.lightingUboGbSpatialMemory, 0, sizeof(LightingUBO), 0,
+                    &fr.lightingUboGbSpatialMapped);
         if (createBuffer(ctx_, sizeof(LightingUBO), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                          fr.lightingUboGt, fr.lightingUboGtMemory) != VK_SUCCESS)
@@ -981,6 +1002,9 @@ bool CompareApp::createSyncResources() {
         deferred_.writeLightingSet(ctx_, fr.lightingSetGb, fr.lightingUboGb, gbAlbedo_.view,
                                    gbNormal_.view, gbMaterial_.view, gbEmissive_.view,
                                    gbDepth_.view, gbAo_.view, shadowView);
+        deferred_.writeLightingSet(ctx_, fr.lightingSetGbSpatial, fr.lightingUboGbSpatial,
+                                   gbAlbedo_.view, gbNormal_.view, gbMaterial_.view,
+                                   gbEmissive_.view, gbDepth_.view, gbAo_.view, shadowView);
         deferred_.writeLightingSet(ctx_, fr.lightingSetGt, fr.lightingUboGt, gtAlbedo_.view,
                                    gtNormal_.view, gtMaterial_.view, gtEmissive_.view,
                                    gtDepth_.view, gtAo_.view, shadowView);
@@ -995,6 +1019,8 @@ bool CompareApp::createSyncResources() {
         // UBOs) plus the path's own SSAO texture: one set per path.
         deferred_.writeTransparentSet(ctx_, fr.transparentSetGb, fr.lightingUboGb, gbAo_.view,
                                       shadowView);
+        deferred_.writeTransparentSet(ctx_, fr.transparentSetGbSpatial, fr.lightingUboGbSpatial,
+                                      gbAo_.view, shadowView);
         deferred_.writeTransparentSet(ctx_, fr.transparentSetGt, fr.lightingUboGb, gtAo_.view,
                                       shadowView);
         if (opts_.gtSsaa) {
@@ -1167,19 +1193,28 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     Mat4 projJittered = proj;
     prevJitterX_ = jitterX_;
     prevJitterY_ = jitterY_;
-    // Shared Halton jitter for the GBuffer pass; the GT pass stays un-jittered.
-    // SR_NO_JITTER keeps the low-res path but zeroes the offsets (and hence
-    // the jitter reported to the upscalers) to isolate jitter from resolution.
+    // Raster jitter cannot be undone by resampling.  Temporal plugins get a
+    // Halton-jittered GBuffer; spatial plugins (FSR1 / SGSR1) get unjittered
+    // LR color (a second deferred pass when mixed).
+    bool hasTemporal = false;
+    bool hasSpatial = false;
+    for (const AlgoColumn& a : algos_) {
+        if (!a.upscaler) continue;
+        if (upscalerNeedsJitter(a.upscaler.get())) hasTemporal = true;
+        else hasSpatial = true;
+    }
+    const bool temporal = hasTemporal;
+    const bool mixed = hasTemporal && hasSpatial;
     const Vec2 h = halton23(frameIndex + 1);
-    jitterX_ = diagNoJitter_ ? 0.f : h.x - 0.5f;
-    jitterY_ = diagNoJitter_ ? 0.f : h.y - 0.5f;
+    jitterX_ = (temporal && !diagNoJitter_) ? (h.x - 0.5f) : 0.f;
+    jitterY_ = (temporal && !diagNoJitter_) ? (h.y - 0.5f) : 0.f;
     // Uniform NDC shift: clip.xy += offset * clip.w (clip.w = -z_view via
     // m[11] = -1), so the offset belongs in column 2 with a negative sign —
     // see Renderer.cpp for the full rationale.
     projJittered.m[8] -= jitterX_ * 2.f / static_cast<float>(renderWidth_);
     projJittered.m[9] -= jitterY_ * 2.f / static_cast<float>(renderHeight_);
 
-    updateSceneUBO(fr.uboGbMapped, true, renderWidth_, renderHeight_, view, proj, projJittered,
+    updateSceneUBO(fr.uboGbMapped, temporal, renderWidth_, renderHeight_, view, proj, projJittered,
                    prevViewProj_);
     const uint32_t gtW = opts_.gtSsaa ? dw * 2 : dw;
     const uint32_t gtH = opts_.gtSsaa ? dh * 2 : dh;
@@ -1207,11 +1242,18 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     }
 
     // Lighting reconstructs world positions with the inverse of the exact
-    // view-projection used for each pass (jittered GB / un-jittered GT; the GT
-    // matrix is resolution-independent and shared by the 1x and 2x SSAA pass).
+    // view-projection used for each pass (jittered GB / unjittered spatial GB /
+    // un-jittered GT; the GT matrix is resolution-independent and shared by
+    // the 1x and 2x SSAA pass).
     updateLightingUBO(fr.lightingUboGbMapped,
                       Mat4::inverse(Mat4::multiply(projJittered, view)), shadow);
     updateLightingUBO(fr.lightingUboGtMapped, Mat4::inverse(Mat4::multiply(proj, view)), shadow);
+    if (mixed) {
+        updateSceneUBO(fr.uboGbSpatialMapped, false, renderWidth_, renderHeight_, view, proj, proj,
+                       prevViewProj_);
+        updateLightingUBO(fr.lightingUboGbSpatialMapped, Mat4::inverse(Mat4::multiply(proj, view)),
+                          shadow);
+    }
 
     auto transition = [&](VkImage image, VkImageLayout& current, VkImageLayout target,
                           VkImageAspectFlags aspect) {
@@ -1220,38 +1262,114 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     };
     const Mat4 cullViewProj = Mat4::multiply(proj, view); // un-jittered (sub-pixel)
 
-    // --- 1) shared low-resolution GBuffer pass (jittered) ----------------------
-    transition(gbAlbedo_.image, gbAlbedoLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-               VK_IMAGE_ASPECT_COLOR_BIT);
-    transition(gbNormal_.image, gbNormalLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-               VK_IMAGE_ASPECT_COLOR_BIT);
-    transition(gbMaterial_.image, gbMaterialLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-               VK_IMAGE_ASPECT_COLOR_BIT);
-    transition(gbEmissive_.image, gbEmissiveLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-               VK_IMAGE_ASPECT_COLOR_BIT);
-    transition(gbMotion_.image, gbMotionLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-               VK_IMAGE_ASPECT_COLOR_BIT);
-    transition(gbDepth_.image, gbDepthLayout_, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-               VK_IMAGE_ASPECT_DEPTH_BIT);
-    {
-        VkRenderingAttachmentInfo colors[5] = {
-            makeColorAttachment(gbAlbedo_.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                                VK_ATTACHMENT_LOAD_OP_CLEAR),
-            makeColorAttachment(gbNormal_.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                                VK_ATTACHMENT_LOAD_OP_CLEAR, 0.f, 0.f, 1.f),
-            makeColorAttachment(gbMaterial_.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                                VK_ATTACHMENT_LOAD_OP_CLEAR),
-            makeColorAttachment(gbEmissive_.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                                VK_ATTACHMENT_LOAD_OP_CLEAR),
-            makeColorAttachment(gbMotion_.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                                VK_ATTACHMENT_LOAD_OP_CLEAR)};
-        VkRenderingAttachmentInfo depth =
-            makeDepthAttachment(gbDepth_.view, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-                                VK_ATTACHMENT_LOAD_OP_CLEAR);
-        beginRendering(cmd, renderWidth_, renderHeight_, 5, colors, &depth);
-        deferred_.recordGBufferDraws(cmd, scene_, false, fr.sceneSetGb, textureSet_,
-                                     materialStride_, renderWidth_, renderHeight_, cullViewProj);
-        vkCmdEndRendering(cmd);
+    auto recordLrGBuffer = [&](VkDescriptorSet sceneSet) {
+        transition(gbAlbedo_.image, gbAlbedoLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                   VK_IMAGE_ASPECT_COLOR_BIT);
+        transition(gbNormal_.image, gbNormalLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                   VK_IMAGE_ASPECT_COLOR_BIT);
+        transition(gbMaterial_.image, gbMaterialLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                   VK_IMAGE_ASPECT_COLOR_BIT);
+        transition(gbEmissive_.image, gbEmissiveLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                   VK_IMAGE_ASPECT_COLOR_BIT);
+        transition(gbMotion_.image, gbMotionLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                   VK_IMAGE_ASPECT_COLOR_BIT);
+        transition(gbDepth_.image, gbDepthLayout_, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                   VK_IMAGE_ASPECT_DEPTH_BIT);
+        {
+            VkRenderingAttachmentInfo colors[5] = {
+                makeColorAttachment(gbAlbedo_.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                    VK_ATTACHMENT_LOAD_OP_CLEAR),
+                makeColorAttachment(gbNormal_.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                    VK_ATTACHMENT_LOAD_OP_CLEAR, 0.f, 0.f, 1.f),
+                makeColorAttachment(gbMaterial_.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                    VK_ATTACHMENT_LOAD_OP_CLEAR),
+                makeColorAttachment(gbEmissive_.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                    VK_ATTACHMENT_LOAD_OP_CLEAR),
+                makeColorAttachment(gbMotion_.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                    VK_ATTACHMENT_LOAD_OP_CLEAR)};
+            VkRenderingAttachmentInfo depth =
+                makeDepthAttachment(gbDepth_.view, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                                    VK_ATTACHMENT_LOAD_OP_CLEAR);
+            beginRendering(cmd, renderWidth_, renderHeight_, 5, colors, &depth);
+            deferred_.recordGBufferDraws(cmd, scene_, false, sceneSet, textureSet_, materialStride_,
+                                         renderWidth_, renderHeight_, cullViewProj);
+            vkCmdEndRendering(cmd);
+        }
+    };
+
+    auto recordLrLighting = [&](VkDescriptorSet sceneSet, VkDescriptorSet lightingSet,
+                                VkDescriptorSet transparentSet, const Mat4& ssaoViewProj) {
+        transition(gbAlbedo_.image, gbAlbedoLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                   VK_IMAGE_ASPECT_COLOR_BIT);
+        transition(gbNormal_.image, gbNormalLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                   VK_IMAGE_ASPECT_COLOR_BIT);
+        transition(gbMaterial_.image, gbMaterialLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                   VK_IMAGE_ASPECT_COLOR_BIT);
+        transition(gbEmissive_.image, gbEmissiveLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                   VK_IMAGE_ASPECT_COLOR_BIT);
+        transition(gbMotion_.image, gbMotionLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                   VK_IMAGE_ASPECT_COLOR_BIT);
+        transition(gbDepth_.image, gbDepthLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                   VK_IMAGE_ASPECT_DEPTH_BIT);
+
+        transition(gbAoRaw_.image, gbAoRawLayout_, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT);
+        deferred_.recordSsaoPass(cmd, ssaoSetGb_, ssaoViewProj, frameIndex, renderWidth_,
+                                 renderHeight_);
+        transition(gbAoRaw_.image, gbAoRawLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                   VK_IMAGE_ASPECT_COLOR_BIT);
+        transition(gbAo_.image, gbAoLayout_, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT);
+        deferred_.recordSsaoBlurPass(cmd, ssaoBlurSetGb_, renderWidth_, renderHeight_);
+        transition(gbAo_.image, gbAoLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                   VK_IMAGE_ASPECT_COLOR_BIT);
+
+        transition(gbColor_.image, gbColorLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                   VK_IMAGE_ASPECT_COLOR_BIT);
+        deferred_.recordLightingPass(cmd, lightingSet, gbColor_.view, renderWidth_, renderHeight_);
+
+        // Overwrites motion (static glass = camera motion) and accumulates the
+        // translucent coverage mask consumed by upscalers as the reactive / TC mask.
+        if (hasTransparency_) {
+            transition(gbMotion_.image, gbMotionLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                       VK_IMAGE_ASPECT_COLOR_BIT);
+            transition(gbReactive_.image, gbReactiveLayout_,
+                       VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+            transition(gbDepth_.image, gbDepthLayout_,
+                       VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
+            {
+                VkRenderingAttachmentInfo tColors[3] = {
+                    makeColorAttachment(gbColor_.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                        VK_ATTACHMENT_LOAD_OP_LOAD),
+                    makeColorAttachment(gbMotion_.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                        VK_ATTACHMENT_LOAD_OP_LOAD),
+                    makeColorAttachment(gbReactive_.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                        VK_ATTACHMENT_LOAD_OP_CLEAR)};
+                VkRenderingAttachmentInfo tDepth =
+                    makeDepthAttachment(gbDepth_.view,
+                                        VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+                                        VK_ATTACHMENT_LOAD_OP_LOAD);
+                beginRendering(cmd, renderWidth_, renderHeight_, 3, tColors, &tDepth);
+                deferred_.recordTransparentDraws(cmd, scene_, false, sceneSet, textureSet_,
+                                                 transparentSet, materialStride_, renderWidth_,
+                                                 renderHeight_, cullViewProj, camera_.position);
+                vkCmdEndRendering(cmd);
+            }
+            transition(gbMotion_.image, gbMotionLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                       VK_IMAGE_ASPECT_COLOR_BIT);
+            transition(gbReactive_.image, gbReactiveLayout_,
+                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+            transition(gbDepth_.image, gbDepthLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                       VK_IMAGE_ASPECT_DEPTH_BIT);
+        }
+
+        transition(gbColor_.image, gbColorLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                   VK_IMAGE_ASPECT_COLOR_BIT);
+    };
+
+    // --- 1) low-resolution deferred (spatial copy then jittered when mixed) -----
+    if (mixed) {
+        recordLrGBuffer(fr.sceneSetGbSpatial);
+    } else {
+        recordLrGBuffer(fr.sceneSetGb);
     }
 
     // --- Shadow pass (sun CSM, one 2048^2 layer per cascade) -------------------
@@ -1267,74 +1385,33 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                      VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, kShadowCascadeCount);
         shadow_.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     }
-    transition(gbAlbedo_.image, gbAlbedoLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-               VK_IMAGE_ASPECT_COLOR_BIT);
-    transition(gbNormal_.image, gbNormalLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-               VK_IMAGE_ASPECT_COLOR_BIT);
-    transition(gbMaterial_.image, gbMaterialLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-               VK_IMAGE_ASPECT_COLOR_BIT);
-    transition(gbEmissive_.image, gbEmissiveLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-               VK_IMAGE_ASPECT_COLOR_BIT);
-    transition(gbMotion_.image, gbMotionLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-               VK_IMAGE_ASPECT_COLOR_BIT);
-    transition(gbDepth_.image, gbDepthLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-               VK_IMAGE_ASPECT_DEPTH_BIT);
 
-    // SSAO (depth + normal -> raw AO -> cross-box blur), jittered LR view-proj.
-    transition(gbAoRaw_.image, gbAoRawLayout_, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT);
-    deferred_.recordSsaoPass(cmd, ssaoSetGb_, Mat4::multiply(projJittered, view), frameIndex,
-                             renderWidth_, renderHeight_);
-    transition(gbAoRaw_.image, gbAoRawLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-               VK_IMAGE_ASPECT_COLOR_BIT);
-    transition(gbAo_.image, gbAoLayout_, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT);
-    deferred_.recordSsaoBlurPass(cmd, ssaoBlurSetGb_, renderWidth_, renderHeight_);
-    transition(gbAo_.image, gbAoLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-               VK_IMAGE_ASPECT_COLOR_BIT);
-
-    // Deferred lighting (PBR direct + IBL, skybox on far-plane pixels) -> gbColor_.
-    transition(gbColor_.image, gbColorLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-               VK_IMAGE_ASPECT_COLOR_BIT);
-    deferred_.recordLightingPass(cmd, fr.lightingSetGb, gbColor_.view, renderWidth_, renderHeight_);
-
-    // --- Transparency pass (alpha-blended surfaces over the lit scene) --------
-    // Overwrites motion (static glass = camera motion, the "Output Velocity"
-    // equivalent) and accumulates the translucent coverage mask consumed by
-    // the upscalers as the reactive / TC / bias mask.
-    if (hasTransparency_) {
-        transition(gbMotion_.image, gbMotionLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+    if (mixed) {
+        recordLrLighting(fr.sceneSetGbSpatial, fr.lightingSetGbSpatial, fr.transparentSetGbSpatial,
+                         cullViewProj);
+        transition(gbColor_.image, gbColorLayout_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                    VK_IMAGE_ASPECT_COLOR_BIT);
-        transition(gbReactive_.image, gbReactiveLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                   VK_IMAGE_ASPECT_COLOR_BIT);
-        transition(gbDepth_.image, gbDepthLayout_, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
-                   VK_IMAGE_ASPECT_DEPTH_BIT);
+        transition(gbColorSpatial_.image, gbColorSpatialLayout_,
+                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
         {
-            VkRenderingAttachmentInfo tColors[3] = {
-                makeColorAttachment(gbColor_.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                                    VK_ATTACHMENT_LOAD_OP_LOAD),
-                makeColorAttachment(gbMotion_.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                                    VK_ATTACHMENT_LOAD_OP_LOAD),
-                makeColorAttachment(gbReactive_.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                                    VK_ATTACHMENT_LOAD_OP_CLEAR)};
-            VkRenderingAttachmentInfo tDepth =
-                makeDepthAttachment(gbDepth_.view,
-                                    VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
-                                    VK_ATTACHMENT_LOAD_OP_LOAD);
-            beginRendering(cmd, renderWidth_, renderHeight_, 3, tColors, &tDepth);
-            deferred_.recordTransparentDraws(cmd, scene_, false, fr.sceneSetGb, textureSet_,
-                                             fr.transparentSetGb, materialStride_, renderWidth_,
-                                             renderHeight_, cullViewProj, camera_.position);
-            vkCmdEndRendering(cmd);
+            VkImageCopy region = {};
+            region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            region.srcSubresource.layerCount = 1;
+            region.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            region.dstSubresource.layerCount = 1;
+            region.extent = {renderWidth_, renderHeight_, 1};
+            vkCmdCopyImage(cmd, gbColor_.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           gbColorSpatial_.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
         }
-        transition(gbMotion_.image, gbMotionLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                   VK_IMAGE_ASPECT_COLOR_BIT);
-        transition(gbReactive_.image, gbReactiveLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                   VK_IMAGE_ASPECT_COLOR_BIT);
-        transition(gbDepth_.image, gbDepthLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                   VK_IMAGE_ASPECT_DEPTH_BIT);
+        transition(gbColorSpatial_.image, gbColorSpatialLayout_,
+                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+        recordLrGBuffer(fr.sceneSetGb);
+        recordLrLighting(fr.sceneSetGb, fr.lightingSetGb, fr.transparentSetGb,
+                         Mat4::multiply(projJittered, view));
+    } else {
+        recordLrLighting(fr.sceneSetGb, fr.lightingSetGb, fr.transparentSetGb,
+                         Mat4::multiply(projJittered, view));
     }
-
-    transition(gbColor_.image, gbColorLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-               VK_IMAGE_ASPECT_COLOR_BIT);
 
     // --- 2) per-algorithm dispatch into its own output texture -----------------
     CameraParams cam;
@@ -1359,9 +1436,19 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         transition(algo.output.image, algo.outputLayout, VK_IMAGE_LAYOUT_GENERAL,
                    VK_IMAGE_ASPECT_COLOR_BIT);
 
+        CameraParams algoCam = cam;
         UpscalerResources res;
-        res.color = gbColor_.image;
-        res.colorView = gbColor_.view;
+        if (mixed && !upscalerNeedsJitter(algo.upscaler.get())) {
+            res.color = gbColorSpatial_.image;
+            res.colorView = gbColorSpatial_.view;
+            algoCam.jitterX = 0.f;
+            algoCam.jitterY = 0.f;
+            algoCam.prevJitterX = 0.f;
+            algoCam.prevJitterY = 0.f;
+        } else {
+            res.color = gbColor_.image;
+            res.colorView = gbColor_.view;
+        }
         res.depth = gbDepth_.image;
         res.depthView = gbDepth_.view;
         res.motion = gbMotion_.image;
@@ -1372,7 +1459,7 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         }
         res.output = algo.output.image;
         res.outputView = algo.output.view;
-        algo.upscaler->dispatch(cmd, res, cam, frame);
+        algo.upscaler->dispatch(cmd, res, algoCam, frame);
 
         transition(algo.output.image, algo.outputLayout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                    VK_IMAGE_ASPECT_COLOR_BIT);
@@ -1859,6 +1946,13 @@ void CompareApp::shutdown() {
             fr.uboGb = VK_NULL_HANDLE;
             fr.uboGbMemory = VK_NULL_HANDLE;
         }
+        if (fr.uboGbSpatial) {
+            vkDestroyBuffer(ctx_.device, fr.uboGbSpatial, nullptr);
+            vkFreeMemory(ctx_.device, fr.uboGbSpatialMemory, nullptr);
+            fr.uboGbSpatial = VK_NULL_HANDLE;
+            fr.uboGbSpatialMemory = VK_NULL_HANDLE;
+            fr.uboGbSpatialMapped = nullptr;
+        }
         if (fr.uboGt) {
             vkDestroyBuffer(ctx_.device, fr.uboGt, nullptr);
             vkFreeMemory(ctx_.device, fr.uboGtMemory, nullptr);
@@ -1870,6 +1964,13 @@ void CompareApp::shutdown() {
             vkFreeMemory(ctx_.device, fr.lightingUboGbMemory, nullptr);
             fr.lightingUboGb = VK_NULL_HANDLE;
             fr.lightingUboGbMemory = VK_NULL_HANDLE;
+        }
+        if (fr.lightingUboGbSpatial) {
+            vkDestroyBuffer(ctx_.device, fr.lightingUboGbSpatial, nullptr);
+            vkFreeMemory(ctx_.device, fr.lightingUboGbSpatialMemory, nullptr);
+            fr.lightingUboGbSpatial = VK_NULL_HANDLE;
+            fr.lightingUboGbSpatialMemory = VK_NULL_HANDLE;
+            fr.lightingUboGbSpatialMapped = nullptr;
         }
         if (fr.lightingUboGt) {
             vkDestroyBuffer(ctx_.device, fr.lightingUboGt, nullptr);
@@ -1914,6 +2015,7 @@ void CompareApp::shutdown() {
     }
 
     gbColor_.destroy(ctx_);
+    gbColorSpatial_.destroy(ctx_);
     gbAlbedo_.destroy(ctx_);
     gbNormal_.destroy(ctx_);
     gbMaterial_.destroy(ctx_);

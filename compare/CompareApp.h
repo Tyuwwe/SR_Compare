@@ -77,22 +77,31 @@ private:
         VkBuffer uboGb = VK_NULL_HANDLE;       // jittered scene UBO (GBuffer pass)
         VkDeviceMemory uboGbMemory = VK_NULL_HANDLE;
         void* uboGbMapped = nullptr;
+        VkBuffer uboGbSpatial = VK_NULL_HANDLE; // unjittered LR scene UBO (spatial plugins)
+        VkDeviceMemory uboGbSpatialMemory = VK_NULL_HANDLE;
+        void* uboGbSpatialMapped = nullptr;
         VkBuffer uboGt = VK_NULL_HANDLE;       // un-jittered scene UBO (GT pass)
         VkDeviceMemory uboGtMemory = VK_NULL_HANDLE;
         void* uboGtMapped = nullptr;
         VkBuffer lightingUboGb = VK_NULL_HANDLE; // lighting UBO (jittered invViewProj)
         VkDeviceMemory lightingUboGbMemory = VK_NULL_HANDLE;
         void* lightingUboGbMapped = nullptr;
+        VkBuffer lightingUboGbSpatial = VK_NULL_HANDLE; // lighting UBO (unjittered LR)
+        VkDeviceMemory lightingUboGbSpatialMemory = VK_NULL_HANDLE;
+        void* lightingUboGbSpatialMapped = nullptr;
         VkBuffer lightingUboGt = VK_NULL_HANDLE; // lighting UBO (un-jittered invViewProj)
         VkDeviceMemory lightingUboGtMemory = VK_NULL_HANDLE;
         void* lightingUboGtMapped = nullptr;
         VkDescriptorSet sceneSetGb = VK_NULL_HANDLE;
+        VkDescriptorSet sceneSetGbSpatial = VK_NULL_HANDLE;
         VkDescriptorSet sceneSetGt = VK_NULL_HANDLE;
         VkDescriptorSet lightingSetGb = VK_NULL_HANDLE;
+        VkDescriptorSet lightingSetGbSpatial = VK_NULL_HANDLE;
         VkDescriptorSet lightingSetGt = VK_NULL_HANDLE;
         VkDescriptorSet lightingSetSsaa = VK_NULL_HANDLE; // 2x GT GBuffer (gtSsaa only)
         // IBL + per-path SSAO texture for the transparency pass.
         VkDescriptorSet transparentSetGb = VK_NULL_HANDLE;
+        VkDescriptorSet transparentSetGbSpatial = VK_NULL_HANDLE;
         VkDescriptorSet transparentSetGt = VK_NULL_HANDLE;
         VkDescriptorSet transparentSetSsaa = VK_NULL_HANDLE; // gtSsaa only
     };
@@ -140,6 +149,7 @@ private:
     uint32_t metricHarvestCount_ = 0;
 
     ImageResource gbColor_;
+    ImageResource gbColorSpatial_; // unjittered LR HDR copy for spatial upscalers
     ImageResource gbMotion_;
     ImageResource gbReactive_; // translucent coverage mask (reactive/TC input)
     ImageResource gbDepth_;
@@ -215,6 +225,7 @@ private:
     VkSampler fontSampler_ = VK_NULL_HANDLE;
 
     VkImageLayout gbColorLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageLayout gbColorSpatialLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gbMotionLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gbReactiveLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gbDepthLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;

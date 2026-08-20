@@ -55,10 +55,10 @@ void main() {
     const float radius = pc.params.x;
     const float bias = pc.params.y;
 
-    // Per-pixel random rotation, additionally rotated every frame (the blur
-    // pass plus temporal jitter average the residual noise out).
-    float angle = 6.2831853 * fract(hash01(uvec2(pix)) +
-                                    fract(pc.params2.x * 0.61803399));
+    // Per-pixel random rotation only.  A per-frame extra spin was designed to
+    // be averaged out by temporal upscalers; spatial plugins (FSR1 / SGSR1)
+    // have no history, so it showed up as full-frame AO shimmer.
+    float angle = 6.2831853 * hash01(uvec2(pix));
 
     // TBN around the world-space normal.
     vec3 up = abs(N.y) < 0.999 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);

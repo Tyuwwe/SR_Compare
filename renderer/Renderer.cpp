@@ -668,7 +668,8 @@ void Renderer::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     timestamps_.resetForFrame(cmd, slot);
     timestamps_.frameBegin(cmd, slot);
 
-    const bool jitter = opts_.upscalerName != "none" && upscaler_ != nullptr;
+    const bool useUpscaler = opts_.upscalerName != "none" && upscaler_ != nullptr;
+    const bool jitter = useUpscaler && upscalerNeedsJitter(upscaler_.get());
     const float aspect = static_cast<float>(opts_.displayWidth) / static_cast<float>(opts_.displayHeight);
     const Mat4 view = camera_.view();
     const Mat4 proj = camera_.proj(aspect);
@@ -698,7 +699,7 @@ void Renderer::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
 
     updateSceneUBO(frameIndex, jitter, renderWidth_, renderHeight_, view, proj, projJittered, prevViewProj_);
 
-    const bool gbuffer = jitter;
+    const bool gbuffer = useUpscaler;
 
     // Lighting reconstructs world positions with the inverse of the exact
     // view-projection used for this pass (jittered for the low-res path).
