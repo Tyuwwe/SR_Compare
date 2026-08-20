@@ -16,18 +16,18 @@
 //             jitterOffset is the framebuffer pixel displacement (same
 //             sign as FSR2).  The official sample's -jitterY must not be
 //             copied: it compensates clip.xy += on Y-up clip positions.
-//   * DLSS  : wants cur->prev (same as FSR/UE velocity) -> mvecScale
-//             {-1/renderW, -1/renderH}; in our static-geometry scenes DLSS
-//             reprojects via clipToPrevClip, so the sign is untestable here.
+//   * DLSS  : wants cur->prev in [-1,1] -> mvecScale {-1/renderW, -1/renderH}
+//             (same sign flip as FSR2).  jitterOffset is framebuffer pixels.
 //   * NSS   : backward pixel motion -> motionVectorScale {-1,-1}.
 //             jitterOffset is negated (NssUpscaler.cpp): NSS wants the
 //             unjitter sampling offset, not the content displacement —
 //             Arm's reference sample applies jitter with proj[2][0/1] +=
 //             on a clip.w = -z projection (content moves by -jitter
 //             pixels) and reports the positive value.
-//   * SGSR2 : shader computes prev = uv - 0.5*clipMV -> takes cur->prev
-//             clip-space MV, correct as-is (encode pass multiplies by
-//             2/renderSize).
+//   * SGSR2 : official InputVelocity is dynamic objects only (zero for
+//             static); Convert reconstructs camera motion from clipToPrevClip
+//             + nearest-depth.  Encode writes zeros.  REQUEST_NDC_Y_UP unset
+//             (Vulkan Y-down).  jitterOffset is framebuffer pixels.
 //
 // Reactive mask (UpscalerResources::reactive/reactiveView) convention:
 //   * R16_SFLOAT, render resolution, per-pixel accumulated translucent alpha

@@ -1,9 +1,10 @@
 #pragma once
 // ============================================================================
 // DLSS Super Resolution upscaler via NVIDIA Streamline (Vulkan).
-// One class, two registered plugins differing only in the DLSS preset:
-//   "dlss-k" -> sl::DLSSPreset::ePresetK (first-gen transformer)
-//   "dlss-m" -> sl::DLSSPreset::ePresetM (second-gen transformer)
+// One class, three registered plugins differing only in the DLSS preset:
+//   "dlss-k" -> sl::DLSSPreset::ePresetK (transformer, quality/balanced default)
+//   "dlss-l" -> sl::DLSSPreset::ePresetL (transformer, ultra-performance default)
+//   "dlss-m" -> sl::DLSSPreset::ePresetM (transformer, performance default)
 // ============================================================================
 #include "upscalers/IUpscaler.h"
 
@@ -45,6 +46,7 @@ private:
 };
 
 std::unique_ptr<IUpscaler> createDlssKUpscaler();
+std::unique_ptr<IUpscaler> createDlssLUpscaler();
 std::unique_ptr<IUpscaler> createDlssMUpscaler();
 
 } // namespace sr

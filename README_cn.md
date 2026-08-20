@@ -9,7 +9,7 @@ Vulkan 单后端，在同一场景/同一相机路径下对比多种超分算法
 | TAA（自研基线） | 时域 | 本仓库 |
 | FSR 1 / 2 / 3.1 | 空间/时域 | AMD FidelityFX SDK 1.1.4（MIT） |
 | Intel XeSS | ML（DP4a） | intel/xess（闭源 DLL，Intel Simplified License） |
-| NVIDIA DLSS 4.5（Preset K / M） | ML（Transformer） | Streamline SDK（框架 MIT；nvngx_dlss.dll 闭源，需 NVIDIA Developer applicationId） |
+| NVIDIA DLSS 4.5（Preset K / L / M） | ML（Transformer） | Streamline SDK（框架 MIT；nvngx_dlss.dll 闭源，需 NVIDIA Developer applicationId） |
 | Arm NSS v1.0.1（high/mid_low int8） | ML（移动端） | arm/neural-graphics-sdk-for-game-engines（MIT）+ HF 模型（Arm AI Model Community License） |
 | SGSR 1 / 2 | 空间/时域（移动端） | SnapdragonGameStudios/snapdragon-gsr（BSD-3-Clause） |
 

@@ -10,7 +10,7 @@ upscaling algorithms, running the same scene under the same camera path.
 | TAA (own baseline) | temporal | this repo |
 | FSR 1 / 2 / 3.1 | spatial / temporal | AMD FidelityFX SDK 1.1.4 (MIT) |
 | Intel XeSS | ML (DP4a) | intel/xess (closed DLL, Intel Simplified License) |
-| NVIDIA DLSS 4.5 (Preset K / M) | ML (Transformer) | Streamline SDK (framework MIT; nvngx_dlss.dll closed, needs an NVIDIA Developer applicationId) |
+| NVIDIA DLSS 4.5 (Preset K / L / M) | ML (Transformer) | Streamline SDK (framework MIT; nvngx_dlss.dll closed, needs an NVIDIA Developer applicationId) |
 | Arm NSS v1.0.1 (high/mid_low int8) | ML (mobile) | arm/neural-graphics-sdk-for-game-engines (MIT) + HF models (Arm AI Model Community License) |
 | SGSR 1 / 2 | spatial / temporal (mobile) | SnapdragonGameStudios/snapdragon-gsr (BSD-3-Clause) |
 

@@ -1,14 +1,14 @@
 #version 450
-// SGSR2 input adapter: convert the renderer's motion texture
-// (R16G16F, render-resolution pixels, y down, unjittered) into the clip-space
-// encoded velocity texture SGSR2 expects:
-//     encoded = clamp(mvClip * 0.2495 + 32767/65535, eps, 1-eps)
-// where mvClip = mvPixels * 2 / renderSize matches the shaders' y-down NDC
-// convention (REQUEST_NDC_Y_UP left undefined in the SGSR2 passes).
-// The target image is R16G16B16A16_UNORM (shader qualifier rgba16): the
-// encoding constants are designed for 16-bit unorm precision.
-// The clamp keeps encoded.x > 0 so the SGSR2 convert pass always takes the
-// velocity branch (never the depth-reprojection fallback).
+// SGSR2 input adapter.  Official v2 README: InputVelocity is clip-space
+// encoded (`out = velocity * 0.2495 + 32767/65535`) and is "calculated for
+// dynamic objects only -- pass zero for static objects."  Convert then
+// reconstructs camera motion from clipToPrevClip + nearest-depth dilation.
+// This renderer has no skinned/rigid animation, so every pixel is static:
+// writing 0 selects that dilated matrix path.  (A previous version always
+// encoded the GBuffer MV, which forced the undilated velocity branch and
+// skipped nearest-Z.)
+// Binding 0 (uMotion) is kept so the pass layout stays identical; it is
+// unused while all geometry is static.
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
@@ -22,10 +22,5 @@ layout(push_constant) uniform Push {
 void main() {
     ivec2 px = ivec2(gl_GlobalInvocationID.xy);
     if (px.x >= int(pc.params.z) || px.y >= int(pc.params.w)) return;
-
-    vec2 mvPx = texelFetch(uMotion, px, 0).xy;
-    vec2 mvClip = mvPx * pc.params.xy;
-    vec2 enc = clamp(mvClip * 0.2495 + 32767.0 / 65535.0, vec2(1.0 / 65535.0),
-                     vec2(65534.0 / 65535.0));
-    imageStore(uEncodedVelocity, px, vec4(enc, 0.0, 1.0));
+    imageStore(uEncodedVelocity, px, vec4(0.0));
 }

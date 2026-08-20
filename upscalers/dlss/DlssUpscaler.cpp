@@ -3,17 +3,14 @@
 //
 // Input conventions (contract from upscalers/InputAdapter.h):
 //   color  : render-res HDR, R16G16B16A16_SFLOAT
-//   depth  : D32_SFLOAT, not inverted, near=0.1, far treated as infinite
+//   depth  : D32_SFLOAT, not inverted; near/far match Camera (finite far)
 //   motion : R16G16_SFLOAT, pixel units at render res, no jitter,
 //            (currentNDC - previousNDC) * 0.5 * renderSize, +y down,
-//            i.e. cur->prev.  NGX expects cur->prev (prev = uv + MV,
-//            same as FSR/UE velocity), so mvecScale negates while
-//            normalizing to [-1,1] ({-1/renderW, -1/renderH}).
-//            NOTE: in our scenes all geometry is static and DLSS reprojects
-//            camera motion via clipToPrevClip, so the MV sign is untestable
-//            here; the sign follows the documented-majority convention.
-//   jitter : pixel units, provided separately via Constants::jitterOffset
-//            (matrices passed to SL never contain jitter).
+//            i.e. previous -> current.  NGX wants current -> previous in
+//            [-1,1], so mvecScale is {-1/renderW, -1/renderH} (same sign
+//            flip as FSR2's {-1,-1}).
+//   jitter : pixel units, framebuffer displacement (same as FSR2/TAA);
+//            matrices passed to SL never contain jitter.
 //   reactive (optional, may be null) : R16_SFLOAT transparency-coverage mask
 //            at render res (0 = opaque, 1 = fully transparent overlay),
 //            tagged as kBufferTypeBiasCurrentColorHint +
@@ -39,10 +36,10 @@
 namespace sr {
 namespace {
 
-// Unique id per DLSS instance.  dlss-k and dlss-m are two separately
+// Unique id per DLSS instance.  dlss-k / dlss-l / dlss-m are separately
 // registered plugins, and compare mode initializes all registered plugins at
 // once; Streamline keys slSetConstants / slDLSSSetOptions / slFreeResources on
-// the viewport handle, so a shared hardcoded id would make the two plugins
+// the viewport handle, so a shared hardcoded id would make the plugins
 // (and their shutdown paths) clobber each other.
 std::atomic<uint32_t> g_nextViewportId{0};
 
@@ -110,7 +107,7 @@ bool DlssUpscaler::init(const VulkanEnv& env, const UpscalerDesc& desc) {
     shutdown();
     env_ = env;
     desc_ = desc;
-    viewportId_ = g_nextViewportId++;  // unique per instance (dlss-k / dlss-m)
+    viewportId_ = g_nextViewportId++;  // unique per instance (dlss-k / l / m)
 
     if (!sl_dlss::bindDevice(env)) return false;
     if (!sl_dlss::dlssSupported(env.physicalDevice)) return false;
@@ -184,9 +181,7 @@ void DlssUpscaler::dispatch(VkCommandBuffer cmd, const UpscalerResources& res,
     sl::matrixFullInvert(consts.prevClipToClip, consts.clipToPrevClip);
 
     consts.jitterOffset = {cam.jitterX, cam.jitterY};
-    // Our MVs are cur->prev pixels; NGX expects cur->prev too (same as
-    // FSR/UE velocity), so negate when normalizing to [-1,1]
-    // (ProgrammingGuideDLSS: pixel-space MVs use {1/renderW, 1/renderH}).
+    // Previous -> current pixels -> current -> previous in [-1,1].
     consts.mvecScale = {-1.0f / static_cast<float>(desc_.renderWidth),
                         -1.0f / static_cast<float>(desc_.renderHeight)};
     consts.cameraPinholeOffset = {0.0f, 0.0f};
@@ -197,7 +192,10 @@ void DlssUpscaler::dispatch(VkCommandBuffer cmd, const UpscalerResources& res,
     consts.cameraUp = {viewInv[1].x, viewInv[1].y, viewInv[1].z};
     consts.cameraFwd = {-viewInv[2].x, -viewInv[2].y, -viewInv[2].z}; // look down -Z
     consts.cameraNear = cam.cameraNear;
-    consts.cameraFar = desc_.infiniteFarPlane ? FLT_MAX : cam.cameraFar;
+    // Projection is finite-far (Camera::farPlane); do not advertise FLT_MAX
+    // just because UpscalerDesc::infiniteFarPlane is set — SL uses this to
+    // linearize depth against cameraViewToClip.
+    consts.cameraFar = cam.cameraFar;
     consts.cameraFOV = cam.fovY;
     consts.cameraAspectRatio =
         static_cast<float>(desc_.displayWidth) / static_cast<float>(desc_.displayHeight);
@@ -348,6 +346,10 @@ std::unique_ptr<IUpscaler> createDlssKUpscaler() {
     return std::make_unique<DlssUpscaler>(sl::DLSSPreset::ePresetK, "DLSS-K");
 }
 
+std::unique_ptr<IUpscaler> createDlssLUpscaler() {
+    return std::make_unique<DlssUpscaler>(sl::DLSSPreset::ePresetL, "DLSS-L");
+}
+
 std::unique_ptr<IUpscaler> createDlssMUpscaler() {
     return std::make_unique<DlssUpscaler>(sl::DLSSPreset::ePresetM, "DLSS-M");
 }
@@ -355,4 +357,5 @@ std::unique_ptr<IUpscaler> createDlssMUpscaler() {
 } // namespace sr
 
 SR_REGISTER_UPSCALER("dlss-k", &sr::createDlssKUpscaler);
+SR_REGISTER_UPSCALER("dlss-l", &sr::createDlssLUpscaler);
 SR_REGISTER_UPSCALER("dlss-m", &sr::createDlssMUpscaler);

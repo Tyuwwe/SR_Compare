@@ -2,7 +2,7 @@
 // ============================================================================
 // SlContext — process-wide Streamline (sl.interposer) lifecycle manager.
 //
-// Both DLSS plugins ("dlss-k" / "dlss-m") share a single slInit/slShutdown
+// All DLSS plugins ("dlss-k" / "dlss-l" / "dlss-m") share a single slInit/slShutdown
 // pair: slInit runs at most once per process (lazily, on first use) and
 // slShutdown runs when the last DLSS upscaler instance is destroyed (while
 // the Vulkan device is still alive, as required by the SL programming guide).

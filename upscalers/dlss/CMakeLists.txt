@@ -2,9 +2,10 @@
 # Convention: plugin targets are named `upscaler_<dirname>` and are linked
 # whole-archive into the umbrella `upscalers` lib by ../CMakeLists.txt.
 #
-# Registers two plugins sharing one process-wide Streamline instance:
-#   "dlss-k" -> sl::DLSSPreset::ePresetK (first-gen transformer)
-#   "dlss-m" -> sl::DLSSPreset::ePresetM (second-gen transformer)
+# Registers three plugins sharing one process-wide Streamline instance:
+#   "dlss-k" -> sl::DLSSPreset::ePresetK
+#   "dlss-l" -> sl::DLSSPreset::ePresetL
+#   "dlss-m" -> sl::DLSSPreset::ePresetM
 add_library(upscaler_dlss STATIC DlssUpscaler.cpp SlContext.cpp)
 sr_common_setup(upscaler_dlss)
 

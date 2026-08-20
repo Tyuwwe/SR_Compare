@@ -19,8 +19,8 @@ namespace cmdline {
 
 // True when `key` is among the --upscaler/--upscalers values.  Values are
 // comma-separated and the token "all" matches every plugin.  Each token is
-// matched by substring so a single key ("dlss") covers both "dlss-k" and
-// "dlss-m".  When the command line cannot be parsed we return true (fail
+// matched by substring so a single key ("dlss") covers "dlss-k", "dlss-l"
+// and "dlss-m".  When the command line cannot be parsed we return true (fail
 // open, matching the original DLSS gate).
 inline bool pluginRequested(const char* key) {
     if (!key || !*key) return true;
