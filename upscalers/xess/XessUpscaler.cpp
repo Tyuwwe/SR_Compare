@@ -1,14 +1,18 @@
 // ============================================================================
 // XeSS — Intel XeSS Super Resolution (Vulkan path) plugin.
 //
-// Conventions (verified against the XeSS 2.x developer guide and the official
-// basic_sample_super_resolution_vk sample):
-//   * Motion vectors: pixel units at input resolution, current frame ->
-//     previous frame, no jitter (2.x guide).  Our renderer produces
-//     previous -> current, so we flip the sign via xessSetVelocityScale(-1,-1).
-//   * Jitter: pixel units in [-0.5, 0.5].  The official VK sample applies
-//     clip.xy += 2*jitter/res (y-down NDC, same as us) and passes
-//     jitterOffsetX = +jitter.x, jitterOffsetY = -jitter.y — we mirror that.
+// Conventions (XeSS-SR 2.x/3.x developer guide + Intel VK/DX12 samples):
+//   * Motion vectors: pixel units at input resolution, current -> previous,
+//     no jitter (2.x guide).  Our GBuffer stores previous -> current, so
+//     xessSetVelocityScale(-1,-1) — same sign flip as FSR2/NSS.
+//   * Jitter: pixel units in [-0.5, 0.5], framebuffer displacement of the
+//     jittered content (same contract as FSR2/TAA/DLSS).  The official
+//     samples pass jitterOffsetY = -halton.y because they add jitter with
+//     clip.xy += 2*j/res on D3D-style Y-up clip positions (DX12 and VK
+//     samples share that shader).  Our projection is already Vulkan Y-down
+//     (Math.h m[5] = -f) and applies m[8]/m[9] -= 2*j/size, which moves
+//     content +j pixels in framebuffer space — reporting -Y on top of that
+//     inverts the Y phase (2*jitterY px misregistration, static flicker).
 //   * Depth: non-inverted, low-res MV path (XeSS dilates/up-samples MVs
 //     internally using depth), XESS_INIT_FLAG_RESPONSIVE_PIXEL_MASK (the
 //     renderer's translucent coverage mask feeds responsivePixelMaskTexture;
@@ -493,8 +497,11 @@ void XessUpscaler::dispatch(VkCommandBuffer cmd, const UpscalerResources& res, c
     params.outputTexture =
         makeTextureInfo(res.outputView, res.output, VK_FORMAT_R16G16B16A16_SFLOAT,
                         VK_IMAGE_ASPECT_COLOR_BIT, impl_->desc.displayWidth, impl_->desc.displayHeight);
+    // Same framebuffer-space displacement we report to FSR2/TAA/DLSS.
+    // Do not copy the official sample's -jitterY: that compensates their
+    // clip.xy += on Y-up clip positions, not our Vulkan Y-down shear.
     params.jitterOffsetX = cam.jitterX;
-    params.jitterOffsetY = -cam.jitterY; // official VK sample convention (y-down clip space)
+    params.jitterOffsetY = cam.jitterY;
     params.exposureScale = frame.preExposure;
     params.resetHistory = frame.resetHistory ? 1u : 0u;
     params.inputWidth = impl_->desc.renderWidth;

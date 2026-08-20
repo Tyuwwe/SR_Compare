@@ -13,6 +13,9 @@
 //   * FSR2/3: prev = uv + MV (see ffx_fsr2_reproject.h) -> motionVectorScale
 //             {-1,-1} (A/B verified: +2.5 dB PSNR vs the wrong sign).
 //   * XeSS  : wants cur->prev -> xessSetVelocityScale(-1,-1).
+//             jitterOffset is the framebuffer pixel displacement (same
+//             sign as FSR2).  The official sample's -jitterY must not be
+//             copied: it compensates clip.xy += on Y-up clip positions.
 //   * DLSS  : wants cur->prev (same as FSR/UE velocity) -> mvecScale
 //             {-1/renderW, -1/renderH}; in our static-geometry scenes DLSS
 //             reprojects via clipToPrevClip, so the sign is untestable here.
