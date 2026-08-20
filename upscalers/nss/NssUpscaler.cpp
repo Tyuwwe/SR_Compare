@@ -21,6 +21,8 @@
 #define NOMINMAX
 #include <windows.h>
 
+#include "upscalers/Cmdline.h"
+
 namespace sr {
 
 namespace {
@@ -56,15 +58,7 @@ bool g_featureChainInit = false;
 // this, the emulation layers + ARM feature chain would be injected into
 // every process of a unified build and break other upscalers.
 bool nssRequestedOnCommandLine() {
-    static const bool requested = [] {
-        LPWSTR w = GetCommandLineW();
-        if (!w) return false;
-        int len = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
-        if (len <= 0) return false;
-        std::vector<char> buf(static_cast<size_t>(len));
-        WideCharToMultiByte(CP_UTF8, 0, w, -1, buf.data(), len, nullptr, nullptr);
-        return std::strstr(buf.data(), "nss") != nullptr;
-    }();
+    static const bool requested = sr::cmdline::pluginRequested("nss");
     // GUI mode flips the global override before device creation; the cached
     // command-line result alone would leave nss unavailable there.
     return allPluginsEnabled() || requested;

@@ -77,6 +77,10 @@ bool Swapchain::create(const VulkanContext& ctx, uint32_t width, uint32_t height
     VkSwapchainKHR newSwapchain = VK_NULL_HANDLE;
     if (vkCreateSwapchainKHR(ctx.device, &ci, nullptr, &newSwapchain) != VK_SUCCESS) return false;
 
+    // In-flight frames may still reference the old swapchain images, so wait
+    // for all queued work to finish before destroying the previous handles.
+    if (swapchain_ != VK_NULL_HANDLE) vkDeviceWaitIdle(ctx.device);
+
     // Destroy the previous swapchain images/views before replacing the handle.
     for (auto& v : views_) vkDestroyImageView(ctx.device, v, nullptr);
     views_.clear();

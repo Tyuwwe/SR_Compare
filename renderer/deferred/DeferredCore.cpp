@@ -625,9 +625,14 @@ void DeferredCore::fillSceneUBO(SceneUBO& out, const Scene& scene, const Camera&
     out.cameraPos[2] = camera.position.z;
     out.cameraPos[3] = 1.f;
 
+    // The SceneUBO light fields are consumed only by the transparent shaders,
+    // which use the same PBR Lambert term (albedo/PI) as the deferred pass, so
+    // scale intensity by PI to keep transparent surfaces consistent with
+    // fillLightingUBO.
     auto fillLight = [](float* pos, float* color, const Light& l) {
         pos[0] = l.position.x; pos[1] = l.position.y; pos[2] = l.position.z; pos[3] = 1.f;
-        color[0] = l.color.x; color[1] = l.color.y; color[2] = l.color.z; color[3] = l.intensity;
+        color[0] = l.color.x; color[1] = l.color.y; color[2] = l.color.z;
+        color[3] = l.intensity * 3.14159265f;
     };
     const Light defaultLight0{{4.f, 7.f, 4.f}, {1.f, 0.9f, 0.75f}, 140.f};
     const Light defaultLight1{{-4.f, 3.f, -3.f}, {0.6f, 0.7f, 1.f}, 55.f};
@@ -710,6 +715,9 @@ bool DeferredCore::createMaterialUbo(const VulkanContext& ctx, const Scene& scen
 
 void DeferredCore::writeTextureSet(const VulkanContext& ctx, VkDescriptorSet set,
                                    const Scene& scene) const {
+    // A glTF without images produces no textures; every material then has
+    // texIndex == -1 and the shaders never sample this array, so nothing to bind.
+    if (scene.textures.empty()) return;
     if (scene.textures.size() > deferred::kMaxTextures) {
         std::fprintf(stderr,
                      "warning: scene has %zu textures, exceeding kMaxTextures=%u; "

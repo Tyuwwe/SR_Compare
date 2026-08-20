@@ -253,6 +253,7 @@ private:
     bool createDescriptors();
     bool createPipelines();
     bool createSyncResources();
+    bool recreateRenderFinishedSemaphores();
     bool createFontAtlas();
     bool createMetricResources();
     bool createScreenshotStaging();

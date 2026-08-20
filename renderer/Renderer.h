@@ -152,6 +152,7 @@ private:
     bool createPipelines();
     bool createSyncResources();
     bool createScreenshotStaging();
+    bool recreateSwapchain(uint32_t width, uint32_t height, bool vsync);
     void updateSceneUBO(uint32_t frameIndex, bool jitter, uint32_t renderW, uint32_t renderH,
                         const Mat4& view, const Mat4& proj, const Mat4& projJittered,
                         const Mat4& prevViewProj);

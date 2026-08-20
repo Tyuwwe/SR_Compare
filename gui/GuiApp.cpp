@@ -487,8 +487,12 @@ void GuiApp::requestRebuild(const RenderConfig& cfg) {
 // reports Ready.  The rebuild is tiered (see LoadPhase in GuiApp.h): scene
 // reload only happens when the scene path actually changed.
 void GuiApp::applyRebuild() {
-    pendingRebuild_ = false;
+    // Check the phase before clearing pendingRebuild_: run() calls this ahead of
+    // finishAsyncRebuild, so at the Ready-but-not-yet-swapped point the request
+    // must stay queued (it becomes effective next frame once phase is Idle)
+    // instead of being silently dropped.
     if (loadPhase_.load(std::memory_order_acquire) != LoadPhase::Idle) return;
+    pendingRebuild_ = false;
     loadConfig_ = pendingConfig_;
 
     // Dirty classification against the active stack.
@@ -2922,6 +2926,13 @@ void GuiApp::collectScreenshotPixels() {
 }
 
 void GuiApp::saveScreenshot(const char* path) {
+    // Reject while a capture is already queued or in flight: a second request
+    // would overwrite screenshotPathPending_/screenshotSlot_, so the first
+    // capture's fence would never be polled again and the shot silently lost.
+    if (screenshotPending_ || screenshotInFlight_) {
+        statusLine_ = "screenshot: already in progress";
+        return;
+    }
     if (!stackOk_) {
         statusLine_ = "screenshot: render stack is not ready";
         return;

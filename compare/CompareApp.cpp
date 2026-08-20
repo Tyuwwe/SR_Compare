@@ -982,6 +982,20 @@ bool CompareApp::createSyncResources() {
     }
 
     // One renderFinished semaphore per swapchain image (present sync).
+    if (!recreateRenderFinishedSemaphores()) return false;
+    return true;
+}
+
+bool CompareApp::recreateRenderFinishedSemaphores() {
+    // Destroy the old set first: the swapchain may now expose a different image
+    // count, so the previous array size (and its semaphores) no longer match.
+    for (VkSemaphore sem : renderFinished_) {
+        if (sem) vkDestroySemaphore(ctx_.device, sem, nullptr);
+    }
+    renderFinished_.clear();
+
+    VkSemaphoreCreateInfo semCi = {};
+    semCi.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
     renderFinished_.resize(swapchain_.imageCount(), VK_NULL_HANDLE);
     for (size_t i = 0; i < renderFinished_.size(); ++i) {
         if (vkCreateSemaphore(ctx_.device, &semCi, nullptr, &renderFinished_[i]) != VK_SUCCESS) return false;
@@ -1637,9 +1651,11 @@ void CompareApp::run() {
         const uint32_t slot = frameIndex % kFramesInFlight;
 
         // Ensure the previous work using this frame slot is complete before
-        // reusing its fence / image-available semaphore / UBOs / staging.
+        // reusing its fence / image-available semaphore / UBOs / staging. The
+        // fence is reset only after a successful acquire: an OUT_OF_DATE /
+        // SUBOPTIMAL acquire leaves it signaled so the next iteration's wait
+        // returns immediately instead of blocking forever.
         vkWaitForFences(ctx_.device, 1, &frames_[slot].fence, VK_TRUE, UINT64_MAX);
-        vkResetFences(ctx_.device, 1, &frames_[slot].fence);
 
         // The metric readback recorded for this slot (if any) is complete now.
         if (metricPending_[slot]) {
@@ -1650,10 +1666,17 @@ void CompareApp::run() {
         uint32_t swapIndex = 0;
         VkResult acq = swapchain_.acquireNext(ctx_, frames_[slot].imageAvailable, swapIndex);
         if (acq == VK_ERROR_OUT_OF_DATE_KHR || acq == VK_SUBOPTIMAL_KHR) {
-            swapchain_.create(ctx_, opts_.displayWidth, opts_.displayHeight, opts_.vsync);
+            // The surface size changed. Wait for in-flight work, then rebuild
+            // the swapchain and the per-image present semaphores for the new
+            // image count (the old count is not guaranteed to match).
+            vkDeviceWaitIdle(ctx_.device);
+            if (!swapchain_.create(ctx_, opts_.displayWidth, opts_.displayHeight, opts_.vsync)) break;
+            if (!recreateRenderFinishedSemaphores()) break;
             continue;
         }
         if (acq != VK_SUCCESS) break;
+
+        vkResetFences(ctx_.device, 1, &frames_[slot].fence);
 
         recordFrame(frameIndex, swapIndex);
 
@@ -1671,7 +1694,12 @@ void CompareApp::run() {
 
         VkResult pres = swapchain_.present(ctx_, swapIndex, renderFinished_[swapIndex]);
         if (pres == VK_ERROR_OUT_OF_DATE_KHR || pres == VK_SUBOPTIMAL_KHR) {
-            swapchain_.create(ctx_, opts_.displayWidth, opts_.displayHeight, opts_.vsync);
+            // Present reported the swapchain is no longer optimal. The queued
+            // present may still reference the old semaphores, so wait idle
+            // before destroying them and rebuilding for the new image count.
+            vkDeviceWaitIdle(ctx_.device);
+            if (!swapchain_.create(ctx_, opts_.displayWidth, opts_.displayHeight, opts_.vsync)) break;
+            if (!recreateRenderFinishedSemaphores()) break;
         } else if (pres != VK_SUCCESS) {
             break;
         }

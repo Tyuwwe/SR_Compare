@@ -33,6 +33,8 @@
 #include <vector>
 #include <windows.h>
 
+#include "upscalers/Cmdline.h"
+
 namespace sr {
 
 namespace {
@@ -70,15 +72,7 @@ void xessLogCallback(const char* message, xess_logging_level_t level) {
 // (which triggers non-fatal VUID-00373/06532 warnings) would be injected
 // into every process of a unified build.
 bool xessRequestedOnCommandLine() {
-    static const bool requested = [] {
-        LPWSTR w = GetCommandLineW();
-        if (!w) return false;
-        int len = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
-        if (len <= 0) return false;
-        std::vector<char> buf(static_cast<size_t>(len));
-        WideCharToMultiByte(CP_UTF8, 0, w, -1, buf.data(), len, nullptr, nullptr);
-        return std::strstr(buf.data(), "xess") != nullptr;
-    }();
+    static const bool requested = sr::cmdline::pluginRequested("xess");
     // GUI mode flips the global override before device creation; the cached
     // command-line result alone would leave xess unavailable there.
     return allPluginsEnabled() || requested;

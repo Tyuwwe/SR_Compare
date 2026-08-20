@@ -245,7 +245,7 @@ bool Scene::loadGltf(const VulkanContext& ctx, const char* path, VkCommandPool p
                 const cgltf_attribute& attr = prim->attributes[a];
                 if (attr.type == cgltf_attribute_type_position) pos = attr.data;
                 else if (attr.type == cgltf_attribute_type_normal) normal = attr.data;
-                else if (attr.type == cgltf_attribute_type_texcoord) uv = attr.data;
+                else if (attr.type == cgltf_attribute_type_texcoord && attr.index == 0) uv = attr.data;
                 else if (attr.type == cgltf_attribute_type_tangent) tangent = attr.data;
             }
             if (!pos) continue;

@@ -546,6 +546,30 @@ bool Renderer::createSyncResources() {
     return true;
 }
 
+bool Renderer::recreateSwapchain(uint32_t width, uint32_t height, bool vsync) {
+    // In-flight frames may still reference the old swapchain images, so wait
+    // for all queued work to finish before destroying the previous semaphores
+    // and swapchain (the image count may change after the recreate).
+    vkDeviceWaitIdle(ctx_.device);
+
+    for (VkSemaphore sem : renderFinished_) {
+        if (sem) vkDestroySemaphore(ctx_.device, sem, nullptr);
+    }
+    renderFinished_.clear();
+
+    if (!swapchain_.create(ctx_, width, height, vsync)) return false;
+
+    // Rebuild one present semaphore per swapchain image: the new swapchain may
+    // have a different image count than the previous one.
+    VkSemaphoreCreateInfo semCi = {};
+    semCi.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+    renderFinished_.resize(swapchain_.imageCount(), VK_NULL_HANDLE);
+    for (size_t i = 0; i < renderFinished_.size(); ++i) {
+        if (vkCreateSemaphore(ctx_.device, &semCi, nullptr, &renderFinished_[i]) != VK_SUCCESS) return false;
+    }
+    return true;
+}
+
 bool Renderer::createScreenshotStaging() {
     screenshotSize_ = static_cast<VkDeviceSize>(opts_.displayWidth) * opts_.displayHeight * 8; // RGBA16F
     if (createBuffer(ctx_, screenshotSize_, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
@@ -863,6 +887,19 @@ void Renderer::run() {
     while (true) {
         if (!window_.poll()) break;
 
+        // WM_SIZE sets input_.resized; consume it here and rebuild the swapchain
+        // against the actual client size (the previous recreate paths used the
+        // fixed opts_ display size, so interactive resizes were ignored).
+        // TODO: the offscreen targets (finalImage_, screenshot staging, ...) are
+        // still allocated from opts_.displayWidth/Height and are not rebuilt
+        // here; the present pass scales them to the swapchain extent, so a
+        // resize works at the presentation level only.
+        if (window_.input().resized) {
+            window_.clearMouseDelta();
+            recreateSwapchain(static_cast<uint32_t>(window_.width()),
+                              static_cast<uint32_t>(window_.height()), opts_.vsync);
+        }
+
         if (opts_.frames >= 0 && static_cast<int>(frameIndex) >= opts_.frames) break;
 
         const auto now = std::chrono::steady_clock::now();
@@ -886,7 +923,7 @@ void Renderer::run() {
         uint32_t swapIndex = 0;
         VkResult acq = swapchain_.acquireNext(ctx_, frames_[slot].imageAvailable, swapIndex);
         if (acq == VK_ERROR_OUT_OF_DATE_KHR || acq == VK_SUBOPTIMAL_KHR) {
-            swapchain_.create(ctx_, opts_.displayWidth, opts_.displayHeight, opts_.vsync);
+            recreateSwapchain(opts_.displayWidth, opts_.displayHeight, opts_.vsync);
             continue;
         }
         if (acq != VK_SUCCESS) break;
@@ -907,7 +944,7 @@ void Renderer::run() {
 
         VkResult pres = swapchain_.present(ctx_, swapIndex, renderFinished_[swapIndex]);
         if (pres == VK_ERROR_OUT_OF_DATE_KHR || pres == VK_SUBOPTIMAL_KHR) {
-            swapchain_.create(ctx_, opts_.displayWidth, opts_.displayHeight, opts_.vsync);
+            recreateSwapchain(opts_.displayWidth, opts_.displayHeight, opts_.vsync);
         } else if (pres != VK_SUCCESS) {
             break;
         }

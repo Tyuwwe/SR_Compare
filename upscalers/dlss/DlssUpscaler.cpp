@@ -31,11 +31,20 @@
 #include <sl_helpers.h>
 #include <sl_matrix_helpers.h>
 
+#include <atomic>
+#include <cfloat>
 #include <cstdio>
 #include <memory>
 
 namespace sr {
 namespace {
+
+// Unique id per DLSS instance.  dlss-k and dlss-m are two separately
+// registered plugins, and compare mode initializes all registered plugins at
+// once; Streamline keys slSetConstants / slDLSSSetOptions / slFreeResources on
+// the viewport handle, so a shared hardcoded id would make the two plugins
+// (and their shutdown paths) clobber each other.
+std::atomic<uint32_t> g_nextViewportId{0};
 
 // ---------------------------------------------------------------------------
 // Small matrix helpers.  sr::CameraParams stores column-major float[16]
@@ -101,6 +110,7 @@ bool DlssUpscaler::init(const VulkanEnv& env, const UpscalerDesc& desc) {
     shutdown();
     env_ = env;
     desc_ = desc;
+    viewportId_ = g_nextViewportId++;  // unique per instance (dlss-k / dlss-m)
 
     if (!sl_dlss::bindDevice(env)) return false;
     if (!sl_dlss::dlssSupported(env.physicalDevice)) return false;
@@ -187,7 +197,7 @@ void DlssUpscaler::dispatch(VkCommandBuffer cmd, const UpscalerResources& res,
     consts.cameraUp = {viewInv[1].x, viewInv[1].y, viewInv[1].z};
     consts.cameraFwd = {-viewInv[2].x, -viewInv[2].y, -viewInv[2].z}; // look down -Z
     consts.cameraNear = cam.cameraNear;
-    consts.cameraFar = cam.cameraFar;
+    consts.cameraFar = desc_.infiniteFarPlane ? FLT_MAX : cam.cameraFar;
     consts.cameraFOV = cam.fovY;
     consts.cameraAspectRatio =
         static_cast<float>(desc_.displayWidth) / static_cast<float>(desc_.displayHeight);

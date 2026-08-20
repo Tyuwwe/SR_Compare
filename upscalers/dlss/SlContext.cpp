@@ -15,6 +15,8 @@
 #include <windows.h> // must precede shellapi.h
 #include <shellapi.h>
 
+#include "upscalers/Cmdline.h"
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -244,18 +246,7 @@ void shutdownIfIdle() {
 // ---------------------------------------------------------------------------
 
 bool dlssRequestedOnCommandLine() {
-    int argc = 0;
-    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
-    if (!argv) return true; // cannot parse -> assume DLSS may be used
-    bool requested = false;
-    for (int i = 1; i < argc && !requested; ++i) {
-        const std::wstring a = argv[i];
-        if ((a == L"--upscaler" || a == L"--upscalers") && i + 1 < argc) {
-            requested = std::wstring(argv[i + 1]).find(L"dlss") != std::wstring::npos;
-        }
-    }
-    LocalFree(argv);
-    return requested;
+    return sr::cmdline::pluginRequested("dlss");
 }
 
 void appendInstanceExtensionsHook(std::vector<const char*>& instanceExts) {
