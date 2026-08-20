@@ -88,11 +88,13 @@ constexpr float kShadowMaxDistance = 200.f;
 // sun so casters between the slice and the sun still land in the map.
 constexpr float kShadowCasterMargin = 150.f;
 // CSM stabilization (bounding-sphere cascades, per MSFT "Common Techniques to
-// Improve Shadow Depth Maps"): the cascade radius is quantized to a 1/N-metre
-// grid (N = kShadowRadiusSnap) so the world size of a shadow texel stays
-// constant for a given split distance regardless of camera position, rotation
-// or TAA jitter — a drifting texel size is what makes the snap grid itself
-// swim and the shadow edges shimmer.
+// Improve Shadow Depth Maps"): the cascade radius is padded by two texels and
+// quantized to a 1/N-metre grid (N = kShadowRadiusSnap) so the world size of a
+// shadow texel stays constant for a given split distance regardless of camera
+// position, rotation or TAA jitter — a drifting texel size is what makes the
+// snap grid itself swim and the shadow edges shimmer.  The padding guarantees
+// the snapped ortho window always covers the whole slice sphere (the floor()
+// centre snap can shift the window almost a full texel towards -x/-y).
 constexpr float kShadowRadiusSnap = 16.f;
 // The light-space depth range [minZ, maxZ] is quantized to this fixed step
 // (m) so the depth remap does not resample against a drifting near/far range

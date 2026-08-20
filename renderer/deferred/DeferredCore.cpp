@@ -1307,12 +1307,20 @@ void DeferredCore::computeCascadeVPs(const Camera& cam, float aspect, const Vec3
         // corners of the map), which is the accepted cost of stability.
         float radius = 0.f;
         for (const Vec3& c : corners) radius = std::max(radius, length(c - center));
+        // Pad by two texels before quantizing: the floor() centre snap below
+        // shifts the ortho window by almost a full texel towards -x/-y, and
+        // without padding the sphere would poke past the +x/+y window edge,
+        // where receivers sample the (white) border and lose their shadows in
+        // a strip whose width oscillates with the snap phase as the camera
+        // moves.
+        radius += 2.f * (2.f * radius / static_cast<float>(kShadowMapSize));
         radius = std::ceil(radius * kShadowRadiusSnap) / kShadowRadiusSnap;
 
         // Sphere centre in light space, snapped to the (now constant) texel
         // grid.  The ortho window below is symmetric around the snapped
-        // centre, so the whole sphere stays covered (snapping shifts it by
-        // less than one texel).
+        // centre; the two-texel radius pad above keeps the whole sphere
+        // covered even when the floor snap shifts the window by nearly a full
+        // texel.
         Vec3 centerLS = transformPoint(lightRot, center);
         const float worldPerTexel = 2.f * radius / static_cast<float>(kShadowMapSize);
         if (worldPerTexel > 1e-6f) {
