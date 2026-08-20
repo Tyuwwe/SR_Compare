@@ -9,6 +9,7 @@
 #include "renderer/scene/Scene.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -29,6 +30,20 @@ VkRenderingAttachmentInfo makeColorAttachment(VkImageView view, VkImageLayout la
     a.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     if (loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) {
         a.clearValue.color = {{r, g, b, 1.f}};
+    }
+    return a;
+}
+
+VkRenderingAttachmentInfo makeDepthAttachment(VkImageView view, VkImageLayout layout,
+                                              VkAttachmentLoadOp loadOp) {
+    VkRenderingAttachmentInfo a = {};
+    a.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+    a.imageView = view;
+    a.imageLayout = layout;
+    a.loadOp = loadOp;
+    a.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    if (loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) {
+        a.clearValue.depthStencil = {1.f, 0};
     }
     return a;
 }
@@ -91,6 +106,23 @@ bool DeferredCore::init(const VulkanContext& ctx, const char* envMapPath) {
     gbufferSampler_ = createSampler(ctx, VK_FILTER_LINEAR, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
     if (!textureSampler_ || !gbufferSampler_) return false;
 
+    // Depth comparison sampler for the CSM shadow map.  CLAMP_TO_BORDER with
+    // an opaque-white border makes off-map reads compare as "lit" (beyond the
+    // last cascade the sun is unshadowed).
+    VkSamplerCreateInfo shadowSamplerCi = {};
+    shadowSamplerCi.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    shadowSamplerCi.magFilter = VK_FILTER_LINEAR; // hardware 2x2 PCF inside the compare
+    shadowSamplerCi.minFilter = VK_FILTER_LINEAR;
+    shadowSamplerCi.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    shadowSamplerCi.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+    shadowSamplerCi.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+    shadowSamplerCi.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+    shadowSamplerCi.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;
+    shadowSamplerCi.compareEnable = VK_TRUE;
+    shadowSamplerCi.compareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+    if (vkCreateSampler(ctx.device, &shadowSamplerCi, nullptr, &shadowSampler_) != VK_SUCCESS)
+        return false;
+
     if (!loadShader(ctx, "gbuffer.vert.spv", gbufferVert_) ||
         !loadShader(ctx, "gbuffer.frag.spv", gbufferFrag_) ||
         !loadShader(ctx, "gbuffer_gt.frag.spv", gbufferGtFrag_) ||
@@ -100,7 +132,9 @@ bool DeferredCore::init(const VulkanContext& ctx, const char* envMapPath) {
         !loadShader(ctx, "transparent.frag.spv", transparentFrag_) ||
         !loadShader(ctx, "transparent_gt.frag.spv", transparentGtFrag_) ||
         !loadShader(ctx, "ssao.comp.spv", ssaoComp_) ||
-        !loadShader(ctx, "ssao_blur.comp.spv", ssaoBlurComp_))
+        !loadShader(ctx, "ssao_blur.comp.spv", ssaoBlurComp_) ||
+        !loadShader(ctx, "shadow_depth.vert.spv", shadowDepthVert_) ||
+        !loadShader(ctx, "shadow_depth.frag.spv", shadowDepthFrag_))
         return false;
 
     if (!createLayouts(ctx)) return false;
@@ -162,13 +196,14 @@ bool DeferredCore::createLayouts(const VulkanContext& ctx) {
 
     // Lighting: binding 0 = LightingUBO; 1-5 = GBuffer (albedo/normal/material/
     // emissive/depth); 6-8 = IBL (irradiance/prefilter/LUT); 9 = env (skybox);
-    // 10 = SSAO (blurred screen-space AO, R16F).
-    VkDescriptorSetLayoutBinding lightBindings[11] = {};
+    // 10 = SSAO (blurred screen-space AO, R16F); 11 = CSM shadow map array
+    // (D32, comparison sampler).
+    VkDescriptorSetLayoutBinding lightBindings[12] = {};
     lightBindings[0].binding = 0;
     lightBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     lightBindings[0].descriptorCount = 1;
     lightBindings[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-    for (uint32_t i = 1; i < 11; ++i) {
+    for (uint32_t i = 1; i < 12; ++i) {
         lightBindings[i].binding = i;
         lightBindings[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         lightBindings[i].descriptorCount = 1;
@@ -176,7 +211,7 @@ bool DeferredCore::createLayouts(const VulkanContext& ctx) {
     }
     VkDescriptorSetLayoutCreateInfo lightLayoutCi = {};
     lightLayoutCi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    lightLayoutCi.bindingCount = 11;
+    lightLayoutCi.bindingCount = 12;
     lightLayoutCi.pBindings = lightBindings;
     if (vkCreateDescriptorSetLayout(ctx.device, &lightLayoutCi, nullptr, &lightingSetLayout_) !=
         VK_SUCCESS)
@@ -184,13 +219,13 @@ bool DeferredCore::createLayouts(const VulkanContext& ctx) {
 
     // Transparency pass: binding 0 = LightingUBO (lights array + iblParams
     // read); 1-3 = IBL (irradiance/prefilter/LUT); 4 = SSAO texture of this
-    // path.
-    VkDescriptorSetLayoutBinding transparentBindings[5] = {};
+    // path; 5 = CSM shadow map array (glass direct light is occluded too).
+    VkDescriptorSetLayoutBinding transparentBindings[6] = {};
     transparentBindings[0].binding = 0;
     transparentBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     transparentBindings[0].descriptorCount = 1;
     transparentBindings[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-    for (uint32_t i = 1; i < 5; ++i) {
+    for (uint32_t i = 1; i < 6; ++i) {
         transparentBindings[i].binding = i;
         transparentBindings[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         transparentBindings[i].descriptorCount = 1;
@@ -198,7 +233,7 @@ bool DeferredCore::createLayouts(const VulkanContext& ctx) {
     }
     VkDescriptorSetLayoutCreateInfo transparentLayoutCi = {};
     transparentLayoutCi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    transparentLayoutCi.bindingCount = 5;
+    transparentLayoutCi.bindingCount = 6;
     transparentLayoutCi.pBindings = transparentBindings;
     if (vkCreateDescriptorSetLayout(ctx.device, &transparentLayoutCi, nullptr,
                                     &transparentSetLayout_) != VK_SUCCESS)
@@ -572,8 +607,63 @@ bool DeferredCore::createPipelines(const VulkanContext& ctx) {
         return false;
     ssaoCi.stage.module = ssaoBlurComp_;
     ssaoCi.layout = ssaoBlurPipelineLayout_;
-    return vkCreateComputePipelines(ctx.device, VK_NULL_HANDLE, 1, &ssaoCi, nullptr,
-                                    &ssaoBlurPipeline_) == VK_SUCCESS;
+    if (vkCreateComputePipelines(ctx.device, VK_NULL_HANDLE, 1, &ssaoCi, nullptr,
+                                 &ssaoBlurPipeline_) != VK_SUCCESS)
+        return false;
+
+    // --- CSM shadow depth pass ------------------------------------------------
+    // Depth-only rendering into one cascade layer at a time.  Reuses the scene
+    // pipeline layout (set0 = scene/material UBO, set1 = texture array); the
+    // ShadowPush block (128 B) fits the layout's 192-byte push range.  Depth
+    // bias is a dynamic state so the values can come from LightingUBO
+    // (shadowParams.xy) per frame without a pipeline rebuild.
+    VkDynamicState shadowDynamicStates[3] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
+                                             VK_DYNAMIC_STATE_DEPTH_BIAS};
+    VkPipelineDynamicStateCreateInfo shadowDynamicState = {};
+    shadowDynamicState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    shadowDynamicState.dynamicStateCount = 3;
+    shadowDynamicState.pDynamicStates = shadowDynamicStates;
+
+    VkPipelineRasterizationStateCreateInfo shadowRasterizer = rasterizer;
+    shadowRasterizer.depthBiasEnable = VK_TRUE;
+
+    VkPipelineDepthStencilStateCreateInfo shadowDepthStencil = depthStencil; // test+write, LESS
+
+    VkPipelineColorBlendStateCreateInfo shadowColorBlend = {};
+    shadowColorBlend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    shadowColorBlend.attachmentCount = 0; // depth-only
+
+    VkPipelineShaderStageCreateInfo shadowStages[2] = {};
+    shadowStages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    shadowStages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    shadowStages[0].module = shadowDepthVert_;
+    shadowStages[0].pName = "main";
+    shadowStages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    shadowStages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    shadowStages[1].module = shadowDepthFrag_;
+    shadowStages[1].pName = "main";
+
+    VkGraphicsPipelineCreateInfo shadowCi = {};
+    shadowCi.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    shadowCi.stageCount = 2;
+    shadowCi.pStages = shadowStages;
+    shadowCi.pVertexInputState = &vertexInput;
+    shadowCi.pInputAssemblyState = &inputAssembly;
+    shadowCi.pViewportState = &viewportState;
+    shadowCi.pRasterizationState = &shadowRasterizer;
+    shadowCi.pMultisampleState = &multisample;
+    shadowCi.pDepthStencilState = &shadowDepthStencil;
+    shadowCi.pColorBlendState = &shadowColorBlend;
+    shadowCi.pDynamicState = &shadowDynamicState;
+    shadowCi.layout = scenePipelineLayout_;
+
+    VkPipelineRenderingCreateInfo shadowRendering = {};
+    shadowRendering.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+    shadowRendering.colorAttachmentCount = 0;
+    shadowRendering.depthAttachmentFormat = deferred::kDepthFormat;
+    shadowCi.pNext = &shadowRendering;
+    return vkCreateGraphicsPipelines(ctx.device, VK_NULL_HANDLE, 1, &shadowCi, nullptr,
+                                     &shadowPipeline_) == VK_SUCCESS;
 }
 
 void DeferredCore::destroy(const VulkanContext& ctx) {
@@ -585,6 +675,7 @@ void DeferredCore::destroy(const VulkanContext& ctx) {
     if (transparentGtPipeline_) { vkDestroyPipeline(ctx.device, transparentGtPipeline_, nullptr); transparentGtPipeline_ = VK_NULL_HANDLE; }
     if (ssaoPipeline_) { vkDestroyPipeline(ctx.device, ssaoPipeline_, nullptr); ssaoPipeline_ = VK_NULL_HANDLE; }
     if (ssaoBlurPipeline_) { vkDestroyPipeline(ctx.device, ssaoBlurPipeline_, nullptr); ssaoBlurPipeline_ = VK_NULL_HANDLE; }
+    if (shadowPipeline_) { vkDestroyPipeline(ctx.device, shadowPipeline_, nullptr); shadowPipeline_ = VK_NULL_HANDLE; }
     if (scenePipelineLayout_) { vkDestroyPipelineLayout(ctx.device, scenePipelineLayout_, nullptr); scenePipelineLayout_ = VK_NULL_HANDLE; }
     if (lightingPipelineLayout_) { vkDestroyPipelineLayout(ctx.device, lightingPipelineLayout_, nullptr); lightingPipelineLayout_ = VK_NULL_HANDLE; }
     if (transparentPipelineLayout_) { vkDestroyPipelineLayout(ctx.device, transparentPipelineLayout_, nullptr); transparentPipelineLayout_ = VK_NULL_HANDLE; }
@@ -600,6 +691,8 @@ void DeferredCore::destroy(const VulkanContext& ctx) {
     if (transparentGtFrag_) { vkDestroyShaderModule(ctx.device, transparentGtFrag_, nullptr); transparentGtFrag_ = VK_NULL_HANDLE; }
     if (ssaoComp_) { vkDestroyShaderModule(ctx.device, ssaoComp_, nullptr); ssaoComp_ = VK_NULL_HANDLE; }
     if (ssaoBlurComp_) { vkDestroyShaderModule(ctx.device, ssaoBlurComp_, nullptr); ssaoBlurComp_ = VK_NULL_HANDLE; }
+    if (shadowDepthVert_) { vkDestroyShaderModule(ctx.device, shadowDepthVert_, nullptr); shadowDepthVert_ = VK_NULL_HANDLE; }
+    if (shadowDepthFrag_) { vkDestroyShaderModule(ctx.device, shadowDepthFrag_, nullptr); shadowDepthFrag_ = VK_NULL_HANDLE; }
     if (sceneSetLayout_) { vkDestroyDescriptorSetLayout(ctx.device, sceneSetLayout_, nullptr); sceneSetLayout_ = VK_NULL_HANDLE; }
     if (textureSetLayout_) { vkDestroyDescriptorSetLayout(ctx.device, textureSetLayout_, nullptr); textureSetLayout_ = VK_NULL_HANDLE; }
     if (lightingSetLayout_) { vkDestroyDescriptorSetLayout(ctx.device, lightingSetLayout_, nullptr); lightingSetLayout_ = VK_NULL_HANDLE; }
@@ -608,6 +701,7 @@ void DeferredCore::destroy(const VulkanContext& ctx) {
     if (ssaoBlurSetLayout_) { vkDestroyDescriptorSetLayout(ctx.device, ssaoBlurSetLayout_, nullptr); ssaoBlurSetLayout_ = VK_NULL_HANDLE; }
     if (textureSampler_) { vkDestroySampler(ctx.device, textureSampler_, nullptr); textureSampler_ = VK_NULL_HANDLE; }
     if (gbufferSampler_) { vkDestroySampler(ctx.device, gbufferSampler_, nullptr); gbufferSampler_ = VK_NULL_HANDLE; }
+    if (shadowSampler_) { vkDestroySampler(ctx.device, shadowSampler_, nullptr); shadowSampler_ = VK_NULL_HANDLE; }
     ibl_.destroy(ctx);
 }
 
@@ -637,7 +731,8 @@ void DeferredCore::fillSceneUBO(SceneUBO& out, const Scene& scene, const Camera&
 
 void DeferredCore::fillLightingUBO(LightingUBO& out, const Scene& scene, const Camera& camera,
                                    const Mat4& invViewProj,
-                                   const std::vector<Light>* overrideLights) const {
+                                   const std::vector<Light>* overrideLights,
+                                   const ShadowFrame* shadow) const {
     std::memcpy(out.invViewProj, invViewProj.m, sizeof(out.invViewProj));
 
     out.cameraPos[0] = camera.position.x;
@@ -684,6 +779,37 @@ void DeferredCore::fillLightingUBO(LightingUBO& out, const Scene& scene, const C
     out.iblParams[1] = static_cast<float>(ibl_.prefilterMaxLod);
     out.iblParams[2] = 1.f; // skybox enabled
     out.iblParams[3] = 0.f;
+
+    // Camera forward is needed by the shaders to convert a world position to
+    // view-space depth for cascade selection; fill it even with shadows off.
+    out.viewForward[0] = camera.forward.x;
+    out.viewForward[1] = camera.forward.y;
+    out.viewForward[2] = camera.forward.z;
+
+    // The rasterizer depth-bias values are mirrored here so hosts can feed the
+    // same constants to vkCmdSetDepthBias in recordShadowPass.
+    out.shadowParams[0] = kShadowDepthBiasConstant;
+    out.shadowParams[1] = kShadowDepthBiasSlope;
+    if (shadow) {
+        for (uint32_t i = 0; i < kShadowCascadeCount; ++i) {
+            std::memcpy(out.cascadeVp[i], shadow->cascadeVp[i].m, sizeof(out.cascadeVp[i]));
+            out.cascadeSplits[i] = shadow->splitDepth[i];
+        }
+        out.shadowParams[2] = 1.f; // shadows enabled
+        out.shadowParams[3] = shadow->debugCascades ? 1.f : 0.f;
+        out.viewForward[3] = static_cast<float>(shadow->lightIndex);
+    } else {
+        // Deterministic disabled state: identity VPs, infinite splits; the
+        // shaders short-circuit on shadowParams.z before touching the map.
+        const Mat4 identity = Mat4::identity();
+        for (uint32_t i = 0; i < kShadowCascadeCount; ++i) {
+            std::memcpy(out.cascadeVp[i], identity.m, sizeof(out.cascadeVp[i]));
+            out.cascadeSplits[i] = 1e9f;
+        }
+        out.shadowParams[2] = 0.f;
+        out.shadowParams[3] = 0.f;
+        out.viewForward[3] = -1.f;
+    }
 }
 
 bool DeferredCore::createMaterialUbo(const VulkanContext& ctx, const Scene& scene,
@@ -759,13 +885,13 @@ void DeferredCore::writeTextureSet(const VulkanContext& ctx, VkDescriptorSet set
 void DeferredCore::writeLightingSet(const VulkanContext& ctx, VkDescriptorSet set,
                                     VkBuffer lightingUbo, VkImageView albedo, VkImageView normal,
                                     VkImageView material, VkImageView emissive,
-                                    VkImageView depth, VkImageView ssao) const {
+                                    VkImageView depth, VkImageView ssao, VkImageView shadow) const {
     VkDescriptorBufferInfo lightBuf = {};
     lightBuf.buffer = lightingUbo;
     lightBuf.offset = 0;
     lightBuf.range = sizeof(LightingUBO);
 
-    VkDescriptorImageInfo img[10] = {};
+    VkDescriptorImageInfo img[11] = {};
     const VkImageView gb[5] = {albedo, normal, material, emissive, depth};
     for (int k = 0; k < 5; ++k) {
         img[k].sampler = gbufferSampler_;
@@ -787,15 +913,19 @@ void DeferredCore::writeLightingSet(const VulkanContext& ctx, VkDescriptorSet se
     img[9].sampler = gbufferSampler_;
     img[9].imageView = ssao;
     img[9].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    img[10].sampler = shadowSampler_;
+    img[10].imageView = shadow;
+    img[10].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
-    VkWriteDescriptorSet w[11] = {};
+    VkWriteDescriptorSet w[12] = {};
     w[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     w[0].dstSet = set;
     w[0].dstBinding = 0;
     w[0].descriptorCount = 1;
     w[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     w[0].pBufferInfo = &lightBuf;
-    for (uint32_t k = 0; k < 10; ++k) {
+    const uint32_t samplerCount = shadow ? 11u : 10u; // skip binding 11 without a shadow map
+    for (uint32_t k = 0; k < samplerCount; ++k) {
         w[k + 1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         w[k + 1].dstSet = set;
         w[k + 1].dstBinding = k + 1;
@@ -803,7 +933,7 @@ void DeferredCore::writeLightingSet(const VulkanContext& ctx, VkDescriptorSet se
         w[k + 1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         w[k + 1].pImageInfo = &img[k];
     }
-    vkUpdateDescriptorSets(ctx.device, 11, w, 0, nullptr);
+    vkUpdateDescriptorSets(ctx.device, 1 + samplerCount, w, 0, nullptr);
 }
 
 void DeferredCore::recordGBufferDraws(VkCommandBuffer cmd, const Scene& scene, bool gtPass,
@@ -886,13 +1016,14 @@ bool DeferredCore::sceneHasTransparency(const Scene& scene) const {
 }
 
 void DeferredCore::writeTransparentSet(const VulkanContext& ctx, VkDescriptorSet set,
-                                       VkBuffer lightingUbo, VkImageView ssao) const {
+                                       VkBuffer lightingUbo, VkImageView ssao,
+                                       VkImageView shadow) const {
     VkDescriptorBufferInfo lightBuf = {};
     lightBuf.buffer = lightingUbo;
     lightBuf.offset = 0;
     lightBuf.range = sizeof(LightingUBO);
 
-    VkDescriptorImageInfo img[4] = {};
+    VkDescriptorImageInfo img[5] = {};
     img[0].sampler = ibl_.cubeSampler;
     img[0].imageView = ibl_.irradianceView;
     img[0].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
@@ -905,15 +1036,19 @@ void DeferredCore::writeTransparentSet(const VulkanContext& ctx, VkDescriptorSet
     img[3].sampler = gbufferSampler_;
     img[3].imageView = ssao;
     img[3].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    img[4].sampler = shadowSampler_;
+    img[4].imageView = shadow;
+    img[4].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
-    VkWriteDescriptorSet w[5] = {};
+    VkWriteDescriptorSet w[6] = {};
     w[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     w[0].dstSet = set;
     w[0].dstBinding = 0;
     w[0].descriptorCount = 1;
     w[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     w[0].pBufferInfo = &lightBuf;
-    for (uint32_t k = 0; k < 4; ++k) {
+    const uint32_t samplerCount = shadow ? 5u : 4u; // skip binding 5 without a shadow map
+    for (uint32_t k = 0; k < samplerCount; ++k) {
         w[k + 1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         w[k + 1].dstSet = set;
         w[k + 1].dstBinding = k + 1;
@@ -921,7 +1056,7 @@ void DeferredCore::writeTransparentSet(const VulkanContext& ctx, VkDescriptorSet
         w[k + 1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         w[k + 1].pImageInfo = &img[k];
     }
-    vkUpdateDescriptorSets(ctx.device, 5, w, 0, nullptr);
+    vkUpdateDescriptorSets(ctx.device, 1 + samplerCount, w, 0, nullptr);
 }
 
 void DeferredCore::writeSsaoSet(const VulkanContext& ctx, VkDescriptorSet set, VkImageView depth,
@@ -1064,6 +1199,199 @@ void DeferredCore::recordTransparentDraws(VkCommandBuffer cmd, const Scene& scen
 
         const Mesh& mesh = scene.meshes[inst.meshIndex];
         vkCmdDrawIndexed(cmd, mesh.indexCount, 1, mesh.firstIndex, mesh.vertexOffset, 0);
+    }
+}
+
+bool DeferredCore::createShadowTargets(const VulkanContext& ctx, ShadowTargets& out) const {
+    if (createImage(ctx, kShadowMapSize, kShadowMapSize, deferred::kDepthFormat,
+                    VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                    out.image, out.memory, 1, kShadowCascadeCount) != VK_SUCCESS)
+        return false;
+
+    // All-layers sampled view (read as sampler2DArrayShadow in the shaders).
+    out.arrayView = createImageView(ctx, out.image, deferred::kDepthFormat,
+                                    VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, VK_IMAGE_VIEW_TYPE_2D_ARRAY,
+                                    kShadowCascadeCount);
+    if (!out.arrayView) return false;
+
+    // One single-layer 2D view per cascade for the depth attachment.
+    for (uint32_t i = 0; i < kShadowCascadeCount; ++i) {
+        VkImageViewCreateInfo ci = {};
+        ci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        ci.image = out.image;
+        ci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        ci.format = deferred::kDepthFormat;
+        ci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+        ci.subresourceRange.baseMipLevel = 0;
+        ci.subresourceRange.levelCount = 1;
+        ci.subresourceRange.baseArrayLayer = i;
+        ci.subresourceRange.layerCount = 1;
+        if (vkCreateImageView(ctx.device, &ci, nullptr, &out.layerViews[i]) != VK_SUCCESS)
+            return false;
+    }
+    out.layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    return true;
+}
+
+void DeferredCore::destroyShadowTargets(const VulkanContext& ctx, ShadowTargets& targets) const {
+    if (!ctx.device) return;
+    for (VkImageView& v : targets.layerViews) {
+        if (v) { vkDestroyImageView(ctx.device, v, nullptr); v = VK_NULL_HANDLE; }
+    }
+    if (targets.arrayView) { vkDestroyImageView(ctx.device, targets.arrayView, nullptr); targets.arrayView = VK_NULL_HANDLE; }
+    if (targets.image) { vkDestroyImage(ctx.device, targets.image, nullptr); targets.image = VK_NULL_HANDLE; }
+    if (targets.memory) { vkFreeMemory(ctx.device, targets.memory, nullptr); targets.memory = VK_NULL_HANDLE; }
+    targets.layout = VK_IMAGE_LAYOUT_UNDEFINED;
+}
+
+void DeferredCore::computeCascadeVPs(const Camera& cam, float aspect, const Vec3& sunDirTowardLight,
+                                     Mat4 outVP[kShadowCascadeCount],
+                                     float outSplitViewDepth[kShadowCascadeCount]) {
+    const float nearZ = cam.nearPlane;
+    const float farZ = std::min(cam.farPlane, kShadowMaxDistance);
+
+    // Practical split scheme: blend uniform and logarithmic splits so the
+    // near cascades stay dense without starving the far ones.
+    float splits[kShadowCascadeCount];
+    for (uint32_t i = 0; i < kShadowCascadeCount; ++i) {
+        const float p = static_cast<float>(i + 1) / static_cast<float>(kShadowCascadeCount);
+        const float uniform = nearZ + (farZ - nearZ) * p;
+        const float log = nearZ * std::pow(farZ / nearZ, p);
+        splits[i] = kShadowSplitLambda * log + (1.f - kShadowSplitLambda) * uniform;
+        outSplitViewDepth[i] = splits[i];
+    }
+
+    const Mat4 view = cam.view();
+    const Vec3 sunDir = normalize(sunDirTowardLight);
+    // Light travels from the sun towards the scene, i.e. along -sunDir.
+    Vec3 up{0.f, 1.f, 0.f};
+    if (std::fabs(dot(sunDir, up)) > 0.99f) up = {1.f, 0.f, 0.f};
+
+    float sliceNear = nearZ;
+    for (uint32_t i = 0; i < kShadowCascadeCount; ++i) {
+        // Unproject the 8 corners of this depth slice to world space.
+        const Mat4 sliceProj = Mat4::perspective(cam.fovY, aspect, sliceNear, splits[i]);
+        const Mat4 invVP = Mat4::inverse(Mat4::multiply(sliceProj, view));
+        Vec3 corners[8];
+        int n = 0;
+        for (int z = 0; z < 2; ++z)
+            for (int y = 0; y < 2; ++y)
+                for (int x = 0; x < 2; ++x) {
+                    corners[n++] = transformPoint(
+                        invVP, Vec3{x ? 1.f : -1.f, y ? 1.f : -1.f, z ? 1.f : 0.f});
+                }
+
+        Vec3 center{0.f, 0.f, 0.f};
+        for (const Vec3& c : corners) center += c;
+        center = center / 8.f;
+
+        // Light view placed far enough behind the slice that every corner is
+        // in front of the eye (ortho clips nothing behind the near plane).
+        float radius = 0.f;
+        for (const Vec3& c : corners) radius = std::max(radius, length(c - center));
+        const Vec3 eye = center + sunDir * (radius + 1.f);
+        const Mat4 lightView = Mat4::lookAt(eye, center, up);
+
+        // Tight AABB of the slice in light space.  The sun side (larger z,
+        // closer to the eye) is extended so casters between the slice and the
+        // sun still land in the map; the far side needs no margin (a caster
+        // deeper than a receiver cannot shadow it).
+        Vec3 mn{1e30f, 1e30f, 1e30f}, mx{-1e30f, -1e30f, -1e30f};
+        for (const Vec3& c : corners) {
+            const Vec3 ls = transformPoint(lightView, c);
+            mn.x = std::min(mn.x, ls.x); mn.y = std::min(mn.y, ls.y); mn.z = std::min(mn.z, ls.z);
+            mx.x = std::max(mx.x, ls.x); mx.y = std::max(mx.y, ls.y); mx.z = std::max(mx.z, ls.z);
+        }
+        mx.z += kShadowCasterMargin;
+
+        // Texel snapping: align the ortho origin to the shadow-map texel grid
+        // so the map does not shimmer when the camera moves.  floor(min) /
+        // ceil(max) keeps the snapped box a superset of the tight one.
+        const float worldPerTexel = (mx.x - mn.x) / static_cast<float>(kShadowMapSize);
+        if (worldPerTexel > 1e-6f) {
+            mn.x = std::floor(mn.x / worldPerTexel) * worldPerTexel;
+            mx.x = std::ceil(mx.x / worldPerTexel) * worldPerTexel;
+        }
+        const float worldPerTexelY = (mx.y - mn.y) / static_cast<float>(kShadowMapSize);
+        if (worldPerTexelY > 1e-6f) {
+            mn.y = std::floor(mn.y / worldPerTexelY) * worldPerTexelY;
+            mx.y = std::ceil(mx.y / worldPerTexelY) * worldPerTexelY;
+        }
+
+        // Right-handed Vulkan ortho (y-flipped, depth [0,1]).  In light view
+        // space the scene sits at z < 0; n/f are positive distances.
+        const float nz = -mx.z, fz = -mn.z;
+        Mat4 ortho;
+        ortho.m[0] = 2.f / (mx.x - mn.x);
+        ortho.m[12] = -(mx.x + mn.x) / (mx.x - mn.x);
+        ortho.m[5] = -2.f / (mx.y - mn.y);            // y flip for Vulkan NDC
+        ortho.m[13] = (mx.y + mn.y) / (mx.y - mn.y);
+        ortho.m[10] = 1.f / (nz - fz);
+        ortho.m[14] = nz / (nz - fz);
+        ortho.m[15] = 1.f;
+
+        outVP[i] = Mat4::multiply(ortho, lightView);
+        sliceNear = splits[i];
+    }
+}
+
+void DeferredCore::recordShadowPass(VkCommandBuffer cmd, const ShadowTargets& targets,
+                                    const Scene& scene, const Mat4 cascadeVp[kShadowCascadeCount],
+                                    VkDescriptorSet sceneSet, VkDescriptorSet textureSet,
+                                    uint32_t materialStride) const {
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, shadowPipeline_);
+    VkViewport viewport = {0.f, 0.f, static_cast<float>(kShadowMapSize),
+                           static_cast<float>(kShadowMapSize), 0.f, 1.f};
+    vkCmdSetViewport(cmd, 0, 1, &viewport);
+    VkRect2D scissor = {{0, 0}, {kShadowMapSize, kShadowMapSize}};
+    vkCmdSetScissor(cmd, 0, 1, &scissor);
+    vkCmdSetDepthBias(cmd, kShadowDepthBiasConstant, 0.f, kShadowDepthBiasSlope);
+
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, scenePipelineLayout_, 1, 1,
+                            &textureSet, 0, nullptr);
+
+    const VkDeviceSize zeroOffset = 0;
+    vkCmdBindVertexBuffers(cmd, 0, 1, &scene.mergedVertexBuffer, &zeroOffset);
+    vkCmdBindIndexBuffer(cmd, scene.mergedIndexBuffer, 0, VK_INDEX_TYPE_UINT32);
+
+    for (uint32_t c = 0; c < kShadowCascadeCount; ++c) {
+        VkRenderingAttachmentInfo depth =
+            makeDepthAttachment(targets.layerViews[c], VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                                VK_ATTACHMENT_LOAD_OP_CLEAR);
+        VkRenderingInfo ri = {};
+        ri.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+        ri.renderArea = {{0, 0}, {kShadowMapSize, kShadowMapSize}};
+        ri.layerCount = 1;
+        ri.colorAttachmentCount = 0;
+        ri.pDepthAttachment = &depth;
+        vkCmdBeginRendering(cmd, &ri);
+
+        // Cull against the cascade frustum; the extended near plane keeps
+        // casters that sit between the slice and the sun.
+        const Frustum frustum = extractFrustum(cascadeVp[c]);
+
+        uint32_t lastMaterial = UINT32_MAX;
+        for (const auto& inst : scene.instances) {
+            if (scene.materials[inst.materialIndex].blend) continue; // glass does not occlude
+            if (!aabbIntersectsFrustum(frustum, inst.aabbMin, inst.aabbMax)) continue;
+
+            ShadowPush push;
+            std::memcpy(push.model, inst.model.m, sizeof(push.model));
+            std::memcpy(push.lightVp, cascadeVp[c].m, sizeof(push.lightVp));
+            vkCmdPushConstants(cmd, scenePipelineLayout_, VK_SHADER_STAGE_VERTEX_BIT, 0,
+                               sizeof(push), &push);
+
+            if (inst.materialIndex != lastMaterial) {
+                lastMaterial = inst.materialIndex;
+                const uint32_t dynOffset = inst.materialIndex * materialStride;
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, scenePipelineLayout_,
+                                        0, 1, &sceneSet, 1, &dynOffset);
+            }
+
+            const Mesh& mesh = scene.meshes[inst.meshIndex];
+            vkCmdDrawIndexed(cmd, mesh.indexCount, 1, mesh.firstIndex, mesh.vertexOffset, 0);
+        }
+        vkCmdEndRendering(cmd);
     }
 }
 

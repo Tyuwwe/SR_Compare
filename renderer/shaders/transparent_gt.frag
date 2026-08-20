@@ -36,12 +36,18 @@ layout(set = 2, binding = 0) uniform LightingUBO {
     vec4 lightCounts; // x = active light count, yzw reserved
     vec4 ambient;
     vec4 iblParams;
+    mat4 cascadeVp[4];  // CSM light view-projections (one per cascade layer)
+    vec4 cascadeSplits; // view-space depth (positive metres) of each cascade's far plane
+    vec4 shadowParams;  // x = rasterizer constant bias, y = slope bias, z = shadows enabled,
+                        // w = debug cascade tint
+    vec4 viewForward;   // xyz = camera forward (world); w = shadowed sun light index (-1 = none)
 } lighting;
 layout(set = 2, binding = 1) uniform samplerCube iblIrradiance;
 layout(set = 2, binding = 2) uniform samplerCube iblPrefilter;
 layout(set = 2, binding = 3) uniform sampler2D iblBrdfLut;
 // Screen-space AO (R16F, same resolution as this path's GBuffer).
 layout(set = 2, binding = 4) uniform sampler2D ssaoTex;
+layout(set = 2, binding = 5) uniform sampler2DArrayShadow shadowMap; // CSM, comparison sampler
 
 layout(location = 0) in vec3 vWorldPos;
 layout(location = 1) in vec3 vNormal;
@@ -124,6 +130,40 @@ void shadeLight(vec3 N, vec3 V, vec3 worldPos, vec3 albedo, float metallic,
     diffuse = kd * albedo / PI * radiance * NdL;
 }
 
+// --- CSM sun shadow sampling (keep in sync with lighting.frag) --------------
+const float kShadowMapTexel = 1.0 / 2048.0;
+const float kShadowDepthEpsilon = 0.0002; // receiver epsilon atop the rasterizer bias
+
+int selectCascade(float viewDepth) {
+    for (int i = 0; i < 4; ++i)
+        if (viewDepth <= lighting.cascadeSplits[i]) return i;
+    return 3;
+}
+
+float sampleCascade(int c, vec3 worldPos) {
+    vec4 sc = lighting.cascadeVp[c] * vec4(worldPos, 1.0);
+    vec3 p = sc.xyz / sc.w;
+    vec2 uv = p.xy * 0.5 + 0.5;
+    float ref = p.z - kShadowDepthEpsilon;
+    float sum = 0.0;
+    for (int y = -1; y <= 2; ++y)
+        for (int x = -1; x <= 2; ++x)
+            sum += texture(shadowMap, vec4(uv + (vec2(x, y) - 0.5) * kShadowMapTexel, float(c), ref));
+    return sum / 16.0;
+}
+
+float sunShadow(vec3 worldPos, float viewDepth) {
+    const int cascade = selectCascade(viewDepth);
+    float s = sampleCascade(cascade, worldPos);
+    if (cascade < 3) {
+        const float split = lighting.cascadeSplits[cascade];
+        const float blend = clamp((viewDepth - split * 0.9) / (split * 0.1), 0.0, 1.0);
+        if (blend > 0.0)
+            s = mix(s, sampleCascade(cascade + 1, worldPos), blend);
+    }
+    return s;
+}
+
 void main() {
     vec4 base = material.baseColor;
     const int baseTex = texIndex(material.tex0.x);
@@ -164,10 +204,19 @@ void main() {
 
     vec3 lightDiffuse = vec3(0.0);
     vec3 lightSpecular = vec3(0.0);
+    // Glass direct light is occluded by the same CSM sun shadow as the opaque
+    // pass (both diffuse and specular lobes).
+    const float viewDepth = dot(vWorldPos - lighting.cameraPos.xyz, lighting.viewForward.xyz);
+    const int sunIndex = int(floor(lighting.viewForward.w + 0.5));
     int lightCount = int(lighting.lightCounts.x + 0.5);
     for (int i = 0; i < lightCount; ++i) {
         vec3 ld, ls;
         shadeLight(N, V, vWorldPos, albedo, metallic, roughness, F0, lighting.lights[i], ld, ls);
+        if (lighting.shadowParams.z > 0.5 && i == sunIndex) {
+            const float shadow = sunShadow(vWorldPos, viewDepth);
+            ld *= shadow;
+            ls *= shadow;
+        }
         lightDiffuse += ld; lightSpecular += ls;
     }
 

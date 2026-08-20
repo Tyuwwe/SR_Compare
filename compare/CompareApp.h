@@ -39,6 +39,8 @@ struct CompareOptions {
     std::string scenePath;              // empty = procedural
     int metricInterval = 15;            // frames between GPU metric readbacks
     bool gtSsaa = false;                // render GT at 2x and downsample to 1080p
+    bool shadows = true;                // CSM sun shadows (all paths share one map)
+    bool shadowDebug = false;           // tint pixels per shadow cascade
     float zoom = 1.f;                   // compare-view zoom (1..16)
     float zoomCenterU = 0.5f;           // zoom window center, normalized source UV
     float zoomCenterV = 0.5f;
@@ -165,6 +167,11 @@ private:
 
     // Shared deferred pipeline (shaders/layouts/pipelines/samplers + IBL maps).
     DeferredCore deferred_;
+    // CSM shadow map (fixed 2048^2 x 4, resolution-independent): created in
+    // init, shared by the GB/GT/SSAA lighting paths; shadowsActive_ = false
+    // degrades to no shadows (bindings stay unwritten, sampling stays off).
+    ShadowTargets shadow_;
+    bool shadowsActive_ = false;
 
     VkDescriptorSetLayout composeSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout copySetLayout_ = VK_NULL_HANDLE;
@@ -260,7 +267,7 @@ private:
     void updateSceneUBO(void* mapped, bool jitter, uint32_t renderW, uint32_t renderH,
                         const Mat4& view, const Mat4& proj, const Mat4& projJittered,
                         const Mat4& prevViewProj);
-    void updateLightingUBO(void* mapped, const Mat4& invViewProj);
+    void updateLightingUBO(void* mapped, const Mat4& invViewProj, const ShadowFrame* shadow);
     void updateCamera(uint32_t frameIndex, float dt);
     void recordFrame(uint32_t frameIndex, uint32_t swapchainIndex);
     void captureScreenshotIntoStaging(VkCommandBuffer cmd);

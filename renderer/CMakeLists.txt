@@ -33,6 +33,8 @@ set(RENDERER_SHADERS
     shaders/transparent.vert
     shaders/transparent.frag
     shaders/transparent_gt.frag
+    shaders/shadow_depth.vert
+    shaders/shadow_depth.frag
     shaders/ssao.comp
     shaders/ssao_blur.comp
     shaders/ibl_equirect.comp

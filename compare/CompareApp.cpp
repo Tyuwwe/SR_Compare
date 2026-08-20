@@ -167,6 +167,12 @@ bool CompareApp::init(const CompareOptions& opts) {
     if (!initAlgorithms()) return false;
     // Shared deferred pipeline: IBL maps + shaders + layouts + pipelines.
     if (!deferred_.init(ctx_, opts_.envMapPath.c_str())) return false;
+    // CSM shadow targets (fixed size; a failure degrades to no shadows).
+    // Created before createSyncResources so the lighting/transparent sets can
+    // bind the array view.
+    shadowsActive_ = deferred_.createShadowTargets(ctx_, shadow_);
+    if (!shadowsActive_)
+        std::fprintf(stderr, "warning: shadow target creation failed, shadows disabled\n");
     if (!createRenderTargets()) return false;
     if (!createFontAtlas()) return false;
     if (!createMetricResources()) return false;
@@ -527,8 +533,8 @@ bool CompareApp::createDescriptors() {
     VkDescriptorPoolSize sizes[5] = {};
     sizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     sizes[0].descriptorCount = deferred::kMaxTextures + numColumns * 2 + 2 + numAlgos * 2 +
-                               10 * kFramesInFlight * 3 + // lighting sets (GB/GT/SSAA)
-                               4 * kFramesInFlight * 3 +  // transparent sets (GB/GT/SSAA)
+                               11 * kFramesInFlight * 3 + // lighting sets (GB/GT/SSAA), +1 shadow
+                               5 * kFramesInFlight * 3 +  // transparent sets (GB/GT/SSAA), +1 shadow
                                3 * 3;                     // ssao + blur samplers (per path)
     sizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     sizes[1].descriptorCount = kFramesInFlight * 2 + numColumns +
@@ -961,26 +967,33 @@ bool CompareApp::createSyncResources() {
         vkMapMemory(ctx_.device, fr.lightingUboGtMemory, 0, sizeof(LightingUBO), 0,
                     &fr.lightingUboGtMapped);
 
+        // Shadow map binding: the array view is always bound when the targets
+        // exist; --no-shadows only zeroes shadowParams.z (sampling off) via
+        // fillLightingUBO.  VK_NULL_HANDLE (creation failed) leaves binding
+        // 11 unwritten, which is safe only while shadows stay off.
+        const VkImageView shadowView = shadowsActive_ ? shadow_.arrayView : VK_NULL_HANDLE;
         deferred_.writeLightingSet(ctx_, fr.lightingSetGb, fr.lightingUboGb, gbAlbedo_.view,
                                    gbNormal_.view, gbMaterial_.view, gbEmissive_.view,
-                                   gbDepth_.view, gbAo_.view);
+                                   gbDepth_.view, gbAo_.view, shadowView);
         deferred_.writeLightingSet(ctx_, fr.lightingSetGt, fr.lightingUboGt, gtAlbedo_.view,
                                    gtNormal_.view, gtMaterial_.view, gtEmissive_.view,
-                                   gtDepth_.view, gtAo_.view);
+                                   gtDepth_.view, gtAo_.view, shadowView);
         if (opts_.gtSsaa) {
             deferred_.writeLightingSet(ctx_, fr.lightingSetSsaa, fr.lightingUboGt,
                                        gtSsaaAlbedo_.view, gtSsaaNormal_.view,
                                        gtSsaaMaterial_.view, gtSsaaEmissive_.view,
-                                       gtSsaaDepth_.view, gtSsaaAo_.view);
+                                       gtSsaaDepth_.view, gtSsaaAo_.view, shadowView);
         }
 
         // The transparency shader reads iblParams (identical in both lighting
         // UBOs) plus the path's own SSAO texture: one set per path.
-        deferred_.writeTransparentSet(ctx_, fr.transparentSetGb, fr.lightingUboGb, gbAo_.view);
-        deferred_.writeTransparentSet(ctx_, fr.transparentSetGt, fr.lightingUboGb, gtAo_.view);
+        deferred_.writeTransparentSet(ctx_, fr.transparentSetGb, fr.lightingUboGb, gbAo_.view,
+                                      shadowView);
+        deferred_.writeTransparentSet(ctx_, fr.transparentSetGt, fr.lightingUboGb, gtAo_.view,
+                                      shadowView);
         if (opts_.gtSsaa) {
             deferred_.writeTransparentSet(ctx_, fr.transparentSetSsaa, fr.lightingUboGb,
-                                          gtSsaaAo_.view);
+                                          gtSsaaAo_.view, shadowView);
         }
     }
 
@@ -1026,9 +1039,10 @@ void CompareApp::updateSceneUBO(void* mapped, bool jitter, uint32_t renderW, uin
     std::memcpy(mapped, &ubo, sizeof(ubo));
 }
 
-void CompareApp::updateLightingUBO(void* mapped, const Mat4& invViewProj) {
+void CompareApp::updateLightingUBO(void* mapped, const Mat4& invViewProj,
+                                   const ShadowFrame* shadow) {
     LightingUBO ubo;
-    deferred_.fillLightingUBO(ubo, scene_, camera_, invViewProj);
+    deferred_.fillLightingUBO(ubo, scene_, camera_, invViewProj, nullptr, shadow);
     std::memcpy(mapped, &ubo, sizeof(ubo));
 }
 
@@ -1151,12 +1165,33 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     const uint32_t gtH = opts_.gtSsaa ? dh * 2 : dh;
     updateSceneUBO(fr.uboGtMapped, false, gtW, gtH, view, proj, proj, prevViewProj_);
 
+    // CSM sun shadows: pick the first shadow-casting directional light (same
+    // light-list selection rule as fillLightingUBO) and compute the cascades.
+    // The GT and SSAA paths sample the same map — GT is the same lighting at
+    // native res.  --no-shadows leaves shadow null (shadowParams.z = 0).
+    ShadowFrame shadowFrame;
+    const ShadowFrame* shadow = nullptr;
+    if (shadowsActive_ && opts_.shadows) {
+        const std::vector<Light>& lights =
+            scene_.lights.empty() ? defaultLights() : scene_.lights;
+        for (uint32_t i = 0; i < lights.size(); ++i) {
+            if (lights[i].type == LightType::Directional && lights[i].castShadow) {
+                DeferredCore::computeCascadeVPs(camera_, aspect, lights[i].positionOrDirection,
+                                                shadowFrame.cascadeVp, shadowFrame.splitDepth);
+                shadowFrame.lightIndex = static_cast<int32_t>(i);
+                shadowFrame.debugCascades = opts_.shadowDebug;
+                shadow = &shadowFrame;
+                break;
+            }
+        }
+    }
+
     // Lighting reconstructs world positions with the inverse of the exact
     // view-projection used for each pass (jittered GB / un-jittered GT; the GT
     // matrix is resolution-independent and shared by the 1x and 2x SSAA pass).
     updateLightingUBO(fr.lightingUboGbMapped,
-                      Mat4::inverse(Mat4::multiply(projJittered, view)));
-    updateLightingUBO(fr.lightingUboGtMapped, Mat4::inverse(Mat4::multiply(proj, view)));
+                      Mat4::inverse(Mat4::multiply(projJittered, view)), shadow);
+    updateLightingUBO(fr.lightingUboGtMapped, Mat4::inverse(Mat4::multiply(proj, view)), shadow);
 
     auto transition = [&](VkImage image, VkImageLayout& current, VkImageLayout target,
                           VkImageAspectFlags aspect) {
@@ -1197,6 +1232,20 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         deferred_.recordGBufferDraws(cmd, scene_, false, fr.sceneSetGb, textureSet_,
                                      materialStride_, renderWidth_, renderHeight_, cullViewProj);
         vkCmdEndRendering(cmd);
+    }
+
+    // --- Shadow pass (sun CSM, one 2048^2 layer per cascade) -------------------
+    // Runs once per frame and feeds the LR, GT and SSAA lighting paths alike.
+    if (shadow) {
+        imageBarrier(cmd, shadow_.image, shadow_.layout,
+                     VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT,
+                     0, 1, 0, kShadowCascadeCount);
+        shadow_.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        deferred_.recordShadowPass(cmd, shadow_, scene_, shadow->cascadeVp, fr.sceneSetGb,
+                                   textureSet_, materialStride_);
+        imageBarrier(cmd, shadow_.image, shadow_.layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                     VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, kShadowCascadeCount);
+        shadow_.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     }
     transition(gbAlbedo_.image, gbAlbedoLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                VK_IMAGE_ASPECT_COLOR_BIT);
@@ -1873,6 +1922,7 @@ void CompareApp::shutdown() {
     composeImage_.destroy(ctx_);
     fontAtlas_.destroy(ctx_);
 
+    if (shadowsActive_) { deferred_.destroyShadowTargets(ctx_, shadow_); shadowsActive_ = false; }
     deferred_.destroy(ctx_);
     scene_.destroy(ctx_);
     swapchain_.destroy(ctx_);

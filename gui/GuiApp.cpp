@@ -276,6 +276,12 @@ bool GuiApp::init(const GuiOptions& opts) {
     envMapActive_ = active_.envMapPath;
     stackOk_ = deferred_.init(ctx_, envMapActive_.c_str());
     if (stackOk_) {
+        // CSM shadow targets: resolution-independent, so they live next to
+        // deferred_ and survive scene/config rebuilds.  A failure degrades to
+        // no shadows (bindings stay unwritten, sampling stays off).
+        shadowsActive_ = deferred_.createShadowTargets(ctx_, shadow_);
+        if (!shadowsActive_)
+            std::fprintf(stderr, "gui: shadow target creation failed, shadows disabled\n");
         stackOk_ = buildRenderStack();
     } else {
         statusLine_ = "deferred core init failed";
@@ -363,6 +369,7 @@ void GuiApp::shutdown() {
     discardLoadResult();
     bench_.stop();
     destroyRenderStack();
+    if (shadowsActive_) { deferred_.destroyShadowTargets(ctx_, shadow_); shadowsActive_ = false; }
     deferred_.destroy(ctx_);
     destroyUiSync();
     shutdownImGui();
@@ -1236,14 +1243,15 @@ bool GuiApp::createDescriptors() {
     // reallocate per-algorithm sets without rebuilding anything else.
     const uint32_t numAlgos = kMaxAlgos;
     const uint32_t numColumns = 1 + kMaxAlgos;
-    // Lighting sets: 3 per frame (GBuffer / GT / GT-SSAA), 10 samplers + 1 UBO
-    // each; transparent sets: 3 per frame (GB/GT/SSAA), 4 samplers + 1 UBO each;
+    // Lighting sets: 3 per frame (GBuffer / GT / GT-SSAA), 11 samplers + 1 UBO
+    // each; transparent sets: 3 per frame (GB/GT/SSAA), 5 samplers + 1 UBO each;
     // SSAO sets: static, 3 samplers + 2 storage images per path.
+    // (+1 sampler per lighting/transparent set is the CSM shadow map binding.)
     VkDescriptorPoolSize sizes[5] = {};
     sizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     sizes[0].descriptorCount =
-        deferred::kMaxTextures + numColumns * 2 + 2 + numAlgos * 2 + 10 * kFramesInFlight * 3 +
-        4 * kFramesInFlight * 3 + 3 * 3;
+        deferred::kMaxTextures + numColumns * 2 + 2 + numAlgos * 2 + 11 * kFramesInFlight * 3 +
+        5 * kFramesInFlight * 3 + 3 * 3;
     sizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     sizes[1].descriptorCount = kFramesInFlight * 2 + numColumns + kFramesInFlight * 3 +
                                kFramesInFlight * 3;
@@ -1697,27 +1705,34 @@ bool GuiApp::createSyncResources() {
         vkMapMemory(ctx_.device, fr.lightingUboGtMemory, 0, lightingSize, 0,
                     &fr.lightingUboGtMapped);
 
+        // Shadow map binding: the array view is always bound when the targets
+        // exist; the "shadows" checkbox only zeroes shadowParams.z (sampling
+        // off) via fillLightingUBO.  VK_NULL_HANDLE (creation failed) leaves
+        // binding 11 unwritten, which is safe only while shadows stay off.
+        const VkImageView shadowView = shadowsActive_ ? shadow_.arrayView : VK_NULL_HANDLE;
         deferred_.writeLightingSet(ctx_, fr.lightingSetGb, fr.lightingUboGb, gbAlbedo_.view,
                                    gbNormal_.view, gbMaterial_.view, gbEmissive_.view,
-                                   gbDepth_.view, gbAo_.view);
+                                   gbDepth_.view, gbAo_.view, shadowView);
         deferred_.writeLightingSet(ctx_, fr.lightingSetGt, fr.lightingUboGt, gtAlbedo_.view,
                                    gtNormal_.view, gtMaterial_.view, gtEmissive_.view,
-                                   gtDepth_.view, gtAo_.view);
+                                   gtDepth_.view, gtAo_.view, shadowView);
         if (active_.gtSsaa) {
             // GT and GT-SSAA share the same (resolution-independent) UBO.
             deferred_.writeLightingSet(ctx_, fr.lightingSetSsaa, fr.lightingUboGt,
                                        gtSsaaAlbedo_.view, gtSsaaNormal_.view,
                                        gtSsaaMaterial_.view, gtSsaaEmissive_.view,
-                                       gtSsaaDepth_.view, gtSsaaAo_.view);
+                                       gtSsaaDepth_.view, gtSsaaAo_.view, shadowView);
         }
 
         // The transparency shader reads iblParams (identical in both lighting
         // UBOs) plus the path's own SSAO texture: one set per path.
-        deferred_.writeTransparentSet(ctx_, fr.transparentSetGb, fr.lightingUboGb, gbAo_.view);
-        deferred_.writeTransparentSet(ctx_, fr.transparentSetGt, fr.lightingUboGb, gtAo_.view);
+        deferred_.writeTransparentSet(ctx_, fr.transparentSetGb, fr.lightingUboGb, gbAo_.view,
+                                      shadowView);
+        deferred_.writeTransparentSet(ctx_, fr.transparentSetGt, fr.lightingUboGb, gtAo_.view,
+                                      shadowView);
         if (active_.gtSsaa) {
             deferred_.writeTransparentSet(ctx_, fr.transparentSetSsaa, fr.lightingUboGb,
-                                          gtSsaaAo_.view);
+                                          gtSsaaAo_.view, shadowView);
         }
     }
 
@@ -2058,8 +2073,7 @@ void GuiApp::updateSceneUBO(void* mapped, bool jitter, uint32_t renderW, uint32_
     std::memcpy(mapped, &ubo, sizeof(ubo));
 }
 
-void GuiApp::updateLightingUBO(void* mapped, const Mat4& invViewProj) {
-    LightingUBO ubo;
+std::vector<Light> GuiApp::buildLightOverride() const {
     // The Viewer-tab lighting section drives the sun through an override
     // light list; scene_.lights is never modified (no rebuild needed).
     // Loaders always fill scene_.lights (defaultLights() when unauthored), so
@@ -2087,6 +2101,10 @@ void GuiApp::updateLightingUBO(void* mapped, const Mat4& invViewProj) {
         }
         sun->positionOrDirection = dir;
         sun->intensity = sunIntensity_; // color/range keep the scene's values
+        // The UI-driven sun is the CSM caster: Light{} defaults castShadow to
+        // false and glTF suns may leave it unauthored.  (LightGPU.params.y is
+        // reserved in the shaders; only the ShadowFrame light index matters.)
+        sun->castShadow = true;
     } else {
         lights.erase(std::remove_if(lights.begin(), lights.end(),
                                     [](const Light& l) {
@@ -2094,7 +2112,13 @@ void GuiApp::updateLightingUBO(void* mapped, const Mat4& invViewProj) {
                                     }),
                      lights.end());
     }
-    deferred_.fillLightingUBO(ubo, scene_, camera_, invViewProj, &lights);
+    return lights;
+}
+
+void GuiApp::updateLightingUBO(void* mapped, const Mat4& invViewProj,
+                               const std::vector<Light>& lights, const ShadowFrame* shadow) {
+    LightingUBO ubo;
+    deferred_.fillLightingUBO(ubo, scene_, camera_, invViewProj, &lights, shadow);
     std::memcpy(mapped, &ubo, sizeof(ubo));
 }
 
@@ -2357,9 +2381,31 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     const uint32_t gtW = active_.gtSsaa ? dw * 2 : (active_.gtApplyScale ? renderWidth_ : dw);
     const uint32_t gtH = active_.gtSsaa ? dh * 2 : (active_.gtApplyScale ? renderHeight_ : dh);
     updateSceneUBO(fr.uboGtMapped, false, gtW, gtH, view, proj, proj, prevViewProj_);
+
+    // CSM sun shadows: the shadowed sun is picked from the same override
+    // light list that fills the LightingUBO, so lightIndex refers to the
+    // packed override order (the GUI sun may be prepended at index 0).  The
+    // GT and SSAA paths sample the same map.  The "shadows" checkbox off
+    // leaves shadow null (shadowParams.z = 0).
+    const std::vector<Light> lights = buildLightOverride();
+    ShadowFrame shadowFrame;
+    const ShadowFrame* shadow = nullptr;
+    if (shadowsActive_ && shadowsEnabled_) {
+        for (uint32_t i = 0; i < lights.size(); ++i) {
+            if (lights[i].type == LightType::Directional && lights[i].castShadow) {
+                DeferredCore::computeCascadeVPs(camera_, aspect, lights[i].positionOrDirection,
+                                                shadowFrame.cascadeVp, shadowFrame.splitDepth);
+                shadowFrame.lightIndex = static_cast<int32_t>(i);
+                shadowFrame.debugCascades = shadowDebugCascades_;
+                shadow = &shadowFrame;
+                break;
+            }
+        }
+    }
     updateLightingUBO(fr.lightingUboGbMapped,
-                      Mat4::inverse(Mat4::multiply(projJittered, view)));
-    updateLightingUBO(fr.lightingUboGtMapped, Mat4::inverse(Mat4::multiply(proj, view)));
+                      Mat4::inverse(Mat4::multiply(projJittered, view)), lights, shadow);
+    updateLightingUBO(fr.lightingUboGtMapped, Mat4::inverse(Mat4::multiply(proj, view)),
+                      lights, shadow);
 
     auto transition = [&](VkImage image, VkImageLayout& current, VkImageLayout target,
                           VkImageAspectFlags aspect_) {
@@ -2475,6 +2521,21 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
 
         transition(gbColor_.image, gbColorLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                    VK_IMAGE_ASPECT_COLOR_BIT);
+    }
+
+    // --- Shadow pass (sun CSM, one 2048^2 layer per cascade) -------------------
+    // Runs once per frame (also when the LR pass is skipped) and feeds the
+    // LR, GT and SSAA lighting paths alike.
+    if (shadow) {
+        imageBarrier(cmd, shadow_.image, shadow_.layout,
+                     VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT,
+                     0, 1, 0, kShadowCascadeCount);
+        shadow_.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        deferred_.recordShadowPass(cmd, shadow_, scene_, shadow->cascadeVp, fr.sceneSetGb,
+                                   textureSet_, materialStride_);
+        imageBarrier(cmd, shadow_.image, shadow_.layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                     VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, kShadowCascadeCount);
+        shadow_.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     }
 
     // --- 2) per-algorithm dispatch ---------------------------------------------
@@ -3373,6 +3434,14 @@ void GuiApp::drawViewerTab() {
     ImGui::SliderFloat("azimuth", &sunAzimuthDeg_, 0.f, 360.f, "%.0f deg");
     ImGui::SliderFloat("intensity", &sunIntensity_, 0.f, 10.f, "%.2f");
     if (!sunEnabled_) ImGui::EndDisabled();
+    // CSM sun shadows: per-frame UBO flag + one extra depth pass (no
+    // rebuild).  Unavailable when the shadow targets failed to create.
+    if (!shadowsActive_) ImGui::BeginDisabled();
+    ImGui::Checkbox("shadows", &shadowsEnabled_);
+    if (!shadowsEnabled_) ImGui::BeginDisabled();
+    ImGui::Checkbox("cascade debug", &shadowDebugCascades_);
+    if (!shadowsEnabled_) ImGui::EndDisabled();
+    if (!shadowsActive_) ImGui::EndDisabled();
     ImGui::Separator();
 
     // Live performance readout.

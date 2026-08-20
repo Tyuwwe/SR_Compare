@@ -99,6 +99,7 @@ inline const std::vector<Light>& defaultLights() {
         sun.positionOrDirection = normalize(Vec3{0.35f, 1.f, 0.3f});
         sun.color = {1.f, 0.95f, 0.85f};
         sun.intensity = 3.f;
+        sun.castShadow = true; // the sun drives the CSM pass (C2)
         Light fill;
         fill.type = LightType::Point;
         fill.positionOrDirection = {-4.f, 5.f, -3.f};

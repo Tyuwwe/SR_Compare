@@ -41,7 +41,9 @@ void printUsage() {
                  "  --camera-path <json>             fixed camera path\n"
                  "  --env-map <hdr>                    equirect HDR for IBL/skybox (default: Bistro san_giuseppe)\n"
                  "  --frames <N>                     render N frames then exit\n"
-                 "  --screenshot <out.png>           save the final frame as PNG\n");
+                 "  --screenshot <out.png>           save the final frame as PNG\n"
+                 "  --no-shadows                     disable CSM sun shadows\n"
+                 "  --shadow-debug                   tint pixels per shadow cascade\n");
 }
 
 int runViewer(int argc, char** argv) {
@@ -87,6 +89,10 @@ int runViewer(int argc, char** argv) {
             opts.frameTimesPath = sr::nextArg(i, argc, argv, "--frame-times");
         } else if (a == "--vsync") {
             opts.vsync = true;
+        } else if (a == "--no-shadows") {
+            opts.shadows = false;
+        } else if (a == "--shadow-debug") {
+            opts.shadowDebug = true;
         } else {
             std::fprintf(stderr, "unknown viewer option: %s\n", a.c_str());
             return 1;

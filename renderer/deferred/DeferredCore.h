@@ -76,6 +76,42 @@ static_assert(sizeof(LightGPU) == 48, "LightGPU std140 size mismatch");
 
 constexpr uint32_t kMaxLights = 8;
 
+// --- CSM sun shadows (AC Unity reference: 4 cascades, 2048^2 each) -----------
+constexpr uint32_t kShadowCascadeCount = 4;
+constexpr uint32_t kShadowMapSize = 2048; // per cascade, fixed (resolution-independent)
+// Practical split blend factor (0 = uniform, 1 = logarithmic).
+constexpr float kShadowSplitLambda = 0.5f;
+// Shadow coverage is capped at this distance (m); beyond it the sun is
+// unshadowed (AC Unity-style range limit keeps cascade texel density useful).
+constexpr float kShadowMaxDistance = 200.f;
+// Light-space margin (m) pulling each cascade's near plane back towards the
+// sun so casters between the slice and the sun still land in the map.
+constexpr float kShadowCasterMargin = 150.f;
+// Rasterizer-side depth bias (vkCmdSetDepthBias, dynamic state) of the shadow
+// pass; mirrored into LightingUBO::shadowParams.xy for reference.
+constexpr float kShadowDepthBiasConstant = 1.25f;
+constexpr float kShadowDepthBiasSlope = 1.75f;
+
+// Host-owned render target set for the CSM pass: one D32 texture array with
+// one layer per cascade, a per-layer attachment view and an all-layer sampled
+// view (bound with DeferredCore's comparison sampler).
+struct ShadowTargets {
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkImageView arrayView = VK_NULL_HANDLE;                       // 4 layers, sampled
+    VkImageView layerViews[kShadowCascadeCount] = {};             // per-cascade attachment
+    VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;             // tracked by the host
+};
+
+// Per-frame cascade data fed into fillLightingUBO.  splitDepth[i] is the far
+// boundary of cascade i in view-space depth (positive metres).
+struct ShadowFrame {
+    Mat4 cascadeVp[kShadowCascadeCount];
+    float splitDepth[kShadowCascadeCount] = {};
+    int32_t lightIndex = -1;   // index into LightingUBO::lights of the shadowed sun
+    bool debugCascades = false;
+};
+
 // std140, matches the LightingUBO block in lighting.frag.
 struct LightingUBO {
     float invViewProj[16];
@@ -84,8 +120,13 @@ struct LightingUBO {
     float lightCounts[4]; // x = active light count, yzw reserved
     float ambient[4];
     float iblParams[4]; // envIntensity, prefilterMaxLod, skyboxEnabled, unused
+    float cascadeVp[kShadowCascadeCount][16];
+    float cascadeSplits[4]; // view-space depth (positive) of each cascade's far plane
+    float shadowParams[4];  // x = depthBiasConstant, y = depthBiasSlope,
+                            // z = shadowsEnabled, w = debugCascades
+    float viewForward[4];   // xyz = camera forward (world); w = shadowed sun light index (-1 = none)
 };
-static_assert(sizeof(LightingUBO) == 512, "LightingUBO std140 size mismatch");
+static_assert(sizeof(LightingUBO) == 816, "LightingUBO std140 size mismatch");
 
 struct ScenePush {
     float model[16];
@@ -93,6 +134,16 @@ struct ScenePush {
     float normalModel[16]; // transpose(inverse(mat3(model))), upper 3x3 used
 };
 static_assert(sizeof(ScenePush) == 192, "ScenePush size mismatch");
+
+// Push constants of the shadow depth pass (shadow_depth.vert): per-instance
+// model + the cascade's light view-projection.  128 bytes fits the guaranteed
+// maxPushConstantsSize minimum, and the pass reuses scenePipelineLayout()
+// (whose 192-byte range covers it).
+struct ShadowPush {
+    float model[16];
+    float lightVp[16];
+};
+static_assert(sizeof(ShadowPush) == 128, "ShadowPush size mismatch");
 
 // Push constants of the SSAO compute pass (ssao.comp), 96 bytes.
 struct SsaoPush {
@@ -127,9 +178,12 @@ public:
     // GUI sun controls rebuild the list per frame without touching the scene.
     // The fallback-to-defaultLights() rule applies only when no override is
     // given; an override is used as-is (still truncated at kMaxLights).
+    // shadow (optional): non-null enables CSM sampling in the shaders
+    // (shadowParams.z = 1); null writes identity cascades with shadows off.
     void fillLightingUBO(LightingUBO& out, const Scene& scene, const Camera& camera,
                          const Mat4& invViewProj,
-                         const std::vector<Light>* overrideLights = nullptr) const;
+                         const std::vector<Light>* overrideLights = nullptr,
+                         const ShadowFrame* shadow = nullptr) const;
 
     // Uploads the dynamic-offset material UBO array (one entry per material).
     bool createMaterialUbo(const VulkanContext& ctx, const Scene& scene, VkBuffer& buffer,
@@ -137,9 +191,13 @@ public:
 
     // --- descriptor writers (sets are allocated from the caller's pool) --------
     void writeTextureSet(const VulkanContext& ctx, VkDescriptorSet set, const Scene& scene) const;
+    // shadow = ShadowTargets::arrayView, or VK_NULL_HANDLE to leave binding 11
+    // unwritten (hosts without a shadow pass; the shaders must run with
+    // shadowParams.z == 0 then, which fillLightingUBO guarantees by default).
     void writeLightingSet(const VulkanContext& ctx, VkDescriptorSet set, VkBuffer lightingUbo,
                           VkImageView albedo, VkImageView normal, VkImageView material,
-                          VkImageView emissive, VkImageView depth, VkImageView ssao) const;
+                          VkImageView emissive, VkImageView depth, VkImageView ssao,
+                          VkImageView shadow) const;
 
     // --- pass recording (the caller owns all layout transitions) ---------------
     // Draws the scene into the already-begun GBuffer rendering block (merged
@@ -158,8 +216,10 @@ public:
     bool sceneHasTransparency(const Scene& scene) const;
     // Binds the LightingUBO (lights + iblParams are read) + IBL maps + the
     // SSAO texture of this path into a transparentSetLayout() descriptor set.
+    // shadow follows the same VK_NULL_HANDLE convention as writeLightingSet
+    // (binding 5 left unwritten).
     void writeTransparentSet(const VulkanContext& ctx, VkDescriptorSet set,
-                             VkBuffer lightingUbo, VkImageView ssao) const;
+                             VkBuffer lightingUbo, VkImageView ssao, VkImageView shadow) const;
     // Draws all BLEND-material instances back-to-front over the lit scene.
     // LR path (gtPass=false): 3 attachments = color (alpha blend) + motion
     // (overwrite) + reactive mask (additive).  GT path: color only.  The
@@ -189,6 +249,31 @@ public:
     void recordSsaoBlurPass(VkCommandBuffer cmd, VkDescriptorSet blurSet, uint32_t width,
                             uint32_t height) const;
 
+    // --- CSM sun shadow pass (between the GBuffer and the lighting pass) ------
+    // Creates the 2048^2 x kShadowCascadeCount D32 array + views.  The
+    // comparison sampler is shared (shadowSampler()); it is created in init().
+    bool createShadowTargets(const VulkanContext& ctx, ShadowTargets& out) const;
+    void destroyShadowTargets(const VulkanContext& ctx, ShadowTargets& targets) const;
+    // Computes the 4 cascade view-projections for the given camera/sun.
+    // Practical split (lambda = kShadowSplitLambda) over [near, min(far,
+    // kShadowMaxDistance)]; each cascade gets a tight, texel-snapped ortho box
+    // around its frustum slice.  outSplitViewDepth[i] = far boundary of
+    // cascade i (positive view-space metres).  Vulkan conventions throughout
+    // (y-flipped projection, [0,1] depth).
+    static void computeCascadeVPs(const Camera& cam, float aspect, const Vec3& sunDirTowardLight,
+                                  Mat4 outVP[kShadowCascadeCount],
+                                  float outSplitViewDepth[kShadowCascadeCount]);
+    // Renders the scene depth into each cascade layer (one dynamic-rendering
+    // block per cascade, cleared to 1.0).  BLEND materials are skipped (they
+    // do not occlude); MASK materials alpha-discard in shadow_depth.frag.
+    // Reuses the scene pipeline layout: sceneSet (material UBO) + textureSet.
+    // The caller owns the image layout transitions (DEPTH_STENCIL_ATTACHMENT
+    // before, SHADER_READ_ONLY after) — record after the GBuffer pass and
+    // before the lighting pass of the active path.
+    void recordShadowPass(VkCommandBuffer cmd, const ShadowTargets& targets, const Scene& scene,
+                          const Mat4 cascadeVp[kShadowCascadeCount], VkDescriptorSet sceneSet,
+                          VkDescriptorSet textureSet, uint32_t materialStride) const;
+
     VkDescriptorSetLayout sceneSetLayout() const { return sceneSetLayout_; }
     VkDescriptorSetLayout textureSetLayout() const { return textureSetLayout_; }
     VkDescriptorSetLayout lightingSetLayout() const { return lightingSetLayout_; }
@@ -203,6 +288,7 @@ public:
     VkShaderModule fullscreenVert() const { return fullscreenVert_; }
     VkSampler textureSampler() const { return textureSampler_; }   // aniso + mipmaps
     VkSampler gbufferSampler() const { return gbufferSampler_; }   // linear clamp
+    VkSampler shadowSampler() const { return shadowSampler_; }     // depth compare (LESS_OR_EQUAL)
 
 private:
     bool loadShader(const VulkanContext& ctx, const char* name, VkShaderModule& out);
@@ -229,6 +315,7 @@ private:
     VkPipeline transparentGtPipeline_ = VK_NULL_HANDLE;
     VkPipeline ssaoPipeline_ = VK_NULL_HANDLE;
     VkPipeline ssaoBlurPipeline_ = VK_NULL_HANDLE;
+    VkPipeline shadowPipeline_ = VK_NULL_HANDLE;
     VkShaderModule gbufferVert_ = VK_NULL_HANDLE;
     VkShaderModule gbufferFrag_ = VK_NULL_HANDLE;
     VkShaderModule gbufferGtFrag_ = VK_NULL_HANDLE;
@@ -239,8 +326,11 @@ private:
     VkShaderModule transparentGtFrag_ = VK_NULL_HANDLE;
     VkShaderModule ssaoComp_ = VK_NULL_HANDLE;
     VkShaderModule ssaoBlurComp_ = VK_NULL_HANDLE;
+    VkShaderModule shadowDepthVert_ = VK_NULL_HANDLE;
+    VkShaderModule shadowDepthFrag_ = VK_NULL_HANDLE;
     VkSampler textureSampler_ = VK_NULL_HANDLE;
     VkSampler gbufferSampler_ = VK_NULL_HANDLE;
+    VkSampler shadowSampler_ = VK_NULL_HANDLE;
 };
 
 } // namespace sr

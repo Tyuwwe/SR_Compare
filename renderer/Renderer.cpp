@@ -119,6 +119,12 @@ bool Renderer::init(const RendererOptions& opts) {
     if (!createRenderTargets()) return false;
     // Shared deferred pipeline: IBL maps + shaders + layouts + pipelines.
     if (!deferred_.init(ctx_, opts_.envMapPath.c_str())) return false;
+    // CSM shadow targets (fixed size; a failure degrades to no shadows).
+    if (opts_.shadows) {
+        shadowsActive_ = deferred_.createShadowTargets(ctx_, shadow_);
+        if (!shadowsActive_)
+            std::fprintf(stderr, "warning: shadow target creation failed, shadows disabled\n");
+    }
     if (!createShaders()) return false;
     if (!createSceneDescriptors()) return false;
     if (!createPipelines()) return false;
@@ -264,8 +270,8 @@ bool Renderer::createSceneDescriptors() {
     VkDescriptorPoolSize sizes[4] = {};
     sizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     sizes[0].descriptorCount = deferred::kMaxTextures + 1 + // texture array + present
-                               10 * kFramesInFlight * 2 + // lighting sets (GB/GT)
-                               4 * kFramesInFlight * 2 +  // transparent sets (GB/GT)
+                               11 * kFramesInFlight * 2 + // lighting sets (GB/GT), +1 shadow map
+                               5 * kFramesInFlight * 2 +  // transparent sets (GB/GT), +1 shadow map
                                2 * 2 + 1 * 2;             // ssao + blur samplers
     sizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     sizes[1].descriptorCount = kFramesInFlight * 4; // scene + lighting + 2 transparent UBOs
@@ -487,12 +493,13 @@ bool Renderer::createSyncResources() {
         if (vkAllocateDescriptorSets(ctx_.device, &lightAlloc, &frames_[i].lightingSetGt) != VK_SUCCESS)
             return false;
 
+        const VkImageView shadowView = shadowsActive_ ? shadow_.arrayView : VK_NULL_HANDLE;
         deferred_.writeLightingSet(ctx_, frames_[i].lightingSetGb, frames_[i].lightingUbo,
                                    gbAlbedo_.view, gbNormal_.view, gbMaterial_.view,
-                                   gbEmissive_.view, gbDepth_.view, gbAo_.view);
+                                   gbEmissive_.view, gbDepth_.view, gbAo_.view, shadowView);
         deferred_.writeLightingSet(ctx_, frames_[i].lightingSetGt, frames_[i].lightingUbo,
                                    gtAlbedo_.view, gtNormal_.view, gtMaterial_.view,
-                                   gtEmissive_.view, gtDepth_.view, gtAo_.view);
+                                   gtEmissive_.view, gtDepth_.view, gtAo_.view, shadowView);
 
         // Per-path transparent sets (each binds its own path's SSAO texture).
         const VkDescriptorSetLayout transparentLayout = deferred_.transparentSetLayout();
@@ -508,9 +515,9 @@ bool Renderer::createSyncResources() {
                                      &frames_[i].transparentSetGt) != VK_SUCCESS)
             return false;
         deferred_.writeTransparentSet(ctx_, frames_[i].transparentSetGb, frames_[i].lightingUbo,
-                                      gbAo_.view);
+                                      gbAo_.view, shadowView);
         deferred_.writeTransparentSet(ctx_, frames_[i].transparentSetGt, frames_[i].lightingUbo,
-                                      gtAo_.view);
+                                      gtAo_.view, shadowView);
     }
 
     // SSAO sets (static bindings; per-frame data goes through push constants).
@@ -590,10 +597,11 @@ void Renderer::updateSceneUBO(uint32_t frameIndex, bool jitter, uint32_t renderW
     std::memcpy(fr.uboMapped, &ubo, sizeof(ubo));
 }
 
-void Renderer::updateLightingUBO(uint32_t frameIndex, const Mat4& invViewProj) {
+void Renderer::updateLightingUBO(uint32_t frameIndex, const Mat4& invViewProj,
+                                 const ShadowFrame* shadow) {
     FrameResources& fr = frames_[frameIndex % kFramesInFlight];
     LightingUBO ubo;
-    deferred_.fillLightingUBO(ubo, scene_, camera_, invViewProj);
+    deferred_.fillLightingUBO(ubo, scene_, camera_, invViewProj, nullptr, shadow);
     std::memcpy(fr.lightingUboMapped, &ubo, sizeof(ubo));
 }
 
@@ -672,7 +680,27 @@ void Renderer::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     // Lighting reconstructs world positions with the inverse of the exact
     // view-projection used for this pass (jittered for the low-res path).
     const Mat4 viewProjUsed = Mat4::multiply(gbuffer ? projJittered : proj, view);
-    updateLightingUBO(frameIndex, Mat4::inverse(viewProjUsed));
+
+    // CSM sun shadows: pick the first shadow-casting directional light (same
+    // light-list selection rule as fillLightingUBO) and compute the cascades.
+    // The GT path samples the same map — GT is the same lighting at native res.
+    ShadowFrame shadowFrame;
+    const ShadowFrame* shadow = nullptr;
+    if (shadowsActive_) {
+        const std::vector<Light>& lights =
+            scene_.lights.empty() ? defaultLights() : scene_.lights;
+        for (uint32_t i = 0; i < lights.size(); ++i) {
+            if (lights[i].type == LightType::Directional && lights[i].castShadow) {
+                DeferredCore::computeCascadeVPs(camera_, aspect, lights[i].positionOrDirection,
+                                                shadowFrame.cascadeVp, shadowFrame.splitDepth);
+                shadowFrame.lightIndex = static_cast<int32_t>(i);
+                shadowFrame.debugCascades = opts_.shadowDebug;
+                shadow = &shadowFrame;
+                break;
+            }
+        }
+    }
+    updateLightingUBO(frameIndex, Mat4::inverse(viewProjUsed), shadow);
 
     ImageResource& tgtAlbedo = gbuffer ? gbAlbedo_ : gtAlbedo_;
     ImageResource& tgtNormal = gbuffer ? gbNormal_ : gtNormal_;
@@ -726,6 +754,20 @@ void Renderer::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                                      materialStride_, sceneW, sceneH,
                                      Mat4::multiply(proj, view));
         vkCmdEndRendering(cmd);
+    }
+
+    // --- Shadow pass (sun CSM, one 2048^2 layer per cascade) -----------------
+    // Runs once per frame and feeds both the LR and the GT lighting paths.
+    if (shadow) {
+        imageBarrier(cmd, shadow_.image, shadow_.layout,
+                     VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT,
+                     0, 1, 0, kShadowCascadeCount);
+        shadow_.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        deferred_.recordShadowPass(cmd, shadow_, scene_, shadow->cascadeVp, fr.sceneSet,
+                                   textureSet_, materialStride_);
+        imageBarrier(cmd, shadow_.image, shadow_.layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                     VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, kShadowCascadeCount);
+        shadow_.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     }
 
     // --- Lighting pass (deferred PBR + IBL, skybox on far-plane pixels) --------
@@ -1038,6 +1080,8 @@ void Renderer::shutdown() {
     gtAoRaw_.destroy(ctx_);
     gtAo_.destroy(ctx_);
     finalImage_.destroy(ctx_);
+
+    if (shadowsActive_) { deferred_.destroyShadowTargets(ctx_, shadow_); shadowsActive_ = false; }
 
     deferred_.destroy(ctx_);
 

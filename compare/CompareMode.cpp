@@ -26,6 +26,8 @@ void printCompareUsage() {
                  "  --screenshot <out.png>         save the final frame as PNG\n"
                  "  --metric-interval <N>          frames between metric readbacks (default 15)\n"
                  "  --gt-ssaa                      GT rendered at 2x, downsampled to output res\n"
+                 "  --no-shadows                   disable CSM sun shadows\n"
+                 "  --shadow-debug                 tint pixels per shadow cascade\n"
                  "  --env-map <hdr>                IBL environment map (default san_giuseppe_bridge)\n"
                  "  --zoom <f>                     compare-view zoom 1..16 (default 1)\n"
                  "  --zoom-center <u,v>            zoom window center, normalized (default 0.5,0.5)\n"
@@ -67,6 +69,10 @@ int runCompareMode(int argc, char** argv) {
             opts.metricInterval = std::atoi(nextArg(i, argc, argv, "--metric-interval"));
         } else if (a == "--gt-ssaa") {
             opts.gtSsaa = true;
+        } else if (a == "--no-shadows") {
+            opts.shadows = false;
+        } else if (a == "--shadow-debug") {
+            opts.shadowDebug = true;
         } else if (a == "--env-map") {
             opts.envMapPath = nextArg(i, argc, argv, "--env-map");
         } else if (a == "--zoom") {

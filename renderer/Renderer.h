@@ -37,6 +37,8 @@ struct RendererOptions {
     // Equirect HDR environment map for IBL + skybox; empty or unreadable file
     // falls back to a procedural gradient (constant-ambient look).
     std::string envMapPath = kDefaultEnvMapPath;
+    bool shadows = true;      // CSM sun shadows (CLI: --no-shadows)
+    bool shadowDebug = false; // cascade tint overlay (CLI: --shadow-debug)
 };
 
 class Renderer {
@@ -122,6 +124,12 @@ private:
     // Shared deferred pipeline (shaders/layouts/pipelines/samplers + IBL maps).
     DeferredCore deferred_;
 
+    // CSM sun shadow targets (fixed 2048^2 x 4, resolution-independent).
+    // shadowsActive_ is false when creation failed or --no-shadows; the UBO
+    // then keeps shadowParams.z = 0 and the shaders short-circuit.
+    ShadowTargets shadow_;
+    bool shadowsActive_ = false;
+
     VkDescriptorSetLayout presentSetLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout presentPipelineLayout_ = VK_NULL_HANDLE;
     VkPipeline presentPipeline_ = VK_NULL_HANDLE;
@@ -160,7 +168,7 @@ private:
     void updateSceneUBO(uint32_t frameIndex, bool jitter, uint32_t renderW, uint32_t renderH,
                         const Mat4& view, const Mat4& proj, const Mat4& projJittered,
                         const Mat4& prevViewProj);
-    void updateLightingUBO(uint32_t frameIndex, const Mat4& invViewProj);
+    void updateLightingUBO(uint32_t frameIndex, const Mat4& invViewProj, const ShadowFrame* shadow);
     void updateCamera(uint32_t frameIndex, float dt);
     void applyCameraKeyframe(uint32_t frameIndex);
     void recordFrame(uint32_t frameIndex, uint32_t swapchainIndex);

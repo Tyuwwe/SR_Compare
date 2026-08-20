@@ -243,7 +243,13 @@ private:
     void updateSceneUBO(void* mapped, bool jitter, uint32_t renderW, uint32_t renderH,
                         const Mat4& view, const Mat4& proj, const Mat4& projJittered,
                         const Mat4& prevViewProj);
-    void updateLightingUBO(void* mapped, const Mat4& invViewProj);
+    void updateLightingUBO(void* mapped, const Mat4& invViewProj,
+                           const std::vector<Light>& lights, const ShadowFrame* shadow);
+    // The Viewer-tab lighting section's override light list (sun direction/
+    // intensity from the UI; scene_.lights untouched).  Also the source of
+    // the CSM shadowed-sun index, so it is built once per frame in
+    // recordFrame and shared by both lighting UBOs.
+    std::vector<Light> buildLightOverride() const;
     void updateCamera(float dt);
     void recordFrame(uint32_t frameIndex, uint32_t swapchainIndex);
     void captureScreenshotIntoStaging(VkCommandBuffer cmd);
@@ -398,6 +404,9 @@ private:
     float sunElevationDeg_ = 65.3f; // asin(1 / sqrt(1.2125)) ~= 65.26 deg
     float sunAzimuthDeg_ = 49.4f;   // atan2(0.35, 0.3) ~= 49.40 deg
     float sunIntensity_ = 3.f;      // matches defaultLights() sun
+    // CSM sun shadows (Viewer-tab lighting section, per-frame, no rebuild).
+    bool shadowsEnabled_ = true;
+    bool shadowDebugCascades_ = false; // tint pixels per shadow cascade
 
     ImageResource gbColor_;
     ImageResource gbAlbedo_;
@@ -434,6 +443,12 @@ private:
 
     DeferredCore deferred_;        // shared deferred PBR + IBL (once per env map)
     std::string envMapActive_;     // env map deferred_ was built with
+    // CSM shadow map (fixed 2048^2 x 4, resolution- and env-independent):
+    // created once next to deferred_, survives scene/config rebuilds, and is
+    // shared by the GB/GT/SSAA lighting paths.  shadowsActive_ = false
+    // (creation failed) degrades to no shadows.
+    ShadowTargets shadow_;
+    bool shadowsActive_ = false;
 
     VkDescriptorSetLayout composeSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout copySetLayout_ = VK_NULL_HANDLE;
