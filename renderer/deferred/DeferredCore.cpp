@@ -182,8 +182,9 @@ bool DeferredCore::createLayouts(const VulkanContext& ctx) {
         VK_SUCCESS)
         return false;
 
-    // Transparency pass: binding 0 = LightingUBO (only iblParams read);
-    // 1-3 = IBL (irradiance/prefilter/LUT); 4 = SSAO texture of this path.
+    // Transparency pass: binding 0 = LightingUBO (lights array + iblParams
+    // read); 1-3 = IBL (irradiance/prefilter/LUT); 4 = SSAO texture of this
+    // path.
     VkDescriptorSetLayoutBinding transparentBindings[5] = {};
     transparentBindings[0].binding = 0;
     transparentBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
@@ -625,20 +626,8 @@ void DeferredCore::fillSceneUBO(SceneUBO& out, const Scene& scene, const Camera&
     out.cameraPos[2] = camera.position.z;
     out.cameraPos[3] = 1.f;
 
-    // The SceneUBO light fields are consumed only by the transparent shaders,
-    // which use the same PBR Lambert term (albedo/PI) as the deferred pass, so
-    // scale intensity by PI to keep transparent surfaces consistent with
-    // fillLightingUBO.
-    auto fillLight = [](float* pos, float* color, const Light& l) {
-        pos[0] = l.position.x; pos[1] = l.position.y; pos[2] = l.position.z; pos[3] = 1.f;
-        color[0] = l.color.x; color[1] = l.color.y; color[2] = l.color.z;
-        color[3] = l.intensity * 3.14159265f;
-    };
-    const Light defaultLight0{{4.f, 7.f, 4.f}, {1.f, 0.9f, 0.75f}, 140.f};
-    const Light defaultLight1{{-4.f, 3.f, -3.f}, {0.6f, 0.7f, 1.f}, 55.f};
-    fillLight(out.light0Pos, out.light0Color, scene.lights.size() > 0 ? scene.lights[0] : defaultLight0);
-    fillLight(out.light1Pos, out.light1Color, scene.lights.size() > 1 ? scene.lights[1] : defaultLight1);
-
+    // Light data no longer lives here; the forward transparency pass reads the
+    // shared LightingUBO array filled by fillLightingUBO.
     out.ambient[0] = 0.08f; out.ambient[1] = 0.08f; out.ambient[2] = 0.10f; out.ambient[3] = 1.f;
     out.renderSizeJitter[0] = static_cast<float>(renderW);
     out.renderSizeJitter[1] = static_cast<float>(renderH);
@@ -647,7 +636,8 @@ void DeferredCore::fillSceneUBO(SceneUBO& out, const Scene& scene, const Camera&
 }
 
 void DeferredCore::fillLightingUBO(LightingUBO& out, const Scene& scene, const Camera& camera,
-                                   const Mat4& invViewProj) const {
+                                   const Mat4& invViewProj,
+                                   const std::vector<Light>* overrideLights) const {
     std::memcpy(out.invViewProj, invViewProj.m, sizeof(out.invViewProj));
 
     out.cameraPos[0] = camera.position.x;
@@ -655,17 +645,39 @@ void DeferredCore::fillLightingUBO(LightingUBO& out, const Scene& scene, const C
     out.cameraPos[2] = camera.position.z;
     out.cameraPos[3] = 1.f;
 
-    // Intensities are scaled by PI so the PBR Lambert term (albedo/PI) matches
-    // the brightness of the legacy forward pass.
-    auto fillLight = [](float* pos, float* color, const Light& l) {
-        pos[0] = l.position.x; pos[1] = l.position.y; pos[2] = l.position.z; pos[3] = 1.f;
-        color[0] = l.color.x; color[1] = l.color.y; color[2] = l.color.z;
-        color[3] = l.intensity * 3.14159265f;
-    };
-    const Light defaultLight0{{4.f, 7.f, 4.f}, {1.f, 0.9f, 0.75f}, 140.f};
-    const Light defaultLight1{{-4.f, 3.f, -3.f}, {0.6f, 0.7f, 1.f}, 55.f};
-    fillLight(out.light0Pos, out.light0Color, scene.lights.size() > 0 ? scene.lights[0] : defaultLight0);
-    fillLight(out.light1Pos, out.light1Color, scene.lights.size() > 1 ? scene.lights[1] : defaultLight1);
+    // Pack the typed scene lights into the fixed-size GPU array.  Scenes
+    // without authored lights fall back to the shared default set so all
+    // three hosts stay identical; extra lights are dropped (lightCounts gates
+    // the shader loop).  An override list (GUI sun controls) replaces the
+    // scene/fallback selection entirely.
+    const std::vector<Light>& lights =
+        overrideLights ? *overrideLights
+                       : (scene.lights.empty() ? defaultLights() : scene.lights);
+    const uint32_t count =
+        static_cast<uint32_t>(std::min(lights.size(), static_cast<size_t>(kMaxLights)));
+    std::memset(out.lights, 0, sizeof(out.lights)); // deterministic unused slots
+    for (uint32_t i = 0; i < count; ++i) {
+        const Light& l = lights[i];
+        LightGPU& g = out.lights[i];
+        g.posOrDir[0] = l.positionOrDirection.x;
+        g.posOrDir[1] = l.positionOrDirection.y;
+        g.posOrDir[2] = l.positionOrDirection.z;
+        g.posOrDir[3] = static_cast<float>(l.type);
+        g.color[0] = l.color.x;
+        g.color[1] = l.color.y;
+        g.color[2] = l.color.z;
+        // Intensities are scaled by PI so the PBR Lambert term (albedo/PI)
+        // matches the brightness of the legacy forward pass.
+        g.color[3] = l.intensity * 3.14159265f;
+        g.params[0] = l.range;
+        g.params[1] = l.castShadow ? 1.f : 0.f;
+        g.params[2] = 0.f;
+        g.params[3] = 0.f;
+    }
+    out.lightCounts[0] = static_cast<float>(count);
+    out.lightCounts[1] = 0.f;
+    out.lightCounts[2] = 0.f;
+    out.lightCounts[3] = 0.f;
 
     out.ambient[0] = 0.08f; out.ambient[1] = 0.08f; out.ambient[2] = 0.10f; out.ambient[3] = 1.f;
     out.iblParams[0] = 1.f; // env intensity

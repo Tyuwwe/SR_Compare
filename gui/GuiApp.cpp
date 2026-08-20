@@ -2060,7 +2060,41 @@ void GuiApp::updateSceneUBO(void* mapped, bool jitter, uint32_t renderW, uint32_
 
 void GuiApp::updateLightingUBO(void* mapped, const Mat4& invViewProj) {
     LightingUBO ubo;
-    deferred_.fillLightingUBO(ubo, scene_, camera_, invViewProj);
+    // The Viewer-tab lighting section drives the sun through an override
+    // light list; scene_.lights is never modified (no rebuild needed).
+    // Loaders always fill scene_.lights (defaultLights() when unauthored), so
+    // copying it keeps every non-directional light untouched.
+    std::vector<Light> lights = scene_.lights;
+    if (sunEnabled_) {
+        // Direction *towards* the sun from elevation/azimuth (degrees).
+        const float el = sunElevationDeg_ * (3.14159265f / 180.f);
+        const float az = sunAzimuthDeg_ * (3.14159265f / 180.f);
+        const Vec3 dir{std::cos(el) * std::sin(az), std::sin(el),
+                       std::cos(el) * std::cos(az)};
+        Light* sun = nullptr;
+        for (Light& l : lights) {
+            if (l.type == LightType::Directional) {
+                sun = &l;
+                break;
+            }
+        }
+        if (!sun) {
+            // No authored sun: prepend one (kMaxLights truncation in
+            // fillLightingUBO drops the tail if the scene is full).
+            lights.insert(lights.begin(), Light{});
+            sun = &lights.front();
+            sun->type = LightType::Directional;
+        }
+        sun->positionOrDirection = dir;
+        sun->intensity = sunIntensity_; // color/range keep the scene's values
+    } else {
+        lights.erase(std::remove_if(lights.begin(), lights.end(),
+                                    [](const Light& l) {
+                                        return l.type == LightType::Directional;
+                                    }),
+                     lights.end());
+    }
+    deferred_.fillLightingUBO(ubo, scene_, camera_, invViewProj, &lights);
     std::memcpy(mapped, &ubo, sizeof(ubo));
 }
 
@@ -3327,6 +3361,18 @@ void GuiApp::drawViewerTab() {
         requestRebuild(configFromUi(Mode::Viewer));
     if (loadInFlight) ImGui::EndDisabled();
     if (loadInFlight) ImGui::TextDisabled("loading... (apply disabled)");
+    ImGui::Separator();
+
+    // Lighting: sun direction/intensity.  Takes effect immediately through
+    // the per-frame lighting UBO (no rebuild).  Defaults reproduce the
+    // Scene.h defaultLights() sun exactly.
+    ImGui::Text("lighting");
+    ImGui::Checkbox("sun", &sunEnabled_);
+    if (!sunEnabled_) ImGui::BeginDisabled();
+    ImGui::SliderFloat("elevation", &sunElevationDeg_, 5.f, 90.f, "%.0f deg");
+    ImGui::SliderFloat("azimuth", &sunAzimuthDeg_, 0.f, 360.f, "%.0f deg");
+    ImGui::SliderFloat("intensity", &sunIntensity_, 0.f, 10.f, "%.2f");
+    if (!sunEnabled_) ImGui::EndDisabled();
     ImGui::Separator();
 
     // Live performance readout.

@@ -388,6 +388,17 @@ private:
     float prevJitterY_ = 0.f;
     bool hasTransparency_ = false; // any alphaMode BLEND material in the scene
 
+    // Viewer-tab "lighting" section: sun direction/intensity.  Applied per
+    // frame through an override light list in updateLightingUBO — the scene
+    // is never touched, so no rebuild is triggered.  Elevation/azimuth are
+    // chosen to reproduce the defaultLights() sun direction
+    // (normalize(0.35, 1, 0.3)) exactly, so the first frame with the override
+    // active looks identical to the unmodified scene.
+    bool sunEnabled_ = true;
+    float sunElevationDeg_ = 65.3f; // asin(1 / sqrt(1.2125)) ~= 65.26 deg
+    float sunAzimuthDeg_ = 49.4f;   // atan2(0.35, 0.3) ~= 49.40 deg
+    float sunIntensity_ = 3.f;      // matches defaultLights() sun
+
     ImageResource gbColor_;
     ImageResource gbAlbedo_;
     ImageResource gbNormal_;

@@ -17,11 +17,13 @@
 #include "renderer/math/Math.h"
 
 #include <cstdint>
+#include <vector>
 
 namespace sr {
 
 class Scene;
 class Camera;
+struct Light;
 
 // Default equirect HDR environment map (Bistro san_giuseppe_bridge, bundled
 // in the project's assets; override with --env-map).
@@ -40,20 +42,18 @@ constexpr VkFormat kReactiveFormat = VK_FORMAT_R16_SFLOAT; // translucent covera
 constexpr uint32_t kMaxTextures = 1024;
 } // namespace deferred
 
-// std140, matches the SceneUBO block in gbuffer.vert.
+// std140, matches the SceneUBO block in gbuffer.vert / transparent.vert.
+// Light data lives in LightingUBO (shared by the deferred and the forward
+// transparency passes); this block carries only camera/transform state.
 struct SceneUBO {
     float viewProj[16];
     float viewProjNoJitter[16];
     float prevViewProj[16];
     float cameraPos[4];
-    float light0Pos[4];
-    float light0Color[4];
-    float light1Pos[4];
-    float light1Color[4];
     float ambient[4];
     float renderSizeJitter[4];
 };
-static_assert(sizeof(SceneUBO) == 304, "SceneUBO std140 size mismatch");
+static_assert(sizeof(SceneUBO) == 240, "SceneUBO std140 size mismatch");
 
 // std140, matches the MaterialUBO block in gbuffer.frag / gbuffer_gt.frag.
 struct MaterialUBO {
@@ -65,18 +65,27 @@ struct MaterialUBO {
 };
 static_assert(sizeof(MaterialUBO) == 80, "MaterialUBO std140 size mismatch");
 
+// GPU mirror of scene::Light (std140: three vec4s per light).  Must match the
+// LightGPU struct in lighting.frag / transparent.frag / transparent_gt.frag.
+struct LightGPU {
+    float posOrDir[4]; // xyz = position (point) / direction-to-light (directional), w = LightType
+    float color[4];    // rgb + w = intensity (PI-scaled, see fillLightingUBO)
+    float params[4];   // x = range (0 = infinite), y = castShadow (C2), zw = reserved
+};
+static_assert(sizeof(LightGPU) == 48, "LightGPU std140 size mismatch");
+
+constexpr uint32_t kMaxLights = 8;
+
 // std140, matches the LightingUBO block in lighting.frag.
 struct LightingUBO {
     float invViewProj[16];
     float cameraPos[4];
-    float light0Pos[4];
-    float light0Color[4];
-    float light1Pos[4];
-    float light1Color[4];
+    LightGPU lights[kMaxLights];
+    float lightCounts[4]; // x = active light count, yzw reserved
     float ambient[4];
     float iblParams[4]; // envIntensity, prefilterMaxLod, skyboxEnabled, unused
 };
-static_assert(sizeof(LightingUBO) == 176, "LightingUBO std140 size mismatch");
+static_assert(sizeof(LightingUBO) == 512, "LightingUBO std140 size mismatch");
 
 struct ScenePush {
     float model[16];
@@ -114,8 +123,13 @@ public:
                       const Mat4& view, const Mat4& proj, const Mat4& projJittered,
                       const Mat4& prevViewProj, uint32_t renderW, uint32_t renderH,
                       float jitterX, float jitterY, bool jitter) const;
+    // overrideLights (optional): pack this list instead of scene.lights — the
+    // GUI sun controls rebuild the list per frame without touching the scene.
+    // The fallback-to-defaultLights() rule applies only when no override is
+    // given; an override is used as-is (still truncated at kMaxLights).
     void fillLightingUBO(LightingUBO& out, const Scene& scene, const Camera& camera,
-                         const Mat4& invViewProj) const;
+                         const Mat4& invViewProj,
+                         const std::vector<Light>* overrideLights = nullptr) const;
 
     // Uploads the dynamic-offset material UBO array (one entry per material).
     bool createMaterialUbo(const VulkanContext& ctx, const Scene& scene, VkBuffer& buffer,
@@ -142,8 +156,8 @@ public:
     // --- transparency pass (alpha-blended surfaces, after lighting) -----------
     // True when any material in the scene is alphaMode BLEND.
     bool sceneHasTransparency(const Scene& scene) const;
-    // Binds the LightingUBO (only iblParams is read) + IBL maps + the SSAO
-    // texture of this path into a transparentSetLayout() descriptor set.
+    // Binds the LightingUBO (lights + iblParams are read) + IBL maps + the
+    // SSAO texture of this path into a transparentSetLayout() descriptor set.
     void writeTransparentSet(const VulkanContext& ctx, VkDescriptorSet set,
                              VkBuffer lightingUbo, VkImageView ssao) const;
     // Draws all BLEND-material instances back-to-front over the lit scene.

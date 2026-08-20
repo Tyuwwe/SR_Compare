@@ -164,6 +164,14 @@ inline Vec3 transformPoint(const Mat4& m, const Vec3& p) {
     return {x / w, y / w, z / w};
 }
 
+// Transform a direction (w=0): upper 3x3 only, no translation.  Not
+// normalized (caller decides; non-uniform scale skews directions).
+inline Vec3 transformDirection(const Mat4& m, const Vec3& v) {
+    return {m.m[0] * v.x + m.m[4] * v.y + m.m[8] * v.z,
+            m.m[1] * v.x + m.m[5] * v.y + m.m[9] * v.z,
+            m.m[2] * v.x + m.m[6] * v.y + m.m[10] * v.z};
+}
+
 // Halton(base, index), index >= 1.
 inline float halton(uint32_t index, uint32_t base) {
     float f = 1.f, r = 0.f;

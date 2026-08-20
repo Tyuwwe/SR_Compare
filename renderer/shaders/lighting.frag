@@ -1,17 +1,22 @@
 #version 450
 // Deferred lighting pass: reconstructs world position from depth, shades with
-// Cook-Torrance GGX + Lambert for the two point lights, adds image-based
-// lighting (irradiance + prefiltered specular + BRDF LUT, split-sum) and
-// emissive.  Pixels at the far plane render the environment as skybox.
-// Output is HDR linear color (R16G16B16A16F); present.frag tone-maps.
+// Cook-Torrance GGX + Lambert for the punctual lights (directional/point),
+// adds image-based lighting (irradiance + prefiltered specular + BRDF LUT,
+// split-sum) and emissive.  Pixels at the far plane render the environment as
+// skybox.  Output is HDR linear color (R16G16B16A16F); present.frag tone-maps.
+
+// GPU mirror of scene::Light; must match LightGPU in DeferredCore.h.
+struct LightGPU {
+    vec4 posOrDir; // xyz = position (point) / direction-to-light (directional), w = type (0 = dir, 1 = point)
+    vec4 color;    // rgb + w = intensity (PI-scaled on the CPU)
+    vec4 params;   // x = range (0 = infinite), y = castShadow (reserved, C2), zw = reserved
+};
 
 layout(set = 0, binding = 0) uniform LightingUBO {
     mat4 invViewProj;   // matches the GBuffer pass (jittered for the low-res path)
     vec4 cameraPos;
-    vec4 light0Pos;
-    vec4 light0Color;   // rgb + intensity
-    vec4 light1Pos;
-    vec4 light1Color;
+    LightGPU lights[8];
+    vec4 lightCounts;   // x = active light count, yzw reserved
     vec4 ambient;       // unused when IBL is active (kept for reference)
     vec4 iblParams;     // x = env intensity, y = prefilter max lod, z = skybox enabled, w = unused
 } u;
@@ -58,12 +63,28 @@ vec3 fresnelSchlickRoughness(float cosTheta, vec3 F0, float roughness) {
     return F0 + (F1 - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
 }
 
-vec3 shadePointLight(vec3 N, vec3 V, vec3 worldPos, vec3 albedo, float metallic,
-                     float roughness, vec3 F0, vec3 lightPos, vec3 lightColor) {
-    vec3 toLight = lightPos - worldPos;
-    float dist = length(toLight);
-    vec3 L = toLight / dist;
-    vec3 radiance = lightColor / (dist * dist); // inverse-square falloff
+// Shades one punctual light.  Directional: no falloff, L = posOrDir (unit
+// direction towards the light).  Point: inverse-square falloff with a
+// Frostbite-style window (saturate(1 - (d/range)^4)^2) that reaches zero
+// exactly at range; range = 0 keeps the legacy pure inverse-square falloff.
+vec3 shadeLight(vec3 N, vec3 V, vec3 worldPos, vec3 albedo, float metallic,
+                float roughness, vec3 F0, LightGPU light) {
+    vec3 radiance = light.color.rgb * light.color.w;
+    vec3 L;
+    if (light.posOrDir.w < 0.5) {
+        L = light.posOrDir.xyz;
+    } else {
+        vec3 toLight = light.posOrDir.xyz - worldPos;
+        float dist = length(toLight);
+        L = toLight / dist;
+        float range = light.params.x;
+        float atten = 1.0 / max(dist * dist, 1e-4);
+        if (range > 0.0) {
+            float w = clamp(1.0 - pow(dist / range, 4.0), 0.0, 1.0);
+            atten *= w * w;
+        }
+        radiance *= atten;
+    }
 
     vec3 H = normalize(V + L);
     float NdL = max(dot(N, L), 0.0);
@@ -114,11 +135,10 @@ void main() {
     vec3 V = -viewDir;
     vec3 F0 = mix(vec3(0.04), albedo, metallic);
 
-    vec3 color =
-        shadePointLight(N, V, wp.xyz, albedo, metallic, roughness, F0, u.light0Pos.xyz,
-                        u.light0Color.rgb * u.light0Color.w) +
-        shadePointLight(N, V, wp.xyz, albedo, metallic, roughness, F0, u.light1Pos.xyz,
-                        u.light1Color.rgb * u.light1Color.w);
+    vec3 color = vec3(0.0);
+    int lightCount = int(u.lightCounts.x + 0.5);
+    for (int i = 0; i < lightCount; ++i)
+        color += shadeLight(N, V, wp.xyz, albedo, metallic, roughness, F0, u.lights[i]);
 
     // IBL (split-sum): cosine irradiance * albedo + prefiltered GGX * LUT.
     float NdV = max(dot(N, V), 0.0);

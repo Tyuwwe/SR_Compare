@@ -302,10 +302,48 @@ bool Scene::loadGltf(const VulkanContext& ctx, const char* path, VkCommandPool p
         }
     }
 
-    // Default lights when the file provides none (keeps the scene visible).
+    // KHR_lights_punctual: cgltf exposes data->lights via node->light.
+    // Directional and point lights are supported; spot lights are skipped
+    // (no cone attenuation in the engine yet).
+    for (int n = 0; n < static_cast<int>(data->nodes_count); ++n) {
+        const cgltf_node* node = &data->nodes[n];
+        if (!node->light) continue;
+        const cgltf_light* gl = node->light;
+        if (gl->type == cgltf_light_type_spot) continue;
+
+        cgltf_float world[16];
+        cgltf_node_transform_world(node, world);
+        Mat4 worldMat;
+        std::memcpy(worldMat.m, world, sizeof(world));
+
+        Light l;
+        l.color = {gl->color[0], gl->color[1], gl->color[2]};
+        if (gl->type == cgltf_light_type_directional) {
+            l.type = LightType::Directional;
+            // glTF convention: the light shines along the node's local -Z, so
+            // the direction *towards* the light (the shader's L) is local +Z
+            // rotated into world space.
+            l.positionOrDirection =
+                normalize(transformDirection(worldMat, Vec3{0.f, 0.f, 1.f}));
+            // glTF directional intensity is in lux (a real sun is ~100k);
+            // scale to engine units where a sun reads as ~1-10, comparable to
+            // the IBL environment brightness.
+            l.intensity = gl->intensity / 10000.f;
+        } else {
+            l.type = LightType::Point;
+            l.positionOrDirection = transformPoint(worldMat, Vec3{0.f, 0.f, 0.f});
+            // glTF point intensity is in candela, which maps 1:1 onto the
+            // engine's inverse-square point-light units.
+            l.intensity = gl->intensity;
+            l.range = gl->range; // 0 = infinite in both glTF and the engine
+        }
+        lights.push_back(l);
+    }
+
+    // Shared fallback lights when the file provides none (keeps the scene
+    // visible; same default the procedural scene and the UBO fillers use).
     if (lights.empty()) {
-        lights.push_back({{4.f, 7.f, 4.f}, {1.f, 0.9f, 0.75f}, 140.f});
-        lights.push_back({{-4.f, 3.f, -3.f}, {0.6f, 0.7f, 1.f}, 55.f});
+        lights = defaultLights();
     }
 
     cgltf_free(data);

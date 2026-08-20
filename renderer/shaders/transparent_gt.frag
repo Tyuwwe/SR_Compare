@@ -8,11 +8,7 @@ layout(set = 0, binding = 0) uniform SceneUBO {
     mat4 viewProjNoJitter;
     mat4 prevViewProj;
     vec4 cameraPos;
-    vec4 light0Pos;
-    vec4 light0Color;
-    vec4 light1Pos;
-    vec4 light1Color;
-    vec4 ambient;
+    vec4 ambient;          // unused here; lights live in LightingUBO
     vec4 renderSizeJitter;
 } ubo;
 
@@ -26,13 +22,18 @@ layout(set = 0, binding = 1) uniform MaterialUBO {
 
 layout(set = 1, binding = 0) uniform sampler2D uTextures[1024];
 
+// IBL + light inputs; the UBO matches LightingUBO in DeferredCore.h.  Same
+// LightGPU layout as lighting.frag.
+struct LightGPU {
+    vec4 posOrDir; // xyz = position (point) / direction-to-light (directional), w = type (0 = dir, 1 = point)
+    vec4 color;    // rgb + w = intensity (PI-scaled on the CPU)
+    vec4 params;   // x = range (0 = infinite), y = castShadow (reserved, C2), zw = reserved
+};
 layout(set = 2, binding = 0) uniform LightingUBO {
     mat4 invViewProj;
     vec4 cameraPos;
-    vec4 light0Pos;
-    vec4 light0Color;
-    vec4 light1Pos;
-    vec4 light1Color;
+    LightGPU lights[8];
+    vec4 lightCounts; // x = active light count, yzw reserved
     vec4 ambient;
     vec4 iblParams;
 } lighting;
@@ -81,20 +82,34 @@ vec3 fresnelSchlickRoughness(float cosTheta, vec3 F0, float roughness) {
     return F0 + (F1 - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
 }
 
-// Returns the point-light BRDF split into its diffuse and specular lobes.
+// Returns one punctual light's BRDF split into its diffuse and specular lobes.
 // The glass model weights them differently: specular is surface reflection,
 // whose energy does not depend on transmission (opacity), while the diffuse
 // lobe approximates the transmitted/tinted term and scales with opacity.
-void shadePointLight(vec3 N, vec3 V, vec3 worldPos, vec3 albedo, float metallic,
-                     float roughness, vec3 F0, vec3 lightPos, vec3 lightColor,
-                     out vec3 diffuse, out vec3 specular) {
+// Directional lights have no falloff; point lights use the windowed
+// inverse-square falloff of lighting.frag (range = 0 -> pure inverse-square).
+void shadeLight(vec3 N, vec3 V, vec3 worldPos, vec3 albedo, float metallic,
+                float roughness, vec3 F0, LightGPU light,
+                out vec3 diffuse, out vec3 specular) {
     diffuse = vec3(0.0);
     specular = vec3(0.0);
 
-    vec3 toLight = lightPos - worldPos;
-    float dist = length(toLight);
-    vec3 L = toLight / dist;
-    vec3 radiance = lightColor / (dist * dist);
+    vec3 radiance = light.color.rgb * light.color.w;
+    vec3 L;
+    if (light.posOrDir.w < 0.5) {
+        L = light.posOrDir.xyz;
+    } else {
+        vec3 toLight = light.posOrDir.xyz - worldPos;
+        float dist = length(toLight);
+        L = toLight / dist;
+        float range = light.params.x;
+        float atten = 1.0 / max(dist * dist, 1e-4);
+        if (range > 0.0) {
+            float w = clamp(1.0 - pow(dist / range, 4.0), 0.0, 1.0);
+            atten *= w * w;
+        }
+        radiance *= atten;
+    }
 
     vec3 H = normalize(V + L);
     float NdL = max(dot(N, L), 0.0);
@@ -149,13 +164,12 @@ void main() {
 
     vec3 lightDiffuse = vec3(0.0);
     vec3 lightSpecular = vec3(0.0);
-    vec3 ld, ls;
-    shadePointLight(N, V, vWorldPos, albedo, metallic, roughness, F0, ubo.light0Pos.xyz,
-                    ubo.light0Color.rgb * ubo.light0Color.w, ld, ls);
-    lightDiffuse += ld; lightSpecular += ls;
-    shadePointLight(N, V, vWorldPos, albedo, metallic, roughness, F0, ubo.light1Pos.xyz,
-                    ubo.light1Color.rgb * ubo.light1Color.w, ld, ls);
-    lightDiffuse += ld; lightSpecular += ls;
+    int lightCount = int(lighting.lightCounts.x + 0.5);
+    for (int i = 0; i < lightCount; ++i) {
+        vec3 ld, ls;
+        shadeLight(N, V, vWorldPos, albedo, metallic, roughness, F0, lighting.lights[i], ld, ls);
+        lightDiffuse += ld; lightSpecular += ls;
+    }
 
     float NdV = max(dot(N, V), 0.0);
     vec3 F = fresnelSchlickRoughness(NdV, F0, roughness);

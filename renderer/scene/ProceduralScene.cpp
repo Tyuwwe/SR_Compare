@@ -135,10 +135,9 @@ bool Scene::loadProcedural(const VulkanContext& ctx, VkCommandPool pool) {
         }
     }
 
-    // Two lights: warm key + cool fill, plus ambient floor.  Intensities are
-    // tuned for the inverse-square falloff in the shaders.
-    lights.push_back({{4.f, 7.f, 4.f}, {1.f, 0.9f, 0.75f}, 140.f});
-    lights.push_back({{-4.f, 3.f, -3.f}, {0.6f, 0.7f, 1.f}, 55.f});
+    // Shared fallback lighting (slanted sun + weak cool point fill), the same
+    // default the glTF loader and the DeferredCore UBO fillers use.
+    lights = defaultLights();
 
     updatePrevTransforms();
     finalizeInstances();

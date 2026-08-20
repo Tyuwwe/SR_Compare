@@ -68,11 +68,48 @@ struct MeshInstance {
     Vec3 aabbMax{0.f, 0.f, 0.f};
 };
 
+// Punctual light, modelled after KHR_lights_punctual.  Plain POD: the GPU
+// packing (std140 LightGPU) happens in DeferredCore::fillLightingUBO.
+enum class LightType : uint32_t { Directional = 0, Point = 1 };
+
 struct Light {
-    Vec3 position;
+    LightType type = LightType::Point;
+    // Point: world-space position.  Directional: unit direction *towards* the
+    // light (i.e. the shader's L), so a sun shining straight down is (0,1,0).
+    Vec3 positionOrDirection{0.f, 1.f, 0.f};
     Vec3 color{1.f, 1.f, 1.f};
     float intensity = 1.f;
+    float range = 0.f;       // point only, 0 = infinite (pure inverse-square)
+    bool castShadow = false; // consumed by the C2 shadow pass; stored only for now
 };
+
+// Shared fallback lighting for scenes without authored lights (procedural
+// scene, glTF files without KHR_lights_punctual, and the DeferredCore UBO
+// filler safety net).  Single source of truth so the three hosts and all
+// loaders stay identical.
+inline const std::vector<Light>& defaultLights() {
+    static const std::vector<Light> lights = [] {
+        std::vector<Light> v;
+        Light sun;
+        sun.type = LightType::Directional;
+        // Slanted sun; the direction points *towards* the light, so the y is
+        // positive (light travels down).  Intensity ~3 matches the perceived
+        // brightness of the old 140-intensity point key light at typical
+        // scene distances (140 / d^2 with d ~ 7 m).  Tweak to taste.
+        sun.positionOrDirection = normalize(Vec3{0.35f, 1.f, 0.3f});
+        sun.color = {1.f, 0.95f, 0.85f};
+        sun.intensity = 3.f;
+        Light fill;
+        fill.type = LightType::Point;
+        fill.positionOrDirection = {-4.f, 5.f, -3.f};
+        fill.color = {0.6f, 0.7f, 1.f};
+        fill.intensity = 55.f; // candela-like units (inverse-square falloff)
+        v.push_back(sun);
+        v.push_back(fill);
+        return v;
+    }();
+    return lights;
+}
 
 class Scene {
 public:

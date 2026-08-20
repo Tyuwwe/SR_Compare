@@ -12,11 +12,7 @@ layout(set = 0, binding = 0) uniform SceneUBO {
     mat4 viewProjNoJitter;
     mat4 prevViewProj;    // previous frame, no jitter
     vec4 cameraPos;
-    vec4 light0Pos;
-    vec4 light0Color;
-    vec4 light1Pos;
-    vec4 light1Color;
-    vec4 ambient;
+    vec4 ambient;         // unused here; lights live in LightingUBO
     vec4 renderSizeJitter; // xy = render size (pixels), zw = jitter (pixels)
 } ubo;
 
