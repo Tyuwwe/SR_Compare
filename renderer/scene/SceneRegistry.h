@@ -57,4 +57,12 @@ std::string resolveSceneArg(const std::string& arg);
 // why BistroExterior has an explicit one.
 bool initialCameraPose(const std::string& scenePath, Vec3& pos, Vec3& fwd);
 
+// Hand-placed reflection probe placements per scene (Phase 4c-2; scenePath is
+// the resolved glTF path, "" = procedural boxes).  Empty = no probes.
+std::vector<ReflectionProbe> reflectionProbesForScene(const std::string& scenePath);
+
+// Bake file location for a scene: alongside the glTF (<path>.probes), or
+// assets/probes/boxes.probes for the built-in procedural scene.
+std::string probeFilePathForScene(const std::string& scenePath);
+
 } // namespace sr

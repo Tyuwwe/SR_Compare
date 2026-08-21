@@ -121,6 +121,13 @@ bool DeferredCore::init(const VulkanContext& ctx, const char* envMapPath) {
         std::fprintf(stderr, "IBL preprocessing failed\n");
         return false;
     }
+    // Empty reflection-probe volume (count 0): the lighting/SSR descriptor
+    // bindings 15-17 / 11-13 always point at valid resources; loadProbes()
+    // fills them when a bake file exists.
+    if (!probes_.create(ctx)) {
+        std::fprintf(stderr, "reflection probe resources failed\n");
+        return false;
+    }
 
     // Scene textures: trilinear mipmapping + anisotropy (grazing-angle fix).
     float maxAniso = 4.f;
@@ -254,8 +261,9 @@ bool DeferredCore::createLayouts(const VulkanContext& ctx) {
     // (D32, comparison sampler); 12 = clustered-shading lights SSBO (all
     // point/spot lights, std430); 13 = this path's cluster grid SSBO
     // (per-cluster light index lists); 14 = spot shadow atlas (D32,
-    // comparison sampler).
-    VkDescriptorSetLayoutBinding lightBindings[15] = {};
+    // comparison sampler); 15 = reflection ProbeUBO; 16/17 = probe prefiltered
+    // specular + irradiance cube arrays (Phase 4c-2).
+    VkDescriptorSetLayoutBinding lightBindings[18] = {};
     lightBindings[0].binding = 0;
     lightBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     lightBindings[0].descriptorCount = 1;
@@ -276,9 +284,19 @@ bool DeferredCore::createLayouts(const VulkanContext& ctx) {
     lightBindings[14].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     lightBindings[14].descriptorCount = 1;
     lightBindings[14].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    lightBindings[15].binding = 15; // ProbeUBO
+    lightBindings[15].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    lightBindings[15].descriptorCount = 1;
+    lightBindings[15].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    for (uint32_t i = 16; i < 18; ++i) { // probe prefilter / irradiance cube arrays
+        lightBindings[i].binding = i;
+        lightBindings[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        lightBindings[i].descriptorCount = 1;
+        lightBindings[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    }
     VkDescriptorSetLayoutCreateInfo lightLayoutCi = {};
     lightLayoutCi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    lightLayoutCi.bindingCount = 15;
+    lightLayoutCi.bindingCount = 18;
     lightLayoutCi.pBindings = lightBindings;
     if (vkCreateDescriptorSetLayout(ctx.device, &lightLayoutCi, nullptr, &lightingSetLayout_) !=
         VK_SUCCESS)
@@ -385,8 +403,10 @@ bool DeferredCore::createLayouts(const VulkanContext& ctx) {
     // albedo / normal / material / depth; 5 = SSAO; 6 = IBL prefilter cube;
     // 7 = BRDF LUT; 8 = lit-color pyramid chain; 9 = Hi-Z depth pyramid;
     // 10 = the path's full-res trace target (write-only storage; rgb =
-    // composite delta, a = view |z|).
-    VkDescriptorSetLayoutBinding ssrBindings[11] = {};
+    // composite delta, a = view |z|); 11 = reflection ProbeUBO; 12/13 = probe
+    // prefilter / irradiance cube arrays (Phase 4c-2: the recomputed specIbl
+    // must use the same probe fallback chain as lighting.frag).
+    VkDescriptorSetLayoutBinding ssrBindings[14] = {};
     ssrBindings[0].binding = 0;
     ssrBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     ssrBindings[0].descriptorCount = 1;
@@ -401,9 +421,19 @@ bool DeferredCore::createLayouts(const VulkanContext& ctx) {
     ssrBindings[10].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     ssrBindings[10].descriptorCount = 1;
     ssrBindings[10].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    ssrBindings[11].binding = 11;
+    ssrBindings[11].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    ssrBindings[11].descriptorCount = 1;
+    ssrBindings[11].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    for (uint32_t i = 12; i < 14; ++i) {
+        ssrBindings[i].binding = i;
+        ssrBindings[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        ssrBindings[i].descriptorCount = 1;
+        ssrBindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
     VkDescriptorSetLayoutCreateInfo ssrLayoutCi = {};
     ssrLayoutCi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    ssrLayoutCi.bindingCount = 11;
+    ssrLayoutCi.bindingCount = 14;
     ssrLayoutCi.pBindings = ssrBindings;
     if (vkCreateDescriptorSetLayout(ctx.device, &ssrLayoutCi, nullptr, &ssrSetLayout_) !=
         VK_SUCCESS)
@@ -1176,6 +1206,7 @@ void DeferredCore::destroy(const VulkanContext& ctx) {
     if (hizSampler_) { vkDestroySampler(ctx.device, hizSampler_, nullptr); hizSampler_ = VK_NULL_HANDLE; }
     if (colorPyramidSampler_) { vkDestroySampler(ctx.device, colorPyramidSampler_, nullptr); colorPyramidSampler_ = VK_NULL_HANDLE; }
     ibl_.destroy(ctx);
+    probes_.destroy(ctx);
 }
 
 void DeferredCore::fillSceneUBO(SceneUBO& out, const Scene& scene, const Camera& camera,
@@ -1602,7 +1633,7 @@ void DeferredCore::writeLightingSet(const VulkanContext& ctx, VkDescriptorSet se
     img[11].imageView = shadowAtlas;
     img[11].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
-    VkWriteDescriptorSet w[16] = {};
+    VkWriteDescriptorSet w[19] = {};
     uint32_t writeCount = 0;
     w[writeCount].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     w[writeCount].dstSet = set;
@@ -1640,6 +1671,37 @@ void DeferredCore::writeLightingSet(const VulkanContext& ctx, VkDescriptorSet se
         s.descriptorCount = 1;
         s.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         s.pImageInfo = &img[11];
+    }
+    // Bindings 15-17: reflection probes (Phase 4c-2), always written — the
+    // empty volume (count 0) keeps probe-less scenes on the global env path.
+    VkDescriptorBufferInfo probeBuf = {};
+    probeBuf.buffer = probes_.uboBuffer();
+    probeBuf.offset = 0;
+    probeBuf.range = sizeof(ProbeUBO);
+    VkDescriptorImageInfo probeImg[2] = {};
+    probeImg[0].sampler = probes_.sampler();
+    probeImg[0].imageView = probes_.prefilterView();
+    probeImg[0].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    probeImg[1].sampler = probes_.sampler();
+    probeImg[1].imageView = probes_.irradianceView();
+    probeImg[1].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    {
+        VkWriteDescriptorSet& s = w[writeCount++];
+        s.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        s.dstSet = set;
+        s.dstBinding = 15;
+        s.descriptorCount = 1;
+        s.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        s.pBufferInfo = &probeBuf;
+    }
+    for (uint32_t k = 0; k < 2; ++k) {
+        VkWriteDescriptorSet& s = w[writeCount++];
+        s.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        s.dstSet = set;
+        s.dstBinding = 16 + k;
+        s.descriptorCount = 1;
+        s.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        s.pImageInfo = &probeImg[k];
     }
     vkUpdateDescriptorSets(ctx.device, writeCount, w, 0, nullptr);
 }
@@ -2413,7 +2475,22 @@ void DeferredCore::writeSsrSet(const VulkanContext& ctx, VkDescriptorSet set,
     storage.imageView = ssrTraceOut;
     storage.imageLayout = VK_IMAGE_LAYOUT_GENERAL; // write-only trace target
 
-    VkWriteDescriptorSet w[11] = {};
+    // Bindings 11-13: reflection probes (Phase 4c-2), always written; the
+    // recomputed specIbl must use the same probe fallback chain as
+    // lighting.frag or the delta composite would double-count / leak energy.
+    VkDescriptorBufferInfo probeBuf = {};
+    probeBuf.buffer = probes_.uboBuffer();
+    probeBuf.offset = 0;
+    probeBuf.range = sizeof(ProbeUBO);
+    VkDescriptorImageInfo probeImg[2] = {};
+    probeImg[0].sampler = probes_.sampler();
+    probeImg[0].imageView = probes_.prefilterView();
+    probeImg[0].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    probeImg[1].sampler = probes_.sampler();
+    probeImg[1].imageView = probes_.irradianceView();
+    probeImg[1].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+    VkWriteDescriptorSet w[14] = {};
     w[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     w[0].dstSet = set;
     w[0].dstBinding = 0;
@@ -2434,7 +2511,21 @@ void DeferredCore::writeSsrSet(const VulkanContext& ctx, VkDescriptorSet set,
     w[10].descriptorCount = 1;
     w[10].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     w[10].pImageInfo = &storage;
-    vkUpdateDescriptorSets(ctx.device, 11, w, 0, nullptr);
+    w[11].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    w[11].dstSet = set;
+    w[11].dstBinding = 11;
+    w[11].descriptorCount = 1;
+    w[11].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    w[11].pBufferInfo = &probeBuf;
+    for (uint32_t k = 0; k < 2; ++k) {
+        w[12 + k].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w[12 + k].dstSet = set;
+        w[12 + k].dstBinding = 12 + k;
+        w[12 + k].descriptorCount = 1;
+        w[12 + k].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        w[12 + k].pImageInfo = &probeImg[k];
+    }
+    vkUpdateDescriptorSets(ctx.device, 14, w, 0, nullptr);
 }
 
 void DeferredCore::recordSsrPass(VkCommandBuffer cmd, VkDescriptorSet ssrSet,

@@ -162,6 +162,8 @@ bool CompareApp::init(const CompareOptions& opts) {
     if (!sceneOk) return false;
     hasTransparency_ = deferred_.sceneHasTransparency(scene_);
     iblIntensity_ = lightingPresetForScene(opts.scenePath).iblIntensity;
+    // Reflection probe placements (Phase 4c-2); inert without a bake file.
+    scene_.probes = reflectionProbesForScene(opts.scenePath);
 
     if (scene_.materials.empty()) {
         Material fallback;
@@ -179,6 +181,8 @@ bool CompareApp::init(const CompareOptions& opts) {
     if (!initAlgorithms()) return false;
     // Shared deferred pipeline: IBL maps + shaders + layouts + pipelines.
     if (!deferred_.init(ctx_, opts_.envMapPath.c_str())) return false;
+    // Baked reflection probes (Phase 4c-2): count 0 without a bake file.
+    deferred_.loadProbes(ctx_, scene_.probes, probeFilePathForScene(opts_.scenePath));
     // CSM shadow targets (fixed size; a failure degrades to no shadows).
     // Created before createSyncResources so the lighting/transparent sets can
     // bind the array view.
@@ -637,9 +641,9 @@ bool CompareApp::createDescriptors() {
     VkDescriptorPoolSize sizes[5] = {};
     sizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     sizes[0].descriptorCount = deferred::kMaxTextures + numColumns * 2 + 2 + numAlgos * 2 +
-                               12 * kFramesInFlight * 4 + // lighting sets (GB/GT/SSAA/spatial), +1 shadow +1 atlas
+                               14 * kFramesInFlight * 4 + // lighting sets (GB/GT/SSAA/spatial), shadow + atlas + 2 probe arrays
                                7 * kFramesInFlight * 4 +  // transparent sets + SSR
-                               9 * kFramesInFlight * 4 +  // opaque-SSR trace sets (GB/GT/SSAA/spatial)
+                               11 * kFramesInFlight * 4 + // opaque-SSR trace sets (GB/GT/SSAA/spatial), +2 probe arrays
                                10 * 3 +                   // ssao + temporal + blur samplers (per path)
                                3 * 6 +                    // ssr temporal samplers (GB/GT/SSAA x2 sets)
                                2 +                        // auto-exposure HDR sources (LR + GT)
@@ -647,8 +651,10 @@ bool CompareApp::createDescriptors() {
     sizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     sizes[1].descriptorCount = kFramesInFlight * 2 + numColumns +
                                kFramesInFlight * 2 + // lighting UBOs
+                               kFramesInFlight * 4 + // lighting probe UBOs
                                kFramesInFlight * 3 +  // transparent UBOs (GB/GT/SSAA)
                                kFramesInFlight * 4 +  // opaque-SSR UBOs (GB/GT/SSAA/spatial)
+                               kFramesInFlight * 4 +  // opaque-SSR probe UBOs
                                3 * kFramesInFlight;   // spatial scene + lighting + transparent
     sizes[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
     sizes[2].descriptorCount = kFramesInFlight * 3; // Gb + Gt + spatial scene sets

@@ -16,6 +16,7 @@ add_library(renderer STATIC
     scene/CameraPath.cpp
     scene/SceneRegistry.cpp
     ibl/Ibl.cpp
+    ibl/Probes.cpp
     deferred/DeferredCore.cpp
     Renderer.cpp
     Screenshot.cpp
@@ -72,9 +73,13 @@ set(RENDERER_SPV "")
 foreach(SHADER ${RENDERER_SHADERS})
     if(SHADER STREQUAL "shaders/present.frag")
         sr_compile_shader(SPV ${SHADER} "${SR_TONE_MAP_GLSL}")
-    elseif(SHADER STREQUAL "shaders/transparent.frag" OR SHADER STREQUAL "shaders/transparent_gt.frag" OR SHADER STREQUAL "shaders/ssr_opaque.comp")
+    elseif(SHADER STREQUAL "shaders/transparent.frag" OR SHADER STREQUAL "shaders/transparent_gt.frag")
         sr_compile_shader(SPV ${SHADER} "${SR_SHADER_INCLUDE_DIR}/ssr.glsl" "${SR_SHADER_INCLUDE_DIR}/brdf.glsl")
-    elseif(SHADER STREQUAL "shaders/lighting.frag" OR SHADER STREQUAL "shaders/ibl_brdf_lut.comp")
+    elseif(SHADER STREQUAL "shaders/ssr_opaque.comp")
+        sr_compile_shader(SPV ${SHADER} "${SR_SHADER_INCLUDE_DIR}/ssr.glsl" "${SR_SHADER_INCLUDE_DIR}/brdf.glsl" "${SR_SHADER_INCLUDE_DIR}/probes.glsl")
+    elseif(SHADER STREQUAL "shaders/lighting.frag")
+        sr_compile_shader(SPV ${SHADER} "${SR_SHADER_INCLUDE_DIR}/brdf.glsl" "${SR_SHADER_INCLUDE_DIR}/ssr.glsl" "${SR_SHADER_INCLUDE_DIR}/probes.glsl")
+    elseif(SHADER STREQUAL "shaders/ibl_brdf_lut.comp")
         sr_compile_shader(SPV ${SHADER} "${SR_SHADER_INCLUDE_DIR}/brdf.glsl")
     else()
         sr_compile_shader(SPV ${SHADER})

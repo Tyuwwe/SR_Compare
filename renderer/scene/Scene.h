@@ -259,6 +259,22 @@ inline const std::vector<Light>& defaultLights() {
     return lights;
 }
 
+// --- Reflection probes (UE4 reflection-capture style, Phase 4c-2) ------------
+// A baked local specular/diffuse capture: the scene is rendered into a small
+// cubemap from `position` once (offline --bake-probes command), prefiltered
+// like the global IBL maps, and at runtime pixels inside the AABB sample it
+// with parallax-corrected box projection instead of the global environment
+// (fallback chain: SSR hit -> local probe -> global env).  Placement is scene
+// data: filled from the scene registry (SceneRegistry::reflectionProbesForScene).
+// Without a matching .probes bake file the probe list is inert.
+constexpr uint32_t kMaxReflectionProbes = 8;
+
+struct ReflectionProbe {
+    Vec3 position{0.f, 0.f, 0.f}; // capture origin (parallax pivot)
+    Vec3 boxMin{0.f, 0.f, 0.f};   // influence box (world AABB)
+    Vec3 boxMax{0.f, 0.f, 0.f};
+};
+
 class Scene {
 public:
     std::vector<Mesh> meshes;
@@ -266,6 +282,9 @@ public:
     std::vector<Material> materials;
     std::vector<MeshInstance> instances;
     std::vector<Light> lights;
+    // Reflection probe placements (see above); populated by the hosts from the
+    // scene registry after load.  Capped at kMaxReflectionProbes on use.
+    std::vector<ReflectionProbe> probes;
 
     // Scene-wide merged vertex/index buffers.  The viewer binds these once per
     // pass and draws with per-mesh firstIndex/vertexOffset, which avoids the

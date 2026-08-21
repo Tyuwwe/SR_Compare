@@ -89,6 +89,9 @@ bool Renderer::init(const RendererOptions& opts) {
     if (!sceneOk) return false;
     hasTransparency_ = deferred_.sceneHasTransparency(scene_);
     iblIntensity_ = lightingPresetForScene(opts.scenePath).iblIntensity;
+    // Reflection probe placements (Phase 4c-2): hand-placed per scene in the
+    // registry; inert until a matching .probes bake file is loaded below.
+    scene_.probes = reflectionProbesForScene(opts.scenePath);
 
     if (scene_.materials.empty()) {
         Material fallback;
@@ -125,6 +128,9 @@ bool Renderer::init(const RendererOptions& opts) {
     if (!createRenderTargets()) return false;
     // Shared deferred pipeline: IBL maps + shaders + layouts + pipelines.
     if (!deferred_.init(ctx_, opts_.envMapPath.c_str())) return false;
+    // Baked reflection probes (Phase 4c-2): no bake file -> count 0, rendering
+    // identical to the global-env-only path.
+    deferred_.loadProbes(ctx_, scene_.probes, probeFilePathForScene(opts_.scenePath));
     // CSM shadow targets + spot shadow atlas (fixed size; a failure degrades
     // to no shadows).  Created unconditionally like CompareApp/GuiApp so the
     // lighting set's shadow bindings are always written; --no-shadows only
@@ -367,16 +373,16 @@ bool Renderer::createSceneDescriptors() {
     const uint32_t colorSets = gbColorPyramid_.mipCount + gtColorPyramid_.mipCount;
     sizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     sizes[0].descriptorCount = deferred::kMaxTextures + 1 + // texture array + present
-                               12 * kFramesInFlight * 2 + // lighting sets (GB/GT), +1 shadow +1 atlas
+                               14 * kFramesInFlight * 2 + // lighting sets (GB/GT), shadow + atlas + 2 probe arrays
                                7 * kFramesInFlight * 2 +  // transparent sets (GB/GT), +SSR+shadow
-                               9 * kFramesInFlight * 2 +  // opaque-SSR trace sets (GB/GT)
+                               11 * kFramesInFlight * 2 + // opaque-SSR trace sets (GB/GT), +2 probe arrays
                                2 * 2 + 3 * 4 + 1 * 4 +     // ssao + temporal + blur samplers
                                3 * 4 +                     // ssr temporal samplers (GB/GT x2 sets)
                                8 +                         // bloom extract/blur/comp (GB/GT)
                                1 +                         // auto-exposure HDR source
                                hizSets + colorSets;
     sizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    sizes[1].descriptorCount = kFramesInFlight * 6; // scene + lighting + 2 transparent + 2 SSR UBOs
+    sizes[1].descriptorCount = kFramesInFlight * 10; // scene + lighting(+probe) + 2 transparent + 2 SSR(+probe) UBOs
     sizes[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
     sizes[2].descriptorCount = kFramesInFlight;
     sizes[3].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;

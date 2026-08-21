@@ -2,6 +2,10 @@
 #extension GL_GOOGLE_include_directive : require
 #include "brdf.glsl"
 #include "ssr.glsl"
+#define SR_PROBE_UBO_BINDING 11
+#define SR_PROBE_SPEC_BINDING 12
+#define SR_PROBE_DIFF_BINDING 13
+#include "probes.glsl"
 // Full-screen SSR trace for opaque surfaces (UE4-style ScreenSpaceReflections,
 // Phase 1b-3; split into trace + temporal/composite in Phase 2d): one compute
 // pass after the deferred lighting pass and before the transparency pass.
@@ -139,9 +143,20 @@ void main() {
         return;
     }
 
-    // The exact specular term lighting.frag added to this pixel.
+    // The exact specular term lighting.frag added to this pixel.  Phase 4c-2:
+    // the prefiltered sample must follow the same fallback chain (SSR hit ->
+    // local probe -> global env) as lighting.frag, otherwise the delta would
+    // subtract a different term than the pass added (energy leak / double
+    // count).  The SSR miss path thereby falls back to the probe term for
+    // free — a miss keeps this specIbl, which is already probe-corrected.
     const float ssao = texelFetch(ssaoTex, pix, 0).r;
-    const vec3 prefiltered = textureLod(iblPrefilter, R, roughness * u.iblParams.y).rgb;
+    vec3 prefiltered = textureLod(iblPrefilter, R, roughness * u.iblParams.y).rgb;
+    int pi0, pi1;
+    float pw0, pw1;
+    const float probeW = probeSelect(wp.xyz, pi0, pi1, pw0, pw1);
+    if (probeW > 0.0)
+        prefiltered = mix(prefiltered,
+                          probeSpecular(wp.xyz, R, roughness, pi0, pi1, pw0, pw1), probeW);
     const vec3 specIbl = prefiltered * envBrdf * (ao * ssao * u.iblParams.x);
 
     imageStore(ssrOut, pix, vec4(conf * (ssr.rgb * envBrdf - specIbl), viewZ));

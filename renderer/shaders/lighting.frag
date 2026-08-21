@@ -2,6 +2,10 @@
 #extension GL_GOOGLE_include_directive : require
 #include "brdf.glsl"
 #include "ssr.glsl"
+#define SR_PROBE_UBO_BINDING 15
+#define SR_PROBE_SPEC_BINDING 16
+#define SR_PROBE_DIFF_BINDING 17
+#include "probes.glsl"
 // Deferred lighting pass: reconstructs world position from depth, shades with
 // Heitz height-correlated GGX + Hammon 2017 diffuse (no Lambert) for punctual
 // lights, plus IBL split-sum and emissive.  Far-plane pixels are the skybox.
@@ -355,14 +359,25 @@ void main() {
 
     // IBL (split-sum): cosine irradiance * Hammon multi-scatter albedo +
     // prefiltered GGX * LUT (LUT integrates the correlated Smith V).
+    // Phase 4c-2: baked reflection probes replace the global environment where
+    // a probe box contains the pixel (fallback chain: SSR -> probe -> global).
     float NdV = max(dot(N, V), 0.0);
     vec3 F = F_SchlickRoughness(NdV, F0, roughness);
     vec3 kd = (vec3(1.0) - F) * (1.0 - metallic);
     vec3 irradiance = texture(iblIrradiance, N).rgb;
-    vec3 diffuseIbl = irradiance * albedo * (1.0 + albedo * (0.1159 * roughness));
 
     vec3 R = reflect(-V, N);
     vec3 prefiltered = textureLod(iblPrefilter, R, roughness * u.iblParams.y).rgb;
+    int pi0, pi1;
+    float pw0, pw1;
+    const float probeW = probeSelect(wp.xyz, pi0, pi1, pw0, pw1);
+    if (probeW > 0.0) {
+        irradiance = mix(irradiance, probeDiffuse(N, pi0, pi1, pw0, pw1), probeW);
+        prefiltered = mix(prefiltered,
+                          probeSpecular(wp.xyz, R, roughness, pi0, pi1, pw0, pw1), probeW);
+    }
+    vec3 diffuseIbl = irradiance * albedo * (1.0 + albedo * (0.1159 * roughness));
+
     vec2 brdf = texture(iblBrdfLut, vec2(NdV, roughness)).rg;
     vec3 specularIbl = prefiltered * specularIblMultiScatter(F, F0, brdf);
 

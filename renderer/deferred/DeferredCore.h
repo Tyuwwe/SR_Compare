@@ -14,6 +14,7 @@
 #include "renderer/core/Vk.h"
 #include "renderer/core/VulkanContext.h"
 #include "renderer/ibl/Ibl.h"
+#include "renderer/ibl/Probes.h"
 #include "renderer/math/Math.h"
 
 #include <cstdint>
@@ -665,6 +666,18 @@ public:
 
     const IblMaps& ibl() const { return ibl_; }
 
+    // Baked local reflection probes (Phase 4c-2; see ibl/Probes.h).  The empty
+    // volume (count 0) is created in init() so the lighting/SSR descriptor
+    // bindings are always written; hosts call this once after scene load with
+    // the registry placements + bake file path (probeFilePathForScene).
+    // Without a matching bake file the probe count stays 0 and the shaders
+    // fall back to the global environment, unchanged.
+    bool loadProbes(const VulkanContext& ctx, const std::vector<ReflectionProbe>& defs,
+                    const std::string& filePath) {
+        return probes_.load(ctx, defs, filePath);
+    }
+    const ReflectionProbes& probes() const { return probes_; }
+
     // --- GTAO pass (between the GBuffer and the lighting pass) ----------------
     // ssao set: AO depth-chain sampler (view-Z mips, GENERAL) + world-normal
     // sampler + working RG16F storage (R=AO, G=|z|).
@@ -942,6 +955,7 @@ private:
                            uint32_t materialStride) const;
 
     IblMaps ibl_;
+    ReflectionProbes probes_; // baked local reflection captures (empty until loadProbes)
 
     VkDescriptorSetLayout sceneSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout textureSetLayout_ = VK_NULL_HANDLE;

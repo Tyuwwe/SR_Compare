@@ -1434,13 +1434,15 @@ bool GuiApp::createDescriptors() {
     VkDescriptorPoolSize sizes[5] = {};
     sizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     sizes[0].descriptorCount =
-        deferred::kMaxTextures + numColumns * 2 + 2 + numAlgos * 6 + 12 * kFramesInFlight * 4 +
-        7 * kFramesInFlight * 4 + 9 * kFramesInFlight * 4 + 10 * 3 + 3 * 6 + hizSets + colorSets +
+        deferred::kMaxTextures + numColumns * 2 + 2 + numAlgos * 6 + 14 * kFramesInFlight * 4 +
+        7 * kFramesInFlight * 4 + 11 * kFramesInFlight * 4 + 10 * 3 + 3 * 6 + hizSets + colorSets +
         2; // + ssr temporal samplers (GB/GT/SSAA x2 sets); auto-exposure HDR sources (LR + GT);
-           // lighting sets: 12 samplers each (GB/GT/SSAA/spatial), incl. shadow + spot atlas
+           // lighting sets: 14 samplers each (GB/GT/SSAA/spatial), incl. shadow + spot atlas +
+           // 2 probe arrays; SSR trace sets: 11 each (incl. 2 probe arrays)
     sizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     sizes[1].descriptorCount = kFramesInFlight * 3 + numColumns + numAlgos + kFramesInFlight * 4 +
-                               kFramesInFlight * 4 + kFramesInFlight * 4; // + opaque-SSR UBOs
+                               kFramesInFlight * 4 + kFramesInFlight * 4 + // + opaque-SSR UBOs
+                               kFramesInFlight * 8; // + probe UBOs (lighting + SSR sets)
     sizes[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
     sizes[2].descriptorCount = kFramesInFlight * 3;
     sizes[3].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;

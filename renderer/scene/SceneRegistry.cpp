@@ -78,4 +78,29 @@ bool initialCameraPose(const std::string& scenePath, Vec3& pos, Vec3& fwd) {
     return false;
 }
 
+std::vector<ReflectionProbe> reflectionProbesForScene(const std::string& scenePath) {
+    std::vector<ReflectionProbe> probes;
+    if (scenePath.empty()) {
+        // boxes: one probe covering the whole 20x10x20 room (walls at
+        // |x| = 10, z = +-10, floor y = 0; see ProceduralScene.cpp).
+        probes.push_back({{0.f, 2.5f, 0.f}, {-9.5f, 0.05f, -9.5f}, {9.5f, 9.5f, 9.5f}});
+    } else if (scenePath.find("Sponza") != std::string::npos) {
+        // Sponza atrium: one demo probe over the central aisle.
+        probes.push_back({{0.f, 4.f, 0.f}, {-6.f, 0.5f, -2.5f}, {6.f, 10.f, 2.5f}});
+    } else if (scenePath.find("BistroInterior") != std::string::npos) {
+        // Bistro cafe interior: three overlapping boxes (cafe floor + bar) so
+        // the two-probe blend path is exercised.
+        probes.push_back({{-2.f, 2.f, 0.f}, {-6.f, 0.2f, -3.f}, {2.f, 5.5f, 3.f}});
+        probes.push_back({{4.f, 2.f, 0.5f}, {2.f, 0.2f, -2.5f}, {7.5f, 5.5f, 3.5f}});
+        probes.push_back({{-2.f, 2.f, -1.5f}, {-5.f, 0.2f, -4.5f}, {1.5f, 5.5f, 0.5f}});
+    }
+    if (probes.size() > kMaxReflectionProbes) probes.resize(kMaxReflectionProbes);
+    return probes;
+}
+
+std::string probeFilePathForScene(const std::string& scenePath) {
+    if (scenePath.empty()) return resolveAssetPath("assets/probes/boxes.probes");
+    return scenePath + ".probes";
+}
+
 } // namespace sr
