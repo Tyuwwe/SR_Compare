@@ -185,6 +185,29 @@ bool CompareApp::init(const CompareOptions& opts) {
     shadowsActive_ = deferred_.createShadowTargets(ctx_, shadow_);
     if (!shadowsActive_)
         std::fprintf(stderr, "warning: shadow target creation failed, shadows disabled\n");
+    // Spot shadow atlas (Phase 4b); a failure degrades to sun-only shadows.
+    spotAtlasActive_ = deferred_.createShadowAtlas(ctx_, spotAtlas_);
+    if (!spotAtlasActive_)
+        std::fprintf(stderr, "warning: spot shadow atlas creation failed, spot shadows disabled\n");
+    // Start both shadow maps in SHADER_READ_ONLY so the descriptor bindings
+    // are layout-valid even on frames that render no shadows (--no-shadows or
+    // a scene without casting lights).
+    submitOneShot(ctx_, [&](VkCommandBuffer cmd) {
+        if (shadowsActive_) {
+            imageBarrier(cmd, shadow_.image, VK_IMAGE_LAYOUT_UNDEFINED,
+                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_NONE,
+                         VK_ACCESS_2_NONE, sync::kFragment, sync::kSampled,
+                         VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, kShadowCascadeCount);
+            shadow_.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        }
+        if (spotAtlasActive_) {
+            imageBarrier(cmd, spotAtlas_.image, VK_IMAGE_LAYOUT_UNDEFINED,
+                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_NONE,
+                         VK_ACCESS_2_NONE, sync::kFragment, sync::kSampled,
+                         VK_IMAGE_ASPECT_DEPTH_BIT);
+            spotAtlas_.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        }
+    });
     if (!createRenderTargets()) return false;
     if (!createFontAtlas()) return false;
     if (!createMetricResources()) return false;
@@ -614,7 +637,7 @@ bool CompareApp::createDescriptors() {
     VkDescriptorPoolSize sizes[5] = {};
     sizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     sizes[0].descriptorCount = deferred::kMaxTextures + numColumns * 2 + 2 + numAlgos * 2 +
-                               11 * kFramesInFlight * 4 + // lighting sets (GB/GT/SSAA/spatial), +1 shadow
+                               12 * kFramesInFlight * 4 + // lighting sets (GB/GT/SSAA/spatial), +1 shadow +1 atlas
                                7 * kFramesInFlight * 4 +  // transparent sets + SSR
                                9 * kFramesInFlight * 4 +  // opaque-SSR trace sets (GB/GT/SSAA/spatial)
                                10 * 3 +                   // ssao + temporal + blur samplers (per path)
@@ -1148,23 +1171,25 @@ bool CompareApp::createSyncResources() {
         // fillLightingUBO.  VK_NULL_HANDLE (creation failed) leaves binding
         // 11 unwritten, which is safe only while shadows stay off.
         const VkImageView shadowView = shadowsActive_ ? shadow_.arrayView : VK_NULL_HANDLE;
+        const VkImageView spotAtlasView = spotAtlasActive_ ? spotAtlas_.view : VK_NULL_HANDLE;
         deferred_.writeLightingSet(ctx_, fr.lightingSetGb, fr.lightingUboGb, gbAlbedo_.view,
                                    gbNormal_.view, gbMaterial_.view, gbEmissive_.view,
-                                   gbDepth_.view, gbAo_.view, shadowView,
+                                   gbDepth_.view, gbAo_.view, shadowView, spotAtlasView,
                                    gbCluster_.lightsBuffer[i], gbCluster_.gridBuffer[i]);
         deferred_.writeLightingSet(ctx_, fr.lightingSetGbSpatial, fr.lightingUboGbSpatial,
                                    gbAlbedo_.view, gbNormal_.view, gbMaterial_.view,
                                    gbEmissive_.view, gbDepth_.view, gbAo_.view, shadowView,
+                                   spotAtlasView,
                                    gbCluster_.lightsBuffer[i], gbCluster_.gridBuffer[i]);
         deferred_.writeLightingSet(ctx_, fr.lightingSetGt, fr.lightingUboGt, gtAlbedo_.view,
                                    gtNormal_.view, gtMaterial_.view, gtEmissive_.view,
-                                   gtDepth_.view, gtAo_.view, shadowView,
+                                   gtDepth_.view, gtAo_.view, shadowView, spotAtlasView,
                                    gtCluster_.lightsBuffer[i], gtCluster_.gridBuffer[i]);
         if (opts_.gtSsaa) {
             deferred_.writeLightingSet(ctx_, fr.lightingSetSsaa, fr.lightingUboGt,
                                        gtSsaaAlbedo_.view, gtSsaaNormal_.view,
                                        gtSsaaMaterial_.view, gtSsaaEmissive_.view,
-                                       gtSsaaDepth_.view, gtSsaaAo_.view, shadowView,
+                                       gtSsaaDepth_.view, gtSsaaAo_.view, shadowView, spotAtlasView,
                                        gtSsaaCluster_.lightsBuffer[i], gtSsaaCluster_.gridBuffer[i]);
         }
 
@@ -1249,18 +1274,19 @@ void CompareApp::updateSceneUBO(void* mapped, bool jitter, uint32_t renderW, uin
 }
 
 void CompareApp::updateLightingUBO(void* mapped, const Mat4& invViewProj,
-                                   const ShadowFrame* shadow) {
+                                   const ShadowFrame* shadow,
+                                   const std::vector<Light>* overrideLights) {
     LightingUBO ubo;
-    deferred_.fillLightingUBO(ubo, scene_, camera_, invViewProj, nullptr, shadow, iblIntensity_);
+    deferred_.fillLightingUBO(ubo, scene_, camera_, invViewProj, overrideLights, shadow,
+                              iblIntensity_);
     std::memcpy(mapped, &ubo, sizeof(ubo));
 }
 
-void CompareApp::updateClusterLights(uint32_t frameIndex) {
+void CompareApp::updateClusterLights(uint32_t frameIndex, const std::vector<Light>& lights) {
     // Full point/spot set for the clustered pass; same per-slot rule as the
     // UBOs (the slot's fence passed before recording).  The list is identical
     // for every path — only the grid resolution differs.
     const uint32_t slot = frameIndex % kFramesInFlight;
-    const std::vector<Light>& lights = DeferredCore::effectiveLights(scene_, nullptr);
     deferred_.fillClusterLights(gbCluster_.lightsMapped[slot], lights);
     deferred_.fillClusterLights(gtCluster_.lightsMapped[slot], lights);
     if (gtSsaaCluster_.lightsMapped[slot])
@@ -1413,12 +1439,17 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     const uint32_t gtH = opts_.gtSsaa ? dh * 2 : dh;
     updateSceneUBO(fr.uboGtMapped, false, gtW, gtH, view, proj, proj, prevViewProj_);
 
-    // CSM sun shadows: pick the first shadow-casting directional light (same
-    // light-list selection rule as fillLightingUBO) and compute the cascades.
-    // The GT and SSAA paths sample the same map — GT is the same lighting at
+    // Shadows (Phase 4b): CSM sun cascades (first shadow-casting directional,
+    // same selection rule as fillLightingUBO) plus the spot shadow atlas —
+    // shadow-casting spots are scored by intensity/distance^2 and the top
+    // kShadowAtlasTiles get a tile (selectSpotShadowLights writes shadowIndex
+    // into a lights copy that overrides both the UBO and the cluster SSBO).
+    // The GT and SSAA paths sample the same maps — GT is the same lighting at
     // native res.  --no-shadows leaves shadow null (shadowParams.z = 0).
     ShadowFrame shadowFrame;
     const ShadowFrame* shadow = nullptr;
+    std::vector<Light> shadowLights;
+    const std::vector<Light>* lightsOverride = nullptr;
     if (shadowsActive_ && opts_.shadows) {
         const std::vector<Light>& lights =
             scene_.lights.empty() ? defaultLights() : scene_.lights;
@@ -1427,11 +1458,23 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                 DeferredCore::computeCascadeVPs(camera_, aspect, lights[i].positionOrDirection,
                                                 shadowFrame.cascadeVp, shadowFrame.splitDepth);
                 shadowFrame.lightIndex = static_cast<int32_t>(i);
-                shadowFrame.debugCascades = opts_.shadowDebug;
-                shadow = &shadowFrame;
                 break;
             }
         }
+        if (spotAtlasActive_) {
+            shadowLights = lights;
+            shadowFrame.atlasTileCount =
+                DeferredCore::selectSpotShadowLights(shadowLights, camera_.position);
+            for (const Light& l : shadowLights) {
+                if (l.shadowIndex >= 0)
+                    shadowFrame.atlasVp[l.shadowIndex] = DeferredCore::computeSpotShadowVp(l);
+            }
+            lightsOverride = &shadowLights;
+        }
+        shadowFrame.debugCascades = opts_.shadowDebug;
+        shadowFrame.frameIndex = frameIndex;
+        if (shadowFrame.lightIndex >= 0 || shadowFrame.atlasTileCount > 0)
+            shadow = &shadowFrame;
     }
 
     // Lighting reconstructs world positions with the inverse of the exact
@@ -1439,14 +1482,15 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     // un-jittered GT; the GT matrix is resolution-independent and shared by
     // the 1x and 2x SSAA pass).
     updateLightingUBO(fr.lightingUboGbMapped,
-                      Mat4::inverse(Mat4::multiply(projJittered, view)), shadow);
-    updateLightingUBO(fr.lightingUboGtMapped, Mat4::inverse(Mat4::multiply(proj, view)), shadow);
-    updateClusterLights(frameIndex);
+                      Mat4::inverse(Mat4::multiply(projJittered, view)), shadow, lightsOverride);
+    updateLightingUBO(fr.lightingUboGtMapped, Mat4::inverse(Mat4::multiply(proj, view)), shadow,
+                      lightsOverride);
+    updateClusterLights(frameIndex, DeferredCore::effectiveLights(scene_, lightsOverride));
     if (mixed) {
         updateSceneUBO(fr.uboGbSpatialMapped, false, renderWidth_, renderHeight_, view, proj, proj,
                        prevViewProj_);
         updateLightingUBO(fr.lightingUboGbSpatialMapped, Mat4::inverse(Mat4::multiply(proj, view)),
-                          shadow);
+                          shadow, lightsOverride);
     }
 
     auto transition = [&](VkImage image, VkImageLayout& current, VkImageLayout target,
@@ -1658,7 +1702,7 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
 
     // --- Shadow pass (sun CSM, one 2048^2 layer per cascade) -------------------
     // Runs once per frame and feeds the LR, GT and SSAA lighting paths alike.
-    if (shadow) {
+    if (shadow && shadow->lightIndex >= 0) {
         imageBarrier(cmd, shadow_.image, shadow_.layout,
                      VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, sync::kFragment,
                      sync::kSampled, sync::kDepthTests, sync::kDepthReadWrite,
@@ -1670,6 +1714,23 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                      sync::kDepthTests, sync::kDepthWrite, sync::kFragment, sync::kSampled,
                      VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, kShadowCascadeCount);
         shadow_.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    }
+
+    // --- Spot shadow atlas (Phase 4b, one 1024^2 tile per selected spot) -----
+    // Same once-per-frame sharing across the LR/GT/SSAA paths as the CSM pass.
+    if (shadow && shadow->atlasTileCount > 0) {
+        imageBarrier(cmd, spotAtlas_.image, spotAtlas_.layout,
+                     VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, sync::kFragment,
+                     sync::kSampled, sync::kDepthTests, sync::kDepthReadWrite,
+                     VK_IMAGE_ASPECT_DEPTH_BIT);
+        spotAtlas_.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        deferred_.recordSpotShadowPass(cmd, spotAtlas_, scene_, shadow->atlasVp,
+                                       shadow->atlasTileCount, fr.sceneSetGb, textureSet_,
+                                       materialStride_);
+        imageBarrier(cmd, spotAtlas_.image, spotAtlas_.layout,
+                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kDepthTests, sync::kDepthWrite,
+                     sync::kFragment, sync::kSampled, VK_IMAGE_ASPECT_DEPTH_BIT);
+        spotAtlas_.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     }
 
     if (mixed) {
@@ -2553,6 +2614,7 @@ void CompareApp::shutdown() {
     fontAtlas_.destroy(ctx_);
 
     if (shadowsActive_) { deferred_.destroyShadowTargets(ctx_, shadow_); shadowsActive_ = false; }
+    if (spotAtlasActive_) { deferred_.destroyShadowAtlas(ctx_, spotAtlas_); spotAtlasActive_ = false; }
     deferred_.destroy(ctx_);
     scene_.destroy(ctx_);
     swapchain_.destroy(ctx_);

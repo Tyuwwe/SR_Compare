@@ -41,8 +41,8 @@ layout(set = 1, binding = 0) uniform sampler2D uTextures[1024];
 struct LightGPU {
     vec4 posOrDir; // xyz = position (point/spot) / direction-to-light (directional), w = type (0 = dir, 1 = point, 2 = spot)
     vec4 color;    // rgb + w = intensity (PI-scaled on the CPU)
-    vec4 params;   // x = range (0 = infinite), y = castShadow (reserved, C2),
-                   // z = shadowIndex (reserved, Phase 4b), w = spot cos(inner)
+    vec4 params;   // x = range (0 = infinite), y = castShadow,
+                   // z = shadowIndex (spot atlas tile, -1 = unshadowed), w = spot cos(inner)
     vec4 spotDir;  // xyz = spot cone direction (unit, world), w = spot cos(outer)
 };
 layout(set = 2, binding = 0) uniform LightingUBO {
@@ -58,6 +58,10 @@ layout(set = 2, binding = 0) uniform LightingUBO {
                         // w = debug cascade tint
     vec4 viewForward;   // xyz = camera forward (world); w = shadowed sun light index (-1 = none)
     vec4 clusterDepth;  // clustered shading slicing range (unused in this pass)
+    // Spot shadow atlas state (Phase 4b), declared for layout parity with
+    // lighting.frag; the forward pass does not sample spot shadows.
+    mat4 shadowTileVp[16];
+    vec4 shadowAtlasParams;
 } lighting;
 layout(set = 2, binding = 1) uniform samplerCube iblIrradiance;
 layout(set = 2, binding = 2) uniform samplerCube iblPrefilter;

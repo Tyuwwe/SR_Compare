@@ -71,8 +71,9 @@ static_assert(sizeof(MaterialUBO) == 80, "MaterialUBO std140 size mismatch");
 struct LightGPU {
     float posOrDir[4]; // xyz = position (point/spot) / direction-to-light (directional), w = LightType
     float color[4];    // rgb + w = intensity (PI-scaled, see fillLightingUBO)
-    float params[4];   // x = range (0 = infinite), y = castShadow (C2),
-                       // z = shadowIndex (-1 until Phase 4b), w = spot cos(inner)
+    float params[4];   // x = range (0 = infinite), y = castShadow,
+                       // z = shadowIndex (spot shadow atlas tile, -1 = unshadowed),
+                       // w = spot cos(inner)
     float spotDir[4];  // xyz = spot cone direction (unit, world), w = spot cos(outer)
 };
 static_assert(sizeof(LightGPU) == 64, "LightGPU layout mismatch");
@@ -159,6 +160,41 @@ struct ShadowTargets {
     VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;             // tracked by the host
 };
 
+// --- Local-light shadow atlas (Phase 4b: shadow-casting spot lights) ---------
+// One D32 atlas per host (shared by the LR/GT/SSAA paths, like the CSM maps),
+// split into a row-major grid of square tiles.  Each frame the hosts score
+// every spot light with castShadow by intensity / distance^2 to the camera
+// (stable sort, ties keep the lower scene index) and assign the top
+// kShadowAtlasTiles lights a tile (Light::shadowIndex = tile); each tile's
+// spot view-projection goes to LightingUBO::shadowTileVp and the map is
+// rendered into the tile rect by recordSpotShadowPass.
+// Point lights are NOT shadow-mapped this phase: an omnidirectional map needs
+// 6 cube-face tiles per light (6x the tile budget plus per-face selection in
+// the fragment shader) or a seam-prone dual-paraboloid pair, neither of which
+// pays for itself in the current scenes.  Their shadowIndex stays -1 and they
+// shade unshadowed (documented leftover).
+constexpr uint32_t kShadowAtlasSize = 4096;     // D32, whole atlas
+constexpr uint32_t kShadowAtlasTileSize = 1024; // one tile per shadowed spot
+constexpr uint32_t kShadowAtlasGrid = kShadowAtlasSize / kShadowAtlasTileSize; // 4x4
+constexpr uint32_t kShadowAtlasTiles = kShadowAtlasGrid * kShadowAtlasGrid;    // 16
+// Perspective far plane for a spot with range == 0 (infinite): the shadow map
+// only needs to cover a generous fixed reach.
+constexpr float kSpotShadowInfiniteRange = 100.f;
+// Angular margin (radians) beyond the outer cone so the penumbra band and the
+// PCF kernel near the cone rim stay inside the map.
+constexpr float kSpotShadowFovMargin = 0.04f;
+
+// Host-owned spot-shadow atlas (same ownership model as ShadowTargets).  The
+// single whole-atlas 2D view doubles as the depth attachment (each light is
+// restricted to its tile via renderArea + viewport/scissor) and as the
+// comparison-sampled view (lighting set binding 14).
+struct ShadowAtlas {
+    VkImage image = VK_NULL_HANDLE;
+    VmaAllocation memory = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE;
+    VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED; // tracked by the host
+};
+
 // Per-frame cascade data fed into fillLightingUBO.  splitDepth[i] is the far
 // boundary of cascade i in view-space depth (positive metres).
 struct ShadowFrame {
@@ -166,6 +202,15 @@ struct ShadowFrame {
     float splitDepth[kShadowCascadeCount] = {};
     int32_t lightIndex = -1;   // index into LightingUBO::lights of the shadowed sun
     bool debugCascades = false;
+    // Spot shadow atlas (Phase 4b): per-tile spot view-projections and the
+    // number of tiles rendered this frame (0 = no spot shadows).  Tile t
+    // covers pixels [(t%kShadowAtlasGrid)*tile, (t/kShadowAtlasGrid)*tile] +
+    // kShadowAtlasTileSize^2.
+    Mat4 atlasVp[kShadowAtlasTiles];
+    uint32_t atlasTileCount = 0;
+    // Frame index; drives the deterministic CSM cascade-transition dither in
+    // lighting.frag (LightingUBO::shadowAtlasParams.z).
+    uint32_t frameIndex = 0;
 };
 
 // std140, matches the LightingUBO block in lighting.frag.
@@ -182,8 +227,15 @@ struct LightingUBO {
                             // z = shadowsEnabled, w = debugCascades
     float viewForward[4];   // xyz = camera forward (world); w = shadowed sun light index (-1 = none)
     float clusterDepth[4];  // x = near, y = far (exponential cluster slicing), zw unused
+    // Spot shadow atlas (Phase 4b): per-tile spot light view-projections
+    // (perspective, y-flipped Vulkan NDC like the CSM matrices); only the
+    // first shadowAtlasParams.x entries are valid.
+    float shadowTileVp[kShadowAtlasTiles][16];
+    float shadowAtlasParams[4]; // x = tiles rendered this frame,
+                                // y = 1 / kShadowAtlasSize (atlas texel, PCF step),
+                                // z = frame index (CSM cascade dither), w = unused
 };
-static_assert(sizeof(LightingUBO) == 1472, "LightingUBO std140 size mismatch");
+static_assert(sizeof(LightingUBO) == 2512, "LightingUBO std140 size mismatch");
 
 // Push constants of the cluster light-assignment pass (cluster_assign.comp),
 // 112 bytes.  The per-cluster view-space AABBs are derived in the shader from
@@ -552,12 +604,15 @@ public:
     // shadow = ShadowTargets::arrayView, or VK_NULL_HANDLE to leave binding 11
     // unwritten (hosts without a shadow pass; the shaders must run with
     // shadowParams.z == 0 then, which fillLightingUBO guarantees by default).
+    // shadowAtlas = ShadowAtlas::view (binding 14), same VK_NULL_HANDLE
+    // convention (safe while shadowAtlasParams.x == 0).
     // clusterLights/clusterGrid bind this slot's ClusterGrid buffers (bindings
     // 12/13: full lights SSBO + this path's per-cluster light lists).
     void writeLightingSet(const VulkanContext& ctx, VkDescriptorSet set, VkBuffer lightingUbo,
                           VkImageView albedo, VkImageView normal, VkImageView material,
                           VkImageView emissive, VkImageView depth, VkImageView ssao,
-                          VkImageView shadow, VkBuffer clusterLights, VkBuffer clusterGrid) const;
+                          VkImageView shadow, VkImageView shadowAtlas,
+                          VkBuffer clusterLights, VkBuffer clusterGrid) const;
 
     // --- pass recording (the caller owns all layout transitions) ---------------
     // Draws the scene into the already-begun GBuffer rendering block (merged
@@ -815,6 +870,36 @@ public:
                           const Mat4 cascadeVp[kShadowCascadeCount], VkDescriptorSet sceneSet,
                           VkDescriptorSet textureSet, uint32_t materialStride) const;
 
+    // --- Spot light shadow atlas (Phase 4b; see the constants above) -----------
+    // Creates the 4096^2 D32 atlas + the whole-atlas view.  The comparison
+    // sampler is shared with the CSM pass (shadowSampler()).
+    bool createShadowAtlas(const VulkanContext& ctx, ShadowAtlas& out) const;
+    void destroyShadowAtlas(const VulkanContext& ctx, ShadowAtlas& atlas) const;
+    // Deterministic per-frame tile assignment: scores every spot light with
+    // castShadow by intensity / distance^2 to the camera, stable-sorts by
+    // score descending (ties keep the lower scene index) and writes
+    // shadowIndex = tile for the top kShadowAtlasTiles lights; every other
+    // light's shadowIndex is reset to -1 (point lights are never selected
+    // this phase — see the atlas comment above).  Mutates the passed list, so
+    // hosts copy the scene list first; returns the number of tiles assigned.
+    // The same frame state always produces the same assignment on every host.
+    static uint32_t selectSpotShadowLights(std::vector<Light>& lights, const Vec3& cameraPos);
+    // Spot shadow view-projection of one light: perspective from the light
+    // position along spotDirection, fov = 2 * outerConeAngle + margin, far =
+    // range (kSpotShadowInfiniteRange when 0).  Camera-independent, so the
+    // map needs no texel snapping to stay stable frame-to-frame.
+    static Mat4 computeSpotShadowVp(const Light& light);
+    // Renders the scene depth of every selected light into its atlas tile:
+    // one dynamic-rendering block per tile (cleared to 1.0), renderArea +
+    // viewport/scissor restricted to the tile, per-tile frustum cull.  Same
+    // pipelines, depth bias and material rules as recordShadowPass (BLEND
+    // skipped, MASK alpha-discards, skinned casters included).  The caller
+    // owns the atlas layout transitions (DEPTH_STENCIL_ATTACHMENT before,
+    // SHADER_READ_ONLY after).
+    void recordSpotShadowPass(VkCommandBuffer cmd, const ShadowAtlas& atlas, const Scene& scene,
+                              const Mat4* tileVp, uint32_t tileCount, VkDescriptorSet sceneSet,
+                              VkDescriptorSet textureSet, uint32_t materialStride) const;
+
     VkDescriptorSetLayout sceneSetLayout() const { return sceneSetLayout_; }
     VkDescriptorSetLayout textureSetLayout() const { return textureSetLayout_; }
     VkDescriptorSetLayout lightingSetLayout() const { return lightingSetLayout_; }
@@ -841,6 +926,12 @@ private:
     bool loadShader(const VulkanContext& ctx, const char* name, VkShaderModule& out);
     bool createLayouts(const VulkanContext& ctx);
     bool createPipelines(const VulkanContext& ctx);
+    // Shared draw loop of the shadow depth passes (CSM cascades and spot
+    // atlas tiles): draws every frustum-visible opaque/skinned caster with the
+    // given light view-projection into the currently open rendering block.
+    void recordShadowDraws(VkCommandBuffer cmd, const Scene& scene, const Mat4& lightVp,
+                           VkDescriptorSet sceneSet, VkDescriptorSet textureSet,
+                           uint32_t materialStride) const;
 
     IblMaps ibl_;
 

@@ -323,6 +323,29 @@ bool GuiApp::init(const GuiOptions& opts) {
         shadowsActive_ = deferred_.createShadowTargets(ctx_, shadow_);
         if (!shadowsActive_)
             std::fprintf(stderr, "gui: shadow target creation failed, shadows disabled\n");
+        // Spot shadow atlas (Phase 4b); a failure degrades to sun-only shadows.
+        spotAtlasActive_ = deferred_.createShadowAtlas(ctx_, spotAtlas_);
+        if (!spotAtlasActive_)
+            std::fprintf(stderr, "gui: spot shadow atlas creation failed, spot shadows disabled\n");
+        // Start both shadow maps in SHADER_READ_ONLY so the descriptor
+        // bindings are layout-valid even on frames that render no shadows
+        // (shadows checkbox off, or a scene without casting lights).
+        submitOneShot(ctx_, [&](VkCommandBuffer cmd) {
+            if (shadowsActive_) {
+                imageBarrier(cmd, shadow_.image, VK_IMAGE_LAYOUT_UNDEFINED,
+                             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_NONE,
+                             VK_ACCESS_2_NONE, sync::kFragment, sync::kSampled,
+                             VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, kShadowCascadeCount);
+                shadow_.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            }
+            if (spotAtlasActive_) {
+                imageBarrier(cmd, spotAtlas_.image, VK_IMAGE_LAYOUT_UNDEFINED,
+                             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_NONE,
+                             VK_ACCESS_2_NONE, sync::kFragment, sync::kSampled,
+                             VK_IMAGE_ASPECT_DEPTH_BIT);
+                spotAtlas_.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            }
+        });
         stackOk_ = buildRenderStack();
     } else {
         statusLine_ = "deferred core init failed";
@@ -411,6 +434,7 @@ void GuiApp::shutdown() {
     bench_.stop();
     destroyRenderStack();
     if (shadowsActive_) { deferred_.destroyShadowTargets(ctx_, shadow_); shadowsActive_ = false; }
+    if (spotAtlasActive_) { deferred_.destroyShadowAtlas(ctx_, spotAtlas_); spotAtlasActive_ = false; }
     deferred_.destroy(ctx_);
     destroyUiSync();
     shutdownImGui();
@@ -1410,9 +1434,10 @@ bool GuiApp::createDescriptors() {
     VkDescriptorPoolSize sizes[5] = {};
     sizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     sizes[0].descriptorCount =
-        deferred::kMaxTextures + numColumns * 2 + 2 + numAlgos * 6 + 11 * kFramesInFlight * 4 +
+        deferred::kMaxTextures + numColumns * 2 + 2 + numAlgos * 6 + 12 * kFramesInFlight * 4 +
         7 * kFramesInFlight * 4 + 9 * kFramesInFlight * 4 + 10 * 3 + 3 * 6 + hizSets + colorSets +
-        2; // + ssr temporal samplers (GB/GT/SSAA x2 sets); auto-exposure HDR sources (LR + GT)
+        2; // + ssr temporal samplers (GB/GT/SSAA x2 sets); auto-exposure HDR sources (LR + GT);
+           // lighting sets: 12 samplers each (GB/GT/SSAA/spatial), incl. shadow + spot atlas
     sizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     sizes[1].descriptorCount = kFramesInFlight * 3 + numColumns + numAlgos + kFramesInFlight * 4 +
                                kFramesInFlight * 4 + kFramesInFlight * 4; // + opaque-SSR UBOs
@@ -1957,24 +1982,26 @@ bool GuiApp::createSyncResources() {
         // off) via fillLightingUBO.  VK_NULL_HANDLE (creation failed) leaves
         // binding 11 unwritten, which is safe only while shadows stay off.
         const VkImageView shadowView = shadowsActive_ ? shadow_.arrayView : VK_NULL_HANDLE;
+        const VkImageView spotAtlasView = spotAtlasActive_ ? spotAtlas_.view : VK_NULL_HANDLE;
         deferred_.writeLightingSet(ctx_, fr.lightingSetGb, fr.lightingUboGb, gbAlbedo_.view,
                                    gbNormal_.view, gbMaterial_.view, gbEmissive_.view,
-                                   gbDepth_.view, gbAo_.view, shadowView,
+                                   gbDepth_.view, gbAo_.view, shadowView, spotAtlasView,
                                    gbCluster_.lightsBuffer[i], gbCluster_.gridBuffer[i]);
         deferred_.writeLightingSet(ctx_, fr.lightingSetGbSpatial, fr.lightingUboGbSpatial,
                                    gbAlbedo_.view, gbNormal_.view, gbMaterial_.view,
                                    gbEmissive_.view, gbDepth_.view, gbAo_.view, shadowView,
+                                   spotAtlasView,
                                    gbCluster_.lightsBuffer[i], gbCluster_.gridBuffer[i]);
         deferred_.writeLightingSet(ctx_, fr.lightingSetGt, fr.lightingUboGt, gtAlbedo_.view,
                                    gtNormal_.view, gtMaterial_.view, gtEmissive_.view,
-                                   gtDepth_.view, gtAo_.view, shadowView,
+                                   gtDepth_.view, gtAo_.view, shadowView, spotAtlasView,
                                    gtCluster_.lightsBuffer[i], gtCluster_.gridBuffer[i]);
         if (active_.gtSsaa) {
             // GT and GT-SSAA share the same (resolution-independent) UBO.
             deferred_.writeLightingSet(ctx_, fr.lightingSetSsaa, fr.lightingUboGt,
                                        gtSsaaAlbedo_.view, gtSsaaNormal_.view,
                                        gtSsaaMaterial_.view, gtSsaaEmissive_.view,
-                                       gtSsaaDepth_.view, gtSsaaAo_.view, shadowView,
+                                       gtSsaaDepth_.view, gtSsaaAo_.view, shadowView, spotAtlasView,
                                        gtSsaaCluster_.lightsBuffer[i], gtSsaaCluster_.gridBuffer[i]);
         }
 
@@ -2840,7 +2867,10 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     // packed override order (the GUI sun may be prepended at index 0).  The
     // GT and SSAA paths sample the same map.  The "shadows" checkbox off
     // leaves shadow null (shadowParams.z = 0).
-    const std::vector<Light> lights = buildLightOverride();
+    // Phase 4b: shadow-casting spots are additionally scored by
+    // intensity/distance^2 and the top kShadowAtlasTiles get an atlas tile
+    // (selectSpotShadowLights writes shadowIndex into the override list).
+    std::vector<Light> lights = buildLightOverride();
     ShadowFrame shadowFrame;
     const ShadowFrame* shadow = nullptr;
     if (shadowsActive_ && shadowsEnabled_) {
@@ -2849,11 +2879,21 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                 DeferredCore::computeCascadeVPs(camera_, aspect, lights[i].positionOrDirection,
                                                 shadowFrame.cascadeVp, shadowFrame.splitDepth);
                 shadowFrame.lightIndex = static_cast<int32_t>(i);
-                shadowFrame.debugCascades = shadowDebugCascades_;
-                shadow = &shadowFrame;
                 break;
             }
         }
+        if (spotAtlasActive_) {
+            shadowFrame.atlasTileCount =
+                DeferredCore::selectSpotShadowLights(lights, camera_.position);
+            for (const Light& l : lights) {
+                if (l.shadowIndex >= 0)
+                    shadowFrame.atlasVp[l.shadowIndex] = DeferredCore::computeSpotShadowVp(l);
+            }
+        }
+        shadowFrame.debugCascades = shadowDebugCascades_;
+        shadowFrame.frameIndex = frameIndex;
+        if (shadowFrame.lightIndex >= 0 || shadowFrame.atlasTileCount > 0)
+            shadow = &shadowFrame;
     }
     updateLightingUBO(fr.lightingUboGbMapped,
                       Mat4::inverse(Mat4::multiply(projJittered, view)), lights, shadow);
@@ -2884,7 +2924,7 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     // moves).  CompareApp/Renderer place this pass ahead of lighting for the
     // same reason.  It only needs scene geometry, so it runs before the GBuffer
     // pass and also covers the gbuffer-less (GT-only) configuration.
-    if (shadow) {
+    if (shadow && shadow->lightIndex >= 0) {
         imageBarrier(cmd, shadow_.image, shadow_.layout,
                      VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, sync::kFragment,
                      sync::kSampled, sync::kDepthTests, sync::kDepthReadWrite,
@@ -2896,6 +2936,23 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                      sync::kDepthTests, sync::kDepthWrite, sync::kFragment, sync::kSampled,
                      VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, kShadowCascadeCount);
         shadow_.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    }
+    // Spot shadow atlas (Phase 4b): one 1024^2 tile per selected spot, shared
+    // by all lighting paths like the CSM map.
+    if (shadow && shadow->atlasTileCount > 0) {
+        imageBarrier(cmd, spotAtlas_.image, spotAtlas_.layout,
+                     VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, sync::kFragment,
+                     sync::kSampled, sync::kDepthTests, sync::kDepthReadWrite,
+                     VK_IMAGE_ASPECT_DEPTH_BIT);
+        spotAtlas_.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        deferred_.recordSpotShadowPass(cmd, spotAtlas_, scene_, shadow->atlasVp,
+                                       shadow->atlasTileCount, fr.sceneSetGb, textureSet_,
+                                       materialStride_);
+        imageBarrier(cmd, spotAtlas_.image, spotAtlas_.layout,
+                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kDepthTests,
+                     sync::kDepthWrite, sync::kFragment, sync::kSampled,
+                     VK_IMAGE_ASPECT_DEPTH_BIT);
+        spotAtlas_.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     }
 
     // --- 1) low-resolution GBuffer (jittered for temporal; extra unjittered

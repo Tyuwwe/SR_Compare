@@ -125,12 +125,35 @@ bool Renderer::init(const RendererOptions& opts) {
     if (!createRenderTargets()) return false;
     // Shared deferred pipeline: IBL maps + shaders + layouts + pipelines.
     if (!deferred_.init(ctx_, opts_.envMapPath.c_str())) return false;
-    // CSM shadow targets (fixed size; a failure degrades to no shadows).
-    if (opts_.shadows) {
-        shadowsActive_ = deferred_.createShadowTargets(ctx_, shadow_);
-        if (!shadowsActive_)
-            std::fprintf(stderr, "warning: shadow target creation failed, shadows disabled\n");
-    }
+    // CSM shadow targets + spot shadow atlas (fixed size; a failure degrades
+    // to no shadows).  Created unconditionally like CompareApp/GuiApp so the
+    // lighting set's shadow bindings are always written; --no-shadows only
+    // zeroes shadowParams.z (sampling off) via fillLightingUBO.
+    shadowsActive_ = deferred_.createShadowTargets(ctx_, shadow_);
+    if (!shadowsActive_)
+        std::fprintf(stderr, "warning: shadow target creation failed, shadows disabled\n");
+    spotAtlasActive_ = deferred_.createShadowAtlas(ctx_, spotAtlas_);
+    if (!spotAtlasActive_)
+        std::fprintf(stderr, "warning: spot shadow atlas creation failed, spot shadows disabled\n");
+    // Start both shadow maps in SHADER_READ_ONLY so the descriptor bindings
+    // are layout-valid even on frames that render no shadows (--no-shadows or
+    // a scene without casting lights).
+    submitOneShot(ctx_, [&](VkCommandBuffer cmd) {
+        if (shadowsActive_) {
+            imageBarrier(cmd, shadow_.image, VK_IMAGE_LAYOUT_UNDEFINED,
+                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_NONE,
+                         VK_ACCESS_2_NONE, sync::kFragment, sync::kSampled,
+                         VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, kShadowCascadeCount);
+            shadow_.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        }
+        if (spotAtlasActive_) {
+            imageBarrier(cmd, spotAtlas_.image, VK_IMAGE_LAYOUT_UNDEFINED,
+                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_NONE,
+                         VK_ACCESS_2_NONE, sync::kFragment, sync::kSampled,
+                         VK_IMAGE_ASPECT_DEPTH_BIT);
+            spotAtlas_.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        }
+    });
     if (!createShaders()) return false;
     if (!createSceneDescriptors()) return false;
     if (!createAutoExposureResources()) return false;
@@ -344,7 +367,7 @@ bool Renderer::createSceneDescriptors() {
     const uint32_t colorSets = gbColorPyramid_.mipCount + gtColorPyramid_.mipCount;
     sizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     sizes[0].descriptorCount = deferred::kMaxTextures + 1 + // texture array + present
-                               11 * kFramesInFlight * 2 + // lighting sets (GB/GT), +1 shadow map
+                               12 * kFramesInFlight * 2 + // lighting sets (GB/GT), +1 shadow +1 atlas
                                7 * kFramesInFlight * 2 +  // transparent sets (GB/GT), +SSR+shadow
                                9 * kFramesInFlight * 2 +  // opaque-SSR trace sets (GB/GT)
                                2 * 2 + 3 * 4 + 1 * 4 +     // ssao + temporal + blur samplers
@@ -620,14 +643,15 @@ bool Renderer::createSyncResources() {
             return false;
 
         const VkImageView shadowView = shadowsActive_ ? shadow_.arrayView : VK_NULL_HANDLE;
+        const VkImageView spotAtlasView = spotAtlasActive_ ? spotAtlas_.view : VK_NULL_HANDLE;
         deferred_.writeLightingSet(ctx_, frames_[i].lightingSetGb, frames_[i].lightingUbo,
                                    gbAlbedo_.view, gbNormal_.view, gbMaterial_.view,
                                    gbEmissive_.view, gbDepth_.view, gbAo_.view, shadowView,
-                                   gbCluster_.lightsBuffer[i], gbCluster_.gridBuffer[i]);
+                                   spotAtlasView, gbCluster_.lightsBuffer[i], gbCluster_.gridBuffer[i]);
         deferred_.writeLightingSet(ctx_, frames_[i].lightingSetGt, frames_[i].lightingUbo,
                                    gtAlbedo_.view, gtNormal_.view, gtMaterial_.view,
                                    gtEmissive_.view, gtDepth_.view, gtAo_.view, shadowView,
-                                   gtCluster_.lightsBuffer[i], gtCluster_.gridBuffer[i]);
+                                   spotAtlasView, gtCluster_.lightsBuffer[i], gtCluster_.gridBuffer[i]);
 
         // Per-path transparent sets (each binds its own path's SSAO texture).
         const VkDescriptorSetLayout transparentLayout = deferred_.transparentSetLayout();
@@ -779,15 +803,17 @@ void Renderer::updateSceneUBO(uint32_t frameIndex, bool jitter, uint32_t renderW
 }
 
 void Renderer::updateLightingUBO(uint32_t frameIndex, const Mat4& invViewProj,
-                                 const ShadowFrame* shadow) {
+                                 const ShadowFrame* shadow,
+                                 const std::vector<Light>* overrideLights) {
     FrameResources& fr = frames_[frameIndex % kFramesInFlight];
     LightingUBO ubo;
-    deferred_.fillLightingUBO(ubo, scene_, camera_, invViewProj, nullptr, shadow, iblIntensity_);
+    deferred_.fillLightingUBO(ubo, scene_, camera_, invViewProj, overrideLights, shadow,
+                              iblIntensity_);
     std::memcpy(fr.lightingUboMapped, &ubo, sizeof(ubo));
     // Full point/spot light set for the clustered pass (same slot rule as the
     // UBO: the slot's fence passed before recording).
     const uint32_t slot = frameIndex % kFramesInFlight;
-    const std::vector<Light>& lights = DeferredCore::effectiveLights(scene_, nullptr);
+    const std::vector<Light>& lights = DeferredCore::effectiveLights(scene_, overrideLights);
     deferred_.fillClusterLights(gbCluster_.lightsMapped[slot], lights);
     deferred_.fillClusterLights(gtCluster_.lightsMapped[slot], lights);
 }
@@ -886,12 +912,17 @@ void Renderer::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     // view-projection used for this pass (jittered for the low-res path).
     const Mat4 viewProjUsed = Mat4::multiply(gbuffer ? projJittered : proj, view);
 
-    // CSM sun shadows: pick the first shadow-casting directional light (same
-    // light-list selection rule as fillLightingUBO) and compute the cascades.
-    // The GT path samples the same map — GT is the same lighting at native res.
+    // Shadows (Phase 4b): CSM sun cascades (first shadow-casting directional,
+    // same selection rule as fillLightingUBO) plus the spot shadow atlas —
+    // shadow-casting spots are scored by intensity/distance^2 and the top
+    // kShadowAtlasTiles get a tile (selectSpotShadowLights writes shadowIndex
+    // into a lights copy that overrides both the UBO and the cluster SSBO).
+    // The GT path samples the same maps — GT is the same lighting at native res.
     ShadowFrame shadowFrame;
     const ShadowFrame* shadow = nullptr;
-    if (shadowsActive_) {
+    std::vector<Light> shadowLights;
+    const std::vector<Light>* lightsOverride = nullptr;
+    if (shadowsActive_ && opts_.shadows) {
         const std::vector<Light>& lights =
             scene_.lights.empty() ? defaultLights() : scene_.lights;
         for (uint32_t i = 0; i < lights.size(); ++i) {
@@ -899,14 +930,26 @@ void Renderer::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                 DeferredCore::computeCascadeVPs(camera_, aspect, lights[i].positionOrDirection,
                                                 shadowFrame.cascadeVp, shadowFrame.splitDepth);
                 shadowFrame.lightIndex = static_cast<int32_t>(i);
-                shadowFrame.debugCascades = opts_.shadowDebug;
-                shadow = &shadowFrame;
                 break;
             }
         }
+        if (spotAtlasActive_) {
+            shadowLights = lights;
+            shadowFrame.atlasTileCount =
+                DeferredCore::selectSpotShadowLights(shadowLights, camera_.position);
+            for (const Light& l : shadowLights) {
+                if (l.shadowIndex >= 0)
+                    shadowFrame.atlasVp[l.shadowIndex] = DeferredCore::computeSpotShadowVp(l);
+            }
+            lightsOverride = &shadowLights;
+        }
+        shadowFrame.debugCascades = opts_.shadowDebug;
+        shadowFrame.frameIndex = frameIndex;
+        if (shadowFrame.lightIndex >= 0 || shadowFrame.atlasTileCount > 0)
+            shadow = &shadowFrame;
     }
     const Mat4 invViewProjUsed = Mat4::inverse(viewProjUsed);
-    updateLightingUBO(frameIndex, invViewProjUsed, shadow);
+    updateLightingUBO(frameIndex, invViewProjUsed, shadow, lightsOverride);
 
     ImageResource& tgtAlbedo = gbuffer ? gbAlbedo_ : gtAlbedo_;
     ImageResource& tgtNormal = gbuffer ? gbNormal_ : gtNormal_;
@@ -981,7 +1024,7 @@ void Renderer::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
 
     // --- Shadow pass (sun CSM, one 2048^2 layer per cascade) -----------------
     // Runs once per frame and feeds both the LR and the GT lighting paths.
-    if (shadow) {
+    if (shadow && shadow->lightIndex >= 0) {
         // Sampled by the lighting fragment shaders last frame -> depth attach.
         imageBarrier(cmd, shadow_.image, shadow_.layout,
                      VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
@@ -996,6 +1039,24 @@ void Renderer::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                      sync::kFragment, sync::kSampled,
                      VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, kShadowCascadeCount);
         shadow_.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    }
+
+    // --- Spot shadow atlas (Phase 4b, one 1024^2 tile per selected spot) -----
+    // Same once-per-frame sharing between the LR and GT paths as the CSM pass.
+    if (shadow && shadow->atlasTileCount > 0) {
+        imageBarrier(cmd, spotAtlas_.image, spotAtlas_.layout,
+                     VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                     sync::kFragment, sync::kSampled, sync::kDepthTests, sync::kDepthReadWrite,
+                     VK_IMAGE_ASPECT_DEPTH_BIT);
+        spotAtlas_.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        deferred_.recordSpotShadowPass(cmd, spotAtlas_, scene_, shadow->atlasVp,
+                                       shadow->atlasTileCount, fr.sceneSet, textureSet_,
+                                       materialStride_);
+        imageBarrier(cmd, spotAtlas_.image, spotAtlas_.layout,
+                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                     VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT, sync::kDepthWrite,
+                     sync::kFragment, sync::kSampled, VK_IMAGE_ASPECT_DEPTH_BIT);
+        spotAtlas_.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     }
 
     // --- Lighting pass (deferred PBR + IBL, skybox on far-plane pixels) --------
@@ -1467,6 +1528,7 @@ void Renderer::shutdown() {
     finalImage_.destroy(ctx_);
 
     if (shadowsActive_) { deferred_.destroyShadowTargets(ctx_, shadow_); shadowsActive_ = false; }
+    if (spotAtlasActive_) { deferred_.destroyShadowAtlas(ctx_, spotAtlas_); spotAtlasActive_ = false; }
 
     deferred_.destroy(ctx_);
 

@@ -204,7 +204,7 @@ struct Light {
     Vec3 color{1.f, 1.f, 1.f};
     float intensity = 1.f;
     float range = 0.f;       // point/spot only, 0 = infinite (pure inverse-square)
-    bool castShadow = false; // consumed by the C2 shadow pass; stored only for now
+    bool castShadow = false; // CSM sun (directional) or spot shadow atlas eligibility
     // Spot only (KHR_lights_punctual): unit direction the cone points (world
     // space) and the inner/outer half-angles in radians (umbra/penumbra).
     // Shading fades smoothly from innerCos to outerCos; the cluster assignment
@@ -212,8 +212,9 @@ struct Light {
     Vec3 spotDirection{0.f, -1.f, 0.f};
     float innerConeAngle = 0.f;                    // full intensity inside
     float outerConeAngle = 3.14159265f / 4.f;      // zero intensity outside
-    int32_t shadowIndex = -1; // per-light shadow-map slot; -1 = unshadowed
-                              // (wired in Phase 4b, always -1 for now)
+    int32_t shadowIndex = -1; // spot shadow atlas tile (Phase 4b), -1 =
+                              // unshadowed; rewritten per frame by
+                              // DeferredCore::selectSpotShadowLights
 };
 
 // Elevation (deg above horizon) / azimuth (deg, 0 = +Z, 90 = +X) to a unit

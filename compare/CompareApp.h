@@ -262,6 +262,9 @@ private:
     // degrades to no shadows (bindings stay unwritten, sampling stays off).
     ShadowTargets shadow_;
     bool shadowsActive_ = false;
+    // Spot light shadow atlas (Phase 4b, fixed 4096^2, shared by all paths).
+    ShadowAtlas spotAtlas_;
+    bool spotAtlasActive_ = false;
     float iblIntensity_ = 1.f; // from lightingPresetForScene
 
     VkDescriptorSetLayout composeSetLayout_ = VK_NULL_HANDLE;
@@ -398,8 +401,9 @@ private:
     void updateSceneUBO(void* mapped, bool jitter, uint32_t renderW, uint32_t renderH,
                         const Mat4& view, const Mat4& proj, const Mat4& projJittered,
                         const Mat4& prevViewProj);
-    void updateLightingUBO(void* mapped, const Mat4& invViewProj, const ShadowFrame* shadow);
-    void updateClusterLights(uint32_t frameIndex);
+    void updateLightingUBO(void* mapped, const Mat4& invViewProj, const ShadowFrame* shadow,
+                           const std::vector<Light>* overrideLights);
+    void updateClusterLights(uint32_t frameIndex, const std::vector<Light>& lights);
     void updateCamera(uint32_t frameIndex, float dt);
     void recordFrame(uint32_t frameIndex, uint32_t swapchainIndex);
     void captureScreenshotIntoStaging(VkCommandBuffer cmd);

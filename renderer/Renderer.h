@@ -182,10 +182,14 @@ private:
     DeferredCore deferred_;
 
     // CSM sun shadow targets (fixed 2048^2 x 4, resolution-independent).
-    // shadowsActive_ is false when creation failed or --no-shadows; the UBO
-    // then keeps shadowParams.z = 0 and the shaders short-circuit.
+    // Created unconditionally (the descriptor binding must stay written);
+    // shadowsActive_ is false only when creation failed, and --no-shadows
+    // keeps shadowParams.z = 0 so the shaders short-circuit.
     ShadowTargets shadow_;
     bool shadowsActive_ = false;
+    // Spot light shadow atlas (Phase 4b, fixed 4096^2, shared by both paths).
+    ShadowAtlas spotAtlas_;
+    bool spotAtlasActive_ = false;
     float iblIntensity_ = 1.f; // from lightingPresetForScene; not a CLI flag
 
     VkDescriptorSetLayout presentSetLayout_ = VK_NULL_HANDLE;
@@ -246,7 +250,8 @@ private:
     void updateSceneUBO(uint32_t frameIndex, bool jitter, uint32_t renderW, uint32_t renderH,
                         const Mat4& view, const Mat4& proj, const Mat4& projJittered,
                         const Mat4& prevViewProj);
-    void updateLightingUBO(uint32_t frameIndex, const Mat4& invViewProj, const ShadowFrame* shadow);
+    void updateLightingUBO(uint32_t frameIndex, const Mat4& invViewProj, const ShadowFrame* shadow,
+                           const std::vector<Light>* overrideLights);
     void updateCamera(uint32_t frameIndex, float dt);
     void applyCameraKeyframe(uint32_t frameIndex);
     void recordFrame(uint32_t frameIndex, uint32_t swapchainIndex);

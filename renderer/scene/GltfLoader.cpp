@@ -670,6 +670,10 @@ bool Scene::loadGltf(const VulkanContext& ctx, const char* path, VkCommandPool p
                     normalize(transformDirection(worldMat, Vec3{0.f, 0.f, -1.f}));
                 l.innerConeAngle = gl->spot_inner_cone_angle;
                 l.outerConeAngle = std::max(gl->spot_outer_cone_angle, gl->spot_inner_cone_angle + 1e-3f);
+                // Authored spots are shadow-casting by default (DCC authoring
+                // intent); the Phase 4b atlas selection caps how many actually
+                // render a map per frame.  Points stay non-casting this phase.
+                l.castShadow = true;
             }
         }
         lights.push_back(l);

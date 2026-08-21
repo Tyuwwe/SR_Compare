@@ -587,6 +587,10 @@ private:
     // (creation failed) degrades to no shadows.
     ShadowTargets shadow_;
     bool shadowsActive_ = false;
+    // Spot light shadow atlas (Phase 4b, fixed 4096^2): same lifetime and
+    // sharing as the CSM targets.
+    ShadowAtlas spotAtlas_;
+    bool spotAtlasActive_ = false;
 
     VkDescriptorSetLayout composeSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout copySetLayout_ = VK_NULL_HANDLE;

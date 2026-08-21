@@ -12,13 +12,18 @@
 // list.  Directional lights (the CSM sun) bypass the clusters and are shaded
 // straight from the UBO's legacy 16-slot array, which also still feeds the
 // forward transparency pass.
+//
+// Shadows (Phase 4b): the sun uses 4 CSM cascades with a temporally dithered
+// cascade transition; shadow-casting spot lights selected into the shadow
+// atlas this frame (LightGPU.params.z = tile) sample their 1024^2 atlas tile
+// with the same 16-tap PCF.  Point lights are unshadowed this phase.
 
 // GPU mirror of scene::Light; must match LightGPU in DeferredCore.h.
 struct LightGPU {
     vec4 posOrDir; // xyz = position (point/spot) / direction-to-light (directional), w = type (0 = dir, 1 = point, 2 = spot)
     vec4 color;    // rgb + w = intensity (PI-scaled on the CPU)
-    vec4 params;   // x = range (0 = infinite), y = castShadow (reserved, C2),
-                   // z = shadowIndex (-1 until Phase 4b), w = spot cos(inner)
+    vec4 params;   // x = range (0 = infinite), y = castShadow,
+                   // z = shadowIndex (spot atlas tile, -1 = unshadowed), w = spot cos(inner)
     vec4 spotDir;  // xyz = spot cone direction (unit, world), w = spot cos(outer)
 };
 
@@ -35,6 +40,12 @@ layout(set = 0, binding = 0) uniform LightingUBO {
                         // z = shadows enabled, w = debug cascade tint
     vec4 viewForward;   // xyz = camera forward (world); w = shadowed sun light index (-1 = none)
     vec4 clusterDepth;  // x = near, y = far (exponential cluster slicing), zw unused
+    mat4 shadowTileVp[16]; // spot shadow atlas per-tile light VPs (must match
+                           // kShadowAtlasTiles in DeferredCore.h); only the
+                           // first shadowAtlasParams.x entries are valid
+    vec4 shadowAtlasParams; // x = tiles rendered this frame, y = 1/atlasSize
+                            // (PCF texel step), z = frame index (CSM cascade
+                            // dither), w = unused
 } u;
 
 layout(set = 0, binding = 1) uniform sampler2D gbAlbedo;
@@ -57,6 +68,9 @@ layout(std430, set = 0, binding = 13) readonly buffer ClusterGridSSBO {
     uvec4 gridHeader; // gridX, gridY, gridZ, maxPerCluster
     uint data[];      // counts[N] then indices[N * maxPerCluster]
 } clusterGrid;
+// Spot shadow atlas (Phase 4b): 4096^2 D32, 16 row-major 1024^2 tiles,
+// comparison sampler shared with the CSM map.
+layout(set = 0, binding = 14) uniform sampler2DShadow shadowAtlas;
 
 // Screen-tile edge of the cluster grid; must match kClusterTileSize in
 // DeferredCore.h.
@@ -135,18 +149,59 @@ float sampleCascade(int c, vec3 worldPos) {
     return sum / 16.0;
 }
 
-// Shadow factor for the CSM sun; blends into the next cascade over the outer
-// 10% of the current one to hide the resolution transition.
-float sunShadow(vec3 worldPos, float viewDepth, out int cascade) {
+// Temporal dither for the CSM cascade transition: interleaved gradient noise
+// (Jimenez 2014) offset by the frame index, so the cascade chosen in the 10%
+// blend zone varies per pixel AND per frame (deterministic — same frame index
+// always reproduces the same pattern).  Dithering picks ONE cascade instead of
+// PCF-sampling and blending both maps: cheaper, and the seam reads as
+// blue-ish noise that TAA/temporal passes absorb rather than a resolution ramp.
+float cascadeDither(ivec2 pix) {
+    const float f = mod(u.shadowAtlasParams.z, 64.0);
+    const vec2 p = vec2(pix) + vec2(5.588238) * f;
+    return fract(52.9829189 * fract(0.06711056 * p.x + 0.00583715 * p.y));
+}
+
+// Shadow factor for the CSM sun.  Within the outer 10% of a cascade the
+// per-pixel dithered threshold switches to the next cascade, hiding the
+// resolution transition.
+float sunShadow(vec3 worldPos, float viewDepth, ivec2 pix, out int cascade) {
     cascade = selectCascade(viewDepth);
-    float s = sampleCascade(cascade, worldPos);
     if (cascade < 3) {
         const float split = u.cascadeSplits[cascade];
         const float blend = clamp((viewDepth - split * 0.9) / (split * 0.1), 0.0, 1.0);
-        if (blend > 0.0)
-            s = mix(s, sampleCascade(cascade + 1, worldPos), blend);
+        if (blend > 0.0 && cascadeDither(pix) < blend) ++cascade;
     }
-    return s;
+    return sampleCascade(cascade, worldPos);
+}
+
+// --- Spot shadow atlas sampling (Phase 4b) ------------------------------------
+// Tile UV rect is derived from the tile index (row-major 4x4 grid).  PCF taps
+// must never cross a tile boundary (the atlas is one texture and the shared
+// border-white sampler only guards the outer edge), so the projected UV is
+// clamped with a 2-texel inset — that covers the 16-tap kernel footprint plus
+// the comparison sampler's bilinear footprint.  PCSS-style variable penumbra
+// was considered and skipped: a distance-widened kernel injects noise that
+// fights TAA and the GT/upscaler pixel parity this tool exists to measure;
+// the fixed 16-tap kernel matches the CSM quality level.
+float spotShadow(int tile, vec3 worldPos) {
+    vec4 sc = u.shadowTileVp[tile] * vec4(worldPos, 1.0);
+    vec3 p = sc.xyz / sc.w;
+    // Behind the light or past the far plane: unshadowed (outside the cone
+    // frustum the cone falloff in shadeLight zeroes the contribution anyway).
+    if (p.z <= 0.0 || p.z >= 1.0) return 1.0;
+    vec2 ndc = p.xy * 0.5 + 0.5; // y-flipped NDC -> tile-local UV (same as CSM)
+    if (any(lessThan(ndc, vec2(0.0))) || any(greaterThan(ndc, vec2(1.0)))) return 1.0;
+    const float inset = 2.0 / 1024.0; // PCF kernel + bilinear footprint, tile UV
+    ndc = clamp(ndc, vec2(inset), vec2(1.0 - inset));
+    const vec2 tileMin = vec2(float(tile % 4), float(tile / 4)) * 0.25;
+    const vec2 uv = tileMin + ndc * 0.25;
+    const float ref = p.z - kShadowDepthEpsilon;
+    const float texel = u.shadowAtlasParams.y; // 1/atlasSize
+    float sum = 0.0;
+    for (int y = -1; y <= 2; ++y)
+        for (int x = -1; x <= 2; ++x)
+            sum += texture(shadowAtlas, vec3(uv + (vec2(x, y) - 0.5) * texel, ref));
+    return sum / 16.0;
 }
 
 void main() {
@@ -204,7 +259,7 @@ void main() {
         float shadow = 1.0;
         if (u.shadowParams.z > 0.5 && i == sunIndex) {
             int c;
-            shadow = sunShadow(wp.xyz, viewDepth, c);
+            shadow = sunShadow(wp.xyz, viewDepth, pix, c);
             debugCascade = c;
         }
         color += shadeLight(N, V, wp.xyz, albedo, metallic, roughness, F0, u.lights[i]) * shadow;
@@ -230,7 +285,14 @@ void main() {
         const uint base = clusterCount + clusterIdx * maxPerCluster;
         for (uint j = 0; j < count; ++j) {
             const LightGPU l = clusterLights.lights[clusterGrid.data[base + j]];
-            color += shadeLight(N, V, wp.xyz, albedo, metallic, roughness, F0, l);
+            // Spot shadow atlas: shadowIndex (params.z) >= 0 selects the
+            // light's atlas tile.  Points keep -1 this phase (no map).
+            float shadow = 1.0;
+            const int tile = int(floor(l.params.z + 0.5));
+            if (u.shadowParams.z > 0.5 && tile >= 0 &&
+                tile < int(floor(u.shadowAtlasParams.x + 0.5)))
+                shadow = spotShadow(tile, wp.xyz);
+            color += shadeLight(N, V, wp.xyz, albedo, metallic, roughness, F0, l) * shadow;
         }
     }
 

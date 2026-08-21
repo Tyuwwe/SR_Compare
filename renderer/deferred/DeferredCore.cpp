@@ -106,7 +106,7 @@ void packLightGpu(const Light& l, LightGPU& g) {
     g.color[3] = l.intensity * 3.14159265f;
     g.params[0] = l.range;
     g.params[1] = l.castShadow ? 1.f : 0.f;
-    g.params[2] = static_cast<float>(l.shadowIndex); // -1 until Phase 4b
+    g.params[2] = static_cast<float>(l.shadowIndex); // spot atlas tile, -1 = unshadowed
     g.params[3] = std::cos(l.innerConeAngle);
     g.spotDir[0] = l.spotDirection.x;
     g.spotDir[1] = l.spotDirection.y;
@@ -253,8 +253,9 @@ bool DeferredCore::createLayouts(const VulkanContext& ctx) {
     // 10 = SSAO (blurred screen-space AO, R16F); 11 = CSM shadow map array
     // (D32, comparison sampler); 12 = clustered-shading lights SSBO (all
     // point/spot lights, std430); 13 = this path's cluster grid SSBO
-    // (per-cluster light index lists).
-    VkDescriptorSetLayoutBinding lightBindings[14] = {};
+    // (per-cluster light index lists); 14 = spot shadow atlas (D32,
+    // comparison sampler).
+    VkDescriptorSetLayoutBinding lightBindings[15] = {};
     lightBindings[0].binding = 0;
     lightBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     lightBindings[0].descriptorCount = 1;
@@ -271,9 +272,13 @@ bool DeferredCore::createLayouts(const VulkanContext& ctx) {
         lightBindings[i].descriptorCount = 1;
         lightBindings[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     }
+    lightBindings[14].binding = 14;
+    lightBindings[14].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    lightBindings[14].descriptorCount = 1;
+    lightBindings[14].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     VkDescriptorSetLayoutCreateInfo lightLayoutCi = {};
     lightLayoutCi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    lightLayoutCi.bindingCount = 14;
+    lightLayoutCi.bindingCount = 15;
     lightLayoutCi.pBindings = lightBindings;
     if (vkCreateDescriptorSetLayout(ctx.device, &lightLayoutCi, nullptr, &lightingSetLayout_) !=
         VK_SUCCESS)
@@ -1281,15 +1286,26 @@ void DeferredCore::fillLightingUBO(LightingUBO& out, const Scene& scene, const C
     // same constants to vkCmdSetDepthBias in recordShadowPass.
     out.shadowParams[0] = kShadowDepthBiasConstant;
     out.shadowParams[1] = kShadowDepthBiasSlope;
+    // The sun shadow index is armed only when the packed slot-0 sun actually
+    // casts (a frame with spot-atlas tiles but no casting sun must not enable
+    // CSM sampling on a non-casting directional).
+    const bool sunShadowed =
+        shadow && sunSrc >= 0 && lights[static_cast<size_t>(sunSrc)].castShadow;
+    out.shadowAtlasParams[1] = 1.f / static_cast<float>(kShadowAtlasSize);
+    out.shadowAtlasParams[3] = 0.f;
     if (shadow) {
         for (uint32_t i = 0; i < kShadowCascadeCount; ++i) {
             std::memcpy(out.cascadeVp[i], shadow->cascadeVp[i].m, sizeof(out.cascadeVp[i]));
             out.cascadeSplits[i] = shadow->splitDepth[i];
         }
+        for (uint32_t i = 0; i < kShadowAtlasTiles; ++i)
+            std::memcpy(out.shadowTileVp[i], shadow->atlasVp[i].m, sizeof(out.shadowTileVp[i]));
+        out.shadowAtlasParams[0] = static_cast<float>(shadow->atlasTileCount);
+        out.shadowAtlasParams[2] = static_cast<float>(shadow->frameIndex);
         out.shadowParams[2] = 1.f; // shadows enabled
         out.shadowParams[3] = shadow->debugCascades ? 1.f : 0.f;
         // Packed index: the sun is always slot 0 when present.
-        out.viewForward[3] = (sunSrc >= 0) ? 0.f : -1.f;
+        out.viewForward[3] = sunShadowed ? 0.f : -1.f;
     } else {
         // Deterministic disabled state: identity VPs, infinite splits; the
         // shaders short-circuit on shadowParams.z before touching the map.
@@ -1298,6 +1314,10 @@ void DeferredCore::fillLightingUBO(LightingUBO& out, const Scene& scene, const C
             std::memcpy(out.cascadeVp[i], identity.m, sizeof(out.cascadeVp[i]));
             out.cascadeSplits[i] = 1e9f;
         }
+        for (uint32_t i = 0; i < kShadowAtlasTiles; ++i)
+            std::memcpy(out.shadowTileVp[i], identity.m, sizeof(out.shadowTileVp[i]));
+        out.shadowAtlasParams[0] = 0.f;
+        out.shadowAtlasParams[2] = 0.f;
         out.shadowParams[2] = 0.f;
         out.shadowParams[3] = 0.f;
         out.viewForward[3] = -1.f;
@@ -1537,6 +1557,7 @@ void DeferredCore::writeLightingSet(const VulkanContext& ctx, VkDescriptorSet se
                                     VkBuffer lightingUbo, VkImageView albedo, VkImageView normal,
                                     VkImageView material, VkImageView emissive,
                                     VkImageView depth, VkImageView ssao, VkImageView shadow,
+                                    VkImageView shadowAtlas,
                                     VkBuffer clusterLights, VkBuffer clusterGrid) const {
     VkDescriptorBufferInfo lightBuf = {};
     lightBuf.buffer = lightingUbo;
@@ -1549,7 +1570,7 @@ void DeferredCore::writeLightingSet(const VulkanContext& ctx, VkDescriptorSet se
     ssboBufs[1].buffer = clusterGrid;   // binding 13: per-cluster light lists
     ssboBufs[1].range = VK_WHOLE_SIZE;
 
-    VkDescriptorImageInfo img[11] = {};
+    VkDescriptorImageInfo img[12] = {};
     const VkImageView gb[5] = {albedo, normal, material, emissive, depth};
     for (int k = 0; k < 5; ++k) {
         img[k].sampler = gbufferSampler_;
@@ -1574,26 +1595,32 @@ void DeferredCore::writeLightingSet(const VulkanContext& ctx, VkDescriptorSet se
     img[10].sampler = shadowSampler_;
     img[10].imageView = shadow;
     img[10].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    img[11].sampler = shadowSampler_;
+    img[11].imageView = shadowAtlas;
+    img[11].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
-    VkWriteDescriptorSet w[14] = {};
-    w[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    w[0].dstSet = set;
-    w[0].dstBinding = 0;
-    w[0].descriptorCount = 1;
-    w[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    w[0].pBufferInfo = &lightBuf;
-    const uint32_t samplerCount = shadow ? 11u : 10u; // skip binding 11 without a shadow map
+    VkWriteDescriptorSet w[16] = {};
+    uint32_t writeCount = 0;
+    w[writeCount].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    w[writeCount].dstSet = set;
+    w[writeCount].dstBinding = 0;
+    w[writeCount].descriptorCount = 1;
+    w[writeCount].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    w[writeCount].pBufferInfo = &lightBuf;
+    ++writeCount;
+    // Bindings 1-10 are always written; 11 (CSM array) only with a shadow map.
+    const uint32_t samplerCount = shadow ? 11u : 10u;
     for (uint32_t k = 0; k < samplerCount; ++k) {
-        w[k + 1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        w[k + 1].dstSet = set;
-        w[k + 1].dstBinding = k + 1;
-        w[k + 1].descriptorCount = 1;
-        w[k + 1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        w[k + 1].pImageInfo = &img[k];
+        VkWriteDescriptorSet& s = w[writeCount++];
+        s.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        s.dstSet = set;
+        s.dstBinding = k + 1;
+        s.descriptorCount = 1;
+        s.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        s.pImageInfo = &img[k];
     }
-    const uint32_t writeCount = 1 + samplerCount;
     for (uint32_t k = 0; k < 2; ++k) {
-        VkWriteDescriptorSet& s = w[writeCount + k];
+        VkWriteDescriptorSet& s = w[writeCount++];
         s.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         s.dstSet = set;
         s.dstBinding = 12 + k;
@@ -1601,7 +1628,17 @@ void DeferredCore::writeLightingSet(const VulkanContext& ctx, VkDescriptorSet se
         s.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         s.pBufferInfo = &ssboBufs[k];
     }
-    vkUpdateDescriptorSets(ctx.device, writeCount + 2, w, 0, nullptr);
+    // Binding 14 (spot shadow atlas) only with an atlas.
+    if (shadowAtlas) {
+        VkWriteDescriptorSet& s = w[writeCount++];
+        s.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        s.dstSet = set;
+        s.dstBinding = 14;
+        s.descriptorCount = 1;
+        s.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        s.pImageInfo = &img[11];
+    }
+    vkUpdateDescriptorSets(ctx.device, writeCount, w, 0, nullptr);
 }
 
 void DeferredCore::recordGBufferDraws(VkCommandBuffer cmd, const Scene& scene, bool gtPass,
@@ -3053,16 +3090,14 @@ void DeferredCore::computeCascadeVPs(const Camera& cam, float aspect, const Vec3
     }
 }
 
-void DeferredCore::recordShadowPass(VkCommandBuffer cmd, const ShadowTargets& targets,
-                                    const Scene& scene, const Mat4 cascadeVp[kShadowCascadeCount],
-                                    VkDescriptorSet sceneSet, VkDescriptorSet textureSet,
-                                    uint32_t materialStride) const {
+// Shared draw loop of the shadow depth passes: binds the (skinned) shadow
+// pipelines and draws every caster intersecting the light frustum into the
+// currently open rendering block.  Used by recordShadowPass (one call per
+// cascade) and recordSpotShadowPass (one call per atlas tile).
+void DeferredCore::recordShadowDraws(VkCommandBuffer cmd, const Scene& scene, const Mat4& lightVp,
+                                     VkDescriptorSet sceneSet, VkDescriptorSet textureSet,
+                                     uint32_t materialStride) const {
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, shadowPipeline_);
-    VkViewport viewport = {0.f, 0.f, static_cast<float>(kShadowMapSize),
-                           static_cast<float>(kShadowMapSize), 0.f, 1.f};
-    vkCmdSetViewport(cmd, 0, 1, &viewport);
-    VkRect2D scissor = {{0, 0}, {kShadowMapSize, kShadowMapSize}};
-    vkCmdSetScissor(cmd, 0, 1, &scissor);
     vkCmdSetDepthBias(cmd, kShadowDepthBiasConstant, 0.f, kShadowDepthBiasSlope);
 
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, scenePipelineLayout_, 1, 1,
@@ -3073,6 +3108,86 @@ void DeferredCore::recordShadowPass(VkCommandBuffer cmd, const ShadowTargets& ta
         vkCmdBindVertexBuffers(cmd, 0, 1, &scene.mergedVertexBuffer, &zeroOffset);
         vkCmdBindIndexBuffer(cmd, scene.mergedIndexBuffer, 0, VK_INDEX_TYPE_UINT32);
     }
+
+    const Frustum frustum = extractFrustum(lightVp);
+
+    uint32_t lastMaterial = UINT32_MAX;
+    bool skinnedBound = false;
+    for (const auto& inst : scene.instances) {
+        if (scene.materials[inst.materialIndex].blend) continue; // glass does not occlude
+        if (!aabbIntersectsFrustum(frustum, inst.aabbMin, inst.aabbMax)) continue;
+        // Same LOD choice as the camera passes: a caster too small to draw
+        // casts a shadow too small to miss, and the ranges are free here.
+        if (inst.lodCulled) continue;
+
+        if (inst.skinIndex >= 0) {
+            // Skinned caster: current-frame palette only (no motion here).
+            if (!skinnedBound) {
+                skinnedBound = true;
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                  shadowSkinnedPipeline_);
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                        scenePipelineLayout_, 1, 1, &textureSet, 0, nullptr);
+                lastMaterial = UINT32_MAX;
+            }
+            const Skin& skin = scene.skins[static_cast<size_t>(inst.skinIndex)];
+            SkinnedShadowPush push;
+            std::memcpy(push.lightVp, lightVp.m, sizeof(push.lightVp));
+            push.paletteCur = skin.paletteCur;
+            vkCmdPushConstants(cmd, scenePipelineLayout_, VK_SHADER_STAGE_VERTEX_BIT, 0,
+                               sizeof(push), &push);
+
+            if (inst.materialIndex != lastMaterial) {
+                lastMaterial = inst.materialIndex;
+                const uint32_t dynOffset = inst.materialIndex * materialStride;
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                        scenePipelineLayout_, 0, 1, &sceneSet, 1, &dynOffset);
+            }
+
+            const Mesh& mesh = scene.skinnedMeshes[inst.meshIndex];
+            vkCmdBindVertexBuffers(cmd, 0, 1, &mesh.vertexBuffer, &zeroOffset);
+            vkCmdBindIndexBuffer(cmd, mesh.indexBuffer, 0, VK_INDEX_TYPE_UINT32);
+            vkCmdDrawIndexed(cmd, mesh.indexCount, 1, 0, 0, 0);
+            continue;
+        }
+
+        if (skinnedBound) {
+            skinnedBound = false;
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, shadowPipeline_);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, scenePipelineLayout_,
+                                    1, 1, &textureSet, 0, nullptr);
+            vkCmdBindVertexBuffers(cmd, 0, 1, &scene.mergedVertexBuffer, &zeroOffset);
+            vkCmdBindIndexBuffer(cmd, scene.mergedIndexBuffer, 0, VK_INDEX_TYPE_UINT32);
+            lastMaterial = UINT32_MAX;
+        }
+
+        ShadowPush push;
+        std::memcpy(push.model, inst.model.m, sizeof(push.model));
+        std::memcpy(push.lightVp, lightVp.m, sizeof(push.lightVp));
+        vkCmdPushConstants(cmd, scenePipelineLayout_, VK_SHADER_STAGE_VERTEX_BIT, 0,
+                           sizeof(push), &push);
+
+        if (inst.materialIndex != lastMaterial) {
+            lastMaterial = inst.materialIndex;
+            const uint32_t dynOffset = inst.materialIndex * materialStride;
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, scenePipelineLayout_,
+                                    0, 1, &sceneSet, 1, &dynOffset);
+        }
+
+        const LodDraw& draw = inst.lodDraws[inst.lodLevel];
+        vkCmdDrawIndexed(cmd, draw.indexCount, 1, draw.firstIndex, draw.vertexOffset, 0);
+    }
+}
+
+void DeferredCore::recordShadowPass(VkCommandBuffer cmd, const ShadowTargets& targets,
+                                    const Scene& scene, const Mat4 cascadeVp[kShadowCascadeCount],
+                                    VkDescriptorSet sceneSet, VkDescriptorSet textureSet,
+                                    uint32_t materialStride) const {
+    VkViewport viewport = {0.f, 0.f, static_cast<float>(kShadowMapSize),
+                           static_cast<float>(kShadowMapSize), 0.f, 1.f};
+    vkCmdSetViewport(cmd, 0, 1, &viewport);
+    VkRect2D scissor = {{0, 0}, {kShadowMapSize, kShadowMapSize}};
+    vkCmdSetScissor(cmd, 0, 1, &scissor);
 
     for (uint32_t c = 0; c < kShadowCascadeCount; ++c) {
         VkRenderingAttachmentInfo depth =
@@ -3088,74 +3203,98 @@ void DeferredCore::recordShadowPass(VkCommandBuffer cmd, const ShadowTargets& ta
 
         // Cull against the cascade frustum; the extended near plane keeps
         // casters that sit between the slice and the sun.
-        const Frustum frustum = extractFrustum(cascadeVp[c]);
+        recordShadowDraws(cmd, scene, cascadeVp[c], sceneSet, textureSet, materialStride);
+        vkCmdEndRendering(cmd);
+    }
+}
 
-        uint32_t lastMaterial = UINT32_MAX;
-        bool skinnedBound = false;
-        for (const auto& inst : scene.instances) {
-            if (scene.materials[inst.materialIndex].blend) continue; // glass does not occlude
-            if (!aabbIntersectsFrustum(frustum, inst.aabbMin, inst.aabbMax)) continue;
-            // Same LOD choice as the camera passes: a caster too small to draw
-            // casts a shadow too small to miss, and the ranges are free here.
-            if (inst.lodCulled) continue;
+bool DeferredCore::createShadowAtlas(const VulkanContext& ctx, ShadowAtlas& out) const {
+    if (createImage(ctx, kShadowAtlasSize, kShadowAtlasSize, deferred::kDepthFormat,
+                    VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                    out.image, out.memory) != VK_SUCCESS)
+        return false;
+    // Whole-atlas 2D view: depth attachment (per-tile renderArea) and the
+    // comparison-sampled view of lighting set binding 14.
+    out.view = createImageView(ctx, out.image, deferred::kDepthFormat, VK_IMAGE_ASPECT_DEPTH_BIT);
+    if (!out.view) return false;
+    out.layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    return true;
+}
 
-            if (inst.skinIndex >= 0) {
-                // Skinned caster: current-frame palette only (no motion here).
-                if (!skinnedBound) {
-                    skinnedBound = true;
-                    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                      shadowSkinnedPipeline_);
-                    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                            scenePipelineLayout_, 1, 1, &textureSet, 0, nullptr);
-                    lastMaterial = UINT32_MAX;
-                }
-                const Skin& skin = scene.skins[static_cast<size_t>(inst.skinIndex)];
-                SkinnedShadowPush push;
-                std::memcpy(push.lightVp, cascadeVp[c].m, sizeof(push.lightVp));
-                push.paletteCur = skin.paletteCur;
-                vkCmdPushConstants(cmd, scenePipelineLayout_, VK_SHADER_STAGE_VERTEX_BIT, 0,
-                                   sizeof(push), &push);
+void DeferredCore::destroyShadowAtlas(const VulkanContext& ctx, ShadowAtlas& atlas) const {
+    if (!ctx.device) return;
+    if (atlas.view) { vkDestroyImageView(ctx.device, atlas.view, nullptr); atlas.view = VK_NULL_HANDLE; }
+    if (atlas.image) { vmaDestroyImage(ctx.allocator, atlas.image, atlas.memory); atlas.image = VK_NULL_HANDLE; atlas.memory = VK_NULL_HANDLE; }
+    atlas.layout = VK_IMAGE_LAYOUT_UNDEFINED;
+}
 
-                if (inst.materialIndex != lastMaterial) {
-                    lastMaterial = inst.materialIndex;
-                    const uint32_t dynOffset = inst.materialIndex * materialStride;
-                    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                            scenePipelineLayout_, 0, 1, &sceneSet, 1, &dynOffset);
-                }
+uint32_t DeferredCore::selectSpotShadowLights(std::vector<Light>& lights, const Vec3& cameraPos) {
+    for (Light& l : lights) l.shadowIndex = -1;
+    // Candidates: shadow-casting spots only (point lights stay unshadowed this
+    // phase — see the atlas comment in the header).
+    std::vector<uint32_t> candidates;
+    for (uint32_t i = 0; i < lights.size(); ++i) {
+        if (lights[i].type == LightType::Spot && lights[i].castShadow)
+            candidates.push_back(i);
+    }
+    // Importance = intensity / distance^2 to the camera; stable_sort keeps the
+    // lower scene index on ties, so the same frame state always produces the
+    // same tile assignment on every host (resolution-independent).
+    const auto score = [&](uint32_t i) {
+        const Vec3 d = lights[i].positionOrDirection - cameraPos;
+        return lights[i].intensity / std::max(dot(d, d), 1e-3f);
+    };
+    std::stable_sort(candidates.begin(), candidates.end(),
+                     [&](uint32_t a, uint32_t b) { return score(a) > score(b); });
+    const uint32_t count =
+        std::min(static_cast<uint32_t>(candidates.size()), kShadowAtlasTiles);
+    for (uint32_t t = 0; t < count; ++t)
+        lights[candidates[t]].shadowIndex = static_cast<int32_t>(t);
+    return count;
+}
 
-                const Mesh& mesh = scene.skinnedMeshes[inst.meshIndex];
-                vkCmdBindVertexBuffers(cmd, 0, 1, &mesh.vertexBuffer, &zeroOffset);
-                vkCmdBindIndexBuffer(cmd, mesh.indexBuffer, 0, VK_INDEX_TYPE_UINT32);
-                vkCmdDrawIndexed(cmd, mesh.indexCount, 1, 0, 0, 0);
-                continue;
-            }
+Mat4 DeferredCore::computeSpotShadowVp(const Light& light) {
+    const float fovY = std::min(2.f * light.outerConeAngle + kSpotShadowFovMargin, 2.9f);
+    const float farZ = light.range > 0.f ? light.range : kSpotShadowInfiniteRange;
+    const float nearZ = std::max(farZ * 1e-3f, 0.02f);
+    Vec3 up{0.f, 1.f, 0.f};
+    if (std::fabs(dot(light.spotDirection, up)) > 0.99f) up = {1.f, 0.f, 0.f};
+    const Mat4 view = Mat4::lookAt(light.positionOrDirection,
+                                   light.positionOrDirection + light.spotDirection, up);
+    return Mat4::multiply(Mat4::perspective(fovY, 1.f, nearZ, farZ), view);
+}
 
-            if (skinnedBound) {
-                skinnedBound = false;
-                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, shadowPipeline_);
-                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, scenePipelineLayout_,
-                                        1, 1, &textureSet, 0, nullptr);
-                vkCmdBindVertexBuffers(cmd, 0, 1, &scene.mergedVertexBuffer, &zeroOffset);
-                vkCmdBindIndexBuffer(cmd, scene.mergedIndexBuffer, 0, VK_INDEX_TYPE_UINT32);
-                lastMaterial = UINT32_MAX;
-            }
+void DeferredCore::recordSpotShadowPass(VkCommandBuffer cmd, const ShadowAtlas& atlas,
+                                        const Scene& scene, const Mat4* tileVp, uint32_t tileCount,
+                                        VkDescriptorSet sceneSet, VkDescriptorSet textureSet,
+                                        uint32_t materialStride) const {
+    // One rendering block per tile: simple, and each block clears only its own
+    // tile rect (renderArea == tile).  Unassigned tiles are never rendered and
+    // never sampled (unshadowed lights keep shadowIndex == -1).
+    for (uint32_t t = 0; t < tileCount; ++t) {
+        const uint32_t x = (t % kShadowAtlasGrid) * kShadowAtlasTileSize;
+        const uint32_t y = (t / kShadowAtlasGrid) * kShadowAtlasTileSize;
+        VkRenderingAttachmentInfo depth =
+            makeDepthAttachment(atlas.view, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                                VK_ATTACHMENT_LOAD_OP_CLEAR);
+        VkRenderingInfo ri = {};
+        ri.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+        ri.renderArea = {{static_cast<int32_t>(x), static_cast<int32_t>(y)},
+                         {kShadowAtlasTileSize, kShadowAtlasTileSize}};
+        ri.layerCount = 1;
+        ri.colorAttachmentCount = 0;
+        ri.pDepthAttachment = &depth;
+        vkCmdBeginRendering(cmd, &ri);
 
-            ShadowPush push;
-            std::memcpy(push.model, inst.model.m, sizeof(push.model));
-            std::memcpy(push.lightVp, cascadeVp[c].m, sizeof(push.lightVp));
-            vkCmdPushConstants(cmd, scenePipelineLayout_, VK_SHADER_STAGE_VERTEX_BIT, 0,
-                               sizeof(push), &push);
+        VkViewport viewport = {static_cast<float>(x), static_cast<float>(y),
+                               static_cast<float>(kShadowAtlasTileSize),
+                               static_cast<float>(kShadowAtlasTileSize), 0.f, 1.f};
+        vkCmdSetViewport(cmd, 0, 1, &viewport);
+        VkRect2D scissor = {{static_cast<int32_t>(x), static_cast<int32_t>(y)},
+                            {kShadowAtlasTileSize, kShadowAtlasTileSize}};
+        vkCmdSetScissor(cmd, 0, 1, &scissor);
 
-            if (inst.materialIndex != lastMaterial) {
-                lastMaterial = inst.materialIndex;
-                const uint32_t dynOffset = inst.materialIndex * materialStride;
-                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, scenePipelineLayout_,
-                                        0, 1, &sceneSet, 1, &dynOffset);
-            }
-
-            const LodDraw& draw = inst.lodDraws[inst.lodLevel];
-            vkCmdDrawIndexed(cmd, draw.indexCount, 1, draw.firstIndex, draw.vertexOffset, 0);
-        }
+        recordShadowDraws(cmd, scene, tileVp[t], sceneSet, textureSet, materialStride);
         vkCmdEndRendering(cmd);
     }
 }
