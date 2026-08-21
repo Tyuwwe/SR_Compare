@@ -51,6 +51,10 @@ struct RendererOptions {
     // Screen-space contact shadows for the CSM sun (CLI: --no-contact-shadows);
     // needs shadows on (rides the CSM sun selection).
     bool contactShadows = true;
+    // Offline reflection-probe baking (CLI: --bake-probes): renders each
+    // probe's 6 cube faces and writes the .probes file, then exits without
+    // entering the frame loop.  Not part of bench.
+    bool bakeProbes = false;
 };
 
 class Renderer {
@@ -58,6 +62,10 @@ public:
     bool init(const RendererOptions& opts);
     void run();
     void shutdown();
+
+    // Bakes scene_.probes (registry placements) to probeFilePathForScene().
+    // Call after init(); the renderer must be shut down without run().
+    bool bakeProbes();
 
 private:
     static constexpr uint32_t kFramesInFlight = 2;

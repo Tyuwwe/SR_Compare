@@ -48,7 +48,8 @@ void printUsage() {
                  "  --exposure <f>                   manual display exposure (disables auto exposure)\n"
                  "  --no-bloom                       disable HDR bloom\n"
                  "  --no-ssr                         disable opaque screen-space reflections\n"
-                 "  --no-contact-shadows             disable screen-space contact shadows (sun)\n");
+                 "  --no-contact-shadows             disable screen-space contact shadows (sun)\n"
+                 "  --bake-probes                    bake reflection probes to the scene's .probes file, then exit\n");
 }
 
 int runViewer(int argc, char** argv) {
@@ -111,6 +112,8 @@ int runViewer(int argc, char** argv) {
             opts.ssr = false;
         } else if (a == "--no-contact-shadows") {
             opts.contactShadows = false;
+        } else if (a == "--bake-probes") {
+            opts.bakeProbes = true;
         } else {
             std::fprintf(stderr, "unknown viewer option: %s\n", a.c_str());
             return 1;
@@ -124,6 +127,12 @@ int runViewer(int argc, char** argv) {
     if (!renderer.init(opts)) {
         std::fprintf(stderr, "renderer init failed\n");
         return 1;
+    }
+    if (opts.bakeProbes) {
+        // Offline reflection-probe bake: no frame loop, no bench involvement.
+        const bool ok = renderer.bakeProbes();
+        renderer.shutdown();
+        return ok ? 0 : 1;
     }
     renderer.run();
     renderer.shutdown();
