@@ -47,6 +47,7 @@ struct LightGPU {
     vec4 posOrDir;
     vec4 color;
     vec4 params;
+    vec4 spotDir;
 };
 layout(set = 0, binding = 0) uniform LightingUBO {
     mat4 invViewProj;

@@ -357,6 +357,13 @@ bool CompareApp::createRenderTargets() {
         return false;
     if (!deferred_.createColorPyramid(ctx_, dw, dh, gtColorPyramid_))
         return false;
+    // Clustered shading grids (per-path resolution, per-slot buffers).  The LR
+    // grid serves both the jittered (temporal) and unjittered (spatial)
+    // lighting variants — jitter only shifts cluster boundaries sub-pixel.
+    if (!deferred_.createClusterGrid(ctx_, renderWidth_, renderHeight_, gbCluster_))
+        return false;
+    if (!deferred_.createClusterGrid(ctx_, dw, dh, gtCluster_))
+        return false;
 
     // Native-resolution ground truth (same camera, no jitter).  The lighting
     // pass samples the GT GBuffer depth, so it needs the SAMPLED bit.
@@ -426,6 +433,8 @@ bool CompareApp::createRenderTargets() {
         if (!deferred_.createSsrHistory(ctx_, dw * 2, dh * 2, gtSsaaSsrHist_))
             return false;
         if (!deferred_.createColorPyramid(ctx_, dw * 2, dh * 2, gtSsaaColorPyramid_))
+            return false;
+        if (!deferred_.createClusterGrid(ctx_, dw * 2, dh * 2, gtSsaaCluster_))
             return false;
     }
 
@@ -621,7 +630,9 @@ bool CompareApp::createDescriptors() {
     sizes[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
     sizes[2].descriptorCount = kFramesInFlight * 3; // Gb + Gt + spatial scene sets
     sizes[3].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    sizes[3].descriptorCount = numAlgos * 2 + 4; // metric blocks/result + auto-exposure (LR + GT)
+    sizes[3].descriptorCount = numAlgos * 2 + 4 + // metric blocks/result + auto-exposure (LR + GT)
+                               2 * kFramesInFlight * 4 + // lighting sets: cluster lights + grid SSBOs
+                               2 * kClusterSlots * 3;    // cluster assign sets (GB/GT/SSAA paths)
     sizes[4].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     // ssao raw + temporal history + blur outputs (GB/GT/SSAA) + pyramid mips +
     // SSR trace targets + SSR temporal history write / scene-color RMW (x2 sets per path)
@@ -635,12 +646,18 @@ bool CompareApp::createDescriptors() {
                      6 +                    // ssr temporal sets (GB/GT/SSAA x2, static)
                      2 +                    // auto-exposure sets (LR + GT)
                      3 * kFramesInFlight + // spatial scene + lighting + transparent
+                     kClusterSlots * 3 +    // cluster assign sets (GB/GT/SSAA)
                      hizSets + colorSets;
     poolCi.poolSizeCount = 5;
     poolCi.pPoolSizes = sizes;
     if (vkCreateDescriptorPool(ctx_.device, &poolCi, nullptr, &descriptorPool_) != VK_SUCCESS)
         return false;
 
+    // Cluster assignment sets (per slot, per path); buffers from createRenderTargets.
+    if (!deferred_.writeClusterGridSets(ctx_, descriptorPool_, gbCluster_)) return false;
+    if (!deferred_.writeClusterGridSets(ctx_, descriptorPool_, gtCluster_)) return false;
+    if (opts_.gtSsaa && !deferred_.writeClusterGridSets(ctx_, descriptorPool_, gtSsaaCluster_))
+        return false;
     if (!deferred_.writeDepthPyramidSets(ctx_, descriptorPool_, gbDepth_.view, gbPyramid_))
         return false;
     if (!deferred_.writeDepthPyramidSets(ctx_, descriptorPool_, gtDepth_.view, gtPyramid_))
@@ -1133,18 +1150,22 @@ bool CompareApp::createSyncResources() {
         const VkImageView shadowView = shadowsActive_ ? shadow_.arrayView : VK_NULL_HANDLE;
         deferred_.writeLightingSet(ctx_, fr.lightingSetGb, fr.lightingUboGb, gbAlbedo_.view,
                                    gbNormal_.view, gbMaterial_.view, gbEmissive_.view,
-                                   gbDepth_.view, gbAo_.view, shadowView);
+                                   gbDepth_.view, gbAo_.view, shadowView,
+                                   gbCluster_.lightsBuffer[i], gbCluster_.gridBuffer[i]);
         deferred_.writeLightingSet(ctx_, fr.lightingSetGbSpatial, fr.lightingUboGbSpatial,
                                    gbAlbedo_.view, gbNormal_.view, gbMaterial_.view,
-                                   gbEmissive_.view, gbDepth_.view, gbAo_.view, shadowView);
+                                   gbEmissive_.view, gbDepth_.view, gbAo_.view, shadowView,
+                                   gbCluster_.lightsBuffer[i], gbCluster_.gridBuffer[i]);
         deferred_.writeLightingSet(ctx_, fr.lightingSetGt, fr.lightingUboGt, gtAlbedo_.view,
                                    gtNormal_.view, gtMaterial_.view, gtEmissive_.view,
-                                   gtDepth_.view, gtAo_.view, shadowView);
+                                   gtDepth_.view, gtAo_.view, shadowView,
+                                   gtCluster_.lightsBuffer[i], gtCluster_.gridBuffer[i]);
         if (opts_.gtSsaa) {
             deferred_.writeLightingSet(ctx_, fr.lightingSetSsaa, fr.lightingUboGt,
                                        gtSsaaAlbedo_.view, gtSsaaNormal_.view,
                                        gtSsaaMaterial_.view, gtSsaaEmissive_.view,
-                                       gtSsaaDepth_.view, gtSsaaAo_.view, shadowView);
+                                       gtSsaaDepth_.view, gtSsaaAo_.view, shadowView,
+                                       gtSsaaCluster_.lightsBuffer[i], gtSsaaCluster_.gridBuffer[i]);
         }
 
         // The transparency shader reads iblParams (identical in both lighting
@@ -1232,6 +1253,18 @@ void CompareApp::updateLightingUBO(void* mapped, const Mat4& invViewProj,
     LightingUBO ubo;
     deferred_.fillLightingUBO(ubo, scene_, camera_, invViewProj, nullptr, shadow, iblIntensity_);
     std::memcpy(mapped, &ubo, sizeof(ubo));
+}
+
+void CompareApp::updateClusterLights(uint32_t frameIndex) {
+    // Full point/spot set for the clustered pass; same per-slot rule as the
+    // UBOs (the slot's fence passed before recording).  The list is identical
+    // for every path — only the grid resolution differs.
+    const uint32_t slot = frameIndex % kFramesInFlight;
+    const std::vector<Light>& lights = DeferredCore::effectiveLights(scene_, nullptr);
+    deferred_.fillClusterLights(gbCluster_.lightsMapped[slot], lights);
+    deferred_.fillClusterLights(gtCluster_.lightsMapped[slot], lights);
+    if (gtSsaaCluster_.lightsMapped[slot])
+        deferred_.fillClusterLights(gtSsaaCluster_.lightsMapped[slot], lights);
 }
 
 void CompareApp::updateCamera(uint32_t frameIndex, float dt) {
@@ -1408,6 +1441,7 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     updateLightingUBO(fr.lightingUboGbMapped,
                       Mat4::inverse(Mat4::multiply(projJittered, view)), shadow);
     updateLightingUBO(fr.lightingUboGtMapped, Mat4::inverse(Mat4::multiply(proj, view)), shadow);
+    updateClusterLights(frameIndex);
     if (mixed) {
         updateSceneUBO(fr.uboGbSpatialMapped, false, renderWidth_, renderHeight_, view, proj, proj,
                        prevViewProj_);
@@ -1469,7 +1503,7 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
 
     auto recordLrLighting = [&](VkDescriptorSet sceneSet, VkDescriptorSet lightingSet,
                                 VkDescriptorSet transparentSet, VkDescriptorSet ssrSet,
-                                const Mat4& ssaoViewProj) {
+                                const Mat4& ssaoViewProj, const Mat4& projUsed) {
         // dst scope includes compute: the opaque-SSR pass (ssr_opaque.comp)
         // samples the GBuffer after the lighting fragment shader.
         transition(gbAlbedo_.image, gbAlbedoLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
@@ -1523,7 +1557,8 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         transition(gbColor_.image, gbColorLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                    sync::kSampleStages, sync::kSampled, sync::kColorAttach, sync::kColorWrite,
                    VK_IMAGE_ASPECT_COLOR_BIT);
-        deferred_.recordLightingPass(cmd, lightingSet, gbColor_.view, renderWidth_, renderHeight_);
+        deferred_.recordLightingPass(cmd, lightingSet, gbCluster_, frameIndex % kFramesInFlight,
+                                     view, projUsed, gbColor_.view, renderWidth_, renderHeight_);
 
         if (hasTransparency_ || opts_.ssr) {
             // Color mip chain: mip 0 is the opaque HDR copy glass SSR used to
@@ -1639,7 +1674,7 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
 
     if (mixed) {
         recordLrLighting(fr.sceneSetGbSpatial, fr.lightingSetGbSpatial, fr.transparentSetGbSpatial,
-                         fr.ssrSetGbSpatial, cullViewProj);
+                         fr.ssrSetGbSpatial, cullViewProj, proj);
         transition(gbColor_.image, gbColorLayout_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                    sync::kSampleStages, sync::kSampled, sync::kCopy, sync::kTransferRead,
                    VK_IMAGE_ASPECT_COLOR_BIT);
@@ -1661,10 +1696,10 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                    sync::kSampleStages, sync::kSampled, VK_IMAGE_ASPECT_COLOR_BIT);
         recordLrGBuffer(fr.sceneSetGb);
         recordLrLighting(fr.sceneSetGb, fr.lightingSetGb, fr.transparentSetGb, fr.ssrSetGb,
-                         Mat4::multiply(projJittered, view));
+                         Mat4::multiply(projJittered, view), projJittered);
     } else {
         recordLrLighting(fr.sceneSetGb, fr.lightingSetGb, fr.transparentSetGb, fr.ssrSetGb,
-                         Mat4::multiply(projJittered, view));
+                         Mat4::multiply(projJittered, view), projJittered);
     }
 
     // --- Auto exposure: LR histogram of this frame's lit HDR (gbColor_) --------
@@ -1830,7 +1865,9 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         transition(gtSsaaColor_.image, gtSsaaColorLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                    sync::kSampleStages, sync::kSampled, sync::kColorAttach, sync::kColorWrite,
                    VK_IMAGE_ASPECT_COLOR_BIT);
-        deferred_.recordLightingPass(cmd, fr.lightingSetSsaa, gtSsaaColor_.view, sw, sh);
+        deferred_.recordLightingPass(cmd, fr.lightingSetSsaa, gtSsaaCluster_,
+                                     frameIndex % kFramesInFlight, view, proj,
+                                     gtSsaaColor_.view, sw, sh);
 
         if (hasTransparency_ || opts_.ssr) {
             // Same color mip chain build as the GB path (GENERAL for life);
@@ -2003,7 +2040,9 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         transition(gtColor_.image, gtColorLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                    sync::kSampleStages, sync::kSampled, sync::kColorAttach, sync::kColorWrite,
                    VK_IMAGE_ASPECT_COLOR_BIT);
-        deferred_.recordLightingPass(cmd, fr.lightingSetGt, gtColor_.view, dw, dh);
+        deferred_.recordLightingPass(cmd, fr.lightingSetGt, gtCluster_,
+                                     frameIndex % kFramesInFlight, view, proj,
+                                     gtColor_.view, dw, dh);
 
         if (hasTransparency_ || opts_.ssr) {
             // Same color mip chain build as the GB path (GENERAL for life);
@@ -2467,6 +2506,9 @@ void CompareApp::shutdown() {
     deferred_.destroyColorPyramid(ctx_, gbColorPyramid_);
     deferred_.destroyColorPyramid(ctx_, gtColorPyramid_);
     deferred_.destroyColorPyramid(ctx_, gtSsaaColorPyramid_);
+    deferred_.destroyClusterGrid(ctx_, gbCluster_);
+    deferred_.destroyClusterGrid(ctx_, gtCluster_);
+    deferred_.destroyClusterGrid(ctx_, gtSsaaCluster_);
     deferred_.destroyDepthPyramid(ctx_, gbPyramid_);
     deferred_.destroyDepthPyramid(ctx_, gtPyramid_);
     deferred_.destroyDepthPyramid(ctx_, gtSsaaPyramid_);

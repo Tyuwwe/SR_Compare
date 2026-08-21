@@ -207,6 +207,10 @@ private:
     ColorPyramid gbColorPyramid_;
     ColorPyramid gtColorPyramid_;
     ColorPyramid gtSsaaColorPyramid_; // gtSsaa only
+    // Clustered shading grids (per-path resolution, per-slot buffers).
+    ClusterGrid gbCluster_;
+    ClusterGrid gtCluster_;
+    ClusterGrid gtSsaaCluster_; // gtSsaa only
     // Hi-Z depth pyramids for the SSR march (LR / GT / GT-SSAA paths); general
     // DeferredCore resource, later reused by GTAO/contact shadows/culling.
     DepthPyramid gbPyramid_;
@@ -395,6 +399,7 @@ private:
                         const Mat4& view, const Mat4& proj, const Mat4& projJittered,
                         const Mat4& prevViewProj);
     void updateLightingUBO(void* mapped, const Mat4& invViewProj, const ShadowFrame* shadow);
+    void updateClusterLights(uint32_t frameIndex);
     void updateCamera(uint32_t frameIndex, float dt);
     void recordFrame(uint32_t frameIndex, uint32_t swapchainIndex);
     void captureScreenshotIntoStaging(VkCommandBuffer cmd);

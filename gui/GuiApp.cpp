@@ -1143,6 +1143,11 @@ bool GuiApp::createRenderTargets() {
         return false;
     if (!deferred_.createColorPyramid(ctx_, gtW, gtH, gtColorPyramid_))
         return false;
+    // Clustered shading grids (per-path resolution, per-slot buffers).
+    if (!deferred_.createClusterGrid(ctx_, renderWidth_, renderHeight_, gbCluster_))
+        return false;
+    if (!deferred_.createClusterGrid(ctx_, gtW, gtH, gtCluster_))
+        return false;
 
     // 200% SSAA ground truth: deferred render at 2x, downsample into gtColor_.
     if (active_.gtSsaa) {
@@ -1190,6 +1195,8 @@ bool GuiApp::createRenderTargets() {
         if (!deferred_.createSsrHistory(ctx_, dw * 2, dh * 2, gtSsaaSsrHist_))
             return false;
         if (!deferred_.createColorPyramid(ctx_, dw * 2, dh * 2, gtSsaaColorPyramid_))
+            return false;
+        if (!deferred_.createClusterGrid(ctx_, dw * 2, dh * 2, gtSsaaCluster_))
             return false;
     }
 
@@ -1412,7 +1419,9 @@ bool GuiApp::createDescriptors() {
     sizes[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
     sizes[2].descriptorCount = kFramesInFlight * 3;
     sizes[3].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    sizes[3].descriptorCount = numAlgos * 2 + 4; // metric blocks/result + auto-exposure (LR + GT)
+    sizes[3].descriptorCount = numAlgos * 2 + 4 + // metric blocks/result + auto-exposure (LR + GT)
+                               2 * kFramesInFlight * 4 + // lighting sets: cluster lights + grid SSBOs
+                               2 * kClusterSlots * 3;    // cluster assign sets (GB/GT/SSAA paths)
     sizes[4].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     // ssao raw + temporal history + blur outputs (GB/GT/SSAA) + pyramid mips +
     // SSR trace targets + SSR temporal history write / scene-color RMW (x2 sets per path)
@@ -1426,10 +1435,17 @@ bool GuiApp::createDescriptors() {
                      15 +                  // ssao + temporal + blur sets (GB/GT/SSAA, static)
                      6 +                   // ssr temporal sets (GB/GT/SSAA x2, static)
                      2 +                   // auto-exposure sets (LR + GT)
+                     kClusterSlots * 3 +   // cluster assign sets (GB/GT/SSAA)
                      hizSets + colorSets;
     poolCi.poolSizeCount = 5;
     poolCi.pPoolSizes = sizes;
     if (vkCreateDescriptorPool(ctx_.device, &poolCi, nullptr, &descriptorPool_) != VK_SUCCESS)
+        return false;
+
+    // Cluster assignment sets (per slot, per path); buffers from createRenderTargets.
+    if (!deferred_.writeClusterGridSets(ctx_, descriptorPool_, gbCluster_)) return false;
+    if (!deferred_.writeClusterGridSets(ctx_, descriptorPool_, gtCluster_)) return false;
+    if (active_.gtSsaa && !deferred_.writeClusterGridSets(ctx_, descriptorPool_, gtSsaaCluster_))
         return false;
 
     if (!deferred_.writeDepthPyramidSets(ctx_, descriptorPool_, gbDepth_.view, gbPyramid_))
@@ -1943,19 +1959,23 @@ bool GuiApp::createSyncResources() {
         const VkImageView shadowView = shadowsActive_ ? shadow_.arrayView : VK_NULL_HANDLE;
         deferred_.writeLightingSet(ctx_, fr.lightingSetGb, fr.lightingUboGb, gbAlbedo_.view,
                                    gbNormal_.view, gbMaterial_.view, gbEmissive_.view,
-                                   gbDepth_.view, gbAo_.view, shadowView);
+                                   gbDepth_.view, gbAo_.view, shadowView,
+                                   gbCluster_.lightsBuffer[i], gbCluster_.gridBuffer[i]);
         deferred_.writeLightingSet(ctx_, fr.lightingSetGbSpatial, fr.lightingUboGbSpatial,
                                    gbAlbedo_.view, gbNormal_.view, gbMaterial_.view,
-                                   gbEmissive_.view, gbDepth_.view, gbAo_.view, shadowView);
+                                   gbEmissive_.view, gbDepth_.view, gbAo_.view, shadowView,
+                                   gbCluster_.lightsBuffer[i], gbCluster_.gridBuffer[i]);
         deferred_.writeLightingSet(ctx_, fr.lightingSetGt, fr.lightingUboGt, gtAlbedo_.view,
                                    gtNormal_.view, gtMaterial_.view, gtEmissive_.view,
-                                   gtDepth_.view, gtAo_.view, shadowView);
+                                   gtDepth_.view, gtAo_.view, shadowView,
+                                   gtCluster_.lightsBuffer[i], gtCluster_.gridBuffer[i]);
         if (active_.gtSsaa) {
             // GT and GT-SSAA share the same (resolution-independent) UBO.
             deferred_.writeLightingSet(ctx_, fr.lightingSetSsaa, fr.lightingUboGt,
                                        gtSsaaAlbedo_.view, gtSsaaNormal_.view,
                                        gtSsaaMaterial_.view, gtSsaaEmissive_.view,
-                                       gtSsaaDepth_.view, gtSsaaAo_.view, shadowView);
+                                       gtSsaaDepth_.view, gtSsaaAo_.view, shadowView,
+                                       gtSsaaCluster_.lightsBuffer[i], gtSsaaCluster_.gridBuffer[i]);
         }
 
         // The transparency shader reads iblParams (identical in both lighting
@@ -2248,6 +2268,9 @@ void GuiApp::destroyStackResources() {
     deferred_.destroyColorPyramid(ctx_, gbColorPyramid_);
     deferred_.destroyColorPyramid(ctx_, gtColorPyramid_);
     deferred_.destroyColorPyramid(ctx_, gtSsaaColorPyramid_);
+    deferred_.destroyClusterGrid(ctx_, gbCluster_);
+    deferred_.destroyClusterGrid(ctx_, gtCluster_);
+    deferred_.destroyClusterGrid(ctx_, gtSsaaCluster_);
     deferred_.destroyDepthPyramid(ctx_, gbPyramid_);
     deferred_.destroyDepthPyramid(ctx_, gtPyramid_);
     deferred_.destroyDepthPyramid(ctx_, gtSsaaPyramid_);
@@ -2464,6 +2487,16 @@ void GuiApp::updateLightingUBO(void* mapped, const Mat4& invViewProj,
     deferred_.fillLightingUBO(ubo, scene_, camera_, invViewProj, &lights, shadow,
                               iblIntensity_);
     std::memcpy(mapped, &ubo, sizeof(ubo));
+}
+
+void GuiApp::updateClusterLights(uint32_t frameIndex, const std::vector<Light>& lights) {
+    // Full point/spot set for the clustered pass (the GUI override list, so
+    // sun/fill toggles apply); same per-slot rule as the UBOs.
+    const uint32_t slot = frameIndex % kFramesInFlight;
+    deferred_.fillClusterLights(gbCluster_.lightsMapped[slot], lights);
+    deferred_.fillClusterLights(gtCluster_.lightsMapped[slot], lights);
+    if (gtSsaaCluster_.lightsMapped[slot])
+        deferred_.fillClusterLights(gtSsaaCluster_.lightsMapped[slot], lights);
 }
 
 // ---------------------------------------------------------------------------
@@ -2830,6 +2863,7 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     }
     updateLightingUBO(fr.lightingUboGtMapped, Mat4::inverse(Mat4::multiply(projGt, viewGt)),
                       lights, shadow);
+    updateClusterLights(frameIndex, lights);
 
     auto transition = [&](VkImage image, VkImageLayout& current, VkImageLayout target,
                           VkPipelineStageFlags2 srcStage, VkAccessFlags2 srcAccess,
@@ -2869,7 +2903,7 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     timestamps_.sceneBegin(cmd, slot);
     auto recordLrDeferred = [&](VkDescriptorSet sceneSet, VkDescriptorSet lightingSet,
                                 VkDescriptorSet transparentSet, VkDescriptorSet ssrSet,
-                                const Mat4& ssaoViewProj) {
+                                const Mat4& ssaoViewProj, const Mat4& projUsed) {
         transition(gbAlbedo_.image, gbAlbedoLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                    sync::kSampleStages, sync::kSampled, sync::kColorAttach, sync::kColorWrite,
                    VK_IMAGE_ASPECT_COLOR_BIT);
@@ -2962,7 +2996,8 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         transition(gbColor_.image, gbColorLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                    sync::kSampleStages, sync::kSampled, sync::kColorAttach, sync::kColorWrite,
                    VK_IMAGE_ASPECT_COLOR_BIT);
-        deferred_.recordLightingPass(cmd, lightingSet, gbColor_.view, renderWidth_, renderHeight_);
+        deferred_.recordLightingPass(cmd, lightingSet, gbCluster_, slot, view, projUsed,
+                                     gbColor_.view, renderWidth_, renderHeight_);
 
         if (hasTransparency_ || ssrEnabled_) {
             // Color mip chain: mip 0 is the opaque HDR copy glass SSR used to
@@ -3055,7 +3090,7 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         if (mixedSpatial) {
             recordLrDeferred(fr.sceneSetGbSpatial, fr.lightingSetGbSpatial,
                              fr.transparentSetGbSpatial, fr.ssrSetGbSpatial,
-                             Mat4::multiply(proj, view));
+                             Mat4::multiply(proj, view), proj);
             transition(gbColor_.image, gbColorLayout_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                        sync::kSampleStages, sync::kSampled, sync::kCopy, sync::kTransferRead,
                        VK_IMAGE_ASPECT_COLOR_BIT);
@@ -3074,7 +3109,7 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                        sync::kSampleStages, sync::kSampled, VK_IMAGE_ASPECT_COLOR_BIT);
         }
         recordLrDeferred(fr.sceneSetGb, fr.lightingSetGb, fr.transparentSetGb, fr.ssrSetGb,
-                         Mat4::multiply(projJittered, view));
+                         Mat4::multiply(projJittered, view), projJittered);
     }
 
     // --- Auto exposure: LR histogram of this frame's lit HDR (gbColor_) --------
@@ -3274,7 +3309,8 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         transition(gtSsaaColor_.image, gtSsaaColorLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                    sync::kSampleStages, sync::kSampled, sync::kColorAttach, sync::kColorWrite,
                    VK_IMAGE_ASPECT_COLOR_BIT);
-        deferred_.recordLightingPass(cmd, fr.lightingSetSsaa, gtSsaaColor_.view, sw, sh);
+        deferred_.recordLightingPass(cmd, fr.lightingSetSsaa, gtSsaaCluster_, slot, viewGt, projGt,
+                                     gtSsaaColor_.view, sw, sh);
 
         if (hasTransparency_ || ssrEnabled_) {
             // Same color mip chain build as the GB path (GENERAL for life);
@@ -3448,7 +3484,8 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         transition(gtColor_.image, gtColorLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                    sync::kSampleStages, sync::kSampled, sync::kColorAttach, sync::kColorWrite,
                    VK_IMAGE_ASPECT_COLOR_BIT);
-        deferred_.recordLightingPass(cmd, fr.lightingSetGt, gtColor_.view, gtW, gtH);
+        deferred_.recordLightingPass(cmd, fr.lightingSetGt, gtCluster_, slot, viewGt, projGt,
+                                     gtColor_.view, gtW, gtH);
 
         if (hasTransparency_ || ssrEnabled_) {
             // Same color mip chain build as the GB path (GENERAL for life);

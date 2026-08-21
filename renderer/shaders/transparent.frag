@@ -39,9 +39,11 @@ layout(set = 1, binding = 0) uniform sampler2D uTextures[1024];
 // IBL + light inputs; the UBO matches LightingUBO in DeferredCore.h.  Same
 // LightGPU layout as lighting.frag.
 struct LightGPU {
-    vec4 posOrDir; // xyz = position (point) / direction-to-light (directional), w = type (0 = dir, 1 = point)
+    vec4 posOrDir; // xyz = position (point/spot) / direction-to-light (directional), w = type (0 = dir, 1 = point, 2 = spot)
     vec4 color;    // rgb + w = intensity (PI-scaled on the CPU)
-    vec4 params;   // x = range (0 = infinite), y = castShadow (reserved, C2), zw = reserved
+    vec4 params;   // x = range (0 = infinite), y = castShadow (reserved, C2),
+                   // z = shadowIndex (reserved, Phase 4b), w = spot cos(inner)
+    vec4 spotDir;  // xyz = spot cone direction (unit, world), w = spot cos(outer)
 };
 layout(set = 2, binding = 0) uniform LightingUBO {
     mat4 invViewProj;
@@ -55,6 +57,7 @@ layout(set = 2, binding = 0) uniform LightingUBO {
     vec4 shadowParams;  // x = rasterizer constant bias, y = slope bias, z = shadows enabled,
                         // w = debug cascade tint
     vec4 viewForward;   // xyz = camera forward (world); w = shadowed sun light index (-1 = none)
+    vec4 clusterDepth;  // clustered shading slicing range (unused in this pass)
 } lighting;
 layout(set = 2, binding = 1) uniform samplerCube iblIrradiance;
 layout(set = 2, binding = 2) uniform samplerCube iblPrefilter;
@@ -84,7 +87,11 @@ int texIndex(float f) { return int(floor(f + 0.5)); }
 // whose energy does not depend on transmission (opacity), while the diffuse
 // lobe approximates the transmitted/tinted term and scales with opacity.
 // Directional lights have no falloff; point lights use the windowed
-// inverse-square falloff of lighting.frag (range = 0 -> pure inverse-square).
+// inverse-square falloff of lighting.frag (range = 0 -> pure inverse-square);
+// spots add the same smoothed cone ramp (cos(inner) -> cos(outer)).
+// Note: this forward pass still iterates the legacy 16-slot UBO array (scene
+// order, sun first); the full light set is only in the clustered deferred
+// pass.
 void shadeLight(vec3 N, vec3 V, vec3 worldPos, vec3 albedo, float metallic,
                 float roughness, vec3 F0, LightGPU light,
                 out vec3 diffuse, out vec3 specular) {
@@ -104,6 +111,13 @@ void shadeLight(vec3 N, vec3 V, vec3 worldPos, vec3 albedo, float metallic,
         if (range > 0.0) {
             float w = clamp(1.0 - pow(dist / range, 4.0), 0.0, 1.0);
             atten *= w * w;
+        }
+        if (light.posOrDir.w > 1.5) {
+            float cosTheta = dot(-L, light.spotDir.xyz);
+            float cone = clamp((cosTheta - light.spotDir.w) /
+                                   max(light.params.w - light.spotDir.w, 1e-5),
+                               0.0, 1.0);
+            atten *= cone * cone;
         }
         radiance *= atten;
     }

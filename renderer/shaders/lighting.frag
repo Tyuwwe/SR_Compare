@@ -5,12 +5,21 @@
 // Heitz height-correlated GGX + Hammon 2017 diffuse (no Lambert) for punctual
 // lights, plus IBL split-sum and emissive.  Far-plane pixels are the skybox.
 // Output is HDR linear color (R16G16B16A16F); present.frag tone-maps.
+//
+// Point/spot lights are evaluated via clustered shading (Olsson et al., HPG
+// 2012; DOOM 2016/Eternal SIGGRAPH): cluster_assign.comp binning pass writes
+// per-cluster light index lists; this shader iterates only its own cluster's
+// list.  Directional lights (the CSM sun) bypass the clusters and are shaded
+// straight from the UBO's legacy 16-slot array, which also still feeds the
+// forward transparency pass.
 
 // GPU mirror of scene::Light; must match LightGPU in DeferredCore.h.
 struct LightGPU {
-    vec4 posOrDir; // xyz = position (point) / direction-to-light (directional), w = type (0 = dir, 1 = point)
+    vec4 posOrDir; // xyz = position (point/spot) / direction-to-light (directional), w = type (0 = dir, 1 = point, 2 = spot)
     vec4 color;    // rgb + w = intensity (PI-scaled on the CPU)
-    vec4 params;   // x = range (0 = infinite), y = castShadow (reserved, C2), zw = reserved
+    vec4 params;   // x = range (0 = infinite), y = castShadow (reserved, C2),
+                   // z = shadowIndex (-1 until Phase 4b), w = spot cos(inner)
+    vec4 spotDir;  // xyz = spot cone direction (unit, world), w = spot cos(outer)
 };
 
 layout(set = 0, binding = 0) uniform LightingUBO {
@@ -25,6 +34,7 @@ layout(set = 0, binding = 0) uniform LightingUBO {
     vec4 shadowParams;  // x = rasterizer constant bias, y = slope bias (reference),
                         // z = shadows enabled, w = debug cascade tint
     vec4 viewForward;   // xyz = camera forward (world); w = shadowed sun light index (-1 = none)
+    vec4 clusterDepth;  // x = near, y = far (exponential cluster slicing), zw unused
 } u;
 
 layout(set = 0, binding = 1) uniform sampler2D gbAlbedo;
@@ -38,13 +48,28 @@ layout(set = 0, binding = 8) uniform sampler2D iblBrdfLut;
 layout(set = 0, binding = 9) uniform samplerCube envCube; // base environment (skybox)
 layout(set = 0, binding = 10) uniform sampler2D ssaoTex;  // GTAO (ssao.comp + bilateral denoise)
 layout(set = 0, binding = 11) uniform sampler2DArrayShadow shadowMap; // CSM, comparison sampler
+// Clustered shading inputs (cluster_assign.comp output + the full lights SSBO).
+layout(std430, set = 0, binding = 12) readonly buffer ClusterLightsSSBO {
+    uvec4 header;    // x = packed point/spot light count
+    LightGPU lights[];
+} clusterLights;
+layout(std430, set = 0, binding = 13) readonly buffer ClusterGridSSBO {
+    uvec4 gridHeader; // gridX, gridY, gridZ, maxPerCluster
+    uint data[];      // counts[N] then indices[N * maxPerCluster]
+} clusterGrid;
+
+// Screen-tile edge of the cluster grid; must match kClusterTileSize in
+// DeferredCore.h.
+const uint kClusterTileSize = 64;
 
 layout(location = 0) out vec4 outColor;
 
 // Shades one punctual light.  Directional: no falloff, L = posOrDir (unit
-// direction towards the light).  Point: inverse-square falloff with a
+// direction towards the light).  Point/spot: inverse-square falloff with a
 // Frostbite-style window (saturate(1 - (d/range)^4)^2) that reaches zero
 // exactly at range; range = 0 keeps the legacy pure inverse-square falloff.
+// Spots additionally fade by the cone: a smoothed (squared) ramp from
+// cos(inner) down to cos(outer), per KHR_lights_punctual's umbra/penumbra.
 vec3 shadeLight(vec3 N, vec3 V, vec3 worldPos, vec3 albedo, float metallic,
                 float roughness, vec3 F0, LightGPU light) {
     vec3 radiance = light.color.rgb * light.color.w;
@@ -60,6 +85,15 @@ vec3 shadeLight(vec3 N, vec3 V, vec3 worldPos, vec3 albedo, float metallic,
         if (range > 0.0) {
             float w = clamp(1.0 - pow(dist / range, 4.0), 0.0, 1.0);
             atten *= w * w;
+        }
+        if (light.posOrDir.w > 1.5) {
+            // Spot cone: cos of the angle between the spot axis and the
+            // direction from the light to the fragment.
+            float cosTheta = dot(-L, light.spotDir.xyz);
+            float cone = clamp((cosTheta - light.spotDir.w) /
+                                   max(light.params.w - light.spotDir.w, 1e-5),
+                               0.0, 1.0);
+            atten *= cone * cone;
         }
         radiance *= atten;
     }
@@ -155,12 +189,16 @@ void main() {
     vec3 F0 = mix(vec3(0.04), albedo, metallic);
 
     vec3 color = vec3(0.0);
-    // View-space depth of this fragment for cascade selection.
+    // View-space depth of this fragment for cascade selection and cluster slicing.
     const float viewDepth = dot(wp.xyz - u.cameraPos.xyz, u.viewForward.xyz);
     const int sunIndex = int(floor(u.viewForward.w + 0.5));
     int debugCascade = -1;
     int lightCount = int(u.lightCounts.x + 0.5);
+    // Directional lights only: the sun (shadow-mapped via CSM) plus any
+    // leftover directionals.  Point/spot lights come from the cluster list
+    // below; the UBO's point/spot entries exist for the transparency pass.
     for (int i = 0; i < lightCount; ++i) {
+        if (u.lights[i].posOrDir.w >= 0.5) continue;
         // Only the CSM sun (first shadow-casting directional light) is
         // shadow-mapped; every other light stays unshadowed.
         float shadow = 1.0;
@@ -170,6 +208,30 @@ void main() {
             debugCascade = c;
         }
         color += shadeLight(N, V, wp.xyz, albedo, metallic, roughness, F0, u.lights[i]) * shadow;
+    }
+
+    // Clustered point/spot lights: locate this pixel's cluster (screen tile +
+    // exponential depth slice, mirroring cluster_assign.comp) and iterate its
+    // light list.  The depth slice uses the fragment's view Z reconstructed
+    // from the GBuffer, so thin geometry straddling a slice boundary still
+    // picks a cluster that conservatively contains the light (the assignment
+    // AABB test is conservative by construction).
+    {
+        const uvec3 gridDim = clusterGrid.gridHeader.xyz;
+        const uint maxPerCluster = clusterGrid.gridHeader.w;
+        const uint clusterCount = gridDim.x * gridDim.y * gridDim.z;
+        const uvec2 tile = min(uvec2(pix) / kClusterTileSize, gridDim.xy - 1);
+        const float nearZ = u.clusterDepth.x;
+        const float sliceF = log(max(viewDepth, nearZ) / nearZ) *
+                             float(gridDim.z) / log(u.clusterDepth.y / nearZ);
+        const uint slice = min(uint(max(sliceF, 0.0)), gridDim.z - 1);
+        const uint clusterIdx = tile.x + tile.y * gridDim.x + slice * gridDim.x * gridDim.y;
+        const uint count = clusterGrid.data[clusterIdx];
+        const uint base = clusterCount + clusterIdx * maxPerCluster;
+        for (uint j = 0; j < count; ++j) {
+            const LightGPU l = clusterLights.lights[clusterGrid.data[base + j]];
+            color += shadeLight(N, V, wp.xyz, albedo, metallic, roughness, F0, l);
+        }
     }
 
     // IBL (split-sum): cosine irradiance * Hammon multi-scatter albedo +

@@ -286,6 +286,11 @@ bool Renderer::createRenderTargets() {
         return false;
     if (!deferred_.createColorPyramid(ctx_, dw, dh, gtColorPyramid_))
         return false;
+    // Clustered shading grids (per-path resolution, per-slot buffers).
+    if (!deferred_.createClusterGrid(ctx_, renderWidth_, renderHeight_, gbCluster_))
+        return false;
+    if (!deferred_.createClusterGrid(ctx_, dw, dh, gtCluster_))
+        return false;
     if (!createRT(finalImage_, dw, dh, deferred::kHdrColorFormat,
                   VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
                       VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
@@ -356,10 +361,13 @@ bool Renderer::createSceneDescriptors() {
     // targets + SSR temporal history write / scene-color RMW (GB/GT x2 sets)
     sizes[3].descriptorCount = 10 + 8 + hizSets + colorSets + kFramesInFlight * 2 + 8;
     sizes[4].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    sizes[4].descriptorCount = 2; // auto-exposure histogram + state
+    sizes[4].descriptorCount = 2 + // auto-exposure histogram + state
+                               2 * kFramesInFlight * 2 + // lighting sets: cluster lights + grid SSBOs
+                               2 * kClusterSlots * 2;    // cluster assign sets (GB/GT paths)
     VkDescriptorPoolCreateInfo poolCi = {};
     poolCi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    poolCi.maxSets = kFramesInFlight * 7 + 12 + 8 + hizSets + colorSets + 1 + 4; // +12 ssao/temporal/blur, +8 bloom, +1 auto-exposure, +4 ssr temporal
+    poolCi.maxSets = kFramesInFlight * 7 + 12 + 8 + hizSets + colorSets + 1 + 4 +
+                     kClusterSlots * 2; // +12 ssao/temporal/blur, +8 bloom, +1 auto-exposure, +4 ssr temporal, +cluster assign
     poolCi.poolSizeCount = 5;
     poolCi.pPoolSizes = sizes;
     if (vkCreateDescriptorPool(ctx_.device, &poolCi, nullptr, &descriptorPool_) != VK_SUCCESS)
@@ -541,6 +549,11 @@ bool Renderer::createSyncResources() {
     if (vkAllocateCommandBuffers(ctx_.device, &alloc, cmds) != VK_SUCCESS) return false;
     for (uint32_t i = 0; i < kFramesInFlight; ++i) frames_[i].cmd = cmds[i];
 
+    // Cluster assignment sets (per slot, both paths); the buffers were created
+    // in createRenderTargets, the pool in createSceneDescriptors.
+    if (!deferred_.writeClusterGridSets(ctx_, descriptorPool_, gbCluster_)) return false;
+    if (!deferred_.writeClusterGridSets(ctx_, descriptorPool_, gtCluster_)) return false;
+
     VkSemaphoreCreateInfo semCi = {};
     semCi.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
     VkFenceCreateInfo fenceCi = {};
@@ -609,10 +622,12 @@ bool Renderer::createSyncResources() {
         const VkImageView shadowView = shadowsActive_ ? shadow_.arrayView : VK_NULL_HANDLE;
         deferred_.writeLightingSet(ctx_, frames_[i].lightingSetGb, frames_[i].lightingUbo,
                                    gbAlbedo_.view, gbNormal_.view, gbMaterial_.view,
-                                   gbEmissive_.view, gbDepth_.view, gbAo_.view, shadowView);
+                                   gbEmissive_.view, gbDepth_.view, gbAo_.view, shadowView,
+                                   gbCluster_.lightsBuffer[i], gbCluster_.gridBuffer[i]);
         deferred_.writeLightingSet(ctx_, frames_[i].lightingSetGt, frames_[i].lightingUbo,
                                    gtAlbedo_.view, gtNormal_.view, gtMaterial_.view,
-                                   gtEmissive_.view, gtDepth_.view, gtAo_.view, shadowView);
+                                   gtEmissive_.view, gtDepth_.view, gtAo_.view, shadowView,
+                                   gtCluster_.lightsBuffer[i], gtCluster_.gridBuffer[i]);
 
         // Per-path transparent sets (each binds its own path's SSAO texture).
         const VkDescriptorSetLayout transparentLayout = deferred_.transparentSetLayout();
@@ -769,6 +784,12 @@ void Renderer::updateLightingUBO(uint32_t frameIndex, const Mat4& invViewProj,
     LightingUBO ubo;
     deferred_.fillLightingUBO(ubo, scene_, camera_, invViewProj, nullptr, shadow, iblIntensity_);
     std::memcpy(fr.lightingUboMapped, &ubo, sizeof(ubo));
+    // Full point/spot light set for the clustered pass (same slot rule as the
+    // UBO: the slot's fence passed before recording).
+    const uint32_t slot = frameIndex % kFramesInFlight;
+    const std::vector<Light>& lights = DeferredCore::effectiveLights(scene_, nullptr);
+    deferred_.fillClusterLights(gbCluster_.lightsMapped[slot], lights);
+    deferred_.fillClusterLights(gtCluster_.lightsMapped[slot], lights);
 }
 
 void Renderer::applyCameraKeyframe(uint32_t frameIndex) {
@@ -1032,6 +1053,8 @@ void Renderer::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                sync::kSampleStages, sync::kSampled, sync::kColorAttach, sync::kColorWrite);
 
     deferred_.recordLightingPass(cmd, gbuffer ? fr.lightingSetGb : fr.lightingSetGt,
+                                 gbuffer ? gbCluster_ : gtCluster_, slot,
+                                 view, gbuffer ? projJittered : proj,
                                  litTarget.view, sceneW, sceneH);
 
     // --- Opaque SSR + transparency pass (over the lit scene) ------------------
@@ -1429,6 +1452,8 @@ void Renderer::shutdown() {
     gtBloomB_.destroy(ctx_);
     deferred_.destroyColorPyramid(ctx_, gbColorPyramid_);
     deferred_.destroyColorPyramid(ctx_, gtColorPyramid_);
+    deferred_.destroyClusterGrid(ctx_, gbCluster_);
+    deferred_.destroyClusterGrid(ctx_, gtCluster_);
     deferred_.destroyDepthPyramid(ctx_, gbPyramid_);
     deferred_.destroyDepthPyramid(ctx_, gtPyramid_);
     deferred_.destroyDepthPyramid(ctx_, gbPyramidAo_);

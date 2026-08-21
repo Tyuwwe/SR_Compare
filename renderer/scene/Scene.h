@@ -192,18 +192,28 @@ constexpr float kAnimDt = 1.f / 60.f;
 constexpr uint32_t kSkinPaletteSlots = 2;
 
 // Punctual light, modelled after KHR_lights_punctual.  Plain POD: the GPU
-// packing (std140 LightGPU) happens in DeferredCore::fillLightingUBO.
-enum class LightType : uint32_t { Directional = 0, Point = 1 };
+// packing (std430 LightGPU) happens in DeferredCore::fillLightingUBO and
+// DeferredCore::fillClusterLights.
+enum class LightType : uint32_t { Directional = 0, Point = 1, Spot = 2 };
 
 struct Light {
     LightType type = LightType::Point;
-    // Point: world-space position.  Directional: unit direction *towards* the
-    // light (i.e. the shader's L), so a sun shining straight down is (0,1,0).
+    // Point/spot: world-space position.  Directional: unit direction *towards*
+    // the light (i.e. the shader's L), so a sun shining straight down is (0,1,0).
     Vec3 positionOrDirection{0.f, 1.f, 0.f};
     Vec3 color{1.f, 1.f, 1.f};
     float intensity = 1.f;
-    float range = 0.f;       // point only, 0 = infinite (pure inverse-square)
+    float range = 0.f;       // point/spot only, 0 = infinite (pure inverse-square)
     bool castShadow = false; // consumed by the C2 shadow pass; stored only for now
+    // Spot only (KHR_lights_punctual): unit direction the cone points (world
+    // space) and the inner/outer half-angles in radians (umbra/penumbra).
+    // Shading fades smoothly from innerCos to outerCos; the cluster assignment
+    // pass bounds the cone with a conservative sphere of height `range`.
+    Vec3 spotDirection{0.f, -1.f, 0.f};
+    float innerConeAngle = 0.f;                    // full intensity inside
+    float outerConeAngle = 3.14159265f / 4.f;      // zero intensity outside
+    int32_t shadowIndex = -1; // per-light shadow-map slot; -1 = unshadowed
+                              // (wired in Phase 4b, always -1 for now)
 };
 
 // Elevation (deg above horizon) / azimuth (deg, 0 = +Z, 90 = +X) to a unit

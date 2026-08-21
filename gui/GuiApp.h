@@ -292,6 +292,7 @@ private:
                         const Mat4& prevViewProj);
     void updateLightingUBO(void* mapped, const Mat4& invViewProj,
                            const std::vector<Light>& lights, const ShadowFrame* shadow);
+    void updateClusterLights(uint32_t frameIndex, const std::vector<Light>& lights);
     // The Viewer-tab lighting section's override light list (sun direction/
     // intensity from the UI; scene_.lights untouched).  Also the source of
     // the CSM shadowed-sun index, so it is built once per frame in
@@ -530,6 +531,10 @@ private:
     ColorPyramid gbColorPyramid_;
     ColorPyramid gtColorPyramid_;
     ColorPyramid gtSsaaColorPyramid_; // compare GT SSAA only
+    // Clustered shading grids (per-path resolution, per-slot buffers).
+    ClusterGrid gbCluster_;
+    ClusterGrid gtCluster_;
+    ClusterGrid gtSsaaCluster_; // compare GT SSAA only
     // Hi-Z depth pyramids for the SSR march (LR / GT / GT-SSAA paths); general
     // DeferredCore resource, later reused by GTAO/contact shadows/culling.
     DepthPyramid gbPyramid_;

@@ -629,13 +629,11 @@ bool Scene::loadGltf(const VulkanContext& ctx, const char* path, VkCommandPool p
     }
 
     // KHR_lights_punctual: cgltf exposes data->lights via node->light.
-    // Directional and point lights are supported; spot lights are skipped
-    // (no cone attenuation in the engine yet).
+    // Directional, point and spot lights are supported.
     for (int n = 0; n < static_cast<int>(data->nodes_count); ++n) {
         const cgltf_node* node = &data->nodes[n];
         if (!node->light) continue;
         const cgltf_light* gl = node->light;
-        if (gl->type == cgltf_light_type_spot) continue;
 
         cgltf_float world[16];
         cgltf_node_transform_world(node, world);
@@ -656,12 +654,23 @@ bool Scene::loadGltf(const VulkanContext& ctx, const char* path, VkCommandPool p
             // the IBL environment brightness.
             l.intensity = gl->intensity / 10000.f;
         } else {
-            l.type = LightType::Point;
+            l.type = gl->type == cgltf_light_type_spot ? LightType::Spot : LightType::Point;
             l.positionOrDirection = transformPoint(worldMat, Vec3{0.f, 0.f, 0.f});
-            // glTF point intensity is in candela, which maps 1:1 onto the
+            // glTF point/spot intensity is in candela, which maps 1:1 onto the
             // engine's inverse-square point-light units.
             l.intensity = gl->intensity;
             l.range = gl->range; // 0 = infinite in both glTF and the engine
+            if (l.type == LightType::Spot) {
+                // The cone shines along the node's local -Z (same convention
+                // as directional, opposite sign).  cgltf fills
+                // inner/outer_cone_angle with the spec defaults (0 / pi/4);
+                // clamp so cos(inner) > cos(outer) keeps a non-zero penumbra
+                // band in the shader's smoothstep.
+                l.spotDirection =
+                    normalize(transformDirection(worldMat, Vec3{0.f, 0.f, -1.f}));
+                l.innerConeAngle = gl->spot_inner_cone_angle;
+                l.outerConeAngle = std::max(gl->spot_outer_cone_angle, gl->spot_inner_cone_angle + 1e-3f);
+            }
         }
         lights.push_back(l);
     }

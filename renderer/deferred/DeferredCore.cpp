@@ -90,6 +90,30 @@ bool aabbIntersectsFrustum(const Frustum& f, const Vec3& mn, const Vec3& mx) {
     return true;
 }
 
+// scene::Light -> GPU packing, shared by fillLightingUBO (legacy 16-slot UBO
+// array) and fillClusterLights (full lights SSBO).  Intensities are scaled by
+// PI so Hammon's single-scatter 1/PI term matches the brightness of the
+// legacy forward pass.  Spot cone angles are stored precomputed as cosines
+// (the shaders never need the radians back).
+void packLightGpu(const Light& l, LightGPU& g) {
+    g.posOrDir[0] = l.positionOrDirection.x;
+    g.posOrDir[1] = l.positionOrDirection.y;
+    g.posOrDir[2] = l.positionOrDirection.z;
+    g.posOrDir[3] = static_cast<float>(l.type);
+    g.color[0] = l.color.x;
+    g.color[1] = l.color.y;
+    g.color[2] = l.color.z;
+    g.color[3] = l.intensity * 3.14159265f;
+    g.params[0] = l.range;
+    g.params[1] = l.castShadow ? 1.f : 0.f;
+    g.params[2] = static_cast<float>(l.shadowIndex); // -1 until Phase 4b
+    g.params[3] = std::cos(l.innerConeAngle);
+    g.spotDir[0] = l.spotDirection.x;
+    g.spotDir[1] = l.spotDirection.y;
+    g.spotDir[2] = l.spotDirection.z;
+    g.spotDir[3] = std::cos(l.outerConeAngle);
+}
+
 } // namespace
 
 bool DeferredCore::init(const VulkanContext& ctx, const char* envMapPath) {
@@ -156,7 +180,8 @@ bool DeferredCore::init(const VulkanContext& ctx, const char* envMapPath) {
         !loadShader(ctx, "exposure_solve.comp.spv", exposureSolveComp_) ||
         !loadShader(ctx, "shadow_depth.vert.spv", shadowDepthVert_) ||
         !loadShader(ctx, "shadow_depth_skinned.vert.spv", shadowDepthSkinnedVert_) ||
-        !loadShader(ctx, "shadow_depth.frag.spv", shadowDepthFrag_))
+        !loadShader(ctx, "shadow_depth.frag.spv", shadowDepthFrag_) ||
+        !loadShader(ctx, "cluster_assign.comp.spv", clusterAssignComp_))
         return false;
 
     if (!createLayouts(ctx)) return false;
@@ -226,8 +251,10 @@ bool DeferredCore::createLayouts(const VulkanContext& ctx) {
     // Lighting: binding 0 = LightingUBO; 1-5 = GBuffer (albedo/normal/material/
     // emissive/depth); 6-8 = IBL (irradiance/prefilter/LUT); 9 = env (skybox);
     // 10 = SSAO (blurred screen-space AO, R16F); 11 = CSM shadow map array
-    // (D32, comparison sampler).
-    VkDescriptorSetLayoutBinding lightBindings[12] = {};
+    // (D32, comparison sampler); 12 = clustered-shading lights SSBO (all
+    // point/spot lights, std430); 13 = this path's cluster grid SSBO
+    // (per-cluster light index lists).
+    VkDescriptorSetLayoutBinding lightBindings[14] = {};
     lightBindings[0].binding = 0;
     lightBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     lightBindings[0].descriptorCount = 1;
@@ -238,9 +265,15 @@ bool DeferredCore::createLayouts(const VulkanContext& ctx) {
         lightBindings[i].descriptorCount = 1;
         lightBindings[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     }
+    for (uint32_t i = 12; i < 14; ++i) {
+        lightBindings[i].binding = i;
+        lightBindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        lightBindings[i].descriptorCount = 1;
+        lightBindings[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    }
     VkDescriptorSetLayoutCreateInfo lightLayoutCi = {};
     lightLayoutCi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    lightLayoutCi.bindingCount = 12;
+    lightLayoutCi.bindingCount = 14;
     lightLayoutCi.pBindings = lightBindings;
     if (vkCreateDescriptorSetLayout(ctx.device, &lightLayoutCi, nullptr, &lightingSetLayout_) !=
         VK_SUCCESS)
@@ -390,6 +423,23 @@ bool DeferredCore::createLayouts(const VulkanContext& ctx) {
     ssrTemporalLayoutCi.pBindings = ssrTemporalBindings;
     if (vkCreateDescriptorSetLayout(ctx.device, &ssrTemporalLayoutCi, nullptr,
                                     &ssrTemporalSetLayout_) != VK_SUCCESS)
+        return false;
+
+    // Cluster light assignment (compute): binding 0 = lights SSBO (read),
+    // 1 = cluster grid SSBO (counts + index lists, write).
+    VkDescriptorSetLayoutBinding clusterBindings[2] = {};
+    for (uint32_t i = 0; i < 2; ++i) {
+        clusterBindings[i].binding = i;
+        clusterBindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        clusterBindings[i].descriptorCount = 1;
+        clusterBindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo clusterLayoutCi = {};
+    clusterLayoutCi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    clusterLayoutCi.bindingCount = 2;
+    clusterLayoutCi.pBindings = clusterBindings;
+    if (vkCreateDescriptorSetLayout(ctx.device, &clusterLayoutCi, nullptr, &clusterSetLayout_) !=
+        VK_SUCCESS)
         return false;
 
     // Auto exposure: one shared set for both passes.  binding 0 = lit HDR
@@ -957,6 +1007,30 @@ bool DeferredCore::createPipelines(const VulkanContext& ctx) {
     if (createComputePipeline(ctx, exposureCi, exposureSolvePipeline_) != VK_SUCCESS)
         return false;
 
+    // --- Clustered shading: light-assignment compute pass -----------------------
+    VkPushConstantRange clusterPushRange = {};
+    clusterPushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    clusterPushRange.offset = 0;
+    clusterPushRange.size = sizeof(ClusterAssignPush);
+    VkPipelineLayoutCreateInfo clusterLayoutCi = {};
+    clusterLayoutCi.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    clusterLayoutCi.setLayoutCount = 1;
+    clusterLayoutCi.pSetLayouts = &clusterSetLayout_;
+    clusterLayoutCi.pushConstantRangeCount = 1;
+    clusterLayoutCi.pPushConstantRanges = &clusterPushRange;
+    if (vkCreatePipelineLayout(ctx.device, &clusterLayoutCi, nullptr, &clusterPipelineLayout_) !=
+        VK_SUCCESS)
+        return false;
+    VkComputePipelineCreateInfo clusterCi = {};
+    clusterCi.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    clusterCi.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    clusterCi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    clusterCi.stage.module = clusterAssignComp_;
+    clusterCi.stage.pName = "main";
+    clusterCi.layout = clusterPipelineLayout_;
+    if (createComputePipeline(ctx, clusterCi, clusterPipeline_) != VK_SUCCESS)
+        return false;
+
     // --- CSM shadow depth pass ------------------------------------------------
     // Depth-only rendering into one cascade layer at a time.  Reuses the scene
     // pipeline layout (set0 = scene/material UBO, set1 = texture array); the
@@ -1040,6 +1114,7 @@ void DeferredCore::destroy(const VulkanContext& ctx) {
     if (exposureSolvePipeline_) { vkDestroyPipeline(ctx.device, exposureSolvePipeline_, nullptr); exposureSolvePipeline_ = VK_NULL_HANDLE; }
     if (shadowPipeline_) { vkDestroyPipeline(ctx.device, shadowPipeline_, nullptr); shadowPipeline_ = VK_NULL_HANDLE; }
     if (shadowSkinnedPipeline_) { vkDestroyPipeline(ctx.device, shadowSkinnedPipeline_, nullptr); shadowSkinnedPipeline_ = VK_NULL_HANDLE; }
+    if (clusterPipeline_) { vkDestroyPipeline(ctx.device, clusterPipeline_, nullptr); clusterPipeline_ = VK_NULL_HANDLE; }
     if (scenePipelineLayout_) { vkDestroyPipelineLayout(ctx.device, scenePipelineLayout_, nullptr); scenePipelineLayout_ = VK_NULL_HANDLE; }
     if (lightingPipelineLayout_) { vkDestroyPipelineLayout(ctx.device, lightingPipelineLayout_, nullptr); lightingPipelineLayout_ = VK_NULL_HANDLE; }
     if (transparentPipelineLayout_) { vkDestroyPipelineLayout(ctx.device, transparentPipelineLayout_, nullptr); transparentPipelineLayout_ = VK_NULL_HANDLE; }
@@ -1052,6 +1127,7 @@ void DeferredCore::destroy(const VulkanContext& ctx) {
     if (bloomPipelineLayout_) { vkDestroyPipelineLayout(ctx.device, bloomPipelineLayout_, nullptr); bloomPipelineLayout_ = VK_NULL_HANDLE; }
     if (histogramPipelineLayout_) { vkDestroyPipelineLayout(ctx.device, histogramPipelineLayout_, nullptr); histogramPipelineLayout_ = VK_NULL_HANDLE; }
     if (exposureSolvePipelineLayout_) { vkDestroyPipelineLayout(ctx.device, exposureSolvePipelineLayout_, nullptr); exposureSolvePipelineLayout_ = VK_NULL_HANDLE; }
+    if (clusterPipelineLayout_) { vkDestroyPipelineLayout(ctx.device, clusterPipelineLayout_, nullptr); clusterPipelineLayout_ = VK_NULL_HANDLE; }
     if (gbufferVert_) { vkDestroyShaderModule(ctx.device, gbufferVert_, nullptr); gbufferVert_ = VK_NULL_HANDLE; }
     if (gbufferSkinnedVert_) { vkDestroyShaderModule(ctx.device, gbufferSkinnedVert_, nullptr); gbufferSkinnedVert_ = VK_NULL_HANDLE; }
     if (gbufferFrag_) { vkDestroyShaderModule(ctx.device, gbufferFrag_, nullptr); gbufferFrag_ = VK_NULL_HANDLE; }
@@ -1076,6 +1152,7 @@ void DeferredCore::destroy(const VulkanContext& ctx) {
     if (shadowDepthVert_) { vkDestroyShaderModule(ctx.device, shadowDepthVert_, nullptr); shadowDepthVert_ = VK_NULL_HANDLE; }
     if (shadowDepthSkinnedVert_) { vkDestroyShaderModule(ctx.device, shadowDepthSkinnedVert_, nullptr); shadowDepthSkinnedVert_ = VK_NULL_HANDLE; }
     if (shadowDepthFrag_) { vkDestroyShaderModule(ctx.device, shadowDepthFrag_, nullptr); shadowDepthFrag_ = VK_NULL_HANDLE; }
+    if (clusterAssignComp_) { vkDestroyShaderModule(ctx.device, clusterAssignComp_, nullptr); clusterAssignComp_ = VK_NULL_HANDLE; }
     if (sceneSetLayout_) { vkDestroyDescriptorSetLayout(ctx.device, sceneSetLayout_, nullptr); sceneSetLayout_ = VK_NULL_HANDLE; }
     if (textureSetLayout_) { vkDestroyDescriptorSetLayout(ctx.device, textureSetLayout_, nullptr); textureSetLayout_ = VK_NULL_HANDLE; }
     if (lightingSetLayout_) { vkDestroyDescriptorSetLayout(ctx.device, lightingSetLayout_, nullptr); lightingSetLayout_ = VK_NULL_HANDLE; }
@@ -1087,6 +1164,7 @@ void DeferredCore::destroy(const VulkanContext& ctx) {
     if (ssrSetLayout_) { vkDestroyDescriptorSetLayout(ctx.device, ssrSetLayout_, nullptr); ssrSetLayout_ = VK_NULL_HANDLE; }
     if (ssrTemporalSetLayout_) { vkDestroyDescriptorSetLayout(ctx.device, ssrTemporalSetLayout_, nullptr); ssrTemporalSetLayout_ = VK_NULL_HANDLE; }
     if (exposureSetLayout_) { vkDestroyDescriptorSetLayout(ctx.device, exposureSetLayout_, nullptr); exposureSetLayout_ = VK_NULL_HANDLE; }
+    if (clusterSetLayout_) { vkDestroyDescriptorSetLayout(ctx.device, clusterSetLayout_, nullptr); clusterSetLayout_ = VK_NULL_HANDLE; }
     if (textureSampler_) { vkDestroySampler(ctx.device, textureSampler_, nullptr); textureSampler_ = VK_NULL_HANDLE; }
     if (gbufferSampler_) { vkDestroySampler(ctx.device, gbufferSampler_, nullptr); gbufferSampler_ = VK_NULL_HANDLE; }
     if (shadowSampler_) { vkDestroySampler(ctx.device, shadowSampler_, nullptr); shadowSampler_ = VK_NULL_HANDLE; }
@@ -1131,13 +1209,12 @@ void DeferredCore::fillLightingUBO(LightingUBO& out, const Scene& scene, const C
     out.cameraPos[2] = camera.position.z;
     out.cameraPos[3] = 1.f;
 
-    // Pack into the fixed-size GPU array: the shadowed sun (if any) is always
-    // slot 0 so CSM lightIndex remaps cleanly; remaining lights are scored by
-    // intensity / distance² from the camera so the nearest lanterns survive
-    // truncation at kMaxLights.
-    const std::vector<Light>& lights =
-        overrideLights ? *overrideLights
-                       : (scene.lights.empty() ? defaultLights() : scene.lights);
+    // Pack into the fixed-size legacy GPU array: the shadowed sun (if any) is
+    // always slot 0 so CSM lightIndex remaps cleanly; the remaining lights
+    // follow scene order (no scoring — the clustered path consumes the full
+    // light set from the SSBO, so this array only feeds the forward
+    // transparency pass and the sun; see fillClusterLights).
+    const std::vector<Light>& lights = effectiveLights(scene, overrideLights);
 
     int sunSrc = -1;
     if (shadow && shadow->lightIndex >= 0 &&
@@ -1162,57 +1239,18 @@ void DeferredCore::fillLightingUBO(LightingUBO& out, const Scene& scene, const C
         }
     }
 
-    struct Scored {
-        int index;
-        float score;
-    };
-    std::vector<Scored> rest;
-    rest.reserve(lights.size());
-    const Vec3 camPos = camera.position;
-    for (int i = 0; i < static_cast<int>(lights.size()); ++i) {
-        if (i == sunSrc) continue;
-        const Light& l = lights[static_cast<size_t>(i)];
-        float score = l.intensity;
-        if (l.type == LightType::Point) {
-            const Vec3 d = l.positionOrDirection - camPos;
-            const float dist2 = std::max(dot(d, d), 1.f);
-            score = l.intensity / dist2;
-            if (l.range > 0.f && std::sqrt(dist2) > l.range) score *= 0.01f;
-        } else {
-            score = l.intensity * 1000.f; // leftover directionals stay near the front
-        }
-        rest.push_back({i, score});
-    }
-    std::sort(rest.begin(), rest.end(),
-              [](const Scored& a, const Scored& b) { return a.score > b.score; });
-
     std::vector<int> order;
-    order.reserve(kMaxLights);
+    order.reserve(std::min<size_t>(kMaxLights, lights.size()));
     if (sunSrc >= 0) order.push_back(sunSrc);
-    for (const Scored& s : rest) {
-        if (order.size() >= kMaxLights) break;
-        order.push_back(s.index);
+    for (int i = 0; i < static_cast<int>(lights.size()) && order.size() < kMaxLights; ++i) {
+        if (i != sunSrc) order.push_back(i);
     }
 
     const uint32_t count = static_cast<uint32_t>(order.size());
     std::memset(out.lights, 0, sizeof(out.lights)); // deterministic unused slots
     for (uint32_t i = 0; i < count; ++i) {
         const Light& l = lights[static_cast<size_t>(order[static_cast<size_t>(i)])];
-        LightGPU& g = out.lights[i];
-        g.posOrDir[0] = l.positionOrDirection.x;
-        g.posOrDir[1] = l.positionOrDirection.y;
-        g.posOrDir[2] = l.positionOrDirection.z;
-        g.posOrDir[3] = static_cast<float>(l.type);
-        g.color[0] = l.color.x;
-        g.color[1] = l.color.y;
-        g.color[2] = l.color.z;
-        // Intensities are scaled by PI so Hammon's single-scatter 1/PI term
-        // matches the brightness of the legacy forward pass.
-        g.color[3] = l.intensity * 3.14159265f;
-        g.params[0] = l.range;
-        g.params[1] = l.castShadow ? 1.f : 0.f;
-        g.params[2] = 0.f;
-        g.params[3] = 0.f;
+        packLightGpu(l, out.lights[i]);
     }
     out.lightCounts[0] = static_cast<float>(count);
     out.lightCounts[1] = 0.f;
@@ -1226,10 +1264,18 @@ void DeferredCore::fillLightingUBO(LightingUBO& out, const Scene& scene, const C
     out.iblParams[3] = 0.f;
 
     // Camera forward is needed by the shaders to convert a world position to
-    // view-space depth for cascade selection; fill it even with shadows off.
+    // view-space depth for cascade selection and cluster slicing; fill it even
+    // with shadows off.
     out.viewForward[0] = camera.forward.x;
     out.viewForward[1] = camera.forward.y;
     out.viewForward[2] = camera.forward.z;
+
+    // Exponential cluster depth slicing range (cluster_assign.comp builds the
+    // same slice bounds from the near/far it gets via push constants).
+    out.clusterDepth[0] = camera.nearPlane;
+    out.clusterDepth[1] = camera.farPlane;
+    out.clusterDepth[2] = 0.f;
+    out.clusterDepth[3] = 0.f;
 
     // The rasterizer depth-bias values are mirrored here so hosts can feed the
     // same constants to vkCmdSetDepthBias in recordShadowPass.
@@ -1256,6 +1302,149 @@ void DeferredCore::fillLightingUBO(LightingUBO& out, const Scene& scene, const C
         out.shadowParams[3] = 0.f;
         out.viewForward[3] = -1.f;
     }
+}
+
+const std::vector<Light>& DeferredCore::effectiveLights(const Scene& scene,
+                                                        const std::vector<Light>* overrideLights) {
+    return overrideLights ? *overrideLights
+                          : (scene.lights.empty() ? defaultLights() : scene.lights);
+}
+
+uint32_t DeferredCore::fillClusterLights(void* mappedLightsSsbo,
+                                         const std::vector<Light>& lights) const {
+    // std430: uvec4 header (x = packed point/spot count) + LightGPU[].
+    // Directionals bypass the clusters (lighting.frag shades them from the
+    // LightingUBO directly); the full untruncated point/spot set goes here —
+    // per-cluster culling in cluster_assign.comp replaces the old CPU-side
+    // intensity/distance^2 top-16 scoring.
+    auto* header = static_cast<uint32_t*>(mappedLightsSsbo);
+    auto* gpu = reinterpret_cast<LightGPU*>(header + 4);
+    uint32_t count = 0;
+    for (const Light& l : lights) {
+        if (l.type == LightType::Directional) continue;
+        if (count >= kMaxSceneLights) break;
+        packLightGpu(l, gpu[count]);
+        ++count;
+    }
+    header[0] = count;
+    header[1] = header[2] = header[3] = 0;
+    return count;
+}
+
+bool DeferredCore::createClusterGrid(const VulkanContext& ctx, uint32_t w, uint32_t h,
+                                     ClusterGrid& out) const {
+    out.gridX = (w + kClusterTileSize - 1) / kClusterTileSize;
+    out.gridY = (h + kClusterTileSize - 1) / kClusterTileSize;
+    out.gridZ = kClusterSlicesZ;
+    out.clusterCount = out.gridX * out.gridY * out.gridZ;
+    const VkDeviceSize lightsSize = 16 + static_cast<VkDeviceSize>(kMaxSceneLights) * sizeof(LightGPU);
+    // Grid buffer: uvec4 header + counts[N] + indices[N * kMaxLightsPerCluster].
+    const VkDeviceSize gridSize =
+        16 + static_cast<VkDeviceSize>(out.clusterCount) * (1 + kMaxLightsPerCluster) * 4;
+    for (uint32_t slot = 0; slot < kClusterSlots; ++slot) {
+        if (createBuffer(ctx, lightsSize,
+                         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                         out.lightsBuffer[slot], out.lightsMemory[slot]) != VK_SUCCESS)
+            return false;
+        vmaMapMemory(ctx.allocator, out.lightsMemory[slot], &out.lightsMapped[slot]);
+        if (createBuffer(ctx, gridSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, out.gridBuffer[slot],
+                         out.gridMemory[slot]) != VK_SUCCESS)
+            return false;
+
+        // Grid header (dimensions + list capacity) never changes per frame;
+        // upload it once through a staging buffer.  The compute pass writes
+        // only the counts/indices region.
+        const uint32_t headerData[4] = {out.gridX, out.gridY, out.gridZ, kMaxLightsPerCluster};
+        VkBuffer staging = VK_NULL_HANDLE;
+        VmaAllocation stagingMemory = VK_NULL_HANDLE;
+        if (createBuffer(ctx, sizeof(headerData), VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                         staging, stagingMemory) != VK_SUCCESS)
+            return false;
+        void* mapped = nullptr;
+        vmaMapMemory(ctx.allocator, stagingMemory, &mapped);
+        std::memcpy(mapped, headerData, sizeof(headerData));
+        vmaUnmapMemory(ctx.allocator, stagingMemory);
+        VkBuffer gridBuffer = out.gridBuffer[slot];
+        submitOneShot(ctx, [&](VkCommandBuffer cmd) {
+            VkBufferCopy region = {};
+            region.size = sizeof(headerData);
+            vkCmdCopyBuffer(cmd, staging, gridBuffer, 1, &region);
+            // Transfer write -> the assignment pass's storage read/write and
+            // the lighting fragment shader's storage read.
+            VkBufferMemoryBarrier2 bar = {};
+            bar.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2;
+            bar.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+            bar.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+            bar.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+            bar.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+            bar.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            bar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            bar.buffer = gridBuffer;
+            bar.offset = 0;
+            bar.size = VK_WHOLE_SIZE;
+            VkDependencyInfo dep = {};
+            dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+            dep.bufferMemoryBarrierCount = 1;
+            dep.pBufferMemoryBarriers = &bar;
+            vkCmdPipelineBarrier2(cmd, &dep);
+        });
+        vkDestroyBuffer(ctx.device, staging, nullptr);
+        vmaFreeMemory(ctx.allocator, stagingMemory);
+    }
+    return true;
+}
+
+bool DeferredCore::writeClusterGridSets(const VulkanContext& ctx, VkDescriptorPool pool,
+                                        ClusterGrid& grid) const {
+    for (uint32_t slot = 0; slot < kClusterSlots; ++slot) {
+        VkDescriptorSetAllocateInfo alloc = {};
+        alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        alloc.descriptorPool = pool;
+        alloc.descriptorSetCount = 1;
+        alloc.pSetLayouts = &clusterSetLayout_;
+        if (vkAllocateDescriptorSets(ctx.device, &alloc, &grid.assignSet[slot]) != VK_SUCCESS)
+            return false;
+        VkDescriptorBufferInfo bufs[2] = {};
+        bufs[0].buffer = grid.lightsBuffer[slot];
+        bufs[0].range = VK_WHOLE_SIZE;
+        bufs[1].buffer = grid.gridBuffer[slot];
+        bufs[1].range = VK_WHOLE_SIZE;
+        VkWriteDescriptorSet writes[2] = {};
+        for (uint32_t k = 0; k < 2; ++k) {
+            writes[k].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[k].dstSet = grid.assignSet[slot];
+            writes[k].dstBinding = k;
+            writes[k].descriptorCount = 1;
+            writes[k].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[k].pBufferInfo = &bufs[k];
+        }
+        vkUpdateDescriptorSets(ctx.device, 2, writes, 0, nullptr);
+    }
+    return true;
+}
+
+void DeferredCore::destroyClusterGrid(const VulkanContext& ctx, ClusterGrid& grid) const {
+    for (uint32_t slot = 0; slot < kClusterSlots; ++slot) {
+        if (grid.lightsBuffer[slot]) {
+            vmaUnmapMemory(ctx.allocator, grid.lightsMemory[slot]);
+            vkDestroyBuffer(ctx.device, grid.lightsBuffer[slot], nullptr);
+            vmaFreeMemory(ctx.allocator, grid.lightsMemory[slot]);
+            grid.lightsBuffer[slot] = VK_NULL_HANDLE;
+            grid.lightsMemory[slot] = VK_NULL_HANDLE;
+            grid.lightsMapped[slot] = nullptr;
+        }
+        if (grid.gridBuffer[slot]) {
+            vkDestroyBuffer(ctx.device, grid.gridBuffer[slot], nullptr);
+            vmaFreeMemory(ctx.allocator, grid.gridMemory[slot]);
+            grid.gridBuffer[slot] = VK_NULL_HANDLE;
+            grid.gridMemory[slot] = VK_NULL_HANDLE;
+        }
+        grid.assignSet[slot] = VK_NULL_HANDLE; // pool-owned
+    }
+    grid.clusterCount = 0;
 }
 
 bool DeferredCore::createMaterialUbo(const VulkanContext& ctx, const Scene& scene,
@@ -1347,11 +1536,18 @@ void DeferredCore::writeTextureSet(const VulkanContext& ctx, VkDescriptorSet set
 void DeferredCore::writeLightingSet(const VulkanContext& ctx, VkDescriptorSet set,
                                     VkBuffer lightingUbo, VkImageView albedo, VkImageView normal,
                                     VkImageView material, VkImageView emissive,
-                                    VkImageView depth, VkImageView ssao, VkImageView shadow) const {
+                                    VkImageView depth, VkImageView ssao, VkImageView shadow,
+                                    VkBuffer clusterLights, VkBuffer clusterGrid) const {
     VkDescriptorBufferInfo lightBuf = {};
     lightBuf.buffer = lightingUbo;
     lightBuf.offset = 0;
     lightBuf.range = sizeof(LightingUBO);
+
+    VkDescriptorBufferInfo ssboBufs[2] = {};
+    ssboBufs[0].buffer = clusterLights; // binding 12: all point/spot lights
+    ssboBufs[0].range = VK_WHOLE_SIZE;
+    ssboBufs[1].buffer = clusterGrid;   // binding 13: per-cluster light lists
+    ssboBufs[1].range = VK_WHOLE_SIZE;
 
     VkDescriptorImageInfo img[11] = {};
     const VkImageView gb[5] = {albedo, normal, material, emissive, depth};
@@ -1379,7 +1575,7 @@ void DeferredCore::writeLightingSet(const VulkanContext& ctx, VkDescriptorSet se
     img[10].imageView = shadow;
     img[10].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
-    VkWriteDescriptorSet w[12] = {};
+    VkWriteDescriptorSet w[14] = {};
     w[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     w[0].dstSet = set;
     w[0].dstBinding = 0;
@@ -1395,7 +1591,17 @@ void DeferredCore::writeLightingSet(const VulkanContext& ctx, VkDescriptorSet se
         w[k + 1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         w[k + 1].pImageInfo = &img[k];
     }
-    vkUpdateDescriptorSets(ctx.device, 1 + samplerCount, w, 0, nullptr);
+    const uint32_t writeCount = 1 + samplerCount;
+    for (uint32_t k = 0; k < 2; ++k) {
+        VkWriteDescriptorSet& s = w[writeCount + k];
+        s.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        s.dstSet = set;
+        s.dstBinding = 12 + k;
+        s.descriptorCount = 1;
+        s.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        s.pBufferInfo = &ssboBufs[k];
+    }
+    vkUpdateDescriptorSets(ctx.device, writeCount + 2, w, 0, nullptr);
 }
 
 void DeferredCore::recordGBufferDraws(VkCommandBuffer cmd, const Scene& scene, bool gtPass,
@@ -1497,7 +1703,55 @@ void DeferredCore::recordGBufferDraws(VkCommandBuffer cmd, const Scene& scene, b
 }
 
 void DeferredCore::recordLightingPass(VkCommandBuffer cmd, VkDescriptorSet lightingSet,
-                                      VkImageView target, uint32_t width, uint32_t height) const {
+                                      ClusterGrid& grid, uint32_t slot, const Mat4& view,
+                                      const Mat4& proj, VkImageView target, uint32_t width,
+                                      uint32_t height) const {
+    // --- Cluster light assignment (compute): per-cluster view-space AABB vs
+    // every point/spot light, once per frame (Olsson et al. 2012 clustered
+    // shading; DOOM 2016/Eternal SIGGRAPH course).  One invocation per cluster
+    // loops the lights in SSBO order, so the lists are bit-deterministic.
+    const uint32_t s = slot % kClusterSlots;
+    ClusterAssignPush push = {};
+    std::memcpy(push.view, view.m, sizeof(push.view));
+    push.projParams[0] = proj.m[0]; // f / aspect
+    push.projParams[1] = proj.m[5]; // -f (Vulkan y-flip; the shader only divides by it)
+    // Recover near/far from the perspective projection (Mat4::perspective):
+    // m[10] = f/(n-f), m[14] = n*f/(n-f)  =>  n = m[14]/m[10], f = n*m[10]/(1+m[10]).
+    push.projParams[2] = proj.m[14] / proj.m[10];
+    push.projParams[3] = push.projParams[2] * proj.m[10] / (1.f + proj.m[10]);
+    push.grid[0] = grid.gridX;
+    push.grid[1] = grid.gridY;
+    push.grid[2] = grid.gridZ;
+    push.grid[3] = kMaxLightsPerCluster;
+    push.misc[0] = width;
+    push.misc[1] = height;
+    push.misc[2] = kClusterTileSize;
+    push.misc[3] = 0;
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, clusterPipeline_);
+    vkCmdPushConstants(cmd, clusterPipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                       sizeof(push), &push);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, clusterPipelineLayout_, 0, 1,
+                            &grid.assignSet[s], 0, nullptr);
+    vkCmdDispatch(cmd, (grid.clusterCount + 63) / 64, 1, 1);
+
+    // Compute writes -> fragment storage reads in the lighting pass below.
+    VkBufferMemoryBarrier2 clusterBar = {};
+    clusterBar.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2;
+    clusterBar.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    clusterBar.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+    clusterBar.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+    clusterBar.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+    clusterBar.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    clusterBar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    clusterBar.buffer = grid.gridBuffer[s];
+    clusterBar.offset = 0;
+    clusterBar.size = VK_WHOLE_SIZE;
+    VkDependencyInfo clusterDep = {};
+    clusterDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    clusterDep.bufferMemoryBarrierCount = 1;
+    clusterDep.pBufferMemoryBarriers = &clusterBar;
+    vkCmdPipelineBarrier2(cmd, &clusterDep);
+
     VkRenderingAttachmentInfo color =
         makeColorAttachment(target, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                             VK_ATTACHMENT_LOAD_OP_CLEAR);

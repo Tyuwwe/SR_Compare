@@ -50,6 +50,7 @@ set(RENDERER_SHADERS
     shaders/shadow_depth.vert
     shaders/shadow_depth_skinned.vert
     shaders/shadow_depth.frag
+    shaders/cluster_assign.comp
     shaders/ssao.comp
     shaders/ssao_blur.comp
     shaders/ssao_temporal.comp

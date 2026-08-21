@@ -173,6 +173,11 @@ private:
     uint32_t ssrFramesGb_ = 0;
     uint32_t ssrFramesGt_ = 0;
 
+    // Clustered shading state, one per path (grid resolution differs):
+    // per-slot full-lights SSBO + per-cluster light list SSBO (DeferredCore).
+    ClusterGrid gbCluster_;
+    ClusterGrid gtCluster_;
+
     // Shared deferred pipeline (shaders/layouts/pipelines/samplers + IBL maps).
     DeferredCore deferred_;
 

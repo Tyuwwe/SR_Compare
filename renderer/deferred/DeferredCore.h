@@ -65,16 +65,59 @@ struct MaterialUBO {
 };
 static_assert(sizeof(MaterialUBO) == 80, "MaterialUBO std140 size mismatch");
 
-// GPU mirror of scene::Light (std140: three vec4s per light).  Must match the
-// LightGPU struct in lighting.frag / transparent.frag / transparent_gt.frag.
+// GPU mirror of scene::Light (std430/std140: four vec4s per light).  Must
+// match the LightGPU struct in lighting.frag / transparent.frag /
+// transparent_gt.frag / cluster_assign.comp.
 struct LightGPU {
-    float posOrDir[4]; // xyz = position (point) / direction-to-light (directional), w = LightType
+    float posOrDir[4]; // xyz = position (point/spot) / direction-to-light (directional), w = LightType
     float color[4];    // rgb + w = intensity (PI-scaled, see fillLightingUBO)
-    float params[4];   // x = range (0 = infinite), y = castShadow (C2), zw = reserved
+    float params[4];   // x = range (0 = infinite), y = castShadow (C2),
+                       // z = shadowIndex (-1 until Phase 4b), w = spot cos(inner)
+    float spotDir[4];  // xyz = spot cone direction (unit, world), w = spot cos(outer)
 };
-static_assert(sizeof(LightGPU) == 48, "LightGPU std140 size mismatch");
+static_assert(sizeof(LightGPU) == 64, "LightGPU layout mismatch");
 
+// Legacy fixed array in LightingUBO: still feeds the forward transparency
+// pass (which shades the global list) and carries the CSM sun for
+// lighting.frag.  The clustered path reads the full light set from the
+// lights SSBO instead.
 constexpr uint32_t kMaxLights = 16; // must match lights[] in lighting/transparent shaders
+
+// --- Clustered shading (Olsson et al. 2012; DOOM 2016/Eternal, SIGGRAPH) -----
+// The view frustum is split into a screen-tile x exponential-depth grid of
+// clusters; a compute pass (cluster_assign.comp) tests every punctual light
+// against each cluster's view-space AABB once per frame and writes a
+// per-cluster light index list.  lighting.frag then iterates only its own
+// cluster's list instead of a globally truncated 16-light array, so the
+// kMaxLights cap (and its CPU intensity/distance^2 scoring) is gone:
+// up to kMaxSceneLights point/spot lights are considered, directionals
+// (the CSM sun) bypass the clusters entirely.
+constexpr uint32_t kMaxSceneLights = 1024;  // lights SSBO capacity (point+spot)
+constexpr uint32_t kClusterTileSize = 64;   // screen tile edge, px (DOOM 2016 uses 64-128 px tiles)
+constexpr uint32_t kClusterSlicesZ = 24;    // exponential depth slices (DOOM Eternal: 24)
+constexpr uint32_t kMaxLightsPerCluster = 64; // fixed-capacity lists keep assignment deterministic
+// Double-buffered to match every host's kFramesInFlight: the slot's buffers
+// are only rewritten once its fence has passed (same rule as the per-slot UBOs).
+constexpr uint32_t kClusterSlots = 2;
+
+// Host-owned clustered-shading state (same ownership model as DepthPyramid):
+// one per deferred render path (LR / GT / GT-SSAA) because the grid depends
+// on the path resolution.  lightsBuffer (std430: uvec4 header +
+// LightGPU[kMaxSceneLights]) is host-visible and refilled per frame;
+// gridBuffer (uvec4 grid header + counts[N] + indices[N*kMaxLightsPerCluster],
+// N = clusterCount) is device-local, its header written once at creation.
+struct ClusterGrid {
+    VkBuffer lightsBuffer[kClusterSlots] = {};
+    VmaAllocation lightsMemory[kClusterSlots] = {};
+    void* lightsMapped[kClusterSlots] = {};
+    VkBuffer gridBuffer[kClusterSlots] = {};
+    VmaAllocation gridMemory[kClusterSlots] = {};
+    VkDescriptorSet assignSet[kClusterSlots] = {}; // pool-owned (clusterSetLayout)
+    uint32_t gridX = 0;
+    uint32_t gridY = 0;
+    uint32_t gridZ = kClusterSlicesZ;
+    uint32_t clusterCount = 0;
+};
 
 // --- CSM sun shadows (AC Unity reference: 4 cascades, 2048^2 each) -----------
 constexpr uint32_t kShadowCascadeCount = 4;
@@ -138,8 +181,21 @@ struct LightingUBO {
     float shadowParams[4];  // x = depthBiasConstant, y = depthBiasSlope,
                             // z = shadowsEnabled, w = debugCascades
     float viewForward[4];   // xyz = camera forward (world); w = shadowed sun light index (-1 = none)
+    float clusterDepth[4];  // x = near, y = far (exponential cluster slicing), zw unused
 };
-static_assert(sizeof(LightingUBO) == 1200, "LightingUBO std140 size mismatch");
+static_assert(sizeof(LightingUBO) == 1472, "LightingUBO std140 size mismatch");
+
+// Push constants of the cluster light-assignment pass (cluster_assign.comp),
+// 112 bytes.  The per-cluster view-space AABBs are derived in the shader from
+// the tile NDC corners and the exponential slice depths (no per-frame CPU
+// AABB rebuild, no extra invProj buffer).
+struct ClusterAssignPush {
+    float view[16];       // world -> view of this frame's camera
+    float projParams[4];  // x = proj.m[0], y = proj.m[5], z = near, w = far
+    uint32_t grid[4];     // gridX, gridY, gridZ, kMaxLightsPerCluster
+    uint32_t misc[4];     // screenW, screenH, kClusterTileSize, unused
+};
+static_assert(sizeof(ClusterAssignPush) == 112, "ClusterAssignPush size mismatch");
 
 struct ScenePush {
     float model[16];
@@ -447,9 +503,11 @@ public:
     // overrideLights (optional): pack this list instead of scene.lights — the
     // GUI sun controls rebuild the list per frame without touching the scene.
     // The fallback-to-defaultLights() rule applies only when no override is
-    // given.  Packed order: shadowed sun first, then other lights scored by
-    // intensity/distance² (truncated at kMaxLights).  The GPU sun index is
-    // remapped to slot 0.
+    // given.  Packed order: shadowed sun first (slot 0, CSM lightIndex remaps
+    // to it), then the remaining lights in scene order, truncated at
+    // kMaxLights.  This legacy array feeds only the forward transparency pass
+    // and the sun; the deferred lighting pass iterates the cluster lists
+    // (fillClusterLights) which carry the full, untruncated light set.
     // shadow (optional): non-null enables CSM sampling in the shaders
     // (shadowParams.z = 1); null writes identity cascades with shadows off.
     void fillLightingUBO(LightingUBO& out, const Scene& scene, const Camera& camera,
@@ -457,6 +515,27 @@ public:
                          const std::vector<Light>* overrideLights = nullptr,
                          const ShadowFrame* shadow = nullptr,
                          float iblIntensity = 1.f) const;
+
+    // The light list fillLightingUBO/fillClusterLights would use: the override
+    // when given, else scene.lights, else defaultLights().  Hosts filling a
+    // ClusterGrid must pass the same list they pass to fillLightingUBO.
+    static const std::vector<Light>& effectiveLights(const Scene& scene,
+                                                     const std::vector<Light>* overrideLights);
+
+    // --- clustered shading (see the constants above) ---------------------------
+    // Packs every point/spot light of the list (scene order, capped at
+    // kMaxSceneLights; directionals bypass the clusters) into the mapped
+    // lights SSBO (uvec4 count header + LightGPU[]).  Returns the packed count.
+    uint32_t fillClusterLights(void* mappedLightsSsbo, const std::vector<Light>& lights) const;
+    // Creates the per-slot lights/grid buffers of one path (w x h = that
+    // path's render resolution) and writes the grid header via staging.
+    bool createClusterGrid(const VulkanContext& ctx, uint32_t w, uint32_t h,
+                           ClusterGrid& out) const;
+    // Allocates the per-slot assignment sets from the caller's pool and binds
+    // the slot's lights (binding 0) + grid (binding 1) buffers.
+    bool writeClusterGridSets(const VulkanContext& ctx, VkDescriptorPool pool,
+                              ClusterGrid& grid) const;
+    void destroyClusterGrid(const VulkanContext& ctx, ClusterGrid& grid) const;
 
     // Uploads the dynamic-offset material UBO array (one entry per material).
     bool createMaterialUbo(const VulkanContext& ctx, const Scene& scene, VkBuffer& buffer,
@@ -473,10 +552,12 @@ public:
     // shadow = ShadowTargets::arrayView, or VK_NULL_HANDLE to leave binding 11
     // unwritten (hosts without a shadow pass; the shaders must run with
     // shadowParams.z == 0 then, which fillLightingUBO guarantees by default).
+    // clusterLights/clusterGrid bind this slot's ClusterGrid buffers (bindings
+    // 12/13: full lights SSBO + this path's per-cluster light lists).
     void writeLightingSet(const VulkanContext& ctx, VkDescriptorSet set, VkBuffer lightingUbo,
                           VkImageView albedo, VkImageView normal, VkImageView material,
                           VkImageView emissive, VkImageView depth, VkImageView ssao,
-                          VkImageView shadow) const;
+                          VkImageView shadow, VkBuffer clusterLights, VkBuffer clusterGrid) const;
 
     // --- pass recording (the caller owns all layout transitions) ---------------
     // Draws the scene into the already-begun GBuffer rendering block (merged
@@ -486,9 +567,15 @@ public:
                             VkDescriptorSet sceneSet, VkDescriptorSet textureSet,
                             uint32_t materialStride, uint32_t width, uint32_t height,
                             const Mat4& cullViewProj) const;
-    // Fullscreen deferred lighting: GBuffer + IBL -> HDR target.
-    void recordLightingPass(VkCommandBuffer cmd, VkDescriptorSet lightingSet, VkImageView target,
-                            uint32_t width, uint32_t height) const;
+    // Fullscreen deferred lighting: GBuffer + IBL -> HDR target.  First runs
+    // the cluster light-assignment compute pass (cluster_assign.comp on
+    // grid.assignSet[slot], view-space AABB tests) with a
+    // compute-write -> fragment-read barrier, then the fullscreen draw.
+    // view/proj are this frame's camera matrices (proj may be the jittered
+    // variant; the jitter only touches m[8]/m[9], which the pass ignores).
+    void recordLightingPass(VkCommandBuffer cmd, VkDescriptorSet lightingSet, ClusterGrid& grid,
+                            uint32_t slot, const Mat4& view, const Mat4& proj,
+                            VkImageView target, uint32_t width, uint32_t height) const;
 
     // --- transparency pass (alpha-blended surfaces, after lighting) -----------
     // True when any material in the scene is alphaMode BLEND.
@@ -737,6 +824,7 @@ public:
     VkDescriptorSetLayout hizSetLayout() const { return hizSetLayout_; }
     VkDescriptorSetLayout ssrSetLayout() const { return ssrSetLayout_; }
     VkDescriptorSetLayout ssrTemporalSetLayout() const { return ssrTemporalSetLayout_; }
+    VkDescriptorSetLayout clusterSetLayout() const { return clusterSetLayout_; }
     VkDescriptorSetLayout bloomSetLayout() const { return ssaoBlurSetLayout_; }
     VkDescriptorSetLayout exposureSetLayout() const { return exposureSetLayout_; }
     VkPipelineLayout scenePipelineLayout() const { return scenePipelineLayout_; }
@@ -766,6 +854,9 @@ private:
     VkDescriptorSetLayout hizSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout ssrSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout ssrTemporalSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout clusterSetLayout_ = VK_NULL_HANDLE;
+    VkPipelineLayout clusterPipelineLayout_ = VK_NULL_HANDLE;
+    VkPipeline clusterPipeline_ = VK_NULL_HANDLE;
     VkPipelineLayout scenePipelineLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout lightingPipelineLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout transparentPipelineLayout_ = VK_NULL_HANDLE;
@@ -824,6 +915,7 @@ private:
     VkShaderModule shadowDepthVert_ = VK_NULL_HANDLE;
     VkShaderModule shadowDepthSkinnedVert_ = VK_NULL_HANDLE;
     VkShaderModule shadowDepthFrag_ = VK_NULL_HANDLE;
+    VkShaderModule clusterAssignComp_ = VK_NULL_HANDLE;
     VkSampler textureSampler_ = VK_NULL_HANDLE;
     VkSampler gbufferSampler_ = VK_NULL_HANDLE;
     VkSampler shadowSampler_ = VK_NULL_HANDLE;
