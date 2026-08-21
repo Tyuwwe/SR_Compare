@@ -1,0 +1,40 @@
+#version 450
+// Hi-Z depth pyramid downsample (one dispatch per mip level).
+//
+// mip 0 copies the opaque GBuffer depth (D32, bound as a sampler) into R32F;
+// each further mip reduces the previous one 2x2.  The projection is standard
+// (non-reversed) Vulkan depth: 0 = near, 1 = far, so a ray marcher testing
+// "ray behind the cell" needs the FARTHEST surface per cell -> max-reduce.
+// Sky pixels (cleared depth 1.0) dominate any mixed cell; the marcher treats
+// the far value as +infinity and skips such cells at speed (the standard
+// Hi-Z tradeoff, see ssr.glsl).
+//
+// The pyramid is a general DeferredCore resource: SSR (Phase 1b) consumes it
+// today; GTAO, contact shadows and occlusion culling are expected to reuse it.
+//
+// Ref: McGuire & Mara, "Efficient GPU Screen-Space Ray Tracing", JCGT 2014
+//      Stachowiak, Stochastic SSR, SIGGRAPH 2015
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D srcTex;
+layout(set = 0, binding = 1, r32f) writeonly uniform image2D dstMip;
+
+layout(push_constant) uniform Push {
+    ivec2 srcSize; // texel size of srcTex (clamps the 2x2 tap on odd sizes)
+} push;
+
+void main() {
+    ivec2 dst = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 dstSize = imageSize(dstMip);
+    if (dst.x >= dstSize.x || dst.y >= dstSize.y) return;
+
+    // Edge replication on odd dimensions: a cell at the right/bottom border
+    // re-samples the edge texel instead of clamping AFTER the fetch.
+    ivec2 lo = min(dst * 2, push.srcSize - 1);
+    ivec2 hi = min(dst * 2 + 1, push.srcSize - 1);
+    float d00 = texelFetch(srcTex, ivec2(lo.x, lo.y), 0).r;
+    float d10 = texelFetch(srcTex, ivec2(hi.x, lo.y), 0).r;
+    float d01 = texelFetch(srcTex, ivec2(lo.x, hi.y), 0).r;
+    float d11 = texelFetch(srcTex, ivec2(hi.x, hi.y), 0).r;
+    imageStore(dstMip, dst, vec4(max(max(d00, d10), max(d01, d11))));
+}

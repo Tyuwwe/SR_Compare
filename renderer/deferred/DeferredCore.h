@@ -178,6 +178,37 @@ constexpr float kSsaoPower = 2.2f;
 // denoise.  The filtered output (gbAo_) stays R16F for lighting/transparent.
 constexpr VkFormat kAoRawFormat = VK_FORMAT_R16G16_SFLOAT;
 
+// --- Hi-Z depth pyramid (max-reduced opaque depth mip chain) -----------------
+// Shared general-purpose resource: the SSR marcher (ssr.glsl) consumes it
+// today; GTAO (Phase 2), contact shadows (Phase 4) and occlusion culling
+// (Phase 7) are expected to reuse the same chain.  R32F, mip 0 = full-res
+// copy of the opaque D32 depth, mips 1..N = 2x2 max-reduce (depth semantics
+// are non-reversed Vulkan: 0 = near, 1 = far, so the marcher needs the
+// farthest surface per cell).
+constexpr VkFormat kDepthPyramidFormat = VK_FORMAT_R32_SFLOAT;
+
+// Push constants of the Hi-Z downsample pass (hiz_downsample.comp), 8 bytes.
+struct HiZPush {
+    int32_t srcSize[2]; // texel size of the source level (edge clamp)
+};
+static_assert(sizeof(HiZPush) == 8, "HiZPush size mismatch");
+
+// Host-owned depth pyramid (same ownership model as ShadowTargets: the host
+// holds the struct and the descriptor pool, DeferredCore provides
+// create/write/record/destroy).  The image stays in VK_IMAGE_LAYOUT_GENERAL
+// for its whole lifetime — every mip ping-pongs between compute storage
+// writes and sampled reads — so hosts track no per-frame layout for it.
+struct DepthPyramid {
+    VkImage image = VK_NULL_HANDLE;
+    VmaAllocation memory = VK_NULL_HANDLE;
+    VkImageView chainView = VK_NULL_HANDLE;   // all mips; bound to the SSR marcher
+    std::vector<VkImageView> mipViews;        // per-mip views (downsample src/dst)
+    std::vector<VkDescriptorSet> sets;        // per-mip downsample sets (pool-owned)
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t mipCount = 0;
+};
+
 // Bloom (half-res extract + separable Gaussian, added back before upscale).
 struct BloomPush {
     float params[4]; // extract: threshold, knee; blur: dir.xy; composite: strength
@@ -246,10 +277,11 @@ public:
     // Binds the LightingUBO (lights + iblParams are read) + IBL maps + the
     // SSAO texture of this path into a transparentSetLayout() descriptor set.
     // shadow follows the same VK_NULL_HANDLE convention as writeLightingSet
-    // (binding 5 left unwritten).
+    // (binding 5 left unwritten).  depthPyramid is the chain view (all mips)
+    // of this path's DepthPyramid; ssr.glsl marches it hierarchically.
     void writeTransparentSet(const VulkanContext& ctx, VkDescriptorSet set,
                              VkBuffer lightingUbo, VkImageView ssao, VkImageView shadow,
-                             VkImageView ssrColor, VkImageView ssrDepth) const;
+                             VkImageView ssrColor, VkImageView depthPyramid) const;
     // Draws all BLEND-material instances back-to-front over the lit scene.
     // LR path (gtPass=false): 3 attachments = color (alpha blend) + motion
     // (overwrite) + reactive mask (additive).  GT path: color only.  The
@@ -293,6 +325,28 @@ public:
                          VkImageLayout& bloomBLayout, VkImageLayout& colorLayout, uint32_t fullW,
                          uint32_t fullH, float strength = kBloomStrength) const;
 
+    // --- Hi-Z depth pyramid (between the GBuffer and the lighting pass) ------
+    // Full mip chain length for w x h (down to 1x1): 1 + floor(log2(max)).
+    static uint32_t depthPyramidMipCount(uint32_t w, uint32_t h);
+    // Creates the pyramid image + per-mip views and transitions it to GENERAL
+    // (one-shot submit).  Descriptor sets are NOT allocated here — call
+    // writeDepthPyramidSets once the host's descriptor pool exists.
+    bool createDepthPyramid(const VulkanContext& ctx, uint32_t w, uint32_t h,
+                            DepthPyramid& out) const;
+    // Allocates mipCount downsample sets from the caller's pool and writes
+    // them: set 0 samples srcDepth (the opaque D32 depth view, read while in
+    // SHADER_READ_ONLY), set i>0 samples mip i-1.  The sets are pool-owned;
+    // destroyDepthPyramid only releases the image and views.
+    bool writeDepthPyramidSets(const VulkanContext& ctx, VkDescriptorPool pool,
+                               VkImageView srcDepth, DepthPyramid& out) const;
+    void destroyDepthPyramid(const VulkanContext& ctx, DepthPyramid& pyramid) const;
+    // Max-reduces the bound source depth into mip 0, then each mip from the
+    // previous (one 8x8 dispatch per level, barriers between).  The source
+    // depth must already be shader-readable by compute (SHADER_READ_ONLY with
+    // compute in the dst scope); the pyramid stays GENERAL throughout and the
+    // pass ends with a barrier making the writes visible to fragment reads.
+    void recordDepthPyramidPass(VkCommandBuffer cmd, const DepthPyramid& pyramid) const;
+
     // --- CSM sun shadow pass (between the GBuffer and the lighting pass) ------
     // Creates the 2048^2 x kShadowCascadeCount D32 array + views.  The
     // comparison sampler is shared (shadowSampler()); it is created in init().
@@ -326,6 +380,7 @@ public:
     VkDescriptorSetLayout transparentSetLayout() const { return transparentSetLayout_; }
     VkDescriptorSetLayout ssaoSetLayout() const { return ssaoSetLayout_; }
     VkDescriptorSetLayout ssaoBlurSetLayout() const { return ssaoBlurSetLayout_; }
+    VkDescriptorSetLayout hizSetLayout() const { return hizSetLayout_; }
     VkDescriptorSetLayout bloomSetLayout() const { return ssaoBlurSetLayout_; }
     VkPipelineLayout scenePipelineLayout() const { return scenePipelineLayout_; }
     VkPipelineLayout lightingPipelineLayout() const { return lightingPipelineLayout_; }
@@ -350,6 +405,7 @@ private:
     VkDescriptorSetLayout transparentSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout ssaoSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout ssaoBlurSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout hizSetLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout scenePipelineLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout lightingPipelineLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout transparentPipelineLayout_ = VK_NULL_HANDLE;
@@ -362,6 +418,8 @@ private:
     VkPipeline transparentGtPipeline_ = VK_NULL_HANDLE;
     VkPipeline ssaoPipeline_ = VK_NULL_HANDLE;
     VkPipeline ssaoBlurPipeline_ = VK_NULL_HANDLE;
+    VkPipelineLayout hizPipelineLayout_ = VK_NULL_HANDLE;
+    VkPipeline hizPipeline_ = VK_NULL_HANDLE;
     VkPipelineLayout bloomPipelineLayout_ = VK_NULL_HANDLE;
     VkPipeline bloomExtractPipeline_ = VK_NULL_HANDLE;
     VkPipeline bloomBlurPipeline_ = VK_NULL_HANDLE;
@@ -377,6 +435,7 @@ private:
     VkShaderModule transparentGtFrag_ = VK_NULL_HANDLE;
     VkShaderModule ssaoComp_ = VK_NULL_HANDLE;
     VkShaderModule ssaoBlurComp_ = VK_NULL_HANDLE;
+    VkShaderModule hizDownsampleComp_ = VK_NULL_HANDLE;
     VkShaderModule bloomExtractComp_ = VK_NULL_HANDLE;
     VkShaderModule bloomBlurComp_ = VK_NULL_HANDLE;
     VkShaderModule bloomCompositeComp_ = VK_NULL_HANDLE;
@@ -385,6 +444,7 @@ private:
     VkSampler textureSampler_ = VK_NULL_HANDLE;
     VkSampler gbufferSampler_ = VK_NULL_HANDLE;
     VkSampler shadowSampler_ = VK_NULL_HANDLE;
+    VkSampler hizSampler_ = VK_NULL_HANDLE; // nearest + clamp (texelFetch pyramid reads)
 };
 
 } // namespace sr
