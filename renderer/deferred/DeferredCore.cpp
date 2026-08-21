@@ -134,6 +134,7 @@ bool DeferredCore::init(const VulkanContext& ctx, const char* envMapPath) {
         return false;
 
     if (!loadShader(ctx, "gbuffer.vert.spv", gbufferVert_) ||
+        !loadShader(ctx, "gbuffer_skinned.vert.spv", gbufferSkinnedVert_) ||
         !loadShader(ctx, "gbuffer.frag.spv", gbufferFrag_) ||
         !loadShader(ctx, "gbuffer_gt.frag.spv", gbufferGtFrag_) ||
         !loadShader(ctx, "lighting.frag.spv", lightingFrag_) ||
@@ -154,6 +155,7 @@ bool DeferredCore::init(const VulkanContext& ctx, const char* envMapPath) {
         !loadShader(ctx, "exposure_histogram.comp.spv", exposureHistogramComp_) ||
         !loadShader(ctx, "exposure_solve.comp.spv", exposureSolveComp_) ||
         !loadShader(ctx, "shadow_depth.vert.spv", shadowDepthVert_) ||
+        !loadShader(ctx, "shadow_depth_skinned.vert.spv", shadowDepthSkinnedVert_) ||
         !loadShader(ctx, "shadow_depth.frag.spv", shadowDepthFrag_))
         return false;
 
@@ -183,7 +185,7 @@ bool DeferredCore::loadShader(const VulkanContext& ctx, const char* name, VkShad
 }
 
 bool DeferredCore::createLayouts(const VulkanContext& ctx) {
-    VkDescriptorSetLayoutBinding sceneBindings[2] = {};
+    VkDescriptorSetLayoutBinding sceneBindings[3] = {};
     sceneBindings[0].binding = 0;
     sceneBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     sceneBindings[0].descriptorCount = 1;
@@ -192,10 +194,17 @@ bool DeferredCore::createLayouts(const VulkanContext& ctx) {
     sceneBindings[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
     sceneBindings[1].descriptorCount = 1;
     sceneBindings[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    // Joint palette SSBO, read by the skinned vertex shaders only (static
+    // shaders never statically use binding 2, so hosts may leave it unwritten
+    // for scenes without skins).
+    sceneBindings[2].binding = 2;
+    sceneBindings[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    sceneBindings[2].descriptorCount = 1;
+    sceneBindings[2].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
 
     VkDescriptorSetLayoutCreateInfo sceneLayoutCi = {};
     sceneLayoutCi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    sceneLayoutCi.bindingCount = 2;
+    sceneLayoutCi.bindingCount = 3;
     sceneLayoutCi.pBindings = sceneBindings;
     if (vkCreateDescriptorSetLayout(ctx.device, &sceneLayoutCi, nullptr, &sceneSetLayout_) !=
         VK_SUCCESS)
@@ -406,17 +415,18 @@ bool DeferredCore::createLayouts(const VulkanContext& ctx) {
 }
 
 bool DeferredCore::createPipelines(const VulkanContext& ctx) {
-    // ScenePush is 192 bytes; require a device with a large-enough push range.
-    if (ctx.properties.limits.maxPushConstantsSize < sizeof(ScenePush)) {
+    // The scene push range must cover the largest block: SkinnedScenePush
+    // (208 B).  Static draws push fewer bytes, which is always legal.
+    if (ctx.properties.limits.maxPushConstantsSize < sizeof(SkinnedScenePush)) {
         std::fprintf(stderr, "device maxPushConstantsSize=%u < %zu\n",
-                     ctx.properties.limits.maxPushConstantsSize, sizeof(ScenePush));
+                     ctx.properties.limits.maxPushConstantsSize, sizeof(SkinnedScenePush));
         return false;
     }
 
     VkPushConstantRange pushRange = {};
     pushRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
     pushRange.offset = 0;
-    pushRange.size = sizeof(ScenePush);
+    pushRange.size = sizeof(SkinnedScenePush);
 
     VkDescriptorSetLayout sceneLayouts[2] = {sceneSetLayout_, textureSetLayout_};
     VkPipelineLayoutCreateInfo sceneLayoutCi = {};
@@ -557,6 +567,48 @@ bool DeferredCore::createPipelines(const VulkanContext& ctx) {
     stages[1].module = gbufferGtFrag_; // GT shader has no motion output
     if (createGraphicsPipeline(ctx, sceneCi, gbufferGtPipeline_) != VK_SUCCESS)
         return false;
+
+    // --- Skinned GBuffer pipelines (gbuffer_skinned.vert) ----------------------
+    // Same fragment shaders and pipeline layout; only the vertex input grows
+    // by JOINTS_0 (u16x4) / WEIGHTS_0 (f32x4).
+    VkVertexInputBindingDescription skinnedBinding = {};
+    skinnedBinding.binding = 0;
+    skinnedBinding.stride = sizeof(SkinnedVertex);
+    skinnedBinding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+
+    VkVertexInputAttributeDescription skinnedAttrs[6] = {};
+    for (uint32_t k = 0; k < 4; ++k) skinnedAttrs[k] = attrs[k]; // pos/normal/uv/tangent
+    skinnedAttrs[4].location = 4;
+    skinnedAttrs[4].binding = 0;
+    skinnedAttrs[4].format = VK_FORMAT_R16G16B16A16_UINT;
+    skinnedAttrs[4].offset = sizeof(Vec3) * 2 + sizeof(Vec2) + sizeof(Vec4);
+    skinnedAttrs[5].location = 5;
+    skinnedAttrs[5].binding = 0;
+    skinnedAttrs[5].format = VK_FORMAT_R32G32B32A32_SFLOAT;
+    skinnedAttrs[5].offset = sizeof(Vec3) * 2 + sizeof(Vec2) + sizeof(Vec4) + sizeof(uint16_t) * 4;
+
+    VkPipelineVertexInputStateCreateInfo skinnedVertexInput = {};
+    skinnedVertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    skinnedVertexInput.vertexBindingDescriptionCount = 1;
+    skinnedVertexInput.pVertexBindingDescriptions = &skinnedBinding;
+    skinnedVertexInput.vertexAttributeDescriptionCount = 6;
+    skinnedVertexInput.pVertexAttributeDescriptions = skinnedAttrs;
+
+    stages[0].module = gbufferSkinnedVert_;
+    stages[1].module = gbufferFrag_;
+    colorBlend.attachmentCount = 5;
+    sceneCi.pNext = &gbRendering;
+    sceneCi.pVertexInputState = &skinnedVertexInput;
+    if (createGraphicsPipeline(ctx, sceneCi, gbufferSkinnedPipeline_) != VK_SUCCESS)
+        return false;
+    stages[1].module = gbufferGtFrag_;
+    colorBlend.attachmentCount = 4;
+    sceneCi.pNext = &gtRendering;
+    if (createGraphicsPipeline(ctx, sceneCi, gbufferSkinnedGtPipeline_) != VK_SUCCESS)
+        return false;
+    stages[0].module = gbufferVert_;
+    sceneCi.pVertexInputState = &vertexInput;
+    colorBlend.attachmentCount = 5;
 
     // Deferred lighting pipeline: fullscreen triangle, GBuffer + IBL -> HDR color.
     VkPipelineShaderStageCreateInfo lightingStages[2] = {};
@@ -956,13 +1008,21 @@ bool DeferredCore::createPipelines(const VulkanContext& ctx) {
     shadowRendering.colorAttachmentCount = 0;
     shadowRendering.depthAttachmentFormat = deferred::kDepthFormat;
     shadowCi.pNext = &shadowRendering;
-    return createGraphicsPipeline(ctx, shadowCi, shadowPipeline_) == VK_SUCCESS;
+    if (createGraphicsPipeline(ctx, shadowCi, shadowPipeline_) != VK_SUCCESS)
+        return false;
+
+    // Skinned variant: same depth-only state, skinned vertex input + shader.
+    shadowStages[0].module = shadowDepthSkinnedVert_;
+    shadowCi.pVertexInputState = &skinnedVertexInput;
+    return createGraphicsPipeline(ctx, shadowCi, shadowSkinnedPipeline_) == VK_SUCCESS;
 }
 
 void DeferredCore::destroy(const VulkanContext& ctx) {
     if (!ctx.device) return;
     if (gbufferPipeline_) { vkDestroyPipeline(ctx.device, gbufferPipeline_, nullptr); gbufferPipeline_ = VK_NULL_HANDLE; }
     if (gbufferGtPipeline_) { vkDestroyPipeline(ctx.device, gbufferGtPipeline_, nullptr); gbufferGtPipeline_ = VK_NULL_HANDLE; }
+    if (gbufferSkinnedPipeline_) { vkDestroyPipeline(ctx.device, gbufferSkinnedPipeline_, nullptr); gbufferSkinnedPipeline_ = VK_NULL_HANDLE; }
+    if (gbufferSkinnedGtPipeline_) { vkDestroyPipeline(ctx.device, gbufferSkinnedGtPipeline_, nullptr); gbufferSkinnedGtPipeline_ = VK_NULL_HANDLE; }
     if (lightingPipeline_) { vkDestroyPipeline(ctx.device, lightingPipeline_, nullptr); lightingPipeline_ = VK_NULL_HANDLE; }
     if (transparentPipeline_) { vkDestroyPipeline(ctx.device, transparentPipeline_, nullptr); transparentPipeline_ = VK_NULL_HANDLE; }
     if (transparentGtPipeline_) { vkDestroyPipeline(ctx.device, transparentGtPipeline_, nullptr); transparentGtPipeline_ = VK_NULL_HANDLE; }
@@ -979,6 +1039,7 @@ void DeferredCore::destroy(const VulkanContext& ctx) {
     if (histogramPipeline_) { vkDestroyPipeline(ctx.device, histogramPipeline_, nullptr); histogramPipeline_ = VK_NULL_HANDLE; }
     if (exposureSolvePipeline_) { vkDestroyPipeline(ctx.device, exposureSolvePipeline_, nullptr); exposureSolvePipeline_ = VK_NULL_HANDLE; }
     if (shadowPipeline_) { vkDestroyPipeline(ctx.device, shadowPipeline_, nullptr); shadowPipeline_ = VK_NULL_HANDLE; }
+    if (shadowSkinnedPipeline_) { vkDestroyPipeline(ctx.device, shadowSkinnedPipeline_, nullptr); shadowSkinnedPipeline_ = VK_NULL_HANDLE; }
     if (scenePipelineLayout_) { vkDestroyPipelineLayout(ctx.device, scenePipelineLayout_, nullptr); scenePipelineLayout_ = VK_NULL_HANDLE; }
     if (lightingPipelineLayout_) { vkDestroyPipelineLayout(ctx.device, lightingPipelineLayout_, nullptr); lightingPipelineLayout_ = VK_NULL_HANDLE; }
     if (transparentPipelineLayout_) { vkDestroyPipelineLayout(ctx.device, transparentPipelineLayout_, nullptr); transparentPipelineLayout_ = VK_NULL_HANDLE; }
@@ -992,6 +1053,7 @@ void DeferredCore::destroy(const VulkanContext& ctx) {
     if (histogramPipelineLayout_) { vkDestroyPipelineLayout(ctx.device, histogramPipelineLayout_, nullptr); histogramPipelineLayout_ = VK_NULL_HANDLE; }
     if (exposureSolvePipelineLayout_) { vkDestroyPipelineLayout(ctx.device, exposureSolvePipelineLayout_, nullptr); exposureSolvePipelineLayout_ = VK_NULL_HANDLE; }
     if (gbufferVert_) { vkDestroyShaderModule(ctx.device, gbufferVert_, nullptr); gbufferVert_ = VK_NULL_HANDLE; }
+    if (gbufferSkinnedVert_) { vkDestroyShaderModule(ctx.device, gbufferSkinnedVert_, nullptr); gbufferSkinnedVert_ = VK_NULL_HANDLE; }
     if (gbufferFrag_) { vkDestroyShaderModule(ctx.device, gbufferFrag_, nullptr); gbufferFrag_ = VK_NULL_HANDLE; }
     if (gbufferGtFrag_) { vkDestroyShaderModule(ctx.device, gbufferGtFrag_, nullptr); gbufferGtFrag_ = VK_NULL_HANDLE; }
     if (lightingFrag_) { vkDestroyShaderModule(ctx.device, lightingFrag_, nullptr); lightingFrag_ = VK_NULL_HANDLE; }
@@ -1012,6 +1074,7 @@ void DeferredCore::destroy(const VulkanContext& ctx) {
     if (exposureHistogramComp_) { vkDestroyShaderModule(ctx.device, exposureHistogramComp_, nullptr); exposureHistogramComp_ = VK_NULL_HANDLE; }
     if (exposureSolveComp_) { vkDestroyShaderModule(ctx.device, exposureSolveComp_, nullptr); exposureSolveComp_ = VK_NULL_HANDLE; }
     if (shadowDepthVert_) { vkDestroyShaderModule(ctx.device, shadowDepthVert_, nullptr); shadowDepthVert_ = VK_NULL_HANDLE; }
+    if (shadowDepthSkinnedVert_) { vkDestroyShaderModule(ctx.device, shadowDepthSkinnedVert_, nullptr); shadowDepthSkinnedVert_ = VK_NULL_HANDLE; }
     if (shadowDepthFrag_) { vkDestroyShaderModule(ctx.device, shadowDepthFrag_, nullptr); shadowDepthFrag_ = VK_NULL_HANDLE; }
     if (sceneSetLayout_) { vkDestroyDescriptorSetLayout(ctx.device, sceneSetLayout_, nullptr); sceneSetLayout_ = VK_NULL_HANDLE; }
     if (textureSetLayout_) { vkDestroyDescriptorSetLayout(ctx.device, textureSetLayout_, nullptr); textureSetLayout_ = VK_NULL_HANDLE; }
@@ -1234,6 +1297,22 @@ bool DeferredCore::createMaterialUbo(const VulkanContext& ctx, const Scene& scen
     return true;
 }
 
+void DeferredCore::writeSceneSkinBinding(const VulkanContext& ctx, VkDescriptorSet set,
+                                         VkBuffer palette) const {
+    VkDescriptorBufferInfo buf = {};
+    buf.buffer = palette;
+    buf.offset = 0;
+    buf.range = VK_WHOLE_SIZE;
+    VkWriteDescriptorSet w = {};
+    w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    w.dstSet = set;
+    w.dstBinding = 2;
+    w.descriptorCount = 1;
+    w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    w.pBufferInfo = &buf;
+    vkUpdateDescriptorSets(ctx.device, 1, &w, 0, nullptr);
+}
+
 void DeferredCore::writeTextureSet(const VulkanContext& ctx, VkDescriptorSet set,
                                    const Scene& scene) const {
     // A glTF without images produces no textures; every material then has
@@ -1337,17 +1416,64 @@ void DeferredCore::recordGBufferDraws(VkCommandBuffer cmd, const Scene& scene, b
     const Frustum frustum = extractFrustum(cullViewProj);
 
     // Bind the scene-wide merged buffers once; draws address into them with
-    // per-mesh firstIndex/vertexOffset.
+    // per-mesh firstIndex/vertexOffset.  (Null in fully-skinned scenes, which
+    // only ever take the skinned branch below.)
     const VkDeviceSize zeroOffset = 0;
-    vkCmdBindVertexBuffers(cmd, 0, 1, &scene.mergedVertexBuffer, &zeroOffset);
-    vkCmdBindIndexBuffer(cmd, scene.mergedIndexBuffer, 0, VK_INDEX_TYPE_UINT32);
+    if (scene.mergedVertexBuffer) {
+        vkCmdBindVertexBuffers(cmd, 0, 1, &scene.mergedVertexBuffer, &zeroOffset);
+        vkCmdBindIndexBuffer(cmd, scene.mergedIndexBuffer, 0, VK_INDEX_TYPE_UINT32);
+    }
 
     // Instances are sorted by (material, mesh) at load time, so state changes
     // collapse to one descriptor bind per material run.
     uint32_t lastMaterial = UINT32_MAX;
+    bool skinnedBound = false;
     for (const auto& inst : scene.instances) {
         if (scene.materials[inst.materialIndex].blend) continue; // transparency pass draws these
         if (!aabbIntersectsFrustum(frustum, inst.aabbMin, inst.aabbMax)) continue;
+
+        if (inst.skinIndex >= 0) {
+            // Skinned draw: own vertex buffers + palette offsets; the push
+            // matrices are unused (the palette carries the node transform).
+            if (!skinnedBound) {
+                skinnedBound = true;
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                  gtPass ? gbufferSkinnedGtPipeline_ : gbufferSkinnedPipeline_);
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                        scenePipelineLayout_, 1, 1, &textureSet, 0, nullptr);
+                lastMaterial = UINT32_MAX; // descriptor offsets were bound for the static pipeline
+            }
+            const Skin& skin = scene.skins[static_cast<size_t>(inst.skinIndex)];
+            SkinnedScenePush push;
+            push.paletteCur = skin.paletteCur;
+            push.palettePrev = skin.palettePrev;
+            vkCmdPushConstants(cmd, scenePipelineLayout_, VK_SHADER_STAGE_VERTEX_BIT, 0,
+                               sizeof(push), &push);
+
+            if (inst.materialIndex != lastMaterial) {
+                lastMaterial = inst.materialIndex;
+                const uint32_t dynOffset = inst.materialIndex * materialStride;
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, scenePipelineLayout_,
+                                        0, 1, &sceneSet, 1, &dynOffset);
+            }
+
+            const Mesh& mesh = scene.skinnedMeshes[inst.meshIndex];
+            vkCmdBindVertexBuffers(cmd, 0, 1, &mesh.vertexBuffer, &zeroOffset);
+            vkCmdBindIndexBuffer(cmd, mesh.indexBuffer, 0, VK_INDEX_TYPE_UINT32);
+            vkCmdDrawIndexed(cmd, mesh.indexCount, 1, 0, 0, 0);
+            continue;
+        }
+
+        if (skinnedBound) {
+            skinnedBound = false;
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                              gtPass ? gbufferGtPipeline_ : gbufferPipeline_);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, scenePipelineLayout_, 1,
+                                    1, &textureSet, 0, nullptr);
+            vkCmdBindVertexBuffers(cmd, 0, 1, &scene.mergedVertexBuffer, &zeroOffset);
+            vkCmdBindIndexBuffer(cmd, scene.mergedIndexBuffer, 0, VK_INDEX_TYPE_UINT32);
+            lastMaterial = UINT32_MAX;
+        }
 
         ScenePush push;
         std::memcpy(push.model, inst.model.m, sizeof(push.model));
@@ -2686,8 +2812,10 @@ void DeferredCore::recordShadowPass(VkCommandBuffer cmd, const ShadowTargets& ta
                             &textureSet, 0, nullptr);
 
     const VkDeviceSize zeroOffset = 0;
-    vkCmdBindVertexBuffers(cmd, 0, 1, &scene.mergedVertexBuffer, &zeroOffset);
-    vkCmdBindIndexBuffer(cmd, scene.mergedIndexBuffer, 0, VK_INDEX_TYPE_UINT32);
+    if (scene.mergedVertexBuffer) {
+        vkCmdBindVertexBuffers(cmd, 0, 1, &scene.mergedVertexBuffer, &zeroOffset);
+        vkCmdBindIndexBuffer(cmd, scene.mergedIndexBuffer, 0, VK_INDEX_TYPE_UINT32);
+    }
 
     for (uint32_t c = 0; c < kShadowCascadeCount; ++c) {
         VkRenderingAttachmentInfo depth =
@@ -2706,9 +2834,51 @@ void DeferredCore::recordShadowPass(VkCommandBuffer cmd, const ShadowTargets& ta
         const Frustum frustum = extractFrustum(cascadeVp[c]);
 
         uint32_t lastMaterial = UINT32_MAX;
+        bool skinnedBound = false;
         for (const auto& inst : scene.instances) {
             if (scene.materials[inst.materialIndex].blend) continue; // glass does not occlude
             if (!aabbIntersectsFrustum(frustum, inst.aabbMin, inst.aabbMax)) continue;
+
+            if (inst.skinIndex >= 0) {
+                // Skinned caster: current-frame palette only (no motion here).
+                if (!skinnedBound) {
+                    skinnedBound = true;
+                    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                      shadowSkinnedPipeline_);
+                    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                            scenePipelineLayout_, 1, 1, &textureSet, 0, nullptr);
+                    lastMaterial = UINT32_MAX;
+                }
+                const Skin& skin = scene.skins[static_cast<size_t>(inst.skinIndex)];
+                SkinnedShadowPush push;
+                std::memcpy(push.lightVp, cascadeVp[c].m, sizeof(push.lightVp));
+                push.paletteCur = skin.paletteCur;
+                vkCmdPushConstants(cmd, scenePipelineLayout_, VK_SHADER_STAGE_VERTEX_BIT, 0,
+                                   sizeof(push), &push);
+
+                if (inst.materialIndex != lastMaterial) {
+                    lastMaterial = inst.materialIndex;
+                    const uint32_t dynOffset = inst.materialIndex * materialStride;
+                    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                            scenePipelineLayout_, 0, 1, &sceneSet, 1, &dynOffset);
+                }
+
+                const Mesh& mesh = scene.skinnedMeshes[inst.meshIndex];
+                vkCmdBindVertexBuffers(cmd, 0, 1, &mesh.vertexBuffer, &zeroOffset);
+                vkCmdBindIndexBuffer(cmd, mesh.indexBuffer, 0, VK_INDEX_TYPE_UINT32);
+                vkCmdDrawIndexed(cmd, mesh.indexCount, 1, 0, 0, 0);
+                continue;
+            }
+
+            if (skinnedBound) {
+                skinnedBound = false;
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, shadowPipeline_);
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, scenePipelineLayout_,
+                                        1, 1, &textureSet, 0, nullptr);
+                vkCmdBindVertexBuffers(cmd, 0, 1, &scene.mergedVertexBuffer, &zeroOffset);
+                vkCmdBindIndexBuffer(cmd, scene.mergedIndexBuffer, 0, VK_INDEX_TYPE_UINT32);
+                lastMaterial = UINT32_MAX;
+            }
 
             ShadowPush push;
             std::memcpy(push.model, inst.model.m, sizeof(push.model));

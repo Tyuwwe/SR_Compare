@@ -1904,6 +1904,11 @@ bool GuiApp::createSyncResources() {
             writes[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
             writes[1].pBufferInfo = &materialBuf;
             vkUpdateDescriptorSets(ctx_.device, 2, writes, 0, nullptr);
+
+            // Joint palette for skinned draws (per-slot buffer, matching the
+            // slot advanceToFrame(frameIndex) writes).
+            if (scene_.hasSkinnedMeshes())
+                deferred_.writeSceneSkinBinding(ctx_, sets[k], scene_.skinPalette(i));
         }
         fr.uboGb = ubos[0]; fr.uboGbMemory = uboMems[0]; fr.uboGbMapped = uboMaps[0];
         fr.uboGbSpatial = ubos[1]; fr.uboGbSpatialMemory = uboMems[1];
@@ -2731,6 +2736,10 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     const uint32_t slot = frameIndex % kFramesInFlight;
     FrameResources& fr = frames_[slot];
     VkCommandBuffer cmd = fr.cmd;
+
+    // Frame-index driven scene animation (dynamic boxes / glTF clips), before
+    // any recording; no-op for static scenes.
+    scene_.advanceToFrame(frameIndex);
 
     vkResetCommandBuffer(cmd, 0);
     VkCommandBufferBeginInfo begin = {};

@@ -1094,6 +1094,11 @@ bool CompareApp::createSyncResources() {
             writes[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
             writes[1].pBufferInfo = &materialBuf;
             vkUpdateDescriptorSets(ctx_.device, 2, writes, 0, nullptr);
+
+            // Joint palette for skinned draws (per-slot buffer, matching the
+            // slot advanceToFrame(frameIndex) writes).
+            if (scene_.hasSkinnedMeshes())
+                deferred_.writeSceneSkinBinding(ctx_, sets[k], scene_.skinPalette(i));
         }
         fr.uboGb = ubos[0]; fr.uboGbMemory = uboMems[0]; fr.uboGbMapped = uboMaps[0];
         fr.uboGbSpatial = ubos[1]; fr.uboGbSpatialMemory = uboMems[1];
@@ -2256,6 +2261,11 @@ void CompareApp::run() {
         // SUBOPTIMAL acquire leaves it signaled so the next iteration's wait
         // returns immediately instead of blocking forever.
         vkWaitForFences(ctx_.device, 1, &frames_[slot].fence, VK_TRUE, UINT64_MAX);
+
+        // Frame-index driven scene animation (dynamic boxes / glTF clips).
+        // After the slot fence: the palette/instance state of this slot is no
+        // longer read by the GPU.  No-op for static scenes.
+        scene_.advanceToFrame(frameIndex);
 
         // The metric readback recorded for this slot (if any) is complete now.
         if (metricPending_[slot]) {

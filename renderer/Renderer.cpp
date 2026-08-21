@@ -589,6 +589,11 @@ bool Renderer::createSyncResources() {
         writes[1].pBufferInfo = &materialBuf;
         vkUpdateDescriptorSets(ctx_.device, 2, writes, 0, nullptr);
 
+        // Joint palette for skinned draws: per-slot buffer, matching the slot
+        // advanceToFrame(frameIndex) writes (slot = frameIndex % frames).
+        if (scene_.hasSkinnedMeshes())
+            deferred_.writeSceneSkinBinding(ctx_, frames_[i].sceneSet, scene_.skinPalette(i));
+
         // Lighting sets: one per frame slot per path (low-res GB / full-res GT).
         const VkDescriptorSetLayout lightingLayout = deferred_.lightingSetLayout();
         VkDescriptorSetAllocateInfo lightAlloc = {};
@@ -1282,6 +1287,11 @@ void Renderer::run() {
         // reusing its fence / image-available semaphore / UBO.
         vkWaitForFences(ctx_.device, 1, &frames_[slot].fence, VK_TRUE, UINT64_MAX);
         vkResetFences(ctx_.device, 1, &frames_[slot].fence);
+
+        // Frame-index driven scene animation (dynamic boxes / glTF clips).
+        // After the slot fence: the palette/instance state of this slot is no
+        // longer read by the GPU.  No-op for static scenes.
+        scene_.advanceToFrame(frameIndex);
 
         // The frame that used this slot (frameIndex - kFramesInFlight) is now
         // complete; harvest its GPU timings before the slot is reused.

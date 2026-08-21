@@ -148,6 +148,21 @@ struct ScenePush {
 };
 static_assert(sizeof(ScenePush) == 192, "ScenePush size mismatch");
 
+// Skinned GBuffer draws (gbuffer_skinned.vert): ScenePush + the draw's joint
+// palette offsets.  The matrix slots are unused (the palette already carries
+// the node transform, per the glTF spec) but kept so one push range covers
+// both static and skinned draws; paletteCur/palettePrev address the current /
+// previous-frame blocks of the joint palette SSBO (scene set binding 2).
+struct SkinnedScenePush {
+    float model[16];
+    float prevModel[16];
+    float normalModel[16];
+    uint32_t paletteCur = 0;
+    uint32_t palettePrev = 0;
+    uint32_t pad[2] = {};
+};
+static_assert(sizeof(SkinnedScenePush) == 208, "SkinnedScenePush size mismatch");
+
 // Push constants of the shadow depth pass (shadow_depth.vert): per-instance
 // model + the cascade's light view-projection.  128 bytes fits the guaranteed
 // maxPushConstantsSize minimum, and the pass reuses scenePipelineLayout()
@@ -157,6 +172,17 @@ struct ShadowPush {
     float lightVp[16];
 };
 static_assert(sizeof(ShadowPush) == 128, "ShadowPush size mismatch");
+
+// Skinned shadow depth draws (shadow_depth_skinned.vert): the current-frame
+// palette offset only — the shadow pass writes no motion vectors, so no
+// previous palette is needed.
+struct SkinnedShadowPush {
+    float model[16]; // unused (palette carries the node transform)
+    float lightVp[16];
+    uint32_t paletteCur = 0;
+    uint32_t pad[3] = {};
+};
+static_assert(sizeof(SkinnedShadowPush) == 144, "SkinnedShadowPush size mismatch");
 
 // Push constants of the GTAO compute pass (ssao.comp), 96 bytes.  The
 // filename is historical; the shader is a XeGTAO-style GTAO main pass.
@@ -438,6 +464,12 @@ public:
 
     // --- descriptor writers (sets are allocated from the caller's pool) --------
     void writeTextureSet(const VulkanContext& ctx, VkDescriptorSet set, const Scene& scene) const;
+    // Scene set binding 2: the joint palette SSBO for this frame slot
+    // (Scene::skinPalette(slot)).  Call once per scene set after scene load;
+    // only needed when the scene has skinned meshes (the static shaders never
+    // statically use binding 2, so an unwritten binding is valid for them).
+    void writeSceneSkinBinding(const VulkanContext& ctx, VkDescriptorSet set,
+                               VkBuffer palette) const;
     // shadow = ShadowTargets::arrayView, or VK_NULL_HANDLE to leave binding 11
     // unwritten (hosts without a shadow pass; the shaders must run with
     // shadowParams.z == 0 then, which fillLightingUBO guarantees by default).
@@ -742,6 +774,8 @@ private:
     VkPipelineLayout ssaoTemporalPipelineLayout_ = VK_NULL_HANDLE;
     VkPipeline gbufferPipeline_ = VK_NULL_HANDLE;
     VkPipeline gbufferGtPipeline_ = VK_NULL_HANDLE;
+    VkPipeline gbufferSkinnedPipeline_ = VK_NULL_HANDLE;   // gbuffer_skinned.vert, motion output
+    VkPipeline gbufferSkinnedGtPipeline_ = VK_NULL_HANDLE; // GT variant (no motion attachment)
     VkPipeline lightingPipeline_ = VK_NULL_HANDLE;
     VkPipeline transparentPipeline_ = VK_NULL_HANDLE;
     VkPipeline transparentGtPipeline_ = VK_NULL_HANDLE;
@@ -765,7 +799,9 @@ private:
     VkPipeline histogramPipeline_ = VK_NULL_HANDLE;
     VkPipeline exposureSolvePipeline_ = VK_NULL_HANDLE;
     VkPipeline shadowPipeline_ = VK_NULL_HANDLE;
+    VkPipeline shadowSkinnedPipeline_ = VK_NULL_HANDLE;
     VkShaderModule gbufferVert_ = VK_NULL_HANDLE;
+    VkShaderModule gbufferSkinnedVert_ = VK_NULL_HANDLE;
     VkShaderModule gbufferFrag_ = VK_NULL_HANDLE;
     VkShaderModule gbufferGtFrag_ = VK_NULL_HANDLE;
     VkShaderModule lightingFrag_ = VK_NULL_HANDLE;
@@ -786,6 +822,7 @@ private:
     VkShaderModule exposureHistogramComp_ = VK_NULL_HANDLE;
     VkShaderModule exposureSolveComp_ = VK_NULL_HANDLE;
     VkShaderModule shadowDepthVert_ = VK_NULL_HANDLE;
+    VkShaderModule shadowDepthSkinnedVert_ = VK_NULL_HANDLE;
     VkShaderModule shadowDepthFrag_ = VK_NULL_HANDLE;
     VkSampler textureSampler_ = VK_NULL_HANDLE;
     VkSampler gbufferSampler_ = VK_NULL_HANDLE;
