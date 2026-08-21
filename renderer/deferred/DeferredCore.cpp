@@ -948,6 +948,7 @@ void DeferredCore::fillSceneUBO(SceneUBO& out, const Scene& scene, const Camera&
                                 float jitterX, float jitterY, bool jitter) const {
     const Mat4 viewProj = Mat4::multiply(projJittered, view);
     const Mat4 viewProjNoJitter = Mat4::multiply(proj, view);
+    (void)scene; // UBO contents derive from camera/matrices only; scene unused.
     std::memcpy(out.viewProj, viewProj.m, sizeof(out.viewProj));
     std::memcpy(out.viewProjNoJitter, viewProjNoJitter.m, sizeof(out.viewProjNoJitter));
     std::memcpy(out.prevViewProj, prevViewProj.m, sizeof(out.prevViewProj));
@@ -1911,7 +1912,8 @@ bool DeferredCore::createAutoExposure(const VulkanContext& ctx, float initialEV,
                      out.histogramMemory) != VK_SUCCESS)
         return false;
     if (createBuffer(ctx, sizeof(ExposureState),
-                     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                         VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, out.state,
                      out.stateMemory) != VK_SUCCESS)
         return false;
