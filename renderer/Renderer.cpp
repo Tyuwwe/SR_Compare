@@ -6,6 +6,7 @@
 #include "renderer/core/MemoryBudget.h"
 #include "renderer/core/PathUtil.h"
 #include "renderer/core/VkUtil.h"
+#include "renderer/core/Vma.h"
 #include "renderer/scene/SceneRegistry.h"
 #include "upscalers/UpscalerFactory.h"
 
@@ -65,8 +66,7 @@ void beginRendering(VkCommandBuffer cmd, uint32_t width, uint32_t height, uint32
 
 void Renderer::ImageResource::destroy(const VulkanContext& ctx) {
     if (view) { vkDestroyImageView(ctx.device, view, nullptr); view = VK_NULL_HANDLE; }
-    if (image) { vkDestroyImage(ctx.device, image, nullptr); image = VK_NULL_HANDLE; }
-    if (memory) { vkFreeMemory(ctx.device, memory, nullptr); memory = VK_NULL_HANDLE; }
+    if (image) { vmaDestroyImage(ctx.allocator, image, memory); image = VK_NULL_HANDLE; memory = VK_NULL_HANDLE; }
 }
 
 bool Renderer::init(const RendererOptions& opts) {
@@ -493,13 +493,13 @@ bool Renderer::createSyncResources() {
                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                          frames_[i].ubo, frames_[i].uboMemory) != VK_SUCCESS)
             return false;
-        vkMapMemory(ctx_.device, frames_[i].uboMemory, 0, uboSize, 0, &frames_[i].uboMapped);
+        vmaMapMemory(ctx_.allocator, frames_[i].uboMemory, &frames_[i].uboMapped);
 
         if (createBuffer(ctx_, sizeof(LightingUBO), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                          frames_[i].lightingUbo, frames_[i].lightingUboMemory) != VK_SUCCESS)
             return false;
-        vkMapMemory(ctx_.device, frames_[i].lightingUboMemory, 0, sizeof(LightingUBO), 0,
+        vmaMapMemory(ctx_.allocator, frames_[i].lightingUboMemory,
                     &frames_[i].lightingUboMapped);
 
         VkDescriptorBufferInfo sceneBuf = {};
@@ -653,7 +653,7 @@ bool Renderer::createScreenshotStaging() {
                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                      screenshotStaging_, screenshotStagingMemory_) != VK_SUCCESS)
         return false;
-    vkMapMemory(ctx_.device, screenshotStagingMemory_, 0, screenshotSize_, 0, &screenshotMapped_);
+    vmaMapMemory(ctx_.allocator, screenshotStagingMemory_, &screenshotMapped_);
     return true;
 }
 
@@ -1117,13 +1117,18 @@ void Renderer::run() {
         }
         const MemoryBudgetInfo budget = queryMemoryBudget(ctx_);
         VkDeviceSize heapTotal = 0;
-        for (uint32_t i = 0; i < budget.heapCount; ++i) heapTotal += budget.heapUsage[i];
+        VkDeviceSize vmaTotal = 0;
+        for (uint32_t i = 0; i < budget.heapCount; ++i) {
+            heapTotal += budget.heapUsage[i];
+            vmaTotal += budget.vmaAllocationBytes[i];
+        }
         const uint64_t algoBytes = upscaler_ ? upscaler_->gpuMemoryBytes() : 0;
         std::ofstream csv(opts_.frameTimesPath);
-        csv << "frame,frameMs,sceneMs,upscaleMs,vramAlgoBytes,vramTotalBytes\n";
+        csv << "frame,frameMs,sceneMs,upscaleMs,vramAlgoBytes,vramTotalBytes,vramVmaBytes\n";
         for (size_t i = 0; i < frameTimes_.size(); ++i) {
             csv << i << ',' << frameTimes_[i].frameMs << ',' << frameTimes_[i].sceneMs << ','
-                << frameTimes_[i].upscaleMs << ',' << algoBytes << ',' << heapTotal << '\n';
+                << frameTimes_[i].upscaleMs << ',' << algoBytes << ',' << heapTotal << ','
+                << vmaTotal << '\n';
         }
         std::fprintf(stdout, "frameTimes=%zu written to %s\n", frameTimes_.size(),
                      opts_.frameTimesPath.c_str());
@@ -1142,14 +1147,14 @@ void Renderer::shutdown() {
 
     if (upscaler_) { upscaler_->shutdown(); upscaler_.reset(); }
 
-    if (screenshotStaging_) { vkDestroyBuffer(ctx_.device, screenshotStaging_, nullptr); vkFreeMemory(ctx_.device, screenshotStagingMemory_, nullptr); screenshotStaging_ = VK_NULL_HANDLE; screenshotStagingMemory_ = VK_NULL_HANDLE; }
+    if (screenshotStaging_) { vmaDestroyBuffer(ctx_.allocator, screenshotStaging_, screenshotStagingMemory_); screenshotStaging_ = VK_NULL_HANDLE; screenshotStagingMemory_ = VK_NULL_HANDLE; }
 
     timestamps_.destroy(ctx_);
 
     for (uint32_t i = 0; i < kFramesInFlight; ++i) {
         FrameResources& fr = frames_[i];
-        if (fr.ubo) { vkDestroyBuffer(ctx_.device, fr.ubo, nullptr); vkFreeMemory(ctx_.device, fr.uboMemory, nullptr); fr.ubo = VK_NULL_HANDLE; fr.uboMemory = VK_NULL_HANDLE; }
-        if (fr.lightingUbo) { vkDestroyBuffer(ctx_.device, fr.lightingUbo, nullptr); vkFreeMemory(ctx_.device, fr.lightingUboMemory, nullptr); fr.lightingUbo = VK_NULL_HANDLE; fr.lightingUboMemory = VK_NULL_HANDLE; }
+        if (fr.ubo) { vmaDestroyBuffer(ctx_.allocator, fr.ubo, fr.uboMemory); fr.ubo = VK_NULL_HANDLE; fr.uboMemory = VK_NULL_HANDLE; }
+        if (fr.lightingUbo) { vmaDestroyBuffer(ctx_.allocator, fr.lightingUbo, fr.lightingUboMemory); fr.lightingUbo = VK_NULL_HANDLE; fr.lightingUboMemory = VK_NULL_HANDLE; }
         if (fr.imageAvailable) { vkDestroySemaphore(ctx_.device, fr.imageAvailable, nullptr); fr.imageAvailable = VK_NULL_HANDLE; }
         if (fr.fence) { vkDestroyFence(ctx_.device, fr.fence, nullptr); fr.fence = VK_NULL_HANDLE; }
     }
@@ -1165,7 +1170,7 @@ void Renderer::shutdown() {
     if (descriptorPool_) { vkDestroyDescriptorPool(ctx_.device, descriptorPool_, nullptr); descriptorPool_ = VK_NULL_HANDLE; }
     if (presentSetLayout_) { vkDestroyDescriptorSetLayout(ctx_.device, presentSetLayout_, nullptr); presentSetLayout_ = VK_NULL_HANDLE; }
 
-    if (materialUbo_) { vkDestroyBuffer(ctx_.device, materialUbo_, nullptr); vkFreeMemory(ctx_.device, materialUboMemory_, nullptr); materialUbo_ = VK_NULL_HANDLE; materialUboMemory_ = VK_NULL_HANDLE; }
+    if (materialUbo_) { vmaDestroyBuffer(ctx_.allocator, materialUbo_, materialUboMemory_); materialUbo_ = VK_NULL_HANDLE; materialUboMemory_ = VK_NULL_HANDLE; }
 
     gbColor_.destroy(ctx_);
     gbMotion_.destroy(ctx_);

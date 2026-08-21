@@ -64,7 +64,7 @@ private:
 
     struct ImageResource {
         VkImage image = VK_NULL_HANDLE;
-        VkDeviceMemory memory = VK_NULL_HANDLE;
+        VmaAllocation memory = VK_NULL_HANDLE;
         VkImageView view = VK_NULL_HANDLE;
         VkFormat format = VK_FORMAT_UNDEFINED;
         uint32_t width = 0;
@@ -77,22 +77,22 @@ private:
         VkFence fence = VK_NULL_HANDLE;
         VkSemaphore imageAvailable = VK_NULL_HANDLE;
         VkBuffer uboGb = VK_NULL_HANDLE;       // jittered scene UBO (GBuffer pass)
-        VkDeviceMemory uboGbMemory = VK_NULL_HANDLE;
+        VmaAllocation uboGbMemory = VK_NULL_HANDLE;
         void* uboGbMapped = nullptr;
         VkBuffer uboGbSpatial = VK_NULL_HANDLE; // unjittered LR scene UBO (spatial plugins)
-        VkDeviceMemory uboGbSpatialMemory = VK_NULL_HANDLE;
+        VmaAllocation uboGbSpatialMemory = VK_NULL_HANDLE;
         void* uboGbSpatialMapped = nullptr;
         VkBuffer uboGt = VK_NULL_HANDLE;       // un-jittered scene UBO (GT pass)
-        VkDeviceMemory uboGtMemory = VK_NULL_HANDLE;
+        VmaAllocation uboGtMemory = VK_NULL_HANDLE;
         void* uboGtMapped = nullptr;
         VkBuffer lightingUboGb = VK_NULL_HANDLE; // lighting UBO (jittered invViewProj)
-        VkDeviceMemory lightingUboGbMemory = VK_NULL_HANDLE;
+        VmaAllocation lightingUboGbMemory = VK_NULL_HANDLE;
         void* lightingUboGbMapped = nullptr;
         VkBuffer lightingUboGbSpatial = VK_NULL_HANDLE; // lighting UBO (unjittered LR)
-        VkDeviceMemory lightingUboGbSpatialMemory = VK_NULL_HANDLE;
+        VmaAllocation lightingUboGbSpatialMemory = VK_NULL_HANDLE;
         void* lightingUboGbSpatialMapped = nullptr;
         VkBuffer lightingUboGt = VK_NULL_HANDLE; // lighting UBO (un-jittered invViewProj)
-        VkDeviceMemory lightingUboGtMemory = VK_NULL_HANDLE;
+        VmaAllocation lightingUboGtMemory = VK_NULL_HANDLE;
         void* lightingUboGtMapped = nullptr;
         VkDescriptorSet sceneSetGb = VK_NULL_HANDLE;
         VkDescriptorSet sceneSetGbSpatial = VK_NULL_HANDLE;
@@ -114,7 +114,7 @@ private:
         ImageResource output; // display-resolution RGBA16F
         VkImageLayout outputLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         VkBuffer blocksBuffer = VK_NULL_HANDLE; // per-block metric records
-        VkDeviceMemory blocksMemory = VK_NULL_HANDLE;
+        VmaAllocation blocksMemory = VK_NULL_HANDLE;
         VkDescriptorSet metricSet = VK_NULL_HANDLE;
         VkDescriptorSet composeSet = VK_NULL_HANDLE;
         float psnr = 0.f;
@@ -287,22 +287,22 @@ private:
     VkImageLayout composeLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
 
     VkBuffer materialUbo_ = VK_NULL_HANDLE;
-    VkDeviceMemory materialUboMemory_ = VK_NULL_HANDLE;
+    VmaAllocation materialUboMemory_ = VK_NULL_HANDLE;
     uint32_t materialStride_ = 0;
 
     VkBuffer textUbo_ = VK_NULL_HANDLE; // packed ASCII overlay text (all columns)
-    VkDeviceMemory textUboMemory_ = VK_NULL_HANDLE;
+    VmaAllocation textUboMemory_ = VK_NULL_HANDLE;
     void* textUboMapped_ = nullptr;
 
     VkBuffer metricResultBuf_ = VK_NULL_HANDLE; // kMaxAlgos * kMetricFloats floats
-    VkDeviceMemory metricResultMemory_ = VK_NULL_HANDLE;
+    VmaAllocation metricResultMemory_ = VK_NULL_HANDLE;
     VkBuffer metricStaging_[kFramesInFlight] = {};
-    VkDeviceMemory metricStagingMemory_[kFramesInFlight] = {};
+    VmaAllocation metricStagingMemory_[kFramesInFlight] = {};
     void* metricStagingMapped_[kFramesInFlight] = {};
     bool metricPending_[kFramesInFlight] = {};
 
     VkBuffer screenshotStaging_ = VK_NULL_HANDLE;
-    VkDeviceMemory screenshotStagingMemory_ = VK_NULL_HANDLE;
+    VmaAllocation screenshotStagingMemory_ = VK_NULL_HANDLE;
     void* screenshotMapped_ = nullptr;
 
     bool initAlgorithms();

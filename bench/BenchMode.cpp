@@ -186,7 +186,7 @@ bool parseFrameTimesCsv(const std::string& path, std::vector<FrameSample>& out) 
     char line[512];
     bool first = true;
     while (std::fgets(line, sizeof(line), f)) {
-        if (first) {  // header: frame,frameMs,sceneMs,upscaleMs,vramAlgoBytes,vramTotalBytes
+        if (first) {  // header: frame,frameMs,sceneMs,upscaleMs,vramAlgoBytes,vramTotalBytes[,vramVmaBytes]
             first = false;
             continue;
         }

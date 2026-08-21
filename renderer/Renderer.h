@@ -54,7 +54,7 @@ private:
 
     struct ImageResource {
         VkImage image = VK_NULL_HANDLE;
-        VkDeviceMemory memory = VK_NULL_HANDLE;
+        VmaAllocation memory = VK_NULL_HANDLE;
         VkImageView view = VK_NULL_HANDLE;
         VkFormat format = VK_FORMAT_UNDEFINED;
         uint32_t width = 0;
@@ -68,10 +68,10 @@ private:
         VkFence fence = VK_NULL_HANDLE;
         VkSemaphore imageAvailable = VK_NULL_HANDLE;
         VkBuffer ubo = VK_NULL_HANDLE;
-        VkDeviceMemory uboMemory = VK_NULL_HANDLE;
+        VmaAllocation uboMemory = VK_NULL_HANDLE;
         void* uboMapped = nullptr;
         VkBuffer lightingUbo = VK_NULL_HANDLE;
-        VkDeviceMemory lightingUboMemory = VK_NULL_HANDLE;
+        VmaAllocation lightingUboMemory = VK_NULL_HANDLE;
         void* lightingUboMapped = nullptr;
         VkDescriptorSet sceneSet = VK_NULL_HANDLE;
         VkDescriptorSet lightingSetGb = VK_NULL_HANDLE;
@@ -152,7 +152,7 @@ private:
     std::vector<VkSemaphore> renderFinished_; // one per swapchain image (present sync)
 
     VkBuffer materialUbo_ = VK_NULL_HANDLE;
-    VkDeviceMemory materialUboMemory_ = VK_NULL_HANDLE;
+    VmaAllocation materialUboMemory_ = VK_NULL_HANDLE;
     uint32_t materialStride_ = 0;
     VkDescriptorSet textureSet_ = VK_NULL_HANDLE;
     VkDescriptorSet presentSet_ = VK_NULL_HANDLE;
@@ -171,7 +171,7 @@ private:
     VkDescriptorSet bloomCompGt_ = VK_NULL_HANDLE;
 
     VkBuffer screenshotStaging_ = VK_NULL_HANDLE;
-    VkDeviceMemory screenshotStagingMemory_ = VK_NULL_HANDLE;
+    VmaAllocation screenshotStagingMemory_ = VK_NULL_HANDLE;
     void* screenshotMapped_ = nullptr;
     VkDeviceSize screenshotSize_ = 0;
 

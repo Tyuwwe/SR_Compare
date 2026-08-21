@@ -26,6 +26,11 @@ struct VulkanContext {
     VkCommandPool oneShotPool = VK_NULL_HANDLE;  // one-time submits (upscalers)
     VkCommandPool framePool = VK_NULL_HANDLE;    // per-frame recording
 
+    // VMA allocator — all device memory owned by VkUtil helpers goes through
+    // this instead of per-resource vkAllocateMemory (Bistro's texture count
+    // otherwise approaches the driver's allocation limit).
+    VmaAllocator allocator = VK_NULL_HANDLE;
+
     // Guards every host access to graphicsQueue/presentQueue (submit, present,
     // queue-wait-idle).  The GUI async loader submits uploads from a worker
     // thread while the main thread keeps rendering, so queue access needs

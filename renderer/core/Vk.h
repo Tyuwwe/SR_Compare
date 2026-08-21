@@ -24,3 +24,10 @@
 #if defined(_MSC_VER)
 #pragma warning(pop)
 #endif
+
+// VMA handle forward declarations.  vk_mem_alloc.h itself is only included
+// (via renderer/core/Vma.h) in translation units that call VMA functions.
+struct VmaAllocator_T;
+typedef struct VmaAllocator_T* VmaAllocator;
+struct VmaAllocation_T;
+typedef struct VmaAllocation_T* VmaAllocation;

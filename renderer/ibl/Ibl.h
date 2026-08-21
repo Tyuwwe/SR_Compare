@@ -37,13 +37,13 @@ public:
 
 private:
     VkImage envImage_ = VK_NULL_HANDLE;
-    VkDeviceMemory envMemory_ = VK_NULL_HANDLE;
+    VmaAllocation envMemory_ = VK_NULL_HANDLE;
     VkImage irrImage_ = VK_NULL_HANDLE;
-    VkDeviceMemory irrMemory_ = VK_NULL_HANDLE;
+    VmaAllocation irrMemory_ = VK_NULL_HANDLE;
     VkImage preImage_ = VK_NULL_HANDLE;
-    VkDeviceMemory preMemory_ = VK_NULL_HANDLE;
+    VmaAllocation preMemory_ = VK_NULL_HANDLE;
     VkImage lutImage_ = VK_NULL_HANDLE;
-    VkDeviceMemory lutMemory_ = VK_NULL_HANDLE;
+    VmaAllocation lutMemory_ = VK_NULL_HANDLE;
     VkDescriptorPool pool_ = VK_NULL_HANDLE;
 
     struct ComputeStage {

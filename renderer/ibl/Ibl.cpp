@@ -2,6 +2,7 @@
 
 #include "renderer/core/PathUtil.h"
 #include "renderer/core/VkUtil.h"
+#include "renderer/core/Vma.h"
 
 #include <cmath>
 #include <cstdio>
@@ -58,27 +59,26 @@ bool loadShaderModule(const VulkanContext& ctx, const char* name, VkShaderModule
 
 // Upload RGBA16F texels to a 1-level 2D image, ending in SHADER_READ_ONLY.
 bool uploadHdrImage(const VulkanContext& ctx, uint32_t w, uint32_t h, const uint16_t* data,
-                    VkImage& image, VkDeviceMemory& memory, VkImageView& view) {
+                    VkImage& image, VmaAllocation& memory, VkImageView& view) {
     if (createImage(ctx, w, h, kHdrFormat,
                     VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, image,
                     memory) != VK_SUCCESS)
         return false;
     const VkDeviceSize size = static_cast<VkDeviceSize>(w) * h * 8;
     VkBuffer staging = VK_NULL_HANDLE;
-    VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
+    VmaAllocation stagingMemory = VK_NULL_HANDLE;
     if (createBuffer(ctx, size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                      staging, stagingMemory) != VK_SUCCESS)
         return false;
     void* mapped = nullptr;
-    vkMapMemory(ctx.device, stagingMemory, 0, size, 0, &mapped);
+    vmaMapMemory(ctx.allocator, stagingMemory, &mapped);
     std::memcpy(mapped, data, static_cast<size_t>(size));
-    vkUnmapMemory(ctx.device, stagingMemory);
+    vmaUnmapMemory(ctx.allocator, stagingMemory);
     submitOneShot(ctx, [&](VkCommandBuffer cmd) {
         copyBufferToImage(cmd, staging, image, w, h, kHdrFormat);
     });
-    vkDestroyBuffer(ctx.device, staging, nullptr);
-    vkFreeMemory(ctx.device, stagingMemory, nullptr);
+    vmaDestroyBuffer(ctx.allocator, staging, stagingMemory);
     view = createImageView(ctx, image, kHdrFormat, VK_IMAGE_ASPECT_COLOR_BIT);
     return view != VK_NULL_HANDLE;
 }
@@ -211,7 +211,7 @@ bool IblMaps::build(const VulkanContext& ctx, const char* hdrPath) {
 
     // --- GPU resources ------------------------------------------------------
     VkImage eqImage = VK_NULL_HANDLE;
-    VkDeviceMemory eqMemory = VK_NULL_HANDLE;
+    VmaAllocation eqMemory = VK_NULL_HANDLE;
     VkImageView eqView = VK_NULL_HANDLE;
     if (!uploadHdrImage(ctx, static_cast<uint32_t>(w), static_cast<uint32_t>(h), pixels.data(),
                         eqImage, eqMemory, eqView))
@@ -416,8 +416,7 @@ bool IblMaps::build(const VulkanContext& ctx, const char* hdrPath) {
 
     // --- cleanup of intermediates ----------------------------------------------
     vkDestroyImageView(ctx.device, eqView, nullptr);
-    vkDestroyImage(ctx.device, eqImage, nullptr);
-    vkFreeMemory(ctx.device, eqMemory, nullptr);
+    vmaDestroyImage(ctx.allocator, eqImage, eqMemory);
     vkDestroyImageView(ctx.device, envStoreMip0, nullptr);
     vkDestroyImageView(ctx.device, irrStore, nullptr);
     return true;
@@ -429,14 +428,10 @@ void IblMaps::destroy(const VulkanContext& ctx) {
     if (irradianceView) vkDestroyImageView(ctx.device, irradianceView, nullptr);
     if (prefilterView) vkDestroyImageView(ctx.device, prefilterView, nullptr);
     if (brdfLutView) vkDestroyImageView(ctx.device, brdfLutView, nullptr);
-    if (envImage_) vkDestroyImage(ctx.device, envImage_, nullptr);
-    if (envMemory_) vkFreeMemory(ctx.device, envMemory_, nullptr);
-    if (irrImage_) vkDestroyImage(ctx.device, irrImage_, nullptr);
-    if (irrMemory_) vkFreeMemory(ctx.device, irrMemory_, nullptr);
-    if (preImage_) vkDestroyImage(ctx.device, preImage_, nullptr);
-    if (preMemory_) vkFreeMemory(ctx.device, preMemory_, nullptr);
-    if (lutImage_) vkDestroyImage(ctx.device, lutImage_, nullptr);
-    if (lutMemory_) vkFreeMemory(ctx.device, lutMemory_, nullptr);
+    if (envImage_) vmaDestroyImage(ctx.allocator, envImage_, envMemory_);
+    if (irrImage_) vmaDestroyImage(ctx.allocator, irrImage_, irrMemory_);
+    if (preImage_) vmaDestroyImage(ctx.allocator, preImage_, preMemory_);
+    if (lutImage_) vmaDestroyImage(ctx.allocator, lutImage_, lutMemory_);
     if (cubeSampler) vkDestroySampler(ctx.device, cubeSampler, nullptr);
     if (lutSampler) vkDestroySampler(ctx.device, lutSampler, nullptr);
     if (pool_) vkDestroyDescriptorPool(ctx.device, pool_, nullptr);

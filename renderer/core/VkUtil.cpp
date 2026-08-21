@@ -1,53 +1,30 @@
 #include "renderer/core/VkUtil.h"
 
+#include "renderer/core/Vma.h"
+
 #include <cstdio>
 
 namespace sr {
 
-uint32_t findMemoryType(const VulkanContext& ctx, uint32_t typeBits, VkMemoryPropertyFlags required) {
-    for (uint32_t i = 0; i < ctx.memoryProperties.memoryTypeCount; ++i) {
-        if ((typeBits & (1u << i)) &&
-            (ctx.memoryProperties.memoryTypes[i].propertyFlags & required) == required)
-            return i;
-    }
-    return 0xFFFFFFFFu;
-}
-
 VkResult createBuffer(const VulkanContext& ctx, VkDeviceSize size, VkBufferUsageFlags usage,
-                      VkMemoryPropertyFlags props, VkBuffer& buffer, VkDeviceMemory& memory) {
+                      VkMemoryPropertyFlags props, VkBuffer& buffer, VmaAllocation& allocation) {
     VkBufferCreateInfo info = {};
     info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     info.size = size;
     info.usage = usage;
     info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    VkResult res = vkCreateBuffer(ctx.device, &info, nullptr, &buffer);
-    if (res != VK_SUCCESS) return res;
 
-    VkMemoryRequirements req;
-    vkGetBufferMemoryRequirements(ctx.device, buffer, &req);
-    const uint32_t type = findMemoryType(ctx, req.memoryTypeBits, props);
-    if (type == 0xFFFFFFFFu) {
-        vkDestroyBuffer(ctx.device, buffer, nullptr);
-        buffer = VK_NULL_HANDLE;
-        return VK_ERROR_INITIALIZATION_FAILED;
-    }
+    VmaAllocationCreateInfo alloc = {};
+    alloc.usage = VMA_MEMORY_USAGE_AUTO;
+    alloc.requiredFlags = props;
+    if (props & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
+        alloc.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT;
 
-    VkMemoryAllocateInfo alloc = {};
-    alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    alloc.allocationSize = req.size;
-    alloc.memoryTypeIndex = type;
-    res = vkAllocateMemory(ctx.device, &alloc, nullptr, &memory);
-    if (res != VK_SUCCESS) {
-        vkDestroyBuffer(ctx.device, buffer, nullptr);
-        buffer = VK_NULL_HANDLE;
-        return res;
-    }
-    vkBindBufferMemory(ctx.device, buffer, memory, 0);
-    return VK_SUCCESS;
+    return vmaCreateBuffer(ctx.allocator, &info, &alloc, &buffer, &allocation, nullptr);
 }
 
 VkResult createImage(const VulkanContext& ctx, uint32_t width, uint32_t height, VkFormat format,
-                     VkImageUsageFlags usage, VkImage& image, VkDeviceMemory& memory,
+                     VkImageUsageFlags usage, VkImage& image, VmaAllocation& allocation,
                      uint32_t mipLevels, uint32_t arrayLayers, VkImageCreateFlags flags) {
     VkImageCreateInfo info = {};
     info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
@@ -62,30 +39,12 @@ VkResult createImage(const VulkanContext& ctx, uint32_t width, uint32_t height, 
     info.usage = usage;
     info.samples = VK_SAMPLE_COUNT_1_BIT;
     info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    VkResult res = vkCreateImage(ctx.device, &info, nullptr, &image);
-    if (res != VK_SUCCESS) return res;
 
-    VkMemoryRequirements req;
-    vkGetImageMemoryRequirements(ctx.device, image, &req);
-    const uint32_t type = findMemoryType(ctx, req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    if (type == 0xFFFFFFFFu) {
-        vkDestroyImage(ctx.device, image, nullptr);
-        image = VK_NULL_HANDLE;
-        return VK_ERROR_INITIALIZATION_FAILED;
-    }
+    VmaAllocationCreateInfo alloc = {};
+    alloc.usage = VMA_MEMORY_USAGE_AUTO;
+    alloc.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
 
-    VkMemoryAllocateInfo alloc = {};
-    alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    alloc.allocationSize = req.size;
-    alloc.memoryTypeIndex = type;
-    res = vkAllocateMemory(ctx.device, &alloc, nullptr, &memory);
-    if (res != VK_SUCCESS) {
-        vkDestroyImage(ctx.device, image, nullptr);
-        image = VK_NULL_HANDLE;
-        return res;
-    }
-    vkBindImageMemory(ctx.device, image, memory, 0);
-    return VK_SUCCESS;
+    return vmaCreateImage(ctx.allocator, &info, &alloc, &image, &allocation, nullptr);
 }
 
 VkImageView createImageView(const VulkanContext& ctx, VkImage image, VkFormat format,

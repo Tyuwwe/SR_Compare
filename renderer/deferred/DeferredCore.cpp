@@ -5,6 +5,7 @@
 
 #include "renderer/core/PathUtil.h"
 #include "renderer/core/VkUtil.h"
+#include "renderer/core/Vma.h"
 #include "renderer/scene/Camera.h"
 #include "renderer/scene/Scene.h"
 
@@ -912,7 +913,7 @@ void DeferredCore::fillLightingUBO(LightingUBO& out, const Scene& scene, const C
 }
 
 bool DeferredCore::createMaterialUbo(const VulkanContext& ctx, const Scene& scene,
-                                     VkBuffer& buffer, VkDeviceMemory& memory,
+                                     VkBuffer& buffer, VmaAllocation& memory,
                                      uint32_t& stride) const {
     stride = alignUp(sizeof(MaterialUBO), static_cast<uint32_t>(ctx.minUniformBufferOffsetAlignment));
     const VkDeviceSize size = static_cast<VkDeviceSize>(stride) * scene.materials.size();
@@ -921,7 +922,7 @@ bool DeferredCore::createMaterialUbo(const VulkanContext& ctx, const Scene& scen
                      buffer, memory) != VK_SUCCESS)
         return false;
     void* mapped = nullptr;
-    vkMapMemory(ctx.device, memory, 0, size, 0, &mapped);
+    vmaMapMemory(ctx.allocator, memory, &mapped);
     auto* bytes = static_cast<uint8_t*>(mapped);
     for (size_t i = 0; i < scene.materials.size(); ++i) {
         MaterialUBO ubo;
@@ -946,7 +947,7 @@ bool DeferredCore::createMaterialUbo(const VulkanContext& ctx, const Scene& scen
         ubo.tex1[1] = ubo.tex1[2] = ubo.tex1[3] = -1.f;
         std::memcpy(bytes + i * stride, &ubo, sizeof(ubo));
     }
-    vkUnmapMemory(ctx.device, memory);
+    vmaUnmapMemory(ctx.allocator, memory);
     return true;
 }
 
@@ -1429,8 +1430,7 @@ void DeferredCore::destroyShadowTargets(const VulkanContext& ctx, ShadowTargets&
         if (v) { vkDestroyImageView(ctx.device, v, nullptr); v = VK_NULL_HANDLE; }
     }
     if (targets.arrayView) { vkDestroyImageView(ctx.device, targets.arrayView, nullptr); targets.arrayView = VK_NULL_HANDLE; }
-    if (targets.image) { vkDestroyImage(ctx.device, targets.image, nullptr); targets.image = VK_NULL_HANDLE; }
-    if (targets.memory) { vkFreeMemory(ctx.device, targets.memory, nullptr); targets.memory = VK_NULL_HANDLE; }
+    if (targets.image) { vmaDestroyImage(ctx.allocator, targets.image, targets.memory); targets.image = VK_NULL_HANDLE; targets.memory = VK_NULL_HANDLE; }
     targets.layout = VK_IMAGE_LAYOUT_UNDEFINED;
 }
 

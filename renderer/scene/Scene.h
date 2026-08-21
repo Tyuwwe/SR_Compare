@@ -22,9 +22,9 @@ struct Vertex {
 
 struct Mesh {
     VkBuffer vertexBuffer = VK_NULL_HANDLE;
-    VkDeviceMemory vertexMemory = VK_NULL_HANDLE;
+    VmaAllocation vertexMemory = VK_NULL_HANDLE;
     VkBuffer indexBuffer = VK_NULL_HANDLE;
-    VkDeviceMemory indexMemory = VK_NULL_HANDLE;
+    VmaAllocation indexMemory = VK_NULL_HANDLE;
     uint32_t indexCount = 0;
     VkIndexType indexType = VK_INDEX_TYPE_UINT32;
     Vec3 aabbMin{0.f, 0.f, 0.f}; // local-space bounds (for frustum culling)
@@ -36,7 +36,7 @@ struct Mesh {
 
 struct Texture {
     VkImage image = VK_NULL_HANDLE;
-    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VmaAllocation memory = VK_NULL_HANDLE;
     VkImageView view = VK_NULL_HANDLE;
     uint32_t width = 0;
     uint32_t height = 0;
@@ -138,9 +138,9 @@ public:
     // (very expensive) per-draw vkCmdBindVertexBuffers/IndexBuffer calls.
     // Compare mode keeps using the per-mesh buffers above.
     VkBuffer mergedVertexBuffer = VK_NULL_HANDLE;
-    VkDeviceMemory mergedVertexMemory = VK_NULL_HANDLE;
+    VmaAllocation mergedVertexMemory = VK_NULL_HANDLE;
     VkBuffer mergedIndexBuffer = VK_NULL_HANDLE;
-    VkDeviceMemory mergedIndexMemory = VK_NULL_HANDLE;
+    VmaAllocation mergedIndexMemory = VK_NULL_HANDLE;
 
     // Optional load progress (glTF).  total == 0 means the stage is
     // indeterminate (parse / finalize).  The callback fires from whichever

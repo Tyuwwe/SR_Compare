@@ -1,6 +1,7 @@
 # Vulkan renderer core + scene + deferred GBuffer/lighting + TAA input generation.
 add_library(renderer STATIC
     core/VulkanContext.cpp
+    core/VmaImpl.cpp
     core/Window.cpp
     core/VkUtil.cpp
     core/Swapchain.cpp

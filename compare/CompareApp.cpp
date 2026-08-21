@@ -6,6 +6,7 @@
 #include "renderer/Screenshot.h"
 #include "renderer/core/PathUtil.h"
 #include "renderer/core/VkUtil.h"
+#include "renderer/core/Vma.h"
 #include "renderer/scene/SceneRegistry.h"
 #include "upscalers/UpscalerFactory.h"
 
@@ -108,8 +109,7 @@ char asciiUpper(char c) {
 
 void CompareApp::ImageResource::destroy(const VulkanContext& ctx) {
     if (view) { vkDestroyImageView(ctx.device, view, nullptr); view = VK_NULL_HANDLE; }
-    if (image) { vkDestroyImage(ctx.device, image, nullptr); image = VK_NULL_HANDLE; }
-    if (memory) { vkFreeMemory(ctx.device, memory, nullptr); memory = VK_NULL_HANDLE; }
+    if (image) { vmaDestroyImage(ctx.allocator, image, memory); image = VK_NULL_HANDLE; memory = VK_NULL_HANDLE; }
 }
 
 void CompareApp::computeViewRegion(uint32_t srcW, uint32_t srcH, uint32_t colW, uint32_t colH,
@@ -412,22 +412,21 @@ bool CompareApp::createRenderTargets() {
 bool CompareApp::createFontAtlas() {
     // Rasterize the 5x7 bitmap font into an R8 atlas and upload it.
     VkBuffer staging = VK_NULL_HANDLE;
-    VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
+    VmaAllocation stagingMemory = VK_NULL_HANDLE;
     const VkDeviceSize size = kFontAtlasW * kFontAtlasH;
     if (createBuffer(ctx_, size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                      staging, stagingMemory) != VK_SUCCESS)
         return false;
     void* mapped = nullptr;
-    vkMapMemory(ctx_.device, stagingMemory, 0, size, 0, &mapped);
+    vmaMapMemory(ctx_.allocator, stagingMemory, &mapped);
     buildFontAtlas(static_cast<uint8_t*>(mapped));
-    vkUnmapMemory(ctx_.device, stagingMemory);
+    vmaUnmapMemory(ctx_.allocator, stagingMemory);
 
     if (createImage(ctx_, kFontAtlasW, kFontAtlasH, VK_FORMAT_R8_UNORM,
                     VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                     fontAtlas_.image, fontAtlas_.memory) != VK_SUCCESS) {
-        vkDestroyBuffer(ctx_.device, staging, nullptr);
-        vkFreeMemory(ctx_.device, stagingMemory, nullptr);
+        vmaDestroyBuffer(ctx_.allocator, staging, stagingMemory);
         return false;
     }
     fontAtlas_.width = kFontAtlasW;
@@ -438,8 +437,7 @@ bool CompareApp::createFontAtlas() {
         copyBufferToImage(cmd, staging, fontAtlas_.image, kFontAtlasW, kFontAtlasH,
                           VK_FORMAT_R8_UNORM);
     });
-    vkDestroyBuffer(ctx_.device, staging, nullptr);
-    vkFreeMemory(ctx_.device, stagingMemory, nullptr);
+    vmaDestroyBuffer(ctx_.allocator, staging, stagingMemory);
 
     fontAtlas_.view = createImageView(ctx_, fontAtlas_.image, VK_FORMAT_R8_UNORM,
                                       VK_IMAGE_ASPECT_COLOR_BIT);
@@ -474,7 +472,7 @@ bool CompareApp::createMetricResources() {
                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                          metricStaging_[i], metricStagingMemory_[i]) != VK_SUCCESS)
             return false;
-        vkMapMemory(ctx_.device, metricStagingMemory_[i], 0, resultSize, 0,
+        vmaMapMemory(ctx_.allocator, metricStagingMemory_[i],
                     &metricStagingMapped_[i]);
     }
     return true;
@@ -604,7 +602,7 @@ bool CompareApp::createDescriptors() {
                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                      textUbo_, textUboMemory_) != VK_SUCCESS)
         return false;
-    vkMapMemory(ctx_.device, textUboMemory_, 0, textSize, 0, &textUboMapped_);
+    vmaMapMemory(ctx_.allocator, textUboMemory_, &textUboMapped_);
 
     // --- allocate sets ---------------------------------------------------------
     auto allocSet = [&](VkDescriptorSetLayout layout, VkDescriptorSet& set) {
@@ -952,7 +950,7 @@ bool CompareApp::createSyncResources() {
 
         // Scene UBOs per frame slot: jittered GB / unjittered spatial GB / unjittered GT.
         VkBuffer ubos[3] = {};
-        VkDeviceMemory uboMems[3] = {};
+        VmaAllocation uboMems[3] = {};
         void* uboMaps[3] = {};
         VkDescriptorSet sets[3] = {fr.sceneSetGb, fr.sceneSetGbSpatial, fr.sceneSetGt};
         for (int k = 0; k < 3; ++k) {
@@ -960,7 +958,7 @@ bool CompareApp::createSyncResources() {
                              VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                              ubos[k], uboMems[k]) != VK_SUCCESS)
                 return false;
-            vkMapMemory(ctx_.device, uboMems[k], 0, uboSize, 0, &uboMaps[k]);
+            vmaMapMemory(ctx_.allocator, uboMems[k], &uboMaps[k]);
 
             VkDescriptorBufferInfo sceneBuf = {};
             sceneBuf.buffer = ubos[k];
@@ -997,19 +995,19 @@ bool CompareApp::createSyncResources() {
                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                          fr.lightingUboGb, fr.lightingUboGbMemory) != VK_SUCCESS)
             return false;
-        vkMapMemory(ctx_.device, fr.lightingUboGbMemory, 0, sizeof(LightingUBO), 0,
+        vmaMapMemory(ctx_.allocator, fr.lightingUboGbMemory,
                     &fr.lightingUboGbMapped);
         if (createBuffer(ctx_, sizeof(LightingUBO), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                          fr.lightingUboGbSpatial, fr.lightingUboGbSpatialMemory) != VK_SUCCESS)
             return false;
-        vkMapMemory(ctx_.device, fr.lightingUboGbSpatialMemory, 0, sizeof(LightingUBO), 0,
+        vmaMapMemory(ctx_.allocator, fr.lightingUboGbSpatialMemory,
                     &fr.lightingUboGbSpatialMapped);
         if (createBuffer(ctx_, sizeof(LightingUBO), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                          fr.lightingUboGt, fr.lightingUboGtMemory) != VK_SUCCESS)
             return false;
-        vkMapMemory(ctx_.device, fr.lightingUboGtMemory, 0, sizeof(LightingUBO), 0,
+        vmaMapMemory(ctx_.allocator, fr.lightingUboGtMemory,
                     &fr.lightingUboGtMapped);
 
         // Shadow map binding: the array view is always bound when the targets
@@ -1077,7 +1075,7 @@ bool CompareApp::createScreenshotStaging() {
                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                      screenshotStaging_, screenshotStagingMemory_) != VK_SUCCESS)
         return false;
-    vkMapMemory(ctx_.device, screenshotStagingMemory_, 0, size, 0, &screenshotMapped_);
+    vmaMapMemory(ctx_.allocator, screenshotStagingMemory_, &screenshotMapped_);
     return true;
 }
 
@@ -1962,8 +1960,7 @@ void CompareApp::shutdown() {
         if (algo.upscaler) { algo.upscaler->shutdown(); algo.upscaler.reset(); }
         algo.output.destroy(ctx_);
         if (algo.blocksBuffer) {
-            vkDestroyBuffer(ctx_.device, algo.blocksBuffer, nullptr);
-            vkFreeMemory(ctx_.device, algo.blocksMemory, nullptr);
+            vmaDestroyBuffer(ctx_.allocator, algo.blocksBuffer, algo.blocksMemory);
             algo.blocksBuffer = VK_NULL_HANDLE;
             algo.blocksMemory = VK_NULL_HANDLE;
         }
@@ -1971,29 +1968,25 @@ void CompareApp::shutdown() {
     algos_.clear();
 
     if (screenshotStaging_) {
-        vkDestroyBuffer(ctx_.device, screenshotStaging_, nullptr);
-        vkFreeMemory(ctx_.device, screenshotStagingMemory_, nullptr);
+        vmaDestroyBuffer(ctx_.allocator, screenshotStaging_, screenshotStagingMemory_);
         screenshotStaging_ = VK_NULL_HANDLE;
         screenshotStagingMemory_ = VK_NULL_HANDLE;
     }
     for (uint32_t i = 0; i < kFramesInFlight; ++i) {
         if (metricStaging_[i]) {
-            vkDestroyBuffer(ctx_.device, metricStaging_[i], nullptr);
-            vkFreeMemory(ctx_.device, metricStagingMemory_[i], nullptr);
+            vmaDestroyBuffer(ctx_.allocator, metricStaging_[i], metricStagingMemory_[i]);
             metricStaging_[i] = VK_NULL_HANDLE;
             metricStagingMemory_[i] = VK_NULL_HANDLE;
             metricStagingMapped_[i] = nullptr;
         }
     }
     if (metricResultBuf_) {
-        vkDestroyBuffer(ctx_.device, metricResultBuf_, nullptr);
-        vkFreeMemory(ctx_.device, metricResultMemory_, nullptr);
+        vmaDestroyBuffer(ctx_.allocator, metricResultBuf_, metricResultMemory_);
         metricResultBuf_ = VK_NULL_HANDLE;
         metricResultMemory_ = VK_NULL_HANDLE;
     }
     if (textUbo_) {
-        vkDestroyBuffer(ctx_.device, textUbo_, nullptr);
-        vkFreeMemory(ctx_.device, textUboMemory_, nullptr);
+        vmaDestroyBuffer(ctx_.allocator, textUbo_, textUboMemory_);
         textUbo_ = VK_NULL_HANDLE;
         textUboMemory_ = VK_NULL_HANDLE;
         textUboMapped_ = nullptr;
@@ -2002,40 +1995,34 @@ void CompareApp::shutdown() {
     for (uint32_t i = 0; i < kFramesInFlight; ++i) {
         FrameResources& fr = frames_[i];
         if (fr.uboGb) {
-            vkDestroyBuffer(ctx_.device, fr.uboGb, nullptr);
-            vkFreeMemory(ctx_.device, fr.uboGbMemory, nullptr);
+            vmaDestroyBuffer(ctx_.allocator, fr.uboGb, fr.uboGbMemory);
             fr.uboGb = VK_NULL_HANDLE;
             fr.uboGbMemory = VK_NULL_HANDLE;
         }
         if (fr.uboGbSpatial) {
-            vkDestroyBuffer(ctx_.device, fr.uboGbSpatial, nullptr);
-            vkFreeMemory(ctx_.device, fr.uboGbSpatialMemory, nullptr);
+            vmaDestroyBuffer(ctx_.allocator, fr.uboGbSpatial, fr.uboGbSpatialMemory);
             fr.uboGbSpatial = VK_NULL_HANDLE;
             fr.uboGbSpatialMemory = VK_NULL_HANDLE;
             fr.uboGbSpatialMapped = nullptr;
         }
         if (fr.uboGt) {
-            vkDestroyBuffer(ctx_.device, fr.uboGt, nullptr);
-            vkFreeMemory(ctx_.device, fr.uboGtMemory, nullptr);
+            vmaDestroyBuffer(ctx_.allocator, fr.uboGt, fr.uboGtMemory);
             fr.uboGt = VK_NULL_HANDLE;
             fr.uboGtMemory = VK_NULL_HANDLE;
         }
         if (fr.lightingUboGb) {
-            vkDestroyBuffer(ctx_.device, fr.lightingUboGb, nullptr);
-            vkFreeMemory(ctx_.device, fr.lightingUboGbMemory, nullptr);
+            vmaDestroyBuffer(ctx_.allocator, fr.lightingUboGb, fr.lightingUboGbMemory);
             fr.lightingUboGb = VK_NULL_HANDLE;
             fr.lightingUboGbMemory = VK_NULL_HANDLE;
         }
         if (fr.lightingUboGbSpatial) {
-            vkDestroyBuffer(ctx_.device, fr.lightingUboGbSpatial, nullptr);
-            vkFreeMemory(ctx_.device, fr.lightingUboGbSpatialMemory, nullptr);
+            vmaDestroyBuffer(ctx_.allocator, fr.lightingUboGbSpatial, fr.lightingUboGbSpatialMemory);
             fr.lightingUboGbSpatial = VK_NULL_HANDLE;
             fr.lightingUboGbSpatialMemory = VK_NULL_HANDLE;
             fr.lightingUboGbSpatialMapped = nullptr;
         }
         if (fr.lightingUboGt) {
-            vkDestroyBuffer(ctx_.device, fr.lightingUboGt, nullptr);
-            vkFreeMemory(ctx_.device, fr.lightingUboGtMemory, nullptr);
+            vmaDestroyBuffer(ctx_.allocator, fr.lightingUboGt, fr.lightingUboGtMemory);
             fr.lightingUboGt = VK_NULL_HANDLE;
             fr.lightingUboGtMemory = VK_NULL_HANDLE;
         }
@@ -2069,8 +2056,7 @@ void CompareApp::shutdown() {
     if (fontSampler_) { vkDestroySampler(ctx_.device, fontSampler_, nullptr); fontSampler_ = VK_NULL_HANDLE; }
 
     if (materialUbo_) {
-        vkDestroyBuffer(ctx_.device, materialUbo_, nullptr);
-        vkFreeMemory(ctx_.device, materialUboMemory_, nullptr);
+        vmaDestroyBuffer(ctx_.allocator, materialUbo_, materialUboMemory_);
         materialUbo_ = VK_NULL_HANDLE;
         materialUboMemory_ = VK_NULL_HANDLE;
     }

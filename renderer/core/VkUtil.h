@@ -1,7 +1,8 @@
 #pragma once
 // ============================================================================
-// Small reusable Vulkan helpers: memory type selection, buffer/image creation,
-// image views/samplers, layout transitions and one-time command submission.
+// Small reusable Vulkan helpers: buffer/image creation (backed by the
+// VulkanContext VMA allocator), image views/samplers, layout transitions and
+// one-time command submission.
 // ============================================================================
 #include "renderer/core/Vk.h"
 #include "renderer/core/VulkanContext.h"
@@ -10,13 +11,13 @@
 
 namespace sr {
 
-uint32_t findMemoryType(const VulkanContext& ctx, uint32_t typeBits, VkMemoryPropertyFlags required);
-
+// Buffers/images are allocated through ctx.allocator (VMA).  Destroy them
+// with vmaDestroyBuffer / vmaDestroyImage, map with vmaMapMemory.
 VkResult createBuffer(const VulkanContext& ctx, VkDeviceSize size, VkBufferUsageFlags usage,
-                      VkMemoryPropertyFlags props, VkBuffer& buffer, VkDeviceMemory& memory);
+                      VkMemoryPropertyFlags props, VkBuffer& buffer, VmaAllocation& allocation);
 
 VkResult createImage(const VulkanContext& ctx, uint32_t width, uint32_t height, VkFormat format,
-                     VkImageUsageFlags usage, VkImage& image, VkDeviceMemory& memory,
+                     VkImageUsageFlags usage, VkImage& image, VmaAllocation& allocation,
                      uint32_t mipLevels = 1, uint32_t arrayLayers = 1,
                      VkImageCreateFlags flags = 0);
 

@@ -1,5 +1,6 @@
 #include "renderer/core/VulkanContext.h"
 
+#include "renderer/core/Vma.h"
 #include "renderer/core/Window.h"
 #include "upscalers/UpscalerFactory.h"
 
@@ -287,6 +288,16 @@ bool VulkanContext::create(Window& window) {
     vkCreateCommandPool(device, &pool, nullptr, &oneShotPool);
     vkCreateCommandPool(device, &pool, nullptr, &framePool);
 
+    VmaAllocatorCreateInfo allocatorInfo = {};
+    allocatorInfo.physicalDevice = physicalDevice;
+    allocatorInfo.device = device;
+    allocatorInfo.instance = instance;
+    allocatorInfo.vulkanApiVersion = kApiVersion;
+    if (vmaCreateAllocator(&allocatorInfo, &allocator) != VK_SUCCESS) {
+        destroy();
+        return false;
+    }
+
     return true;
 }
 
@@ -299,6 +310,7 @@ void VulkanContext::destroy() {
     }
     if (oneShotPool) { vkDestroyCommandPool(device, oneShotPool, nullptr); oneShotPool = VK_NULL_HANDLE; }
     if (framePool) { vkDestroyCommandPool(device, framePool, nullptr); framePool = VK_NULL_HANDLE; }
+    if (allocator) { vmaDestroyAllocator(allocator); allocator = VK_NULL_HANDLE; }
     vkDestroyDevice(device, nullptr);
     device = VK_NULL_HANDLE;
     if (surface) { vkDestroySurfaceKHR(instance, surface, nullptr); surface = VK_NULL_HANDLE; }

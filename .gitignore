@@ -3,6 +3,7 @@ build-nss-emu/
 out/
 third_party/*/
 !third_party/.gitkeep
+!third_party/vma/
 assets/*/
 !assets/.gitkeep
 metrics/venv/

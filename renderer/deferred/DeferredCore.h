@@ -110,7 +110,7 @@ constexpr float kShadowDepthBiasSlope = 1.75f;
 // view (bound with DeferredCore's comparison sampler).
 struct ShadowTargets {
     VkImage image = VK_NULL_HANDLE;
-    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VmaAllocation memory = VK_NULL_HANDLE;
     VkImageView arrayView = VK_NULL_HANDLE;                       // 4 layers, sampled
     VkImageView layerViews[kShadowCascadeCount] = {};             // per-cascade attachment
     VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;             // tracked by the host
@@ -216,7 +216,7 @@ public:
 
     // Uploads the dynamic-offset material UBO array (one entry per material).
     bool createMaterialUbo(const VulkanContext& ctx, const Scene& scene, VkBuffer& buffer,
-                           VkDeviceMemory& memory, uint32_t& stride) const;
+                           VmaAllocation& memory, uint32_t& stride) const;
 
     // --- descriptor writers (sets are allocated from the caller's pool) --------
     void writeTextureSet(const VulkanContext& ctx, VkDescriptorSet set, const Scene& scene) const;

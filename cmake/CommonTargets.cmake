@@ -14,10 +14,11 @@ function(sr_common_setup TARGET)
 
     target_include_directories(${TARGET} PUBLIC ${CMAKE_SOURCE_DIR})
 
-    # Single-header dependencies (cgltf / stb) — external, warnings silenced.
+    # Single-header dependencies (cgltf / stb / vma) — external, warnings silenced.
     target_include_directories(${TARGET} SYSTEM PRIVATE
         ${SR_THIRD_PARTY_DIR}/cgltf
-        ${SR_THIRD_PARTY_DIR}/stb)
+        ${SR_THIRD_PARTY_DIR}/stb
+        ${SR_THIRD_PARTY_DIR}/vma)
 
     # Vulkan SDK headers as external too.
     if(Vulkan_INCLUDE_DIRS)
