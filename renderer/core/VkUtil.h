@@ -68,6 +68,9 @@ inline constexpr VkPipelineStageFlags2 kBlit = VK_PIPELINE_STAGE_2_BLIT_BIT;
 inline constexpr VkPipelineStageFlags2 kCopy = VK_PIPELINE_STAGE_2_COPY_BIT;
 inline constexpr VkAccessFlags2 kSampled = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
 inline constexpr VkAccessFlags2 kStorageWrite = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+// Opaque SSR reads its own texel back via imageLoad before rewriting it.
+inline constexpr VkAccessFlags2 kStorageReadWrite =
+    VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
 inline constexpr VkAccessFlags2 kColorWrite = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
 inline constexpr VkAccessFlags2 kColorReadWrite =
     VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;

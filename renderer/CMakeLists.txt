@@ -38,6 +38,7 @@ set(RENDERER_SHADERS
     shaders/shadow_depth.frag
     shaders/ssao.comp
     shaders/ssao_blur.comp
+    shaders/ssr_opaque.comp
     shaders/hiz_downsample.comp
     shaders/color_downsample.comp
     shaders/bloom_extract.comp
@@ -52,7 +53,7 @@ set(RENDERER_SPV "")
 foreach(SHADER ${RENDERER_SHADERS})
     if(SHADER STREQUAL "shaders/present.frag")
         sr_compile_shader(SPV ${SHADER} "${SR_TONE_MAP_GLSL}")
-    elseif(SHADER STREQUAL "shaders/transparent.frag" OR SHADER STREQUAL "shaders/transparent_gt.frag")
+    elseif(SHADER STREQUAL "shaders/transparent.frag" OR SHADER STREQUAL "shaders/transparent_gt.frag" OR SHADER STREQUAL "shaders/ssr_opaque.comp")
         sr_compile_shader(SPV ${SHADER} "${SR_SHADER_INCLUDE_DIR}/ssr.glsl" "${SR_SHADER_INCLUDE_DIR}/brdf.glsl")
     elseif(SHADER STREQUAL "shaders/lighting.frag" OR SHADER STREQUAL "shaders/ibl_brdf_lut.comp")
         sr_compile_shader(SPV ${SHADER} "${SR_SHADER_INCLUDE_DIR}/brdf.glsl")

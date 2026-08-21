@@ -1,0 +1,120 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "brdf.glsl"
+#include "ssr.glsl"
+// Full-screen SSR for opaque surfaces (UE4-style ScreenSpaceReflections,
+// Phase 1b-3): one compute pass after the deferred lighting pass and before
+// the transparency pass.  Every pixel marches reflect(-V, N) through the Hi-Z
+// pyramid (traceSsr, ssr.glsl) and reads the hit colour from the box-filtered
+// lit-colour mip chain at a roughness-driven LOD.
+//
+// Composite: the lighting pass already added the split-sum IBL specular term
+// to the scene colour, so SSR REPLACES it (energy conservation — SSR must not
+// stack on top of IBL) instead of adding:
+//     out = old + conf * (ssrColor * envBRDF - iblSpec)
+// which equals mix(iblSpec, ssrColor * envBRDF, conf) on the specular term;
+// misses (conf = 0) keep the original IBL.  iblSpec is recomputed here from
+// the same GBuffer / LUT / prefilter inputs lighting.frag used, so the
+// subtraction is exact — this avoids both a second lighting output and any
+// new GBuffer channel (the material RT's free alpha is UNORM8 and could not
+// hold the HDR term anyway).
+//
+// Why in-place imageLoad/imageStore: each invocation reads and rewrites only
+// its own texel, so a single storage binding replaces the classic
+// trace-into-SSR-target + blend-composite two-pass arrangement with no extra
+// full-res target and no feedback hazard.
+//
+// Perf note: the march runs at full resolution.  Half-res trace + full-res
+// composite (the common 2020 setup) is the documented optimisation point if
+// this pass ever shows up in profiles.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// Prefix of LightingUBO (DeferredCore.h); the bound buffer is the lighting
+// UBO of this path, only these leading members are read.
+struct LightGPU {
+    vec4 posOrDir;
+    vec4 color;
+    vec4 params;
+};
+layout(set = 0, binding = 0) uniform LightingUBO {
+    mat4 invViewProj;
+    vec4 cameraPos;
+    LightGPU lights[16]; // layout placeholder; not read
+    vec4 lightCounts;    // layout placeholder; not read
+    vec4 ambient;        // layout placeholder; not read
+    vec4 iblParams;      // x = env intensity, y = prefilter max lod
+} u;
+
+layout(set = 0, binding = 1) uniform sampler2D gbAlbedo;
+layout(set = 0, binding = 2) uniform sampler2D gbNormal;
+layout(set = 0, binding = 3) uniform sampler2D gbMaterial;
+layout(set = 0, binding = 4) uniform sampler2D gbDepth;
+layout(set = 0, binding = 5) uniform sampler2D ssaoTex;
+layout(set = 0, binding = 6) uniform samplerCube iblPrefilter;
+layout(set = 0, binding = 7) uniform sampler2D iblBrdfLut;
+layout(set = 0, binding = 8) uniform sampler2D ssrColor; // lit HDR colour mip chain
+layout(set = 0, binding = 9) uniform sampler2D ssrHiZ;   // max-reduced depth pyramid
+layout(set = 0, binding = 10, rgba16f) uniform image2D sceneColor; // in/out, in-place RMW
+
+// The path's view-projection (jittered for the LR path), matching the GBuffer
+// pass; the inverse ships in the lighting UBO.
+layout(push_constant) uniform SsrPush {
+    mat4 viewProj;
+} push;
+
+void main() {
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    const vec2 renderSize = vec2(textureSize(gbDepth, 0));
+    if (pix.x >= int(renderSize.x) || pix.y >= int(renderSize.y)) return;
+
+    const float depth = texelFetch(gbDepth, pix, 0).r;
+    if (depth == 1.0) return; // sky pixels keep the skybox
+
+    // Same world-position reconstruction as lighting.frag.
+    const vec2 uv = (vec2(pix) + 0.5) / renderSize;
+    vec4 wp = u.invViewProj * vec4(uv * 2.0 - 1.0, depth, 1.0);
+    wp /= wp.w;
+
+    vec3 V = normalize(u.cameraPos.xyz - wp.xyz);
+    // A2B10G10R10 stores the normal remapped to [0,1]; unpack back to [-1,1].
+    vec3 N = normalize(texelFetch(gbNormal, pix, 0).xyz * 2.0 - 1.0);
+    // Two-sided foliage stores inverted normals (lighting.frag flips them);
+    // mirror that rule so the replaced IBL term matches what lighting added.
+    if (dot(N, V) < 0.0) N = -N;
+
+    const vec4 matParams = texelFetch(gbMaterial, pix, 0);
+    const float metallic = matParams.r;
+    const float roughness = max(matParams.g, 0.04); // same floor as lighting.frag
+    const float ao = matParams.b;
+    const vec3 albedo = texelFetch(gbAlbedo, pix, 0).rgb;
+
+    const float NdV = max(dot(N, V), 0.0);
+    const vec3 F0 = mix(vec3(0.04), albedo, metallic);
+    const vec3 F = F_SchlickRoughness(NdV, F0, roughness);
+    const vec2 brdf = texture(iblBrdfLut, vec2(NdV, roughness)).rg;
+    const vec3 envBrdf = F * brdf.x + brdf.y; // UE EnvBRDF, applied at composite
+
+    // Early-out where the specular lobe carries no energy: roughness ~ 1 and
+    // diffuse-dominated dielectrics push envBrdf to ~0, so the composite below
+    // would be a no-op even on a hit.  This is the "SSR weight -> 0" skip.
+    if (dot(envBrdf, vec3(1.0)) < 0.01) return;
+
+    const vec3 R = reflect(-V, N);
+    const vec4 ssr = traceSsr(ssrColor, textureQueryLevels(ssrColor), ssrHiZ,
+                              textureQueryLevels(ssrHiZ), push.viewProj, u.invViewProj,
+                              u.cameraPos.xyz, wp.xyz, N, R, roughness, renderSize);
+    const float conf = clamp(ssr.a, 0.0, 1.0);
+    if (conf <= 0.0) return; // miss: keep the IBL specular term as-is
+
+    // The exact specular term lighting.frag added to this pixel.
+    const float ssao = texelFetch(ssaoTex, pix, 0).r;
+    const vec3 prefiltered = textureLod(iblPrefilter, R, roughness * u.iblParams.y).rgb;
+    const vec3 specIbl = prefiltered * envBrdf * (ao * ssao * u.iblParams.x);
+
+    // The SSR side deliberately skips the env-intensity multiplier (the hit
+    // colour is real scene radiance, not the environment map) and the AO terms
+    // (the marched radiance already carries the scene's own occlusion).
+    const vec4 old = imageLoad(sceneColor, pix);
+    imageStore(sceneColor, pix, vec4(old.rgb + conf * (ssr.rgb * envBrdf - specIbl), old.a));
+}

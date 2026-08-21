@@ -232,6 +232,15 @@ struct ColorPyramid {
     uint32_t mipCount = 0;
 };
 
+// Push constants of the opaque SSR pass (ssr_opaque.comp): the path's
+// view-projection (jittered for the LR path).  Everything else the marcher
+// needs (invViewProj, cameraPos, iblParams) comes from the bound LightingUBO
+// prefix, so no second UBO per path is required.
+struct SsrPush {
+    float viewProj[16];
+};
+static_assert(sizeof(SsrPush) == 64, "SsrPush size mismatch");
+
 // Bloom (half-res extract + separable Gaussian, added back before upscale).
 struct BloomPush {
     float params[4]; // extract: threshold, knee; blur: dir.xy; composite: strength
@@ -395,6 +404,26 @@ public:
     // barrier making the writes visible to fragment reads.
     void recordColorPyramidPass(VkCommandBuffer cmd, const ColorPyramid& pyramid) const;
 
+    // --- Opaque SSR (after lighting + color pyramid, before transparency) -----
+    // Full-screen compute pass (ssr_opaque.comp): Hi-Z march per opaque pixel,
+    // composited energy-conservingly by replacing the IBL specular term the
+    // lighting pass already wrote (mix(iblSpec, ssrColor*envBRDF, conf)).
+    // ssr set: binding 0 = the path's LightingUBO (only the invViewProj /
+    // cameraPos / iblParams prefix is read); 1-4 = GBuffer albedo/normal/
+    // material/depth; 5 = SSAO; 6-7 = IBL prefilter + BRDF LUT; 8 = color
+    // pyramid chain (GENERAL); 9 = depth pyramid chain (GENERAL); 10 = the lit
+    // HDR target as a storage image (in-place read-modify-write, GENERAL).
+    void writeSsrSet(const VulkanContext& ctx, VkDescriptorSet set, VkBuffer lightingUbo,
+                     VkImageView albedo, VkImageView normal, VkImageView material,
+                     VkImageView depth, VkImageView ssao, VkImageView ssrColor,
+                     VkImageView depthPyramid, VkImageView sceneColor) const;
+    // Dispatches ssr_opaque.comp.  viewProj must be the exact view-projection
+    // of this path's GBuffer pass (jittered for LR).  The caller owns all
+    // layout transitions: sceneColor in GENERAL on entry, the GBuffer + SSAO
+    // textures shader-readable by compute, both pyramids already rebuilt.
+    void recordSsrPass(VkCommandBuffer cmd, VkDescriptorSet ssrSet, const Mat4& viewProj,
+                       uint32_t width, uint32_t height) const;
+
     // --- CSM sun shadow pass (between the GBuffer and the lighting pass) ------
     // Creates the 2048^2 x kShadowCascadeCount D32 array + views.  The
     // comparison sampler is shared (shadowSampler()); it is created in init().
@@ -429,6 +458,7 @@ public:
     VkDescriptorSetLayout ssaoSetLayout() const { return ssaoSetLayout_; }
     VkDescriptorSetLayout ssaoBlurSetLayout() const { return ssaoBlurSetLayout_; }
     VkDescriptorSetLayout hizSetLayout() const { return hizSetLayout_; }
+    VkDescriptorSetLayout ssrSetLayout() const { return ssrSetLayout_; }
     VkDescriptorSetLayout bloomSetLayout() const { return ssaoBlurSetLayout_; }
     VkPipelineLayout scenePipelineLayout() const { return scenePipelineLayout_; }
     VkPipelineLayout lightingPipelineLayout() const { return lightingPipelineLayout_; }
@@ -454,6 +484,7 @@ private:
     VkDescriptorSetLayout ssaoSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout ssaoBlurSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout hizSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout ssrSetLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout scenePipelineLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout lightingPipelineLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout transparentPipelineLayout_ = VK_NULL_HANDLE;
@@ -469,6 +500,8 @@ private:
     VkPipelineLayout hizPipelineLayout_ = VK_NULL_HANDLE;
     VkPipeline hizPipeline_ = VK_NULL_HANDLE;
     VkPipeline colorDownsamplePipeline_ = VK_NULL_HANDLE; // reuses hizPipelineLayout_
+    VkPipelineLayout ssrPipelineLayout_ = VK_NULL_HANDLE;
+    VkPipeline ssrPipeline_ = VK_NULL_HANDLE;
     VkPipelineLayout bloomPipelineLayout_ = VK_NULL_HANDLE;
     VkPipeline bloomExtractPipeline_ = VK_NULL_HANDLE;
     VkPipeline bloomBlurPipeline_ = VK_NULL_HANDLE;
@@ -486,6 +519,7 @@ private:
     VkShaderModule ssaoBlurComp_ = VK_NULL_HANDLE;
     VkShaderModule hizDownsampleComp_ = VK_NULL_HANDLE;
     VkShaderModule colorDownsampleComp_ = VK_NULL_HANDLE;
+    VkShaderModule ssrOpaqueComp_ = VK_NULL_HANDLE;
     VkShaderModule bloomExtractComp_ = VK_NULL_HANDLE;
     VkShaderModule bloomBlurComp_ = VK_NULL_HANDLE;
     VkShaderModule bloomCompositeComp_ = VK_NULL_HANDLE;
