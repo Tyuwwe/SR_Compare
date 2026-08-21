@@ -13,3 +13,4 @@ metrics/selftest_out/
 *.pyc
 output/
 captures/
+VISUAL_ACCEPTANCE.md
