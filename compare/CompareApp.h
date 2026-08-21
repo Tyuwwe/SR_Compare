@@ -43,6 +43,9 @@ struct CompareOptions {
     bool shadowDebug = false;           // tint pixels per shadow cascade
     bool bloom = true;                  // HDR bloom before upscale
     bool ssr = true;                    // opaque screen-space reflections (CLI: --no-ssr)
+    // Screen-space contact shadows for the CSM sun (CLI: --no-contact-shadows);
+    // needs shadows on (rides the CSM sun selection).
+    bool contactShadows = true;
     float zoom = 1.f;                   // compare-view zoom (1..16)
     float zoomCenterU = 0.5f;           // zoom window center, normalized source UV
     float zoomCenterV = 0.5f;
@@ -401,7 +404,7 @@ private:
     void updateSceneUBO(void* mapped, bool jitter, uint32_t renderW, uint32_t renderH,
                         const Mat4& view, const Mat4& proj, const Mat4& projJittered,
                         const Mat4& prevViewProj);
-    void updateLightingUBO(void* mapped, const Mat4& invViewProj, const ShadowFrame* shadow,
+    void updateLightingUBO(void* mapped, const Mat4& viewProj, const ShadowFrame* shadow,
                            const std::vector<Light>* overrideLights);
     void updateClusterLights(uint32_t frameIndex, const std::vector<Light>& lights);
     void updateCamera(uint32_t frameIndex, float dt);

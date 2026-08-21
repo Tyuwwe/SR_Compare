@@ -290,7 +290,7 @@ private:
     void updateSceneUBO(void* mapped, bool jitter, uint32_t renderW, uint32_t renderH,
                         const Mat4& view, const Mat4& proj, const Mat4& projJittered,
                         const Mat4& prevViewProj);
-    void updateLightingUBO(void* mapped, const Mat4& invViewProj,
+    void updateLightingUBO(void* mapped, const Mat4& viewProj,
                            const std::vector<Light>& lights, const ShadowFrame* shadow);
     void updateClusterLights(uint32_t frameIndex, const std::vector<Light>& lights);
     // The Viewer-tab lighting section's override light list (sun direction/
@@ -492,6 +492,9 @@ private:
     // CSM sun shadows (Viewer-tab lighting section, per-frame, no rebuild).
     bool shadowsEnabled_ = true;
     bool shadowDebugCascades_ = false; // tint pixels per shadow cascade
+    // Screen-space contact shadows for the CSM sun (per-frame UBO flag; needs
+    // shadows on — rides the CSM sun selection).
+    bool contactShadowsEnabled_ = true;
     // Opaque screen-space reflections (per-frame pass skip, no rebuild).
     bool ssrEnabled_ = true;
     // Screen-size LOD switching + distance cull (per-frame CPU selection).

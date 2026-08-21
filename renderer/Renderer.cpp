@@ -802,13 +802,14 @@ void Renderer::updateSceneUBO(uint32_t frameIndex, bool jitter, uint32_t renderW
     std::memcpy(fr.uboMapped, &ubo, sizeof(ubo));
 }
 
-void Renderer::updateLightingUBO(uint32_t frameIndex, const Mat4& invViewProj,
-                                 const ShadowFrame* shadow,
+void Renderer::updateLightingUBO(uint32_t frameIndex, const Mat4& viewProj,
+                                 const Mat4& invViewProj, const ShadowFrame* shadow,
                                  const std::vector<Light>* overrideLights) {
     FrameResources& fr = frames_[frameIndex % kFramesInFlight];
     LightingUBO ubo;
-    deferred_.fillLightingUBO(ubo, scene_, camera_, invViewProj, overrideLights, shadow,
+    deferred_.fillLightingUBO(ubo, scene_, camera_, viewProj, invViewProj, overrideLights, shadow,
                               iblIntensity_);
+    ubo.shadowAtlasParams[3] = opts_.contactShadows ? 1.f : 0.f;
     std::memcpy(fr.lightingUboMapped, &ubo, sizeof(ubo));
     // Full point/spot light set for the clustered pass (same slot rule as the
     // UBO: the slot's fence passed before recording).
@@ -949,7 +950,7 @@ void Renderer::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
             shadow = &shadowFrame;
     }
     const Mat4 invViewProjUsed = Mat4::inverse(viewProjUsed);
-    updateLightingUBO(frameIndex, invViewProjUsed, shadow, lightsOverride);
+    updateLightingUBO(frameIndex, viewProjUsed, invViewProjUsed, shadow, lightsOverride);
 
     ImageResource& tgtAlbedo = gbuffer ? gbAlbedo_ : gtAlbedo_;
     ImageResource& tgtNormal = gbuffer ? gbNormal_ : gtNormal_;

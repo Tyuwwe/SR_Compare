@@ -1204,10 +1204,11 @@ void DeferredCore::fillSceneUBO(SceneUBO& out, const Scene& scene, const Camera&
 }
 
 void DeferredCore::fillLightingUBO(LightingUBO& out, const Scene& scene, const Camera& camera,
-                                   const Mat4& invViewProj,
+                                   const Mat4& viewProj, const Mat4& invViewProj,
                                    const std::vector<Light>* overrideLights,
                                    const ShadowFrame* shadow, float iblIntensity) const {
     std::memcpy(out.invViewProj, invViewProj.m, sizeof(out.invViewProj));
+    std::memcpy(out.viewProj, viewProj.m, sizeof(out.viewProj));
 
     out.cameraPos[0] = camera.position.x;
     out.cameraPos[1] = camera.position.y;
@@ -1292,6 +1293,8 @@ void DeferredCore::fillLightingUBO(LightingUBO& out, const Scene& scene, const C
     const bool sunShadowed =
         shadow && sunSrc >= 0 && lights[static_cast<size_t>(sunSrc)].castShadow;
     out.shadowAtlasParams[1] = 1.f / static_cast<float>(kShadowAtlasSize);
+    // Contact-shadow enable (w) is a host option, not scene state: the hosts
+    // overwrite it after this call (Renderer/CompareApp/GuiApp wrappers).
     out.shadowAtlasParams[3] = 0.f;
     if (shadow) {
         for (uint32_t i = 0; i < kShadowCascadeCount; ++i) {

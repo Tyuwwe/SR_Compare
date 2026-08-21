@@ -233,9 +233,15 @@ struct LightingUBO {
     float shadowTileVp[kShadowAtlasTiles][16];
     float shadowAtlasParams[4]; // x = tiles rendered this frame,
                                 // y = 1 / kShadowAtlasSize (atlas texel, PCF step),
-                                // z = frame index (CSM cascade dither), w = unused
+                                // z = frame index (CSM cascade dither),
+                                // w = contact shadows enabled (Phase 4c, hosts
+                                //     set after fillLightingUBO)
+    // Forward view-projection of this path (jittered for the LR path): the
+    // lighting pass's screen-space contact-shadow march (Phase 4c) reprojects
+    // its world-space samples with it.
+    float viewProj[16];
 };
-static_assert(sizeof(LightingUBO) == 2512, "LightingUBO std140 size mismatch");
+static_assert(sizeof(LightingUBO) == 2576, "LightingUBO std140 size mismatch");
 
 // Push constants of the cluster light-assignment pass (cluster_assign.comp),
 // 112 bytes.  The per-cluster view-space AABBs are derived in the shader from
@@ -562,8 +568,10 @@ public:
     // (fillClusterLights) which carry the full, untruncated light set.
     // shadow (optional): non-null enables CSM sampling in the shaders
     // (shadowParams.z = 1); null writes identity cascades with shadows off.
+    // viewProj is the forward matrix invViewProj inverts (jittered for the LR
+    // path); only the contact-shadow march reads it.
     void fillLightingUBO(LightingUBO& out, const Scene& scene, const Camera& camera,
-                         const Mat4& invViewProj,
+                         const Mat4& viewProj, const Mat4& invViewProj,
                          const std::vector<Light>* overrideLights = nullptr,
                          const ShadowFrame* shadow = nullptr,
                          float iblIntensity = 1.f) const;

@@ -28,6 +28,7 @@ void printCompareUsage() {
                  "  --gt-ssaa                      GT rendered at 2x, downsampled to output res\n"
                  "  --no-shadows                   disable CSM sun shadows\n"
                  "  --no-ssr                       disable opaque screen-space reflections\n"
+                 "  --no-contact-shadows           disable screen-space contact shadows (sun)\n"
                  "  --shadow-debug                 tint pixels per shadow cascade\n"
                  "  --env-map <hdr>                IBL environment map (default san_giuseppe_bridge)\n"
                  "  --exposure <f>                 manual display exposure (disables auto exposure)\n"
@@ -75,6 +76,8 @@ int runCompareMode(int argc, char** argv) {
             opts.shadows = false;
         } else if (a == "--no-ssr") {
             opts.ssr = false;
+        } else if (a == "--no-contact-shadows") {
+            opts.contactShadows = false;
         } else if (a == "--shadow-debug") {
             opts.shadowDebug = true;
         } else if (a == "--env-map") {

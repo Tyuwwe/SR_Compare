@@ -1,6 +1,7 @@
 #version 450
 #extension GL_GOOGLE_include_directive : require
 #include "brdf.glsl"
+#include "ssr.glsl"
 // Deferred lighting pass: reconstructs world position from depth, shades with
 // Heitz height-correlated GGX + Hammon 2017 diffuse (no Lambert) for punctual
 // lights, plus IBL split-sum and emissive.  Far-plane pixels are the skybox.
@@ -17,6 +18,9 @@
 // cascade transition; shadow-casting spot lights selected into the shadow
 // atlas this frame (LightGPU.params.z = tile) sample their 1024^2 atlas tile
 // with the same 16-tap PCF.  Point lights are unshadowed this phase.
+// Phase 4c: the sun additionally gets a screen-space contact shadow
+// (contactShadow() below), and the IBL specular term carries the Fdez-Agüera
+// 2019 multi-scatter compensation (specularIblMultiScatter, brdf.glsl).
 
 // GPU mirror of scene::Light; must match LightGPU in DeferredCore.h.
 struct LightGPU {
@@ -45,7 +49,10 @@ layout(set = 0, binding = 0) uniform LightingUBO {
                            // first shadowAtlasParams.x entries are valid
     vec4 shadowAtlasParams; // x = tiles rendered this frame, y = 1/atlasSize
                             // (PCF texel step), z = frame index (CSM cascade
-                            // dither), w = unused
+                            // dither), w = contact shadows enabled
+    mat4 viewProj;          // forward view-projection of this path (jittered for
+                            // the low-res path); the contact-shadow march
+                            // reprojects its world-space samples with it
 } u;
 
 layout(set = 0, binding = 1) uniform sampler2D gbAlbedo;
@@ -204,6 +211,50 @@ float spotShadow(int tile, vec3 worldPos) {
     return sum / 16.0;
 }
 
+// --- Screen-space contact shadows (UE4.19+, Phase 4c), sun only ---------------
+// Short march from the surface towards the sun against the opaque depth
+// buffer (binding 5).  Covers the two gaps the 4-cascade CSM leaves:
+// contact-scale detail its 2048^2 texels blur away, and everything past the
+// last split (~200 m, where cascade 3's border-white leaves the sun fully
+// lit).  Sun only, like the 2020-era engines the feature comes from: a
+// per-light screen march does not pay off, and shadowed local lights already
+// have the spot atlas.
+//
+// Tradeoff vs. the SSR marcher (ssr.glsl): rays are ~2 m and the step count
+// is small, so the Hi-Z cell-skip machinery costs more setup than it saves;
+// fixed world-space steps with a per-sample view-Z compare stay deterministic
+// (no frame jitter) and cheap.  The occlusion test mirrors SSR's acceptance
+// model: a step counts when the ray point sits behind the visible surface by
+// more than a distance-scaled thickness; the darkening fades out at the ray
+// end so the length cutoff does not pop.
+const float kContactMaxLen = 2.0; // world metres (UE ContactShadowLength)
+const float kContactBias = 0.03;  // origin offset along N, self-hit guard
+const int kContactSteps = 12;
+
+float contactShadow(vec3 worldPos, vec3 N, vec3 L) {
+    const vec2 renderSize = vec2(textureSize(gbDepth, 0));
+    const vec3 origin = worldPos + N * kContactBias;
+    float shadow = 1.0;
+    for (int i = 1; i <= kContactSteps; ++i) {
+        const float t = float(i) / float(kContactSteps);
+        const vec4 clip = u.viewProj * vec4(origin + L * (kContactMaxLen * t), 1.0);
+        if (clip.w < 0.02) break; // crossed the near plane; later steps too
+        const vec2 suv = clip.xy / clip.w * 0.5 + 0.5;
+        if (any(lessThan(suv, vec2(0.0))) || any(greaterThan(suv, vec2(1.0)))) continue;
+        const ivec2 spix = clamp(ivec2(suv * renderSize), ivec2(0), ivec2(renderSize) - 1);
+        const float bufDepth = texelFetch(gbDepth, spix, 0).r;
+        if (bufDepth >= 0.9999) continue; // sky: no occluder
+        // View-Z of the visible surface at that pixel (the SSR marcher's
+        // helper; both matrices come from this path's lighting UBO).
+        const vec2 cuv = (vec2(spix) + 0.5) / renderSize;
+        const float bufZ = ssrViewZ(u.viewProj, u.invViewProj, cuv, bufDepth);
+        const float rayZ = abs(clip.w);
+        if (rayZ > bufZ + 0.02 + 0.01 * bufZ)
+            shadow = min(shadow, 1.0 - smoothstep(0.75, 1.0, t));
+    }
+    return shadow;
+}
+
 void main() {
     ivec2 pix = ivec2(gl_FragCoord.xy);
     float depth = texelFetch(gbDepth, pix, 0).r;
@@ -261,6 +312,12 @@ void main() {
             int c;
             shadow = sunShadow(wp.xyz, viewDepth, pix, c);
             debugCascade = c;
+            // Screen-space contact shadow for the sun (UE4.19+): hardens the
+            // contacts the CSM texels blur and fills in past the last split.
+            // Key light only — a per-light march does not pay off.  Skipped
+            // when the surface already faces away (shadeLight zeroes NdL).
+            if (u.shadowAtlasParams.w > 0.5 && dot(N, u.lights[i].posOrDir.xyz) > 0.0)
+                shadow = min(shadow, contactShadow(wp.xyz, N, u.lights[i].posOrDir.xyz));
         }
         color += shadeLight(N, V, wp.xyz, albedo, metallic, roughness, F0, u.lights[i]) * shadow;
     }

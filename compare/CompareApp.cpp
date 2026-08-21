@@ -1273,12 +1273,13 @@ void CompareApp::updateSceneUBO(void* mapped, bool jitter, uint32_t renderW, uin
     std::memcpy(mapped, &ubo, sizeof(ubo));
 }
 
-void CompareApp::updateLightingUBO(void* mapped, const Mat4& invViewProj,
+void CompareApp::updateLightingUBO(void* mapped, const Mat4& viewProj,
                                    const ShadowFrame* shadow,
                                    const std::vector<Light>* overrideLights) {
     LightingUBO ubo;
-    deferred_.fillLightingUBO(ubo, scene_, camera_, invViewProj, overrideLights, shadow,
-                              iblIntensity_);
+    deferred_.fillLightingUBO(ubo, scene_, camera_, viewProj, Mat4::inverse(viewProj),
+                              overrideLights, shadow, iblIntensity_);
+    ubo.shadowAtlasParams[3] = opts_.contactShadows ? 1.f : 0.f;
     std::memcpy(mapped, &ubo, sizeof(ubo));
 }
 
@@ -1481,15 +1482,15 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     // view-projection used for each pass (jittered GB / unjittered spatial GB /
     // un-jittered GT; the GT matrix is resolution-independent and shared by
     // the 1x and 2x SSAA pass).
-    updateLightingUBO(fr.lightingUboGbMapped,
-                      Mat4::inverse(Mat4::multiply(projJittered, view)), shadow, lightsOverride);
-    updateLightingUBO(fr.lightingUboGtMapped, Mat4::inverse(Mat4::multiply(proj, view)), shadow,
+    updateLightingUBO(fr.lightingUboGbMapped, Mat4::multiply(projJittered, view), shadow,
+                      lightsOverride);
+    updateLightingUBO(fr.lightingUboGtMapped, Mat4::multiply(proj, view), shadow,
                       lightsOverride);
     updateClusterLights(frameIndex, DeferredCore::effectiveLights(scene_, lightsOverride));
     if (mixed) {
         updateSceneUBO(fr.uboGbSpatialMapped, false, renderWidth_, renderHeight_, view, proj, proj,
                        prevViewProj_);
-        updateLightingUBO(fr.lightingUboGbSpatialMapped, Mat4::inverse(Mat4::multiply(proj, view)),
+        updateLightingUBO(fr.lightingUboGbSpatialMapped, Mat4::multiply(proj, view),
                           shadow, lightsOverride);
     }
 

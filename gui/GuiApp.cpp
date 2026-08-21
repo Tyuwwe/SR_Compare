@@ -2508,11 +2508,12 @@ void GuiApp::applyLightingPreset(const LightingPreset& p) {
     exposure_ = p.exposure;
 }
 
-void GuiApp::updateLightingUBO(void* mapped, const Mat4& invViewProj,
+void GuiApp::updateLightingUBO(void* mapped, const Mat4& viewProj,
                                const std::vector<Light>& lights, const ShadowFrame* shadow) {
     LightingUBO ubo;
-    deferred_.fillLightingUBO(ubo, scene_, camera_, invViewProj, &lights, shadow,
-                              iblIntensity_);
+    deferred_.fillLightingUBO(ubo, scene_, camera_, viewProj, Mat4::inverse(viewProj), &lights,
+                              shadow, iblIntensity_);
+    ubo.shadowAtlasParams[3] = contactShadowsEnabled_ ? 1.f : 0.f;
     std::memcpy(mapped, &ubo, sizeof(ubo));
 }
 
@@ -2895,13 +2896,12 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         if (shadowFrame.lightIndex >= 0 || shadowFrame.atlasTileCount > 0)
             shadow = &shadowFrame;
     }
-    updateLightingUBO(fr.lightingUboGbMapped,
-                      Mat4::inverse(Mat4::multiply(projJittered, view)), lights, shadow);
+    updateLightingUBO(fr.lightingUboGbMapped, Mat4::multiply(projJittered, view), lights, shadow);
     if (mixedSpatial) {
-        updateLightingUBO(fr.lightingUboGbSpatialMapped, Mat4::inverse(Mat4::multiply(proj, view)),
+        updateLightingUBO(fr.lightingUboGbSpatialMapped, Mat4::multiply(proj, view),
                           lights, shadow);
     }
-    updateLightingUBO(fr.lightingUboGtMapped, Mat4::inverse(Mat4::multiply(projGt, viewGt)),
+    updateLightingUBO(fr.lightingUboGtMapped, Mat4::multiply(projGt, viewGt),
                       lights, shadow);
     updateClusterLights(frameIndex, lights);
 
@@ -4581,6 +4581,8 @@ void GuiApp::drawViewerTab() {
     ImGui::Checkbox("shadows", &shadowsEnabled_);
     if (!shadowsEnabled_) ImGui::BeginDisabled();
     ImGui::Checkbox("cascade debug", &shadowDebugCascades_);
+    // Screen-space contact shadows (sun only): per-frame UBO flag, no rebuild.
+    ImGui::Checkbox("contact shadows", &contactShadowsEnabled_);
     if (!shadowsEnabled_) ImGui::EndDisabled();
     if (!shadowsActive_) ImGui::EndDisabled();
     // Opaque SSR: per-frame pass skip (no rebuild), all deferred paths.

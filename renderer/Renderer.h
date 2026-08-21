@@ -48,6 +48,9 @@ struct RendererOptions {
     float exposureMaxEV = 8.f;
     bool bloom = true;        // HDR bloom before upscale (CLI: --no-bloom)
     bool ssr = true;          // opaque screen-space reflections (CLI: --no-ssr)
+    // Screen-space contact shadows for the CSM sun (CLI: --no-contact-shadows);
+    // needs shadows on (rides the CSM sun selection).
+    bool contactShadows = true;
 };
 
 class Renderer {
@@ -250,8 +253,8 @@ private:
     void updateSceneUBO(uint32_t frameIndex, bool jitter, uint32_t renderW, uint32_t renderH,
                         const Mat4& view, const Mat4& proj, const Mat4& projJittered,
                         const Mat4& prevViewProj);
-    void updateLightingUBO(uint32_t frameIndex, const Mat4& invViewProj, const ShadowFrame* shadow,
-                           const std::vector<Light>* overrideLights);
+    void updateLightingUBO(uint32_t frameIndex, const Mat4& viewProj, const Mat4& invViewProj,
+                           const ShadowFrame* shadow, const std::vector<Light>* overrideLights);
     void updateCamera(uint32_t frameIndex, float dt);
     void applyCameraKeyframe(uint32_t frameIndex);
     void recordFrame(uint32_t frameIndex, uint32_t swapchainIndex);
