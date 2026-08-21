@@ -49,6 +49,18 @@
 //                output/outputTm1 + scalars (ffx-api/include/ffx_api/ffx_nss.h).
 //       SGSR2  : fixed shader inputs (color/depth/velocity/history), no mask
 //                concept in the reference shaders.
+// FrameParams::preExposure convention:
+//   The input color (UpscalerResources::color) is un-exposed scene-linear HDR.
+//   preExposure is the display exposure multiplier (ACES input scale) that the
+//   host applies to this frame's image at present/compose time.  With auto
+//   exposure (UE4-style histogram + EV solver, see DeferredCore) it is the
+//   latest CPU-harvested solver output — i.e. the value solved
+//   kFramesInFlight frames ago (engine-style: earlier frames' luminance
+//   drives the current frame's exposure; FSR2/DLSS expect the current or
+//   previous frame's exposure here, both conventions are this value within
+//   one frame).  Manual mode (--exposure) feeds the fixed override instead.
+//   Deterministic: the solver smooths with a fixed 1/60 step per frame, so a
+//   fixed camera path reproduces the same preExposure per frame index.
 // ============================================================================
 #include <cstdint>
 

@@ -1,0 +1,80 @@
+#version 450
+// Auto exposure, pass 2: reduce the 256-bin histogram to an average log2
+// luminance, derive a target EV, and advance the smoothed EV towards it.
+//
+// Formula (Frostbite, "Moving Frostbite to PBR", exposure chapter; UE4
+// AutoExposure uses the same structure): the exposure multiplier maps the
+// geometric-mean scene luminance onto the middle-grey key value:
+//     Lavg     = exp2(sum(count_i * binLogLum_i) / sum(count_i))
+//     targetEV = clamp(log2(Lavg / key), minEV, maxEV)   (EV relative to key)
+//     exposure = exp2(evOffset - ev)
+// Smoothing is exponential with separate up/down rates (UE4 SpeedUp/SpeedDown
+// defaults 3/1: adapting to a brighter scene is faster than to a darker one).
+//
+// Determinism contract: the smoothing step uses the FIXED dt pushed by the
+// host (kExposureFixedDt = 1/60), never wall-clock time, so a fixed camera
+// path yields the same exposure at the same frame index on every run.
+// resetState snaps the smoothed EV to the target (first frame of a run /
+// fresh stack), which is also what engines do on a camera cut.
+
+layout(local_size_x = 256, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 1) buffer Histogram { uint bins[]; } uHistogram;
+layout(std430, set = 0, binding = 2) buffer State {
+    // x = exposure multiplier, y = average log2 luminance,
+    // z = smoothed EV, w = target EV (debug/readback)
+    vec4 data;
+} uState;
+
+layout(push_constant) uniform Push {
+    vec4 ev;     // x = minEV, y = maxEV, z = evOffset, w = resetState (!= 0: snap)
+    vec4 tuning; // x = speedUp (EV/s), y = speedDown (EV/s), z = fixed dt, w = log2(key)
+} pc;
+
+const float kMinLogLum = -16.0; // must match exposure_histogram.comp
+const float kLogLumRange = 32.0;
+const int kBinCount = 256;
+
+shared float sCount[kBinCount];
+shared float sSumLog[kBinCount];
+
+void main() {
+    const uint lane = gl_LocalInvocationIndex; // 0..255, one bin per thread
+    const uint count = uHistogram.bins[lane];
+    // Bin centre in log2 luminance.
+    const float binLog = kMinLogLum + (float(lane) + 0.5) * (kLogLumRange / float(kBinCount));
+    sCount[lane] = float(count);
+    sSumLog[lane] = float(count) * binLog;
+    // Consume the histogram: the next frame accumulates from zero.
+    uHistogram.bins[lane] = 0u;
+    barrier();
+
+    for (uint s = kBinCount / 2; s > 0; s >>= 1) {
+        if (lane < s) {
+            sCount[lane] += sCount[lane + s];
+            sSumLog[lane] += sSumLog[lane + s];
+        }
+        barrier();
+    }
+
+    if (lane == 0) {
+        vec4 state = uState.data;
+        const float total = sCount[0];
+        if (total > 0.0) {
+            const float avgLog = sSumLog[0] / total;
+            const float targetEV = clamp(avgLog - pc.tuning.w, pc.ev.x, pc.ev.y);
+            float ev = state.z;
+            if (pc.ev.w != 0.0) {
+                ev = targetEV; // camera cut / first frame: snap
+            } else {
+                const float speed = targetEV > ev ? pc.tuning.x : pc.tuning.y;
+                const float alpha = 1.0 - exp(-speed * pc.tuning.z);
+                ev += (targetEV - ev) * alpha;
+            }
+            ev = clamp(ev, pc.ev.x, pc.ev.y);
+            state = vec4(exp2(pc.ev.z - ev), avgLog, ev, targetEV);
+        }
+        // Empty histogram (all-black frame): keep the previous state.
+        uState.data = state;
+    }
+}

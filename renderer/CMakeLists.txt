@@ -44,6 +44,8 @@ set(RENDERER_SHADERS
     shaders/bloom_extract.comp
     shaders/bloom_blur.comp
     shaders/bloom_composite.comp
+    shaders/exposure_histogram.comp
+    shaders/exposure_solve.comp
     shaders/ibl_equirect.comp
     shaders/ibl_irradiance.comp
     shaders/ibl_prefilter.comp

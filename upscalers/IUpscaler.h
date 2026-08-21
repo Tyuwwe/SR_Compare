@@ -28,7 +28,7 @@ struct CameraParams {
 struct FrameParams {
     int   frameIndex = 0;
     float deltaTime = 0.f;         // 秒
-    float preExposure = 1.f;       // 无自动曝光时为 1
+    float preExposure = 1.f;       // 本帧显示曝光值（自动曝光开启时为求解值，约定见 InputAdapter.h）
     bool  resetHistory = false;    // 切场景/改分辨率/切算法首帧置真
 };
 

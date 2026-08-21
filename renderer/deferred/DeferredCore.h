@@ -250,6 +250,81 @@ constexpr float kBloomThreshold = 1.0f;
 constexpr float kBloomKnee = 0.5f;
 constexpr float kBloomStrength = 0.15f;
 
+// --- Auto exposure (UE4 AutoExposure / Frostbite histogram + EV solver) -------
+// Two compute passes per frame and path: exposure_histogram.comp builds a
+// 256-bin log2-luminance histogram of the lit HDR color (half-res sampling),
+// exposure_solve.comp reduces it to an average log luminance, derives a
+// target EV (geometric mean mapped onto the middle-grey key), and advances a
+// smoothed EV with exponential up/down rates.  The smoothing step uses the
+// FIXED kExposureFixedDt per frame (never wall-clock), so a fixed camera path
+// produces the same exposure at the same frame index on every run — bench
+// determinism depends on this.
+constexpr uint32_t kExposureHistogramBins = 256;
+constexpr float kExposureKeyValue = 0.18f;    // middle grey the average maps to
+constexpr float kExposureSpeedUp = 3.f;       // EV/s towards a brighter target
+constexpr float kExposureSpeedDown = 1.f;     // EV/s towards a darker target
+constexpr float kExposureFixedDt = 1.f / 60.f; // per-frame smoothing step
+
+// Push constants of exposure_solve.comp (ExposureSolvePush) and
+// exposure_histogram.comp (HistogramPush).
+struct ExposureSolvePush {
+    float minEV = 0.f;      // clamp range for the target/smoothed EV
+    float maxEV = 0.f;
+    float evOffset = 0.f;   // exposure compensation (EV units)
+    float resetState = 0.f; // != 0: snap the smoothed EV to the target (first frame)
+};
+static_assert(sizeof(ExposureSolvePush) == 16, "ExposureSolvePush size mismatch");
+
+struct HistogramPush {
+    int32_t sampleDims[2]; // half-resolution sample grid (ceil(src / 2))
+};
+static_assert(sizeof(HistogramPush) == 8, "HistogramPush size mismatch");
+
+// GPU state record of the solve pass (std430 vec4).  Also the readback layout:
+// hosts copy it to a per-slot staging buffer and read it after the slot's
+// fence, so the CPU-side exposure used for present/preExposure/screenshots
+// lags the GPU by kFramesInFlight frames (engine-style: last frames'
+// luminance drives this frame's exposure).
+struct ExposureState {
+    float exposure;  // display-domain multiplier (exp2(evOffset - ev))
+    float avgLogLum; // average log2 luminance of the measured frame
+    float ev;        // smoothed EV
+    float targetEV;  // unsmoothed target EV (debug)
+};
+static_assert(sizeof(ExposureState) == 16, "ExposureState size mismatch");
+
+// Host-owned auto-exposure state (same ownership model as DepthPyramid: the
+// host holds the struct and the descriptor pool, DeferredCore provides
+// create/write/record/destroy).  One instance per HDR source path (LR / GT /
+// GT-SSAA) — each path auto-exposes from its own HDR target, so compare
+// columns legitimately differ (independent pipelines, engine behaviour).
+struct AutoExposure {
+    VkBuffer histogram = VK_NULL_HANDLE;          // kExposureHistogramBins uints
+    VmaAllocation histogramMemory = VK_NULL_HANDLE;
+    VkBuffer state = VK_NULL_HANDLE;              // ExposureState
+    VmaAllocation stateMemory = VK_NULL_HANDLE;
+    VkDescriptorSet set = VK_NULL_HANDLE;         // sampler + histogram + state
+    uint32_t srcWidth = 0;
+    uint32_t srcHeight = 0;
+};
+
+// Host-side auto-exposure bundle: the GPU state (AutoExposure) plus the
+// per-slot staging buffers the solved ExposureState is copied into each frame,
+// plus the latest harvested CPU-side value.  The slot count matches every
+// host's kFramesInFlight (2); the harvested value lags the GPU by that many
+// frames (engine convention: earlier frames' luminance drives the current
+// frame's exposure) and is deterministic under a fixed camera path.
+constexpr uint32_t kExposureSlots = 2;
+struct ExposureChannel {
+    AutoExposure gpu;
+    VkBuffer staging[kExposureSlots] = {};
+    VmaAllocation stagingMemory[kExposureSlots] = {};
+    void* stagingMapped[kExposureSlots] = {};
+    bool pending[kExposureSlots] = {};
+    float value = 1.f; // latest harvested exposure multiplier
+};
+
+
 class DeferredCore {
 public:
     // Builds the IBL maps (envMapPath empty/unreadable -> procedural gradient
@@ -424,6 +499,36 @@ public:
     void recordSsrPass(VkCommandBuffer cmd, VkDescriptorSet ssrSet, const Mat4& viewProj,
                        uint32_t width, uint32_t height) const;
 
+    // --- Auto exposure (after lighting + bloom, before upscale/present) -------
+    // Creates the histogram + state buffers; initialEV seeds the smoothed EV
+    // (pick -log2(initialExposure) so the first frames match the manual look
+    // until the first readback arrives).
+    bool createAutoExposure(const VulkanContext& ctx, float initialEV, AutoExposure& out) const;
+    // Allocates the shared set from the caller's pool and binds srcColor (the
+    // lit HDR target, sampled in SHADER_READ_ONLY) + the two buffers.
+    bool writeAutoExposureSet(const VulkanContext& ctx, VkDescriptorPool pool,
+                              VkImageView srcColor, AutoExposure& out) const;
+    void destroyAutoExposure(const VulkanContext& ctx, AutoExposure& ae) const;
+    // Histogram pass + solve pass, then copies the solved ExposureState into
+    // readbackDst (TRANSFER_DST staging, may be VK_NULL_HANDLE).  The source
+    // must already be shader-readable by compute (SHADER_READ_ONLY with
+    // compute in the dst scope); the caller sets solve.push fields and marks
+    // the readback pending for its slot.
+    void recordAutoExposurePass(VkCommandBuffer cmd, const AutoExposure& ae,
+                                const ExposureSolvePush& solve, VkBuffer readbackDst) const;
+
+    // ExposureChannel helpers (all hosts share this exact plumbing).
+    // createExposureChannel = createAutoExposure + writeAutoExposureSet +
+    // per-slot readback staging; initialEV seeds the smoothed EV (pass
+    // -log2(initialExposure) so early frames match the manual look).
+    bool createExposureChannel(const VulkanContext& ctx, VkDescriptorPool pool,
+                               VkImageView srcColor, uint32_t srcW, uint32_t srcH,
+                               float initialEV, ExposureChannel& out) const;
+    void destroyExposureChannel(const VulkanContext& ctx, ExposureChannel& channel) const;
+    // Call after the slot's fence: adopts the solved exposure if this slot's
+    // readback was recorded.
+    void harvestExposureChannel(ExposureChannel& channel, uint32_t slot) const;
+
     // --- CSM sun shadow pass (between the GBuffer and the lighting pass) ------
     // Creates the 2048^2 x kShadowCascadeCount D32 array + views.  The
     // comparison sampler is shared (shadowSampler()); it is created in init().
@@ -460,6 +565,7 @@ public:
     VkDescriptorSetLayout hizSetLayout() const { return hizSetLayout_; }
     VkDescriptorSetLayout ssrSetLayout() const { return ssrSetLayout_; }
     VkDescriptorSetLayout bloomSetLayout() const { return ssaoBlurSetLayout_; }
+    VkDescriptorSetLayout exposureSetLayout() const { return exposureSetLayout_; }
     VkPipelineLayout scenePipelineLayout() const { return scenePipelineLayout_; }
     VkPipelineLayout lightingPipelineLayout() const { return lightingPipelineLayout_; }
     VkPipeline gbufferPipeline() const { return gbufferPipeline_; }
@@ -506,6 +612,11 @@ private:
     VkPipeline bloomExtractPipeline_ = VK_NULL_HANDLE;
     VkPipeline bloomBlurPipeline_ = VK_NULL_HANDLE;
     VkPipeline bloomCompositePipeline_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout exposureSetLayout_ = VK_NULL_HANDLE;
+    VkPipelineLayout histogramPipelineLayout_ = VK_NULL_HANDLE;
+    VkPipelineLayout exposureSolvePipelineLayout_ = VK_NULL_HANDLE;
+    VkPipeline histogramPipeline_ = VK_NULL_HANDLE;
+    VkPipeline exposureSolvePipeline_ = VK_NULL_HANDLE;
     VkPipeline shadowPipeline_ = VK_NULL_HANDLE;
     VkShaderModule gbufferVert_ = VK_NULL_HANDLE;
     VkShaderModule gbufferFrag_ = VK_NULL_HANDLE;
@@ -523,6 +634,8 @@ private:
     VkShaderModule bloomExtractComp_ = VK_NULL_HANDLE;
     VkShaderModule bloomBlurComp_ = VK_NULL_HANDLE;
     VkShaderModule bloomCompositeComp_ = VK_NULL_HANDLE;
+    VkShaderModule exposureHistogramComp_ = VK_NULL_HANDLE;
+    VkShaderModule exposureSolveComp_ = VK_NULL_HANDLE;
     VkShaderModule shadowDepthVert_ = VK_NULL_HANDLE;
     VkShaderModule shadowDepthFrag_ = VK_NULL_HANDLE;
     VkSampler textureSampler_ = VK_NULL_HANDLE;

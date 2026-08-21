@@ -149,6 +149,8 @@ bool DeferredCore::init(const VulkanContext& ctx, const char* envMapPath) {
         !loadShader(ctx, "bloom_extract.comp.spv", bloomExtractComp_) ||
         !loadShader(ctx, "bloom_blur.comp.spv", bloomBlurComp_) ||
         !loadShader(ctx, "bloom_composite.comp.spv", bloomCompositeComp_) ||
+        !loadShader(ctx, "exposure_histogram.comp.spv", exposureHistogramComp_) ||
+        !loadShader(ctx, "exposure_solve.comp.spv", exposureSolveComp_) ||
         !loadShader(ctx, "shadow_depth.vert.spv", shadowDepthVert_) ||
         !loadShader(ctx, "shadow_depth.frag.spv", shadowDepthFrag_))
         return false;
@@ -333,8 +335,30 @@ bool DeferredCore::createLayouts(const VulkanContext& ctx) {
     ssrLayoutCi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
     ssrLayoutCi.bindingCount = 11;
     ssrLayoutCi.pBindings = ssrBindings;
-    return vkCreateDescriptorSetLayout(ctx.device, &ssrLayoutCi, nullptr, &ssrSetLayout_) ==
-           VK_SUCCESS;
+    if (vkCreateDescriptorSetLayout(ctx.device, &ssrLayoutCi, nullptr, &ssrSetLayout_) !=
+        VK_SUCCESS)
+        return false;
+
+    // Auto exposure: one shared set for both passes.  binding 0 = lit HDR
+    // source (sampler, histogram pass); 1 = histogram SSBO; 2 = exposure
+    // state SSBO (solve pass).  Unused bindings per pass are legal.
+    VkDescriptorSetLayoutBinding exposureBindings[3] = {};
+    exposureBindings[0].binding = 0;
+    exposureBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    exposureBindings[0].descriptorCount = 1;
+    exposureBindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    for (uint32_t i = 1; i < 3; ++i) {
+        exposureBindings[i].binding = i;
+        exposureBindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        exposureBindings[i].descriptorCount = 1;
+        exposureBindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo exposureLayoutCi = {};
+    exposureLayoutCi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    exposureLayoutCi.bindingCount = 3;
+    exposureLayoutCi.pBindings = exposureBindings;
+    return vkCreateDescriptorSetLayout(ctx.device, &exposureLayoutCi, nullptr,
+                                       &exposureSetLayout_) == VK_SUCCESS;
 }
 
 bool DeferredCore::createPipelines(const VulkanContext& ctx) {
@@ -754,6 +778,51 @@ bool DeferredCore::createPipelines(const VulkanContext& ctx) {
     if (createComputePipeline(ctx, bloomCi, bloomCompositePipeline_) != VK_SUCCESS)
         return false;
 
+    // --- Auto exposure (histogram + EV solver) --------------------------------
+    // Both passes share exposureSetLayout_ (bindings 0-2); each pipeline
+    // layout carries its own push range.
+    VkPushConstantRange histogramPushRange = {};
+    histogramPushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    histogramPushRange.offset = 0;
+    histogramPushRange.size = sizeof(HistogramPush);
+    VkPipelineLayoutCreateInfo histogramLayoutCi = {};
+    histogramLayoutCi.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    histogramLayoutCi.setLayoutCount = 1;
+    histogramLayoutCi.pSetLayouts = &exposureSetLayout_;
+    histogramLayoutCi.pushConstantRangeCount = 1;
+    histogramLayoutCi.pPushConstantRanges = &histogramPushRange;
+    if (vkCreatePipelineLayout(ctx.device, &histogramLayoutCi, nullptr,
+                               &histogramPipelineLayout_) != VK_SUCCESS)
+        return false;
+
+    VkPushConstantRange solvePushRange = {};
+    solvePushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    solvePushRange.offset = 0;
+    solvePushRange.size = sizeof(ExposureSolvePush) + 16; // + tuning vec4
+    VkPipelineLayoutCreateInfo solveLayoutCi = {};
+    solveLayoutCi.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    solveLayoutCi.setLayoutCount = 1;
+    solveLayoutCi.pSetLayouts = &exposureSetLayout_;
+    solveLayoutCi.pushConstantRangeCount = 1;
+    solveLayoutCi.pPushConstantRanges = &solvePushRange;
+    if (vkCreatePipelineLayout(ctx.device, &solveLayoutCi, nullptr,
+                               &exposureSolvePipelineLayout_) != VK_SUCCESS)
+        return false;
+
+    VkComputePipelineCreateInfo exposureCi = {};
+    exposureCi.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    exposureCi.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    exposureCi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    exposureCi.stage.pName = "main";
+    exposureCi.stage.module = exposureHistogramComp_;
+    exposureCi.layout = histogramPipelineLayout_;
+    if (createComputePipeline(ctx, exposureCi, histogramPipeline_) != VK_SUCCESS)
+        return false;
+    exposureCi.stage.module = exposureSolveComp_;
+    exposureCi.layout = exposureSolvePipelineLayout_;
+    if (createComputePipeline(ctx, exposureCi, exposureSolvePipeline_) != VK_SUCCESS)
+        return false;
+
     // --- CSM shadow depth pass ------------------------------------------------
     // Depth-only rendering into one cascade layer at a time.  Reuses the scene
     // pipeline layout (set0 = scene/material UBO, set1 = texture array); the
@@ -823,6 +892,8 @@ void DeferredCore::destroy(const VulkanContext& ctx) {
     if (bloomExtractPipeline_) { vkDestroyPipeline(ctx.device, bloomExtractPipeline_, nullptr); bloomExtractPipeline_ = VK_NULL_HANDLE; }
     if (bloomBlurPipeline_) { vkDestroyPipeline(ctx.device, bloomBlurPipeline_, nullptr); bloomBlurPipeline_ = VK_NULL_HANDLE; }
     if (bloomCompositePipeline_) { vkDestroyPipeline(ctx.device, bloomCompositePipeline_, nullptr); bloomCompositePipeline_ = VK_NULL_HANDLE; }
+    if (histogramPipeline_) { vkDestroyPipeline(ctx.device, histogramPipeline_, nullptr); histogramPipeline_ = VK_NULL_HANDLE; }
+    if (exposureSolvePipeline_) { vkDestroyPipeline(ctx.device, exposureSolvePipeline_, nullptr); exposureSolvePipeline_ = VK_NULL_HANDLE; }
     if (shadowPipeline_) { vkDestroyPipeline(ctx.device, shadowPipeline_, nullptr); shadowPipeline_ = VK_NULL_HANDLE; }
     if (scenePipelineLayout_) { vkDestroyPipelineLayout(ctx.device, scenePipelineLayout_, nullptr); scenePipelineLayout_ = VK_NULL_HANDLE; }
     if (lightingPipelineLayout_) { vkDestroyPipelineLayout(ctx.device, lightingPipelineLayout_, nullptr); lightingPipelineLayout_ = VK_NULL_HANDLE; }
@@ -832,6 +903,8 @@ void DeferredCore::destroy(const VulkanContext& ctx) {
     if (hizPipelineLayout_) { vkDestroyPipelineLayout(ctx.device, hizPipelineLayout_, nullptr); hizPipelineLayout_ = VK_NULL_HANDLE; }
     if (ssrPipelineLayout_) { vkDestroyPipelineLayout(ctx.device, ssrPipelineLayout_, nullptr); ssrPipelineLayout_ = VK_NULL_HANDLE; }
     if (bloomPipelineLayout_) { vkDestroyPipelineLayout(ctx.device, bloomPipelineLayout_, nullptr); bloomPipelineLayout_ = VK_NULL_HANDLE; }
+    if (histogramPipelineLayout_) { vkDestroyPipelineLayout(ctx.device, histogramPipelineLayout_, nullptr); histogramPipelineLayout_ = VK_NULL_HANDLE; }
+    if (exposureSolvePipelineLayout_) { vkDestroyPipelineLayout(ctx.device, exposureSolvePipelineLayout_, nullptr); exposureSolvePipelineLayout_ = VK_NULL_HANDLE; }
     if (gbufferVert_) { vkDestroyShaderModule(ctx.device, gbufferVert_, nullptr); gbufferVert_ = VK_NULL_HANDLE; }
     if (gbufferFrag_) { vkDestroyShaderModule(ctx.device, gbufferFrag_, nullptr); gbufferFrag_ = VK_NULL_HANDLE; }
     if (gbufferGtFrag_) { vkDestroyShaderModule(ctx.device, gbufferGtFrag_, nullptr); gbufferGtFrag_ = VK_NULL_HANDLE; }
@@ -848,6 +921,8 @@ void DeferredCore::destroy(const VulkanContext& ctx) {
     if (bloomExtractComp_) { vkDestroyShaderModule(ctx.device, bloomExtractComp_, nullptr); bloomExtractComp_ = VK_NULL_HANDLE; }
     if (bloomBlurComp_) { vkDestroyShaderModule(ctx.device, bloomBlurComp_, nullptr); bloomBlurComp_ = VK_NULL_HANDLE; }
     if (bloomCompositeComp_) { vkDestroyShaderModule(ctx.device, bloomCompositeComp_, nullptr); bloomCompositeComp_ = VK_NULL_HANDLE; }
+    if (exposureHistogramComp_) { vkDestroyShaderModule(ctx.device, exposureHistogramComp_, nullptr); exposureHistogramComp_ = VK_NULL_HANDLE; }
+    if (exposureSolveComp_) { vkDestroyShaderModule(ctx.device, exposureSolveComp_, nullptr); exposureSolveComp_ = VK_NULL_HANDLE; }
     if (shadowDepthVert_) { vkDestroyShaderModule(ctx.device, shadowDepthVert_, nullptr); shadowDepthVert_ = VK_NULL_HANDLE; }
     if (shadowDepthFrag_) { vkDestroyShaderModule(ctx.device, shadowDepthFrag_, nullptr); shadowDepthFrag_ = VK_NULL_HANDLE; }
     if (sceneSetLayout_) { vkDestroyDescriptorSetLayout(ctx.device, sceneSetLayout_, nullptr); sceneSetLayout_ = VK_NULL_HANDLE; }
@@ -858,6 +933,7 @@ void DeferredCore::destroy(const VulkanContext& ctx) {
     if (ssaoBlurSetLayout_) { vkDestroyDescriptorSetLayout(ctx.device, ssaoBlurSetLayout_, nullptr); ssaoBlurSetLayout_ = VK_NULL_HANDLE; }
     if (hizSetLayout_) { vkDestroyDescriptorSetLayout(ctx.device, hizSetLayout_, nullptr); hizSetLayout_ = VK_NULL_HANDLE; }
     if (ssrSetLayout_) { vkDestroyDescriptorSetLayout(ctx.device, ssrSetLayout_, nullptr); ssrSetLayout_ = VK_NULL_HANDLE; }
+    if (exposureSetLayout_) { vkDestroyDescriptorSetLayout(ctx.device, exposureSetLayout_, nullptr); exposureSetLayout_ = VK_NULL_HANDLE; }
     if (textureSampler_) { vkDestroySampler(ctx.device, textureSampler_, nullptr); textureSampler_ = VK_NULL_HANDLE; }
     if (gbufferSampler_) { vkDestroySampler(ctx.device, gbufferSampler_, nullptr); gbufferSampler_ = VK_NULL_HANDLE; }
     if (shadowSampler_) { vkDestroySampler(ctx.device, shadowSampler_, nullptr); shadowSampler_ = VK_NULL_HANDLE; }
@@ -1820,6 +1896,207 @@ void DeferredCore::recordBloomPass(VkCommandBuffer cmd, VkDescriptorSet extractS
                  VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                  VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
     colorLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+}
+
+// --- Auto exposure -------------------------------------------------------------
+// Resource model matches the pyramids: host-owned buffers + pool-owned set,
+// DeferredCore creates/writes/records/destroys.  The state buffer is seeded
+// with the initial EV so the frames before the first CPU readback still match
+// the manual-exposure look.
+
+bool DeferredCore::createAutoExposure(const VulkanContext& ctx, float initialEV,
+                                      AutoExposure& out) const {
+    if (createBuffer(ctx, kExposureHistogramBins * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, out.histogram,
+                     out.histogramMemory) != VK_SUCCESS)
+        return false;
+    if (createBuffer(ctx, sizeof(ExposureState),
+                     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, out.state,
+                     out.stateMemory) != VK_SUCCESS)
+        return false;
+
+    // Seed the state (exposure = exp2(-initialEV), ev = initialEV) via a
+    // one-shot update; the histogram starts zeroed.
+    submitOneShot(ctx, [&](VkCommandBuffer cmd) {
+        const ExposureState seed = {std::exp2(-initialEV), 0.f, initialEV, initialEV};
+        vkCmdUpdateBuffer(cmd, out.state, 0, sizeof(seed), &seed);
+        // The update must be visible before the first solve pass reads it.
+        VkMemoryBarrier2 barrier = {};
+        barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+        barrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+        barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        barrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        barrier.dstAccessMask =
+            VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+        VkDependencyInfo dep = {};
+        dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+        dep.memoryBarrierCount = 1;
+        dep.pMemoryBarriers = &barrier;
+        vkCmdPipelineBarrier2(cmd, &dep);
+    });
+    return true;
+}
+
+bool DeferredCore::writeAutoExposureSet(const VulkanContext& ctx, VkDescriptorPool pool,
+                                        VkImageView srcColor, AutoExposure& out) const {
+    VkDescriptorSetAllocateInfo alloc = {};
+    alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    alloc.descriptorPool = pool;
+    alloc.descriptorSetCount = 1;
+    alloc.pSetLayouts = &exposureSetLayout_;
+    if (vkAllocateDescriptorSets(ctx.device, &alloc, &out.set) != VK_SUCCESS) return false;
+
+    VkDescriptorImageInfo src = {};
+    src.sampler = hizSampler_; // nearest + clamp; texelFetch ignores it anyway
+    src.imageView = srcColor;
+    src.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    VkDescriptorBufferInfo hist = {};
+    hist.buffer = out.histogram;
+    hist.range = kExposureHistogramBins * 4;
+    VkDescriptorBufferInfo state = {};
+    state.buffer = out.state;
+    state.range = sizeof(ExposureState);
+
+    VkWriteDescriptorSet w[3] = {};
+    w[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    w[0].dstSet = out.set;
+    w[0].dstBinding = 0;
+    w[0].descriptorCount = 1;
+    w[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    w[0].pImageInfo = &src;
+    for (uint32_t i = 1; i < 3; ++i) {
+        w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w[i].dstSet = out.set;
+        w[i].dstBinding = i;
+        w[i].descriptorCount = 1;
+        w[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        w[i].pBufferInfo = i == 1 ? &hist : &state;
+    }
+    vkUpdateDescriptorSets(ctx.device, 3, w, 0, nullptr);
+    return true;
+}
+
+void DeferredCore::destroyAutoExposure(const VulkanContext& ctx, AutoExposure& ae) const {
+    if (ae.histogram) {
+        vmaDestroyBuffer(ctx.allocator, ae.histogram, ae.histogramMemory);
+        ae.histogram = VK_NULL_HANDLE;
+        ae.histogramMemory = VK_NULL_HANDLE;
+    }
+    if (ae.state) {
+        vmaDestroyBuffer(ctx.allocator, ae.state, ae.stateMemory);
+        ae.state = VK_NULL_HANDLE;
+        ae.stateMemory = VK_NULL_HANDLE;
+    }
+    ae.set = VK_NULL_HANDLE; // pool-owned; freed with the host's descriptor pool
+    ae.srcWidth = ae.srcHeight = 0;
+}
+
+void DeferredCore::recordAutoExposurePass(VkCommandBuffer cmd, const AutoExposure& ae,
+                                          const ExposureSolvePush& solve,
+                                          VkBuffer readbackDst) const {
+    if (!ae.set) return;
+
+    // WAR: last frame's solve read the histogram; this frame's histogram pass
+    // rewrites it.  (First frame after creation: covered by the seed barrier.)
+    auto bufferBarrier = [&](VkAccessFlags2 srcAccess, VkAccessFlags2 dstAccess,
+                             VkPipelineStageFlags2 dstStage) {
+        VkMemoryBarrier2 barrier = {};
+        barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+        barrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        barrier.srcAccessMask = srcAccess;
+        barrier.dstStageMask = dstStage;
+        barrier.dstAccessMask = dstAccess;
+        VkDependencyInfo dep = {};
+        dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+        dep.memoryBarrierCount = 1;
+        dep.pMemoryBarriers = &barrier;
+        vkCmdPipelineBarrier2(cmd, &dep);
+    };
+    bufferBarrier(VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                  VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, histogramPipeline_);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, histogramPipelineLayout_, 0, 1,
+                            &ae.set, 0, nullptr);
+    HistogramPush hp;
+    hp.sampleDims[0] = static_cast<int32_t>((ae.srcWidth + 1) / 2);
+    hp.sampleDims[1] = static_cast<int32_t>((ae.srcHeight + 1) / 2);
+    vkCmdPushConstants(cmd, histogramPipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(hp),
+                       &hp);
+    vkCmdDispatch(cmd, (hp.sampleDims[0] + 15) / 16, (hp.sampleDims[1] + 15) / 16, 1);
+
+    // Histogram writes -> solve reads.
+    bufferBarrier(VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+                  VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, exposureSolvePipeline_);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, exposureSolvePipelineLayout_, 0,
+                            1, &ae.set, 0, nullptr);
+    // Push the EV clamp/offset/reset block + the fixed tuning block
+    // (speeds, fixed dt, log2 key).  dt is a constant by design: smoothing
+    // steps per FRAME, not per wall-clock second, for bench determinism.
+    struct {
+        ExposureSolvePush ev;
+        float tuning[4];
+    } push = {solve,
+              {kExposureSpeedUp, kExposureSpeedDown, kExposureFixedDt,
+               std::log2(kExposureKeyValue)}};
+    static_assert(sizeof(push) == 32, "exposure solve push size mismatch");
+    vkCmdPushConstants(cmd, exposureSolvePipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                       sizeof(push), &push);
+    vkCmdDispatch(cmd, 1, 1, 1);
+
+    if (readbackDst) {
+        // Solve writes -> transfer read; the host harvests the staging copy
+        // after this frame's fence (kFramesInFlight frames of latency).
+        bufferBarrier(VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+                      VK_PIPELINE_STAGE_2_COPY_BIT);
+        VkBufferCopy region = {};
+        region.size = sizeof(ExposureState);
+        vkCmdCopyBuffer(cmd, ae.state, readbackDst, 1, &region);
+    }
+}
+
+bool DeferredCore::createExposureChannel(const VulkanContext& ctx, VkDescriptorPool pool,
+                                         VkImageView srcColor, uint32_t srcW, uint32_t srcH,
+                                         float initialEV, ExposureChannel& out) const {
+    if (!createAutoExposure(ctx, initialEV, out.gpu)) return false;
+    out.gpu.srcWidth = srcW;
+    out.gpu.srcHeight = srcH;
+    if (!writeAutoExposureSet(ctx, pool, srcColor, out.gpu)) return false;
+    for (uint32_t i = 0; i < kExposureSlots; ++i) {
+        if (createBuffer(ctx, sizeof(ExposureState), VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                         out.staging[i], out.stagingMemory[i]) != VK_SUCCESS)
+            return false;
+        if (vmaMapMemory(ctx.allocator, out.stagingMemory[i], &out.stagingMapped[i]) != VK_SUCCESS)
+            return false;
+    }
+    // The CPU-visible value starts at the seed exposure (pre-readback frames).
+    out.value = std::exp2(-initialEV);
+    return true;
+}
+
+void DeferredCore::destroyExposureChannel(const VulkanContext& ctx, ExposureChannel& channel) const {
+    for (uint32_t i = 0; i < kExposureSlots; ++i) {
+        if (channel.staging[i]) {
+            vmaUnmapMemory(ctx.allocator, channel.stagingMemory[i]);
+            vmaDestroyBuffer(ctx.allocator, channel.staging[i], channel.stagingMemory[i]);
+            channel.staging[i] = VK_NULL_HANDLE;
+            channel.stagingMemory[i] = VK_NULL_HANDLE;
+            channel.stagingMapped[i] = nullptr;
+        }
+        channel.pending[i] = false;
+    }
+    destroyAutoExposure(ctx, channel.gpu);
+}
+
+void DeferredCore::harvestExposureChannel(ExposureChannel& channel, uint32_t slot) const {
+    if (!channel.pending[slot]) return;
+    const auto* s = static_cast<const ExposureState*>(channel.stagingMapped[slot]);
+    channel.value = s->exposure;
+    channel.pending[slot] = false;
 }
 
 void DeferredCore::recordTransparentDraws(VkCommandBuffer cmd, const Scene& scene, bool gtPass,
