@@ -43,7 +43,11 @@ bool VulkanContext::create(Window& window) {
     }
     if (std::getenv("SR_NO_VALIDATION")) useValidation = false;  // opt-out for end users
     std::vector<const char*> enabledLayers;
-    if (useValidation) enabledLayers.push_back(validationLayer);
+    if (useValidation) {
+        enabledLayers.push_back(validationLayer);
+        // Needed for the stderr debug messenger created after instance creation.
+        instanceExt.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+    }
 
     // Plugin-declared instance requirements (registered via
     // SR_REGISTER_VULKAN_DEVICE_NEEDS): instance extensions and layers.
@@ -114,6 +118,34 @@ bool VulkanContext::create(Window& window) {
     ici.enabledLayerCount = static_cast<uint32_t>(enabledLayers.size());
     ici.ppEnabledLayerNames = enabledLayers.empty() ? nullptr : enabledLayers.data();
     if (vkCreateInstance(&ici, nullptr, &instance) != VK_SUCCESS) return false;
+
+    // Route validation messages to stderr (the layer alone is silent without a
+    // messenger; bench/smoke runs depend on seeing these).
+    if (useValidation) {
+        auto createMessenger =
+            reinterpret_cast<PFN_vkCreateDebugUtilsMessengerEXT>(
+                vkGetInstanceProcAddr(instance, "vkCreateDebugUtilsMessengerEXT"));
+        if (createMessenger) {
+            VkDebugUtilsMessengerCreateInfoEXT mci = {};
+            mci.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT;
+            mci.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
+                                  VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
+            mci.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
+                              VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
+                              VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
+            mci.pfnUserCallback = +[](VkDebugUtilsMessageSeverityFlagBitsEXT severity,
+                                      VkDebugUtilsMessageTypeFlagsEXT,
+                                      const VkDebugUtilsMessengerCallbackDataEXT* data,
+                                      void*) -> VkBool32 {
+                std::fprintf(stderr, "[vulkan-%s] %s\n",
+                             severity == VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT ? "error"
+                                                                                       : "warn",
+                             data->pMessage);
+                return VK_FALSE;
+            };
+            createMessenger(instance, &mci, nullptr, &debugMessenger);
+        }
+    }
 
     VkWin32SurfaceCreateInfoKHR sci = {};
     sci.sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR;
@@ -330,6 +362,12 @@ void VulkanContext::destroy() {
     if (!device) {
         // Instance-only partial state.
         if (surface) { vkDestroySurfaceKHR(instance, surface, nullptr); surface = VK_NULL_HANDLE; }
+        if (debugMessenger) {
+            auto f = reinterpret_cast<PFN_vkDestroyDebugUtilsMessengerEXT>(
+                vkGetInstanceProcAddr(instance, "vkDestroyDebugUtilsMessengerEXT"));
+            if (f) f(instance, debugMessenger, nullptr);
+            debugMessenger = VK_NULL_HANDLE;
+        }
         if (instance) { vkDestroyInstance(instance, nullptr); instance = VK_NULL_HANDLE; }
         return;
     }
@@ -356,6 +394,12 @@ void VulkanContext::destroy() {
     vkDestroyDevice(device, nullptr);
     device = VK_NULL_HANDLE;
     if (surface) { vkDestroySurfaceKHR(instance, surface, nullptr); surface = VK_NULL_HANDLE; }
+    if (debugMessenger) {
+        auto f = reinterpret_cast<PFN_vkDestroyDebugUtilsMessengerEXT>(
+            vkGetInstanceProcAddr(instance, "vkDestroyDebugUtilsMessengerEXT"));
+        if (f) f(instance, debugMessenger, nullptr);
+        debugMessenger = VK_NULL_HANDLE;
+    }
     if (instance) { vkDestroyInstance(instance, nullptr); instance = VK_NULL_HANDLE; }
 }
 
