@@ -324,17 +324,15 @@ bool CompareApp::createRenderTargets() {
     if (!createRT(gbAo_, renderWidth_, renderHeight_, VK_FORMAT_R16_SFLOAT, aoUsage,
                   VK_IMAGE_ASPECT_COLOR_BIT))
         return false;
-    const VkImageUsageFlags ssrUsage =
-        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-    if (!createRT(gbSsrSrc_, renderWidth_, renderHeight_, deferred::kHdrColorFormat, ssrUsage,
-                  VK_IMAGE_ASPECT_COLOR_BIT))
-        return false;
-    if (!createRT(gtSsrSrc_, dw, dh, deferred::kHdrColorFormat, ssrUsage, VK_IMAGE_ASPECT_COLOR_BIT))
-        return false;
     // Hi-Z depth pyramids for the SSR march (LR / GT / GT-SSAA paths).
     if (!deferred_.createDepthPyramid(ctx_, renderWidth_, renderHeight_, gbPyramid_))
         return false;
     if (!deferred_.createDepthPyramid(ctx_, dw, dh, gtPyramid_))
+        return false;
+    // Color mip chains for roughness-aware SSR (mip 0 = the lit-color copy).
+    if (!deferred_.createColorPyramid(ctx_, renderWidth_, renderHeight_, gbColorPyramid_))
+        return false;
+    if (!deferred_.createColorPyramid(ctx_, dw, dh, gtColorPyramid_))
         return false;
 
     // Native-resolution ground truth (same camera, no jitter).  The lighting
@@ -392,10 +390,9 @@ bool CompareApp::createRenderTargets() {
         if (!createRT(gtSsaaAo_, dw * 2, dh * 2, VK_FORMAT_R16_SFLOAT, aoUsage,
                       VK_IMAGE_ASPECT_COLOR_BIT))
             return false;
-        if (!createRT(gtSsaaSsrSrc_, dw * 2, dh * 2, deferred::kHdrColorFormat, ssrUsage,
-                      VK_IMAGE_ASPECT_COLOR_BIT))
-            return false;
         if (!deferred_.createDepthPyramid(ctx_, dw * 2, dh * 2, gtSsaaPyramid_))
+            return false;
+        if (!deferred_.createColorPyramid(ctx_, dw * 2, dh * 2, gtSsaaColorPyramid_))
             return false;
     }
 
@@ -566,16 +563,18 @@ bool CompareApp::createDescriptors() {
     // --- pool ----------------------------------------------------------------
     const uint32_t numAlgos = static_cast<uint32_t>(algos_.size());
     const uint32_t numColumns = 1 + numAlgos;
-    // Hi-Z downsample sets: one per mip per pyramid (sampler + storage image).
+    // Hi-Z / color downsample sets: one per mip per pyramid (sampler + storage image).
     const uint32_t hizSets =
         gbPyramid_.mipCount + gtPyramid_.mipCount + gtSsaaPyramid_.mipCount;
+    const uint32_t colorSets =
+        gbColorPyramid_.mipCount + gtColorPyramid_.mipCount + gtSsaaColorPyramid_.mipCount;
     VkDescriptorPoolSize sizes[5] = {};
     sizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     sizes[0].descriptorCount = deferred::kMaxTextures + numColumns * 2 + 2 + numAlgos * 2 +
                                11 * kFramesInFlight * 4 + // lighting sets (GB/GT/SSAA/spatial), +1 shadow
                                7 * kFramesInFlight * 4 +  // transparent sets + SSR
                                3 * 3 +                    // ssao + blur samplers (per path)
-                               hizSets;
+                               hizSets + colorSets;
     sizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     sizes[1].descriptorCount = kFramesInFlight * 2 + numColumns +
                                kFramesInFlight * 2 + // lighting UBOs
@@ -586,14 +585,14 @@ bool CompareApp::createDescriptors() {
     sizes[3].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     sizes[3].descriptorCount = numAlgos * 2;
     sizes[4].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    sizes[4].descriptorCount = 6 + hizSets; // ssao raw + blurred outputs (GB/GT/SSAA) + Hi-Z
+    sizes[4].descriptorCount = 6 + hizSets + colorSets; // ssao raw + blurred outputs (GB/GT/SSAA) + pyramid mips
     VkDescriptorPoolCreateInfo poolCi = {};
     poolCi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     poolCi.maxSets = kFramesInFlight * 2 + 2 + numColumns + 1 + numAlgos + kFramesInFlight * 3 +
                      kFramesInFlight * 3 + // transparent sets (GB/GT/SSAA)
                      6 +                    // ssao sets (GB/GT/SSAA, static)
                      3 * kFramesInFlight + // spatial scene + lighting + transparent
-                     hizSets;
+                     hizSets + colorSets;
     poolCi.poolSizeCount = 5;
     poolCi.pPoolSizes = sizes;
     if (vkCreateDescriptorPool(ctx_.device, &poolCi, nullptr, &descriptorPool_) != VK_SUCCESS)
@@ -606,6 +605,15 @@ bool CompareApp::createDescriptors() {
     if (opts_.gtSsaa &&
         !deferred_.writeDepthPyramidSets(ctx_, descriptorPool_, gtSsaaDepth_.view,
                                          gtSsaaPyramid_))
+        return false;
+    // Color chain set 0 samples the lit HDR target of each path.
+    if (!deferred_.writeColorPyramidSets(ctx_, descriptorPool_, gbColor_.view, gbColorPyramid_))
+        return false;
+    if (!deferred_.writeColorPyramidSets(ctx_, descriptorPool_, gtColor_.view, gtColorPyramid_))
+        return false;
+    if (opts_.gtSsaa &&
+        !deferred_.writeColorPyramidSets(ctx_, descriptorPool_, gtSsaaColor_.view,
+                                         gtSsaaColorPyramid_))
         return false;
 
     linearSampler_ = createSampler(ctx_, VK_FILTER_LINEAR, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
@@ -1052,15 +1060,18 @@ bool CompareApp::createSyncResources() {
         // The transparency shader reads iblParams (identical in both lighting
         // UBOs) plus the path's own SSAO texture: one set per path.
         deferred_.writeTransparentSet(ctx_, fr.transparentSetGb, fr.lightingUboGb, gbAo_.view,
-                                      shadowView, gbSsrSrc_.view, gbPyramid_.chainView);
+                                      shadowView, gbColorPyramid_.chainView,
+                                      gbPyramid_.chainView);
         deferred_.writeTransparentSet(ctx_, fr.transparentSetGbSpatial, fr.lightingUboGbSpatial,
-                                      gbAo_.view, shadowView, gbSsrSrc_.view,
+                                      gbAo_.view, shadowView, gbColorPyramid_.chainView,
                                       gbPyramid_.chainView);
         deferred_.writeTransparentSet(ctx_, fr.transparentSetGt, fr.lightingUboGt, gtAo_.view,
-                                      shadowView, gtSsrSrc_.view, gtPyramid_.chainView);
+                                      shadowView, gtColorPyramid_.chainView,
+                                      gtPyramid_.chainView);
         if (opts_.gtSsaa) {
             deferred_.writeTransparentSet(ctx_, fr.transparentSetSsaa, fr.lightingUboGt,
-                                          gtSsaaAo_.view, shadowView, gtSsaaSsrSrc_.view,
+                                          gtSsaaAo_.view, shadowView,
+                                          gtSsaaColorPyramid_.chainView,
                                           gtSsaaPyramid_.chainView);
         }
     }
@@ -1392,20 +1403,14 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         deferred_.recordLightingPass(cmd, lightingSet, gbColor_.view, renderWidth_, renderHeight_);
 
         if (hasTransparency_) {
-            transition(gbColor_.image, gbColorLayout_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                       sync::kColorAttach, sync::kColorWrite, sync::kCopy, sync::kTransferRead,
+            // Color mip chain: mip 0 is the opaque HDR copy glass SSR used to
+            // make with a transfer; the chain stays GENERAL for life.
+            transition(gbColor_.image, gbColorLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                       sync::kColorAttach, sync::kColorWrite, sync::kCompute, sync::kSampled,
                        VK_IMAGE_ASPECT_COLOR_BIT);
-            transition(gbSsrSrc_.image, gbSsrSrcLayout_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                       sync::kFragment, sync::kSampled, sync::kCopy, sync::kTransferWrite,
-                       VK_IMAGE_ASPECT_COLOR_BIT);
-            copyColorImage(cmd, gbColor_.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                           gbSsrSrc_.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, renderWidth_,
-                           renderHeight_);
-            transition(gbSsrSrc_.image, gbSsrSrcLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                       sync::kCopy, sync::kTransferWrite, sync::kFragment, sync::kSampled,
-                       VK_IMAGE_ASPECT_COLOR_BIT);
+            deferred_.recordColorPyramidPass(cmd, gbColorPyramid_);
             transition(gbColor_.image, gbColorLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                       sync::kCopy, sync::kTransferRead, sync::kColorAttach, sync::kColorReadWrite,
+                       sync::kCompute, sync::kSampled, sync::kColorAttach, sync::kColorReadWrite,
                        VK_IMAGE_ASPECT_COLOR_BIT);
         }
 
@@ -1646,19 +1651,13 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         deferred_.recordLightingPass(cmd, fr.lightingSetSsaa, gtSsaaColor_.view, sw, sh);
 
         if (hasTransparency_) {
-            transition(gtSsaaColor_.image, gtSsaaColorLayout_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                       sync::kColorAttach, sync::kColorWrite, sync::kCopy, sync::kTransferRead,
+            // Same color mip chain build as the GB path (GENERAL for life).
+            transition(gtSsaaColor_.image, gtSsaaColorLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                       sync::kColorAttach, sync::kColorWrite, sync::kCompute, sync::kSampled,
                        VK_IMAGE_ASPECT_COLOR_BIT);
-            transition(gtSsaaSsrSrc_.image, gtSsaaSsrSrcLayout_,
-                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, sync::kFragment, sync::kSampled,
-                       sync::kCopy, sync::kTransferWrite, VK_IMAGE_ASPECT_COLOR_BIT);
-            copyColorImage(cmd, gtSsaaColor_.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                           gtSsaaSsrSrc_.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, sw, sh);
-            transition(gtSsaaSsrSrc_.image, gtSsaaSsrSrcLayout_,
-                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kCopy, sync::kTransferWrite,
-                       sync::kFragment, sync::kSampled, VK_IMAGE_ASPECT_COLOR_BIT);
+            deferred_.recordColorPyramidPass(cmd, gtSsaaColorPyramid_);
             transition(gtSsaaColor_.image, gtSsaaColorLayout_,
-                       VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, sync::kCopy, sync::kTransferRead,
+                       VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, sync::kCompute, sync::kSampled,
                        sync::kColorAttach, sync::kColorReadWrite, VK_IMAGE_ASPECT_COLOR_BIT);
         }
 
@@ -1786,19 +1785,13 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         deferred_.recordLightingPass(cmd, fr.lightingSetGt, gtColor_.view, dw, dh);
 
         if (hasTransparency_) {
-            transition(gtColor_.image, gtColorLayout_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                       sync::kColorAttach, sync::kColorWrite, sync::kCopy, sync::kTransferRead,
+            // Same color mip chain build as the GB path (GENERAL for life).
+            transition(gtColor_.image, gtColorLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                       sync::kColorAttach, sync::kColorWrite, sync::kCompute, sync::kSampled,
                        VK_IMAGE_ASPECT_COLOR_BIT);
-            transition(gtSsrSrc_.image, gtSsrSrcLayout_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                       sync::kFragment, sync::kSampled, sync::kCopy, sync::kTransferWrite,
-                       VK_IMAGE_ASPECT_COLOR_BIT);
-            copyColorImage(cmd, gtColor_.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                           gtSsrSrc_.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, dw, dh);
-            transition(gtSsrSrc_.image, gtSsrSrcLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                       sync::kCopy, sync::kTransferWrite, sync::kFragment, sync::kSampled,
-                       VK_IMAGE_ASPECT_COLOR_BIT);
+            deferred_.recordColorPyramidPass(cmd, gtColorPyramid_);
             transition(gtColor_.image, gtColorLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                       sync::kCopy, sync::kTransferRead, sync::kColorAttach, sync::kColorReadWrite,
+                       sync::kCompute, sync::kSampled, sync::kColorAttach, sync::kColorReadWrite,
                        VK_IMAGE_ASPECT_COLOR_BIT);
         }
 
@@ -2186,9 +2179,9 @@ void CompareApp::shutdown() {
 
     gbColor_.destroy(ctx_);
     gbColorSpatial_.destroy(ctx_);
-    gbSsrSrc_.destroy(ctx_);
-    gtSsrSrc_.destroy(ctx_);
-    gtSsaaSsrSrc_.destroy(ctx_);
+    deferred_.destroyColorPyramid(ctx_, gbColorPyramid_);
+    deferred_.destroyColorPyramid(ctx_, gtColorPyramid_);
+    deferred_.destroyColorPyramid(ctx_, gtSsaaColorPyramid_);
     deferred_.destroyDepthPyramid(ctx_, gbPyramid_);
     deferred_.destroyDepthPyramid(ctx_, gtPyramid_);
     deferred_.destroyDepthPyramid(ctx_, gtSsaaPyramid_);

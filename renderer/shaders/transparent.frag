@@ -62,8 +62,8 @@ layout(set = 2, binding = 3) uniform sampler2D iblBrdfLut;
 // Screen-space AO (R16F, same resolution as this path's GBuffer).
 layout(set = 2, binding = 4) uniform sampler2D ssaoTex;
 layout(set = 2, binding = 5) uniform sampler2DArrayShadow shadowMap; // CSM, comparison sampler
-// Opaque HDR + depth pyramid (Hi-Z, R32F) captured before this pass writes
-// color (SSR).
+// Opaque HDR color mip chain (RGBA16F) + depth pyramid (Hi-Z, R32F), both
+// captured before this pass writes color (SSR).
 layout(set = 2, binding = 6) uniform sampler2D ssrColor;
 layout(set = 2, binding = 7) uniform sampler2D ssrHiZ;
 
@@ -241,17 +241,19 @@ void main() {
     vec3 Fg = F_Schlick(NdV, F0);
 
     vec3 specSsr = specularIbl * ambientScale;
-    float ssrHit = 0.0;
-    if (roughness < 0.45) {
-        vec4 ssr = traceSsr(ssrColor, ssrHiZ, textureQueryLevels(ssrHiZ), ubo.viewProj,
-                            lighting.invViewProj, ubo.cameraPos.xyz, vWorldPos, N, R,
-                            ubo.renderSizeJitter.xy);
-        ssrHit = clamp(ssr.a, 0.0, 1.0);
-        // UE applies EnvBRDF on the hit (not D*G*F).  Shop glass is a
-        // coated mirror: lerp EnvBRDF toward 1 with hit confidence so a
-        // solid trace is not crushed back to F0 (~0.22).
-        specSsr = mix(specSsr, ssr.rgb * mix(envBrdf, vec3(1.0), ssrHit * 0.8), ssrHit);
-    }
+    // SSR covers the full roughness range: traceSsr reads the hit colour from
+    // the box-filtered colour mip chain at lod = roughness * (mipCount - 1),
+    // so rough glass gets a blurred reflection instead of the old hard cutoff
+    // that fell back to IBL above roughness 0.45.
+    vec4 ssr = traceSsr(ssrColor, textureQueryLevels(ssrColor), ssrHiZ,
+                        textureQueryLevels(ssrHiZ), ubo.viewProj,
+                        lighting.invViewProj, ubo.cameraPos.xyz, vWorldPos, N, R, roughness,
+                        ubo.renderSizeJitter.xy);
+    float ssrHit = clamp(ssr.a, 0.0, 1.0);
+    // UE applies EnvBRDF on the hit (not D*G*F).  Shop glass is a
+    // coated mirror: lerp EnvBRDF toward 1 with hit confidence so a
+    // solid trace is not crushed back to F0 (~0.22).
+    specSsr = mix(specSsr, ssr.rgb * mix(envBrdf, vec3(1.0), ssrHit * 0.8), ssrHit);
 
     // Hide the dark interior: SSR confidence and Fresnel both raise opacity.
     // Head-on panes reflect behind the camera (not in the colour buffer), so

@@ -1199,9 +1199,9 @@ void DeferredCore::writeTransparentSet(const VulkanContext& ctx, VkDescriptorSet
     img[4].sampler = shadowSampler_;
     img[4].imageView = shadow;
     img[4].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    img[5].sampler = gbufferSampler_;
+    img[5].sampler = colorPyramidSampler_; // trilinear: roughness picks the mip
     img[5].imageView = ssrColor;
-    img[5].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    img[5].imageLayout = VK_IMAGE_LAYOUT_GENERAL; // color pyramid lives in GENERAL
     img[6].sampler = hizSampler_;
     img[6].imageView = depthPyramid;
     img[6].imageLayout = VK_IMAGE_LAYOUT_GENERAL; // pyramid lives in GENERAL

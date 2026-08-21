@@ -57,9 +57,13 @@ float ssrClipToScreen(vec2 startUv, vec2 endUv) {
 
 // hizTex: max-reduced depth pyramid (mip 0 = opaque depth copy, R32F);
 // hizMipCount = textureQueryLevels(hizTex) at the call site.
-vec4 traceSsr(sampler2D colorTex, sampler2D hizTex, int hizMipCount,
+// colorTex: box-filtered mip chain of the lit opaque HDR color (mip 0 =
+// sharp copy); colorMipCount = textureQueryLevels(colorTex).  The hit colour
+// is read at a roughness-driven LOD so one ray approximates the widened GGX
+// lobe (rough reflections average a larger screen footprint).
+vec4 traceSsr(sampler2D colorTex, int colorMipCount, sampler2D hizTex, int hizMipCount,
               mat4 viewProj, mat4 invViewProj, vec3 cameraPos, vec3 worldPos,
-              vec3 N, vec3 R, vec2 renderSize) {
+              vec3 N, vec3 R, float roughness, vec2 renderSize) {
     const int kMaxIters = 128; // hierarchy steps (each descends or advances)
     const int kRefine = 8;
     const float kMaxDist = 100.0;
@@ -224,9 +228,19 @@ vec4 traceSsr(sampler2D colorTex, sampler2D hizTex, int hizMipCount,
 
     if (!hit) return vec4(0.0);
 
-    vec3 col = texture(colorTex, hitUv).rgb;
+    // Roughness → mip LOD: each chain level doubles the footprint of the 2x2
+    // box average, approximating a reflection cone whose aperture grows with
+    // the GGX lobe.  A linear mapping in perceptual roughness (the material
+    // parameter IS perceptual roughness; GGX alpha = r²) matches how the
+    // split-sum IBL path picks its prefilter LOD, and trilinear sampling
+    // between levels keeps the blur free of banding.  This is the standard
+    // "colour mip chain" half of stochastic-free SSR (UE samples its blurred
+    // scene-colour pyramid the same way once denoising is skipped).
+    const float lod = roughness * float(colorMipCount - 1);
+    vec3 col = textureLod(colorTex, hitUv, lod).rgb;
     // UE tames fireflies with rcp(1+lum) because SSSR is stochastic; this
-    // path is a single sharp ray (shop glass), so keep linear HDR.
+    // path is a single ray and the mip chain already averages out the hot
+    // texels at higher LODs, so keep linear HDR.
 
     vec2 edge = smoothstep(vec2(0.0), vec2(0.05), hitUv) *
                 smoothstep(vec2(0.0), vec2(0.05), 1.0 - hitUv);

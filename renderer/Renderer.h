@@ -129,8 +129,11 @@ private:
     ImageResource gbBloomB_;
     ImageResource gtBloomA_;
     ImageResource gtBloomB_;
-    ImageResource gbSsrSrc_; // opaque HDR copy for glass SSR
-    ImageResource gtSsrSrc_;
+    // HDR color mip chains (lit opaque color, box-filtered) for
+    // roughness-aware glass SSR; same GENERAL-for-life resource model as the
+    // depth pyramids.  Phase 6's bloom pyramid is expected to reuse them.
+    ColorPyramid gbColorPyramid_;
+    ColorPyramid gtColorPyramid_;
     // Hi-Z depth pyramids for the SSR march (LR / GT); general DeferredCore
     // resource, later reused by GTAO/contact shadows/occlusion culling.
     DepthPyramid gbPyramid_;

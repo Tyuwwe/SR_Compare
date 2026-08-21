@@ -253,16 +253,14 @@ bool Renderer::createRenderTargets() {
     if (!createRT(gtBloomB_, gtHalfW, gtHalfH, deferred::kHdrColorFormat, bloomUsage,
                   VK_IMAGE_ASPECT_COLOR_BIT))
         return false;
-    const VkImageUsageFlags ssrUsage =
-        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-    if (!createRT(gbSsrSrc_, renderWidth_, renderHeight_, deferred::kHdrColorFormat, ssrUsage,
-                  VK_IMAGE_ASPECT_COLOR_BIT))
-        return false;
-    if (!createRT(gtSsrSrc_, dw, dh, deferred::kHdrColorFormat, ssrUsage, VK_IMAGE_ASPECT_COLOR_BIT))
-        return false;
     if (!deferred_.createDepthPyramid(ctx_, renderWidth_, renderHeight_, gbPyramid_))
         return false;
     if (!deferred_.createDepthPyramid(ctx_, dw, dh, gtPyramid_))
+        return false;
+    // Color mip chains for roughness-aware SSR (mip 0 = the lit-color copy).
+    if (!deferred_.createColorPyramid(ctx_, renderWidth_, renderHeight_, gbColorPyramid_))
+        return false;
+    if (!deferred_.createColorPyramid(ctx_, dw, dh, gtColorPyramid_))
         return false;
     if (!createRT(finalImage_, dw, dh, deferred::kHdrColorFormat,
                   VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
@@ -311,24 +309,25 @@ bool Renderer::createSceneDescriptors() {
         return false;
 
     VkDescriptorPoolSize sizes[4] = {};
-    // Hi-Z downsample sets: one per mip per pyramid (sampler + storage image).
+    // Hi-Z / color downsample sets: one per mip per pyramid (sampler + storage image).
     const uint32_t hizSets = gbPyramid_.mipCount + gtPyramid_.mipCount;
+    const uint32_t colorSets = gbColorPyramid_.mipCount + gtColorPyramid_.mipCount;
     sizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     sizes[0].descriptorCount = deferred::kMaxTextures + 1 + // texture array + present
                                11 * kFramesInFlight * 2 + // lighting sets (GB/GT), +1 shadow map
                                7 * kFramesInFlight * 2 +  // transparent sets (GB/GT), +SSR+shadow
                                2 * 2 + 1 * 2 +            // ssao + blur samplers
                                8 +                        // bloom extract/blur/comp (GB/GT)
-                               hizSets;
+                               hizSets + colorSets;
     sizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     sizes[1].descriptorCount = kFramesInFlight * 4; // scene + lighting + 2 transparent UBOs
     sizes[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
     sizes[2].descriptorCount = kFramesInFlight;
     sizes[3].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    sizes[3].descriptorCount = 4 + 8 + hizSets; // ssao + bloom (GB/GT) + Hi-Z mips
+    sizes[3].descriptorCount = 4 + 8 + hizSets + colorSets; // ssao + bloom (GB/GT) + pyramid mips
     VkDescriptorPoolCreateInfo poolCi = {};
     poolCi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    poolCi.maxSets = kFramesInFlight * 5 + 6 + 8 + hizSets; // + 8 bloom sets
+    poolCi.maxSets = kFramesInFlight * 5 + 6 + 8 + hizSets + colorSets; // + 8 bloom sets
     poolCi.poolSizeCount = 4;
     poolCi.pPoolSizes = sizes;
     if (vkCreateDescriptorPool(ctx_.device, &poolCi, nullptr, &descriptorPool_) != VK_SUCCESS)
@@ -337,6 +336,11 @@ bool Renderer::createSceneDescriptors() {
     if (!deferred_.writeDepthPyramidSets(ctx_, descriptorPool_, gbDepth_.view, gbPyramid_))
         return false;
     if (!deferred_.writeDepthPyramidSets(ctx_, descriptorPool_, gtDepth_.view, gtPyramid_))
+        return false;
+    // Color chain set 0 samples the lit HDR target (gbColor_ / finalImage_).
+    if (!deferred_.writeColorPyramidSets(ctx_, descriptorPool_, gbColor_.view, gbColorPyramid_))
+        return false;
+    if (!deferred_.writeColorPyramidSets(ctx_, descriptorPool_, finalImage_.view, gtColorPyramid_))
         return false;
 
     if (!deferred_.createMaterialUbo(ctx_, scene_, materialUbo_, materialUboMemory_,
@@ -572,9 +576,11 @@ bool Renderer::createSyncResources() {
                                      &frames_[i].transparentSetGt) != VK_SUCCESS)
             return false;
         deferred_.writeTransparentSet(ctx_, frames_[i].transparentSetGb, frames_[i].lightingUbo,
-                                      gbAo_.view, shadowView, gbSsrSrc_.view, gbPyramid_.chainView);
+                                      gbAo_.view, shadowView, gbColorPyramid_.chainView,
+                                      gbPyramid_.chainView);
         deferred_.writeTransparentSet(ctx_, frames_[i].transparentSetGt, frames_[i].lightingUbo,
-                                      gtAo_.view, shadowView, gtSsrSrc_.view, gtPyramid_.chainView);
+                                      gtAo_.view, shadowView, gtColorPyramid_.chainView,
+                                      gtPyramid_.chainView);
     }
 
     // SSAO sets (static bindings; per-frame data goes through push constants).
@@ -928,21 +934,16 @@ void Renderer::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                                  litTarget.view, sceneW, sceneH);
 
     // --- Transparency pass (alpha-blended surfaces over the lit scene) --------
-    // Copy opaque HDR for SSR: the transparent pass writes the same color
-    // target, so glass cannot sample it in-place.
+    // Build the color mip chain from the lit target: mip 0 IS the opaque HDR
+    // copy glass SSR used to make with a transfer; the chain is GENERAL for
+    // life, so only litTarget transitions here (color attach -> compute read
+    // -> color attach).
     if (hasTransparency_) {
-        transition(litTarget, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                   sync::kColorAttach, sync::kColorWrite, sync::kCopy, sync::kTransferRead);
-        ImageResource& ssrSrc = gbuffer ? gbSsrSrc_ : gtSsrSrc_;
-        // ssrSrc was sampled by the transparent fragment shader last frame.
-        transition(ssrSrc, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                   sync::kFragment, sync::kSampled, sync::kCopy, sync::kTransferWrite);
-        copyColorImage(cmd, litTarget.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, ssrSrc.image,
-                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, sceneW, sceneH);
-        transition(ssrSrc, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                   sync::kCopy, sync::kTransferWrite, sync::kFragment, sync::kSampled);
+        transition(litTarget, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                   sync::kColorAttach, sync::kColorWrite, sync::kCompute, sync::kSampled);
+        deferred_.recordColorPyramidPass(cmd, gbuffer ? gbColorPyramid_ : gtColorPyramid_);
         transition(litTarget, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                   sync::kCopy, sync::kTransferRead, sync::kColorAttach, sync::kColorReadWrite);
+                   sync::kCompute, sync::kSampled, sync::kColorAttach, sync::kColorReadWrite);
     }
     if (hasTransparency_) {
         if (gbuffer) {
@@ -1265,8 +1266,8 @@ void Renderer::shutdown() {
     gbBloomB_.destroy(ctx_);
     gtBloomA_.destroy(ctx_);
     gtBloomB_.destroy(ctx_);
-    gbSsrSrc_.destroy(ctx_);
-    gtSsrSrc_.destroy(ctx_);
+    deferred_.destroyColorPyramid(ctx_, gbColorPyramid_);
+    deferred_.destroyColorPyramid(ctx_, gtColorPyramid_);
     deferred_.destroyDepthPyramid(ctx_, gbPyramid_);
     deferred_.destroyDepthPyramid(ctx_, gtPyramid_);
     finalImage_.destroy(ctx_);

@@ -51,7 +51,7 @@ layout(set = 2, binding = 3) uniform sampler2D iblBrdfLut;
 // Screen-space AO (R16F, same resolution as this path's GBuffer).
 layout(set = 2, binding = 4) uniform sampler2D ssaoTex;
 layout(set = 2, binding = 5) uniform sampler2DArrayShadow shadowMap; // CSM, comparison sampler
-layout(set = 2, binding = 6) uniform sampler2D ssrColor;
+layout(set = 2, binding = 6) uniform sampler2D ssrColor; // opaque HDR color mip chain (RGBA16F)
 layout(set = 2, binding = 7) uniform sampler2D ssrHiZ; // opaque depth pyramid (Hi-Z, R32F)
 
 layout(location = 0) in vec3 vWorldPos;
@@ -214,14 +214,14 @@ void main() {
     vec3 Fg = F_Schlick(NdV, F0);
 
     vec3 specSsr = specularIbl * ambientScale;
-    float ssrHit = 0.0;
-    if (roughness < 0.45) {
-        vec4 ssr = traceSsr(ssrColor, ssrHiZ, textureQueryLevels(ssrHiZ), ubo.viewProj,
-                            lighting.invViewProj, ubo.cameraPos.xyz, vWorldPos, N, R,
-                            ubo.renderSizeJitter.xy);
-        ssrHit = clamp(ssr.a, 0.0, 1.0);
-        specSsr = mix(specSsr, ssr.rgb * mix(envBrdf, vec3(1.0), ssrHit * 0.8), ssrHit);
-    }
+    // Full roughness range (same as transparent.frag — keep in sync): the hit
+    // colour comes from the colour mip chain at lod = roughness * (mips - 1).
+    vec4 ssr = traceSsr(ssrColor, textureQueryLevels(ssrColor), ssrHiZ,
+                        textureQueryLevels(ssrHiZ), ubo.viewProj,
+                        lighting.invViewProj, ubo.cameraPos.xyz, vWorldPos, N, R, roughness,
+                        ubo.renderSizeJitter.xy);
+    float ssrHit = clamp(ssr.a, 0.0, 1.0);
+    specSsr = mix(specSsr, ssr.rgb * mix(envBrdf, vec3(1.0), ssrHit * 0.8), ssrHit);
 
     float alpha = clamp(max(base.a, max(Fg.r, ssrHit * 0.88)), 0.0, 1.0);
     if (shopGlass && ssrHit < 0.35)

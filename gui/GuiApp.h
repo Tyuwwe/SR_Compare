@@ -493,9 +493,12 @@ private:
     ImageResource gtAo_;
     ImageResource gtSsaaAoRaw_; // compare GT SSAA only
     ImageResource gtSsaaAo_;
-    ImageResource gbSsrSrc_;
-    ImageResource gtSsrSrc_;
-    ImageResource gtSsaaSsrSrc_;
+    // HDR color mip chains (lit opaque color, box-filtered) for
+    // roughness-aware SSR; same GENERAL-for-life resource model as the
+    // depth pyramids.  Phase 6's bloom pyramid is expected to reuse them.
+    ColorPyramid gbColorPyramid_;
+    ColorPyramid gtColorPyramid_;
+    ColorPyramid gtSsaaColorPyramid_; // compare GT SSAA only
     // Hi-Z depth pyramids for the SSR march (LR / GT / GT-SSAA paths); general
     // DeferredCore resource, later reused by GTAO/contact shadows/culling.
     DepthPyramid gbPyramid_;
@@ -580,9 +583,6 @@ private:
     VkImageLayout gtAoLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gtSsaaAoRawLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gtSsaaAoLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
-    VkImageLayout gbSsrSrcLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
-    VkImageLayout gtSsrSrcLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
-    VkImageLayout gtSsaaSsrSrcLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout composeLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
 
     VkBuffer materialUbo_ = VK_NULL_HANDLE;
