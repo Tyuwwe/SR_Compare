@@ -99,7 +99,11 @@ vec4 traceSsr(sampler2D colorTex, sampler2D depthTex, mat4 viewProj, mat4 invVie
     float lastDiff = -1.0;
     bool hit = false;
     vec2 hitUv = endUv;
-    float hitT = 1.0;
+    float hitDist = kMaxDist;
+    // |R·N|: 1 head-on, ~0 at grazing.  Scales the self-hit radius and the
+    // thickness window below; grazing incidence is where both fixed
+    // thresholds used to kill valid reflections (Bistro shop windows).
+    float grazing = abs(dot(R, N));
 
     for (int i = 1; i <= steps; ++i) {
         float t = float(i) / float(steps);
@@ -151,23 +155,38 @@ vec4 traceSsr(sampler2D colorTex, sampler2D depthTex, mat4 viewProj, mat4 invVie
             float hiRayZ = abs(1.0 / mix(invW0, invW1, hi));
             float hiSceneZ = ssrViewZ(viewProj, invViewProj, hiUv, hiDepth);
             float hiOver = hiRayZ - hiSceneZ;
-            float thickness = 0.35 + 0.03 * hiRayZ;
+            // Widen the view-Z window at grazing incidence: the ray's view-Z
+            // then advances slowly, so even after binary refinement the hit
+            // can sit a coarse step past a thin reflector (window frame,
+            // mullion) and the angle-independent window rejected it.
+            float thickness = (0.35 + 0.03 * hiRayZ) / max(grazing, 0.25);
             if (hiOver < 0.0 || hiOver > thickness) {
-                lastDiff = diff;
+                // Reset, not lastDiff = diff: a positive lastDiff blocks the
+                // crossing test for the rest of the march, so one rejected
+                // crossing used to void the whole ray.  A rejected crossing
+                // at grazing is often the ray hugging a surface with internal
+                // depth jumps; later real crossings must stay detectable.
+                lastDiff = -1.0;
                 continue;
             }
             vec4 hw = invViewProj * vec4(hiUv * 2.0 - 1.0, hiDepth, 1.0);
             hw /= hw.w;
+            float dist = length(hw.xyz - worldPos);
             // Reject hits on the reflecting surface itself, not hits that are
             // simply closer to the camera (street furniture in front of a
-            // shop window is a valid mirror image).
-            if (length(hw.xyz - worldPos) < 0.22) {
-                lastDiff = diff;
+            // shop window is a valid mirror image).  The fixed 0.22 m radius
+            // discarded exactly the grazing-angle case: the ray runs almost
+            // parallel to the pane and legitimately strikes frames and walls
+            // within a few tens of centimetres.  Scale the radius by the
+            // clearance rate |R·N| — 0.22 m head-on (old behaviour), down to
+            // the origin bias at exact grazing — and keep probing on reject.
+            if (dist < kBias + 0.14 * grazing) {
+                lastDiff = -1.0;
                 continue;
             }
             hit = true;
             hitUv = hiUv;
-            hitT = hi;
+            hitDist = dist;
             break;
         }
         lastDiff = diff;
@@ -181,7 +200,12 @@ vec4 traceSsr(sampler2D colorTex, sampler2D depthTex, mat4 viewProj, mat4 invVie
 
     vec2 edge = smoothstep(vec2(0.0), vec2(0.05), hitUv) *
                 smoothstep(vec2(0.0), vec2(0.05), 1.0 - hitUv);
-    float conf = edge.x * edge.y * (1.0 - hitT * hitT);
+    // Fade with world-space hit distance, not the screen-segment parameter:
+    // grazing-angle hits cluster near the clipped segment end (hitT → 1),
+    // so 1 - hitT² faded exactly the far-field reflections this pass exists
+    // to keep, reading as "reflection lost" on shop windows.
+    float distFade = 1.0 - smoothstep(0.4 * kMaxDist, 0.9 * kMaxDist, hitDist);
+    float conf = edge.x * edge.y * distFade;
     return vec4(col, conf);
 }
 
