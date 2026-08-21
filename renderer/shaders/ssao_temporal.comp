@@ -1,0 +1,74 @@
+#version 450
+// Temporal accumulation of the GTAO visibility term.
+// XeGTAO itself delegates temporal stability to TAA ("rely on a spatial
+// filter, TAA does the temporal part"); this pass provides the temporal part
+// in-engine so the spatial-only upscaler paths (FSR1 / SGSR1, no history of
+// their own) are stable too — see Jimenez 2016 (GTAO) on temporal filtering.
+//
+// Camera-only reprojection: the current pixel's world position (rebuilt from
+// the GBuffer depth with this frame's inverse view-projection) is projected
+// with the PREVIOUS frame's view-projection into the history buffer.
+// History is rejected when the reprojected texel's stored view Z disagrees
+// with the projected view Z (disocclusion / different surface), on screen
+// exit, and on the first frame of the path (reset).  Valid history blends
+// with an exponential moving average (~1/blend frame window).  Only the
+// visibility (R) is blended; G carries the CURRENT frame's view Z so the
+// bilateral denoise weights stay correct.  All inputs derive from the frame
+// index — deterministic, no wall clock, no real randomness.
+//
+// bindings: 0 = raw AO (R = visibility, G = view |z|; SHADER_READ_ONLY)
+//           1 = history read  (the OTHER ping-pong buffer, GENERAL)
+//           2 = history write (this frame's buffer, GENERAL storage)
+//           3 = GBuffer depth (NDC, SHADER_READ_ONLY) for reconstruction
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D rawAO;
+layout(set = 0, binding = 1) uniform sampler2D history;
+layout(set = 0, binding = 2, rg16f) uniform writeonly image2D outHistory;
+layout(set = 0, binding = 3) uniform sampler2D gbDepth;
+
+layout(push_constant) uniform Push {
+    mat4 invViewProj;  // current frame (this path's convention; jittered for LR)
+    mat4 prevViewProj; // previous frame, same path/convention
+    vec4 params;       // x = EMA blend weight, y = reset (1 = pass-through)
+} pc;
+
+const float kDepthReject = 0.04; // relative view-Z tolerance (mirror of the host constant)
+
+void main() {
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(outHistory);
+    if (pix.x >= size.x || pix.y >= size.y) return;
+
+    vec2 cur = texelFetch(rawAO, pix, 0).rg;
+    float depth = texelFetch(gbDepth, pix, 0).r;
+    // First frame of the path (history is uninitialised) and sky pixels
+    // (nothing to accumulate; the G-channel sentinel also breaks the depth
+    // test) pass through unblended.
+    if (pc.params.y > 0.5 || depth >= 1.0) {
+        imageStore(outHistory, pix, vec4(cur.r, cur.g, 0.0, 0.0));
+        return;
+    }
+
+    vec2 uv = (vec2(pix) + 0.5) / vec2(size);
+    vec4 w = pc.invViewProj * vec4(uv * 2.0 - 1.0, depth, 1.0);
+    vec3 worldPos = w.xyz / w.w;
+    vec4 prevClip = pc.prevViewProj * vec4(worldPos, 1.0);
+
+    float vis = cur.r;
+    if (prevClip.w > 0.0) {
+        vec2 prevUv = prevClip.xy / prevClip.w * 0.5 + 0.5;
+        if (all(greaterThan(prevUv, vec2(0.0))) && all(lessThan(prevUv, vec2(1.0)))) {
+            float prevViewZ = abs(prevClip.w);
+            ivec2 hp = clamp(ivec2(prevUv * vec2(size)), ivec2(0), size - 1);
+            vec2 hist = texelFetch(history, hp, 0).rg;
+            // Depth rejection: the reprojected history texel must be the same
+            // surface; otherwise restart the EMA from the current frame.
+            float tol = max(prevViewZ * kDepthReject, 0.01);
+            if (abs(hist.g - prevViewZ) <= tol)
+                vis = mix(hist.r, cur.r, pc.params.x);
+        }
+    }
+    imageStore(outHistory, pix, vec4(vis, cur.g, 0.0, 0.0));
+}

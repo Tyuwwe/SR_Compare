@@ -38,6 +38,7 @@ set(RENDERER_SHADERS
     shaders/shadow_depth.frag
     shaders/ssao.comp
     shaders/ssao_blur.comp
+    shaders/ssao_temporal.comp
     shaders/ssr_opaque.comp
     shaders/hiz_downsample.comp
     shaders/color_downsample.comp

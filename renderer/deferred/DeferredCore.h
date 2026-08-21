@@ -160,38 +160,70 @@ static_assert(sizeof(ShadowPush) == 128, "ShadowPush size mismatch");
 
 // Push constants of the GTAO compute pass (ssao.comp), 96 bytes.  The
 // filename is historical; the shader is a XeGTAO-style GTAO main pass.
+// invViewProj is pushed (not inverted per pixel) — same matrix the lighting
+// pass carries in its UBO prefix.
 struct SsaoPush {
-    float viewProj[16]; // matches the GBuffer pass of this path (jittered for LR)
-    float params[4];    // x = radius (m), y = unused, z = unused, w = final power
-    float params2[4];   // x = frame index (reserved; spatial-only noise), yzw unused
+    float invViewProj[16]; // inverse of this path's GBuffer view-projection (jittered for LR)
+    float params[4];   // x = radius (m), y = final power, z/w = depth unpack
+                       // (viewZ = mul / (add - ndcDepth)); non-reversed Vulkan depth
+    float params2[4];  // x = frame index (drives the XeGTAO temporal noise spin),
+                       // y = max depth mip LOD, z = far plane (sky test), w = unused
 };
 static_assert(sizeof(SsaoPush) == 96, "SsaoPush size mismatch");
 
+// Push constants of the temporal AO accumulation pass (ssao_temporal.comp),
+// 144 bytes (< the 192 the device check already guarantees for ScenePush).
+struct SsaoTemporalPush {
+    float invViewProj[16];  // current frame, this path's convention (jittered for LR)
+    float prevViewProj[16]; // previous frame, same path/convention
+    float params[4];        // x = EMA blend weight, y = reset (1 = pass-through), zw unused
+};
+static_assert(sizeof(SsaoTemporalPush) == 144, "SsaoTemporalPush size mismatch");
+
 // GTAO defaults (Jimenez 2016 / XeGTAO heuristics).  0.5 m is a near-field
 // contact radius at Bistro street scale; FinalValuePower 2.2 is XeGTAO High.
+// The RadiusMultiplier/FalloffRange mirror XE_GTAO_DEFAULT_* and are shared
+// with the AO depth-chain filter (XeGTAO_DepthMIPFilter, hiz_downsample.comp).
 constexpr float kSsaoRadius = 0.5f;
+constexpr float kSsaoRadiusMultiplier = 1.457f; // XE_GTAO_DEFAULT_RADIUS_MULTIPLIER
+constexpr float kSsaoFalloffRange = 0.615f;     // XE_GTAO_DEFAULT_FALLOFF_RANGE
+constexpr float kSsaoDepthMipRangeScale = 0.75f; // XeGTAO_DepthMIPFilter, "found empirically"
 constexpr float kSsaoBias = 0.03f;      // unused (kept so SsaoPush comments stay stable)
 constexpr float kSsaoIntensity = 1.5f;  // unused
 constexpr float kSsaoPower = 2.2f;
+// Temporal accumulation (Jimenez 2016 temporal filtering; XeGTAO itself defers
+// to TAA): exponential moving average with ~8-frame window, history rejected
+// on reprojection depth mismatch.  Frame-index driven, deterministic.
+constexpr float kSsaoTemporalBlend = 0.125f;
+constexpr float kSsaoTemporalDepthReject = 0.04f; // relative view-Z tolerance
 
-// Working GTAO target: R = visibility, G = view-space |z| for the bilateral
-// denoise.  The filtered output (gbAo_) stays R16F for lighting/transparent.
+// Working GTAO target: R = visibility, G = view-space |z| for the temporal
+// accumulation and the bilateral denoise.  The filtered output (gbAo_) stays
+// R16F for lighting/transparent.
 constexpr VkFormat kAoRawFormat = VK_FORMAT_R16G16_SFLOAT;
 
 // --- Hi-Z depth pyramid (max-reduced opaque depth mip chain) -----------------
-// Shared general-purpose resource: the SSR marcher (ssr.glsl) consumes it
-// today; GTAO (Phase 2), contact shadows (Phase 4) and occlusion culling
-// (Phase 7) are expected to reuse the same chain.  R32F, mip 0 = full-res
-// copy of the opaque D32 depth, mips 1..N = 2x2 max-reduce (depth semantics
-// are non-reversed Vulkan: 0 = near, 1 = far, so the marcher needs the
-// farthest surface per cell).
+// Shared general-purpose resource in two flavors:
+//   * SSR chains (default): R32F NDC depth, 2x2 MAX-reduce — depth semantics
+//     are non-reversed Vulkan (0 = near, 1 = far), so the marcher needs the
+//     farthest surface per cell.
+//   * AO chains (aoFilter): R32F LINEAR view-space Z (mip 0 is a true
+//     per-texel NDC->viewZ conversion, not the SSR pseudo-copy), reduced with
+//     XeGTAO's DepthMIPFilter — a far-biased weighted average that keeps
+//     coherent-surface mips smooth while letting thin near occluders fade out
+//     instead of haloing (Intel XeGTAO, vaGTAO/XeGTAO_PrefilterDepths16x16).
+// R32F, mip 0 = full-res, mips 1..N down to 1x1.
 constexpr VkFormat kDepthPyramidFormat = VK_FORMAT_R32_SFLOAT;
 
-// Push constants of the Hi-Z downsample pass (hiz_downsample.comp), 8 bytes.
+// Push constants of the Hi-Z downsample pass (hiz_downsample.comp), 32 bytes.
 struct HiZPush {
-    int32_t srcSize[2]; // texel size of the source level (edge clamp)
+    int32_t srcSize[2];   // texel size of the source level (edge clamp)
+    int32_t aoFilter;     // 0 = SSR max-reduce, 1 = XeGTAO DepthMIPFilter (view-Z chain)
+    int32_t level;        // AO chains: level 0 is the per-texel NDC->viewZ copy
+    float depthUnpack[2]; // viewZ = mul / (add - ndcDepth); AO chains only
+    float falloff[2];     // x = falloffMul, y = falloffAdd (DepthMIPFilter weights)
 };
-static_assert(sizeof(HiZPush) == 8, "HiZPush size mismatch");
+static_assert(sizeof(HiZPush) == 32, "HiZPush size mismatch");
 
 // Host-owned depth pyramid (same ownership model as ShadowTargets: the host
 // holds the struct and the descriptor pool, DeferredCore provides
@@ -207,6 +239,28 @@ struct DepthPyramid {
     uint32_t width = 0;
     uint32_t height = 0;
     uint32_t mipCount = 0;
+    // AO-chain flavor (see the header comment above); zeroed for SSR chains.
+    bool aoFilter = false;
+    float depthUnpack[2] = {0.f, 0.f};
+    float falloff[2] = {0.f, 0.f};
+};
+
+// --- Temporal AO accumulation (GTAO visibility EMA) ----------------------------
+// Host-owned ping-pong state (same ownership/layout model as DepthPyramid):
+// two RG16F buffers (R = accumulated visibility, G = CURRENT-frame view |z| —
+// never blended, so the denoise weights stay correct), GENERAL for life.
+// ssao_temporal.comp reprojects buffer 1-i with the previous frame's
+// view-projection, depth-rejects stale texels and EMA-blends into buffer i;
+// ssao_blur.comp then denoises buffer i.  Camera-only reprojection (scenes
+// are static; a moving occluder would be caught by the depth rejection).
+struct AoHistory {
+    VkImage image[2] = {};
+    VmaAllocation memory[2] = {};
+    VkImageView view[2] = {};
+    VkDescriptorSet temporalSet[2] = {}; // [i]: reads view[1-i], writes view[i]
+    VkDescriptorSet blurSet[2] = {};     // [i]: samples view[i] into the path's AO target
+    uint32_t width = 0;
+    uint32_t height = 0;
 };
 
 // --- HDR color mip chain (box-filtered lit-color pyramid) --------------------
@@ -404,21 +458,47 @@ public:
     const IblMaps& ibl() const { return ibl_; }
 
     // --- GTAO pass (between the GBuffer and the lighting pass) ----------------
-    // ssao set: depth + normal samplers + working RG16F storage (R=AO, G=|z|).
-    void writeSsaoSet(const VulkanContext& ctx, VkDescriptorSet set, VkImageView depth,
+    // ssao set: AO depth-chain sampler (view-Z mips, GENERAL) + world-normal
+    // sampler + working RG16F storage (R=AO, G=|z|).
+    void writeSsaoSet(const VulkanContext& ctx, VkDescriptorSet set, VkImageView depthChain,
                       VkImageView normal, VkImageView aoRaw) const;
-    // denoise set: working target sampler + filtered R16F storage image.
-    void writeSsaoBlurSet(const VulkanContext& ctx, VkDescriptorSet set, VkImageView aoRaw,
-                          VkImageView ao) const;
-    // Dispatches ssao.comp (GTAO main pass).  The caller owns all layout
-    // transitions: depth and normal in SHADER_READ_ONLY, aoRaw in GENERAL.
-    // viewProj must match the GBuffer pass of this path (jittered for LR).
-    void recordSsaoPass(VkCommandBuffer cmd, VkDescriptorSet ssaoSet, const Mat4& viewProj,
-                        uint32_t frameIndex, uint32_t width, uint32_t height) const;
-    // Dispatches ssao_blur.comp (5x5 depth-aware denoise): aoRaw
-    // SHADER_READ_ONLY, ao GENERAL.
+    // Dispatches ssao.comp (GTAO main pass, XeGTAO High: 3x3 slices/steps with
+    // depth-mip step sampling).  The caller owns all layout transitions:
+    // normal in SHADER_READ_ONLY, aoRaw in GENERAL; the AO depth chain must
+    // already be rebuilt this frame.  invViewProj is the inverse of the exact
+    // view-projection used by this path's GBuffer pass (jittered for LR);
+    // nearZ/farZ unpack the chain's view Z, maxMipLod caps the step LOD
+    // (min(chainMipCount-1, 4), XeGTAO's 5-level working depth).
+    void recordSsaoPass(VkCommandBuffer cmd, VkDescriptorSet ssaoSet, const Mat4& invViewProj,
+                        uint32_t frameIndex, float nearZ, float farZ, float maxMipLod,
+                        uint32_t width, uint32_t height) const;
+    // Dispatches ssao_temporal.comp (reprojection + depth rejection + EMA) on
+    // the path's AoHistory.  aoRaw must be SHADER_READ_ONLY (main pass done),
+    // the GBuffer depth SHADER_READ_ONLY.  Both history barriers (last frame's
+    // readers -> storage write -> this frame's blur read) are handled inside.
+    // reset = first frame of this path: history is bypassed.  Hosts track
+    // prevViewProj per path (jittered for LR, matching invViewProj).
+    void recordSsaoTemporalPass(VkCommandBuffer cmd, const AoHistory& history,
+                                uint32_t writeIndex, const Mat4& invViewProj,
+                                const Mat4& prevViewProj, uint32_t width, uint32_t height,
+                                bool reset) const;
+    // Dispatches ssao_blur.comp (5x5 depth-aware denoise) on blurSet
+    // (AoHistory::blurSet[writeIndex] of this frame): history GENERAL-sampled,
+    // ao GENERAL storage.
     void recordSsaoBlurPass(VkCommandBuffer cmd, VkDescriptorSet blurSet, uint32_t width,
                             uint32_t height) const;
+    // Temporal accumulation state (host-owned; see AoHistory).  Creates the
+    // two RG16F ping-pong images (GENERAL for life); descriptor sets are
+    // written by writeAoHistorySets once the host's pool exists.
+    bool createAoHistory(const VulkanContext& ctx, uint32_t w, uint32_t h, AoHistory& out) const;
+    // Allocates temporalSet[2] + blurSet[2] from the caller's pool: temporal
+    // binds aoRaw (SHADER_READ_ONLY), the two history buffers and the path's
+    // GBuffer depth (SHADER_READ_ONLY); blur binds history + the path's
+    // filtered R16F AO target.  The sets are pool-owned; destroyAoHistory
+    // only releases the images and views.
+    bool writeAoHistorySets(const VulkanContext& ctx, VkDescriptorPool pool, VkImageView aoRaw,
+                            VkImageView depth, VkImageView aoOut, AoHistory& out) const;
+    void destroyAoHistory(const VulkanContext& ctx, AoHistory& history) const;
 
     // --- Bloom (after lighting+transparency, before upscale) ------------------
     // Reuses ssaoBlurSetLayout (sampler + storage).  writeBloomSet binds src
@@ -440,8 +520,11 @@ public:
     // Creates the pyramid image + per-mip views and transitions it to GENERAL
     // (one-shot submit).  Descriptor sets are NOT allocated here — call
     // writeDepthPyramidSets once the host's descriptor pool exists.
-    bool createDepthPyramid(const VulkanContext& ctx, uint32_t w, uint32_t h,
-                            DepthPyramid& out) const;
+    // aoFilter=true builds a GTAO chain (linear view-Z, XeGTAO DepthMIPFilter)
+    // instead of the default SSR chain (NDC depth, max-reduce); nearZ/farZ
+    // feed the NDC->viewZ unpack and are ignored for SSR chains.
+    bool createDepthPyramid(const VulkanContext& ctx, uint32_t w, uint32_t h, DepthPyramid& out,
+                            bool aoFilter = false, float nearZ = 1.f, float farZ = 100.f) const;
     // Allocates mipCount downsample sets from the caller's pool and writes
     // them: set 0 samples srcDepth (the opaque D32 depth view, read while in
     // SHADER_READ_ONLY), set i>0 samples mip i-1.  The sets are pool-owned;
@@ -449,11 +532,13 @@ public:
     bool writeDepthPyramidSets(const VulkanContext& ctx, VkDescriptorPool pool,
                                VkImageView srcDepth, DepthPyramid& out) const;
     void destroyDepthPyramid(const VulkanContext& ctx, DepthPyramid& pyramid) const;
-    // Max-reduces the bound source depth into mip 0, then each mip from the
-    // previous (one 8x8 dispatch per level, barriers between).  The source
-    // depth must already be shader-readable by compute (SHADER_READ_ONLY with
-    // compute in the dst scope); the pyramid stays GENERAL throughout and the
-    // pass ends with a barrier making the writes visible to fragment reads.
+    // Fills mip 0 from the bound source depth, then reduces each mip from the
+    // previous (one 8x8 dispatch per level, barriers between; SSR chains
+    // max-reduce NDC depth, AO chains run XeGTAO's far-biased DepthMIPFilter
+    // on view Z).  The source depth must already be shader-readable by compute
+    // (SHADER_READ_ONLY with compute in the dst scope); the pyramid stays
+    // GENERAL throughout and the pass ends with a barrier making the writes
+    // visible to fragment reads.
     void recordDepthPyramidPass(VkCommandBuffer cmd, const DepthPyramid& pyramid) const;
 
     // --- HDR color mip chain (after the lighting pass, before transparency) ---
@@ -589,6 +674,7 @@ private:
     VkDescriptorSetLayout transparentSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout ssaoSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout ssaoBlurSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout ssaoTemporalSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout hizSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout ssrSetLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout scenePipelineLayout_ = VK_NULL_HANDLE;
@@ -596,6 +682,7 @@ private:
     VkPipelineLayout transparentPipelineLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout ssaoPipelineLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout ssaoBlurPipelineLayout_ = VK_NULL_HANDLE;
+    VkPipelineLayout ssaoTemporalPipelineLayout_ = VK_NULL_HANDLE;
     VkPipeline gbufferPipeline_ = VK_NULL_HANDLE;
     VkPipeline gbufferGtPipeline_ = VK_NULL_HANDLE;
     VkPipeline lightingPipeline_ = VK_NULL_HANDLE;
@@ -603,6 +690,7 @@ private:
     VkPipeline transparentGtPipeline_ = VK_NULL_HANDLE;
     VkPipeline ssaoPipeline_ = VK_NULL_HANDLE;
     VkPipeline ssaoBlurPipeline_ = VK_NULL_HANDLE;
+    VkPipeline ssaoTemporalPipeline_ = VK_NULL_HANDLE;
     VkPipelineLayout hizPipelineLayout_ = VK_NULL_HANDLE;
     VkPipeline hizPipeline_ = VK_NULL_HANDLE;
     VkPipeline colorDownsamplePipeline_ = VK_NULL_HANDLE; // reuses hizPipelineLayout_
@@ -628,6 +716,7 @@ private:
     VkShaderModule transparentGtFrag_ = VK_NULL_HANDLE;
     VkShaderModule ssaoComp_ = VK_NULL_HANDLE;
     VkShaderModule ssaoBlurComp_ = VK_NULL_HANDLE;
+    VkShaderModule ssaoTemporalComp_ = VK_NULL_HANDLE;
     VkShaderModule hizDownsampleComp_ = VK_NULL_HANDLE;
     VkShaderModule colorDownsampleComp_ = VK_NULL_HANDLE;
     VkShaderModule ssrOpaqueComp_ = VK_NULL_HANDLE;

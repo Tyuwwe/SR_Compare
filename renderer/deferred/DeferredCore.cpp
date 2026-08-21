@@ -143,6 +143,7 @@ bool DeferredCore::init(const VulkanContext& ctx, const char* envMapPath) {
         !loadShader(ctx, "transparent_gt.frag.spv", transparentGtFrag_) ||
         !loadShader(ctx, "ssao.comp.spv", ssaoComp_) ||
         !loadShader(ctx, "ssao_blur.comp.spv", ssaoBlurComp_) ||
+        !loadShader(ctx, "ssao_temporal.comp.spv", ssaoTemporalComp_) ||
         !loadShader(ctx, "hiz_downsample.comp.spv", hizDownsampleComp_) ||
         !loadShader(ctx, "color_downsample.comp.spv", colorDownsampleComp_) ||
         !loadShader(ctx, "ssr_opaque.comp.spv", ssrOpaqueComp_) ||
@@ -257,7 +258,8 @@ bool DeferredCore::createLayouts(const VulkanContext& ctx) {
                                     &transparentSetLayout_) != VK_SUCCESS)
         return false;
 
-    // GTAO: binding 0 = depth, 1 = normal (samplers), 2 = working RG16F (storage).
+    // GTAO: binding 0 = AO depth chain (view-Z mips, GENERAL), 1 = normal
+    // (samplers), 2 = working RG16F (storage).
     VkDescriptorSetLayoutBinding ssaoBindings[3] = {};
     for (uint32_t i = 0; i < 3; ++i) {
         ssaoBindings[i].binding = i;
@@ -272,6 +274,25 @@ bool DeferredCore::createLayouts(const VulkanContext& ctx) {
     ssaoLayoutCi.pBindings = ssaoBindings;
     if (vkCreateDescriptorSetLayout(ctx.device, &ssaoLayoutCi, nullptr, &ssaoSetLayout_) !=
         VK_SUCCESS)
+        return false;
+
+    // GTAO temporal accumulation: binding 0 = raw AO (sampler), 1 = history
+    // read (sampler, GENERAL), 2 = history write (storage), 3 = GBuffer depth
+    // (sampler, for the reprojection world-position reconstruction).
+    VkDescriptorSetLayoutBinding ssaoTemporalBindings[4] = {};
+    for (uint32_t i = 0; i < 4; ++i) {
+        ssaoTemporalBindings[i].binding = i;
+        ssaoTemporalBindings[i].descriptorCount = 1;
+        ssaoTemporalBindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        ssaoTemporalBindings[i].descriptorType =
+            i == 2 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    }
+    VkDescriptorSetLayoutCreateInfo ssaoTemporalLayoutCi = {};
+    ssaoTemporalLayoutCi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    ssaoTemporalLayoutCi.bindingCount = 4;
+    ssaoTemporalLayoutCi.pBindings = ssaoTemporalBindings;
+    if (vkCreateDescriptorSetLayout(ctx.device, &ssaoTemporalLayoutCi, nullptr,
+                                    &ssaoTemporalSetLayout_) != VK_SUCCESS)
         return false;
 
     // GTAO denoise / bloom: binding 0 = src (sampler), 1 = dst (storage).
@@ -656,7 +677,7 @@ bool DeferredCore::createPipelines(const VulkanContext& ctx) {
     if (createGraphicsPipeline(ctx, transparentCi, transparentGtPipeline_) != VK_SUCCESS)
         return false;
 
-    // --- GTAO compute passes (main + 5x5 bilateral denoise) --------------------
+    // --- GTAO compute passes (main + temporal accumulation + 5x5 denoise) ------
     VkPushConstantRange ssaoPushRange = {};
     ssaoPushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     ssaoPushRange.offset = 0;
@@ -679,6 +700,20 @@ bool DeferredCore::createPipelines(const VulkanContext& ctx) {
                                &ssaoBlurPipelineLayout_) != VK_SUCCESS)
         return false;
 
+    VkPushConstantRange ssaoTemporalPushRange = {};
+    ssaoTemporalPushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    ssaoTemporalPushRange.offset = 0;
+    ssaoTemporalPushRange.size = sizeof(SsaoTemporalPush);
+    VkPipelineLayoutCreateInfo ssaoTemporalLayoutCi = {};
+    ssaoTemporalLayoutCi.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    ssaoTemporalLayoutCi.setLayoutCount = 1;
+    ssaoTemporalLayoutCi.pSetLayouts = &ssaoTemporalSetLayout_;
+    ssaoTemporalLayoutCi.pushConstantRangeCount = 1;
+    ssaoTemporalLayoutCi.pPushConstantRanges = &ssaoTemporalPushRange;
+    if (vkCreatePipelineLayout(ctx.device, &ssaoTemporalLayoutCi, nullptr,
+                               &ssaoTemporalPipelineLayout_) != VK_SUCCESS)
+        return false;
+
     VkComputePipelineCreateInfo ssaoCi = {};
     ssaoCi.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
     ssaoCi.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -692,8 +727,12 @@ bool DeferredCore::createPipelines(const VulkanContext& ctx) {
     ssaoCi.layout = ssaoBlurPipelineLayout_;
     if (createComputePipeline(ctx, ssaoCi, ssaoBlurPipeline_) != VK_SUCCESS)
         return false;
+    ssaoCi.stage.module = ssaoTemporalComp_;
+    ssaoCi.layout = ssaoTemporalPipelineLayout_;
+    if (createComputePipeline(ctx, ssaoCi, ssaoTemporalPipeline_) != VK_SUCCESS)
+        return false;
 
-    // --- Hi-Z downsample (per-mip max reduce) --------------------------------
+    // --- Hi-Z downsample (per-mip reduce; max for SSR, XeGTAO filter for AO) ---
     VkPushConstantRange hizPushRange = {};
     hizPushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     hizPushRange.offset = 0;
@@ -886,6 +925,7 @@ void DeferredCore::destroy(const VulkanContext& ctx) {
     if (transparentGtPipeline_) { vkDestroyPipeline(ctx.device, transparentGtPipeline_, nullptr); transparentGtPipeline_ = VK_NULL_HANDLE; }
     if (ssaoPipeline_) { vkDestroyPipeline(ctx.device, ssaoPipeline_, nullptr); ssaoPipeline_ = VK_NULL_HANDLE; }
     if (ssaoBlurPipeline_) { vkDestroyPipeline(ctx.device, ssaoBlurPipeline_, nullptr); ssaoBlurPipeline_ = VK_NULL_HANDLE; }
+    if (ssaoTemporalPipeline_) { vkDestroyPipeline(ctx.device, ssaoTemporalPipeline_, nullptr); ssaoTemporalPipeline_ = VK_NULL_HANDLE; }
     if (hizPipeline_) { vkDestroyPipeline(ctx.device, hizPipeline_, nullptr); hizPipeline_ = VK_NULL_HANDLE; }
     if (colorDownsamplePipeline_) { vkDestroyPipeline(ctx.device, colorDownsamplePipeline_, nullptr); colorDownsamplePipeline_ = VK_NULL_HANDLE; }
     if (ssrPipeline_) { vkDestroyPipeline(ctx.device, ssrPipeline_, nullptr); ssrPipeline_ = VK_NULL_HANDLE; }
@@ -900,6 +940,7 @@ void DeferredCore::destroy(const VulkanContext& ctx) {
     if (transparentPipelineLayout_) { vkDestroyPipelineLayout(ctx.device, transparentPipelineLayout_, nullptr); transparentPipelineLayout_ = VK_NULL_HANDLE; }
     if (ssaoPipelineLayout_) { vkDestroyPipelineLayout(ctx.device, ssaoPipelineLayout_, nullptr); ssaoPipelineLayout_ = VK_NULL_HANDLE; }
     if (ssaoBlurPipelineLayout_) { vkDestroyPipelineLayout(ctx.device, ssaoBlurPipelineLayout_, nullptr); ssaoBlurPipelineLayout_ = VK_NULL_HANDLE; }
+    if (ssaoTemporalPipelineLayout_) { vkDestroyPipelineLayout(ctx.device, ssaoTemporalPipelineLayout_, nullptr); ssaoTemporalPipelineLayout_ = VK_NULL_HANDLE; }
     if (hizPipelineLayout_) { vkDestroyPipelineLayout(ctx.device, hizPipelineLayout_, nullptr); hizPipelineLayout_ = VK_NULL_HANDLE; }
     if (ssrPipelineLayout_) { vkDestroyPipelineLayout(ctx.device, ssrPipelineLayout_, nullptr); ssrPipelineLayout_ = VK_NULL_HANDLE; }
     if (bloomPipelineLayout_) { vkDestroyPipelineLayout(ctx.device, bloomPipelineLayout_, nullptr); bloomPipelineLayout_ = VK_NULL_HANDLE; }
@@ -915,6 +956,7 @@ void DeferredCore::destroy(const VulkanContext& ctx) {
     if (transparentGtFrag_) { vkDestroyShaderModule(ctx.device, transparentGtFrag_, nullptr); transparentGtFrag_ = VK_NULL_HANDLE; }
     if (ssaoComp_) { vkDestroyShaderModule(ctx.device, ssaoComp_, nullptr); ssaoComp_ = VK_NULL_HANDLE; }
     if (ssaoBlurComp_) { vkDestroyShaderModule(ctx.device, ssaoBlurComp_, nullptr); ssaoBlurComp_ = VK_NULL_HANDLE; }
+    if (ssaoTemporalComp_) { vkDestroyShaderModule(ctx.device, ssaoTemporalComp_, nullptr); ssaoTemporalComp_ = VK_NULL_HANDLE; }
     if (hizDownsampleComp_) { vkDestroyShaderModule(ctx.device, hizDownsampleComp_, nullptr); hizDownsampleComp_ = VK_NULL_HANDLE; }
     if (colorDownsampleComp_) { vkDestroyShaderModule(ctx.device, colorDownsampleComp_, nullptr); colorDownsampleComp_ = VK_NULL_HANDLE; }
     if (ssrOpaqueComp_) { vkDestroyShaderModule(ctx.device, ssrOpaqueComp_, nullptr); ssrOpaqueComp_ = VK_NULL_HANDLE; }
@@ -931,6 +973,7 @@ void DeferredCore::destroy(const VulkanContext& ctx) {
     if (transparentSetLayout_) { vkDestroyDescriptorSetLayout(ctx.device, transparentSetLayout_, nullptr); transparentSetLayout_ = VK_NULL_HANDLE; }
     if (ssaoSetLayout_) { vkDestroyDescriptorSetLayout(ctx.device, ssaoSetLayout_, nullptr); ssaoSetLayout_ = VK_NULL_HANDLE; }
     if (ssaoBlurSetLayout_) { vkDestroyDescriptorSetLayout(ctx.device, ssaoBlurSetLayout_, nullptr); ssaoBlurSetLayout_ = VK_NULL_HANDLE; }
+    if (ssaoTemporalSetLayout_) { vkDestroyDescriptorSetLayout(ctx.device, ssaoTemporalSetLayout_, nullptr); ssaoTemporalSetLayout_ = VK_NULL_HANDLE; }
     if (hizSetLayout_) { vkDestroyDescriptorSetLayout(ctx.device, hizSetLayout_, nullptr); hizSetLayout_ = VK_NULL_HANDLE; }
     if (ssrSetLayout_) { vkDestroyDescriptorSetLayout(ctx.device, ssrSetLayout_, nullptr); ssrSetLayout_ = VK_NULL_HANDLE; }
     if (exposureSetLayout_) { vkDestroyDescriptorSetLayout(ctx.device, exposureSetLayout_, nullptr); exposureSetLayout_ = VK_NULL_HANDLE; }
@@ -1379,12 +1422,13 @@ void DeferredCore::writeTransparentSet(const VulkanContext& ctx, VkDescriptorSet
     vkUpdateDescriptorSets(ctx.device, n, w, 0, nullptr);
 }
 
-void DeferredCore::writeSsaoSet(const VulkanContext& ctx, VkDescriptorSet set, VkImageView depth,
-                                VkImageView normal, VkImageView aoRaw) const {
+void DeferredCore::writeSsaoSet(const VulkanContext& ctx, VkDescriptorSet set,
+                                VkImageView depthChain, VkImageView normal,
+                                VkImageView aoRaw) const {
     VkDescriptorImageInfo img[3] = {};
-    img[0].sampler = gbufferSampler_;
-    img[0].imageView = depth;
-    img[0].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    img[0].sampler = hizSampler_; // texelFetch with explicit lod on the view-Z chain
+    img[0].imageView = depthChain;
+    img[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL; // pyramid images are GENERAL for life
     img[1].sampler = gbufferSampler_;
     img[1].imageView = normal;
     img[1].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
@@ -1405,49 +1449,58 @@ void DeferredCore::writeSsaoSet(const VulkanContext& ctx, VkDescriptorSet set, V
     vkUpdateDescriptorSets(ctx.device, 3, w, 0, nullptr);
 }
 
-void DeferredCore::writeSsaoBlurSet(const VulkanContext& ctx, VkDescriptorSet set,
-                                    VkImageView aoRaw, VkImageView ao) const {
-    VkDescriptorImageInfo img[2] = {};
-    img[0].sampler = gbufferSampler_;
-    img[0].imageView = aoRaw;
-    img[0].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    img[1].sampler = VK_NULL_HANDLE;
-    img[1].imageView = ao;
-    img[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-
-    VkWriteDescriptorSet w[2] = {};
-    w[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    w[0].dstSet = set;
-    w[0].dstBinding = 0;
-    w[0].descriptorCount = 1;
-    w[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    w[0].pImageInfo = &img[0];
-    w[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    w[1].dstSet = set;
-    w[1].dstBinding = 1;
-    w[1].descriptorCount = 1;
-    w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    w[1].pImageInfo = &img[1];
-    vkUpdateDescriptorSets(ctx.device, 2, w, 0, nullptr);
-}
-
 void DeferredCore::recordSsaoPass(VkCommandBuffer cmd, VkDescriptorSet ssaoSet,
-                                  const Mat4& viewProj, uint32_t frameIndex, uint32_t width,
+                                  const Mat4& invViewProj, uint32_t frameIndex, float nearZ,
+                                  float farZ, float maxMipLod, uint32_t width,
                                   uint32_t height) const {
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ssaoPipeline_);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ssaoPipelineLayout_, 0, 1,
                             &ssaoSet, 0, nullptr);
     SsaoPush push;
-    std::memcpy(push.viewProj, viewProj.m, sizeof(push.viewProj));
+    std::memcpy(push.invViewProj, invViewProj.m, sizeof(push.invViewProj));
     push.params[0] = kSsaoRadius;
-    push.params[1] = 0.f;
-    push.params[2] = 0.f;
-    push.params[3] = kSsaoPower;
+    push.params[1] = kSsaoPower;
+    // Non-reversed perspective unpack: viewZ = mul / (add - ndcDepth), the
+    // inverse of d = far*(z-near) / (z*(far-near)).
+    push.params[2] = nearZ * farZ / (farZ - nearZ);
+    push.params[3] = farZ / (farZ - nearZ);
     push.params2[0] = static_cast<float>(frameIndex);
-    push.params2[1] = push.params2[2] = push.params2[3] = 0.f;
+    push.params2[1] = maxMipLod;
+    push.params2[2] = farZ;
+    push.params2[3] = 0.f;
     vkCmdPushConstants(cmd, ssaoPipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push),
                        &push);
     vkCmdDispatch(cmd, (width + 7) / 8, (height + 7) / 8, 1);
+}
+
+void DeferredCore::recordSsaoTemporalPass(VkCommandBuffer cmd, const AoHistory& history,
+                                          uint32_t writeIndex, const Mat4& invViewProj,
+                                          const Mat4& prevViewProj, uint32_t width,
+                                          uint32_t height, bool reset) const {
+    if (!history.image[0]) return;
+    const uint32_t i = writeIndex & 1u;
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ssaoTemporalPipeline_);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ssaoTemporalPipelineLayout_, 0, 1,
+                            &history.temporalSet[i], 0, nullptr);
+    // WAR: last frame's blur (and the temporal read two frames ago) sampled
+    // this buffer before it becomes the storage target again.  Same-layout
+    // barrier; the buffers are GENERAL for life.
+    imageBarrier(cmd, history.image[i], VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+                 sync::kCompute, sync::kSampled, sync::kCompute, sync::kStorageWrite,
+                 VK_IMAGE_ASPECT_COLOR_BIT, 0, 1);
+    SsaoTemporalPush push;
+    std::memcpy(push.invViewProj, invViewProj.m, sizeof(push.invViewProj));
+    std::memcpy(push.prevViewProj, prevViewProj.m, sizeof(push.prevViewProj));
+    push.params[0] = kSsaoTemporalBlend;
+    push.params[1] = reset ? 1.f : 0.f;
+    push.params[2] = push.params[3] = 0.f;
+    vkCmdPushConstants(cmd, ssaoTemporalPipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                       sizeof(push), &push);
+    vkCmdDispatch(cmd, (width + 7) / 8, (height + 7) / 8, 1);
+    // This frame's blur samples the just-written buffer.
+    imageBarrier(cmd, history.image[i], VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+                 sync::kCompute, sync::kStorageWrite, sync::kCompute, sync::kSampled,
+                 VK_IMAGE_ASPECT_COLOR_BIT, 0, 1);
 }
 
 void DeferredCore::recordSsaoBlurPass(VkCommandBuffer cmd, VkDescriptorSet blurSet, uint32_t width,
@@ -1456,6 +1509,98 @@ void DeferredCore::recordSsaoBlurPass(VkCommandBuffer cmd, VkDescriptorSet blurS
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ssaoBlurPipelineLayout_, 0, 1,
                             &blurSet, 0, nullptr);
     vkCmdDispatch(cmd, (width + 7) / 8, (height + 7) / 8, 1);
+}
+
+bool DeferredCore::createAoHistory(const VulkanContext& ctx, uint32_t w, uint32_t h,
+                                   AoHistory& out) const {
+    out.width = w;
+    out.height = h;
+    for (uint32_t i = 0; i < 2; ++i) {
+        if (createImage(ctx, w, h, kAoRawFormat,
+                        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, out.image[i],
+                        out.memory[i], 1) != VK_SUCCESS)
+            return false;
+        out.view[i] = createImageView(ctx, out.image[i], kAoRawFormat, VK_IMAGE_ASPECT_COLOR_BIT,
+                                      0, 1);
+        if (!out.view[i]) return false;
+    }
+    // GENERAL for life (same model as the depth pyramids): each buffer
+    // ping-pongs between temporal storage writes and temporal/blur reads.
+    submitOneShot(ctx, [&](VkCommandBuffer cmd) {
+        for (uint32_t i = 0; i < 2; ++i)
+            imageBarrier(cmd, out.image[i], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                         VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                         VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, VK_IMAGE_ASPECT_COLOR_BIT, 0, 1);
+    });
+    return true;
+}
+
+bool DeferredCore::writeAoHistorySets(const VulkanContext& ctx, VkDescriptorPool pool,
+                                      VkImageView aoRaw, VkImageView depth, VkImageView aoOut,
+                                      AoHistory& out) const {
+    for (uint32_t i = 0; i < 2; ++i) {
+        VkDescriptorSetAllocateInfo alloc = {};
+        alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        alloc.descriptorPool = pool;
+        alloc.descriptorSetCount = 1;
+        alloc.pSetLayouts = &ssaoTemporalSetLayout_;
+        if (vkAllocateDescriptorSets(ctx.device, &alloc, &out.temporalSet[i]) != VK_SUCCESS)
+            return false;
+        alloc.pSetLayouts = &ssaoBlurSetLayout_;
+        if (vkAllocateDescriptorSets(ctx.device, &alloc, &out.blurSet[i]) != VK_SUCCESS)
+            return false;
+
+        VkDescriptorImageInfo img[6] = {};
+        // temporal: raw AO + history read (the OTHER buffer) + GBuffer depth
+        img[0].sampler = gbufferSampler_;
+        img[0].imageView = aoRaw;
+        img[0].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        img[1].sampler = gbufferSampler_;
+        img[1].imageView = out.view[1 - i];
+        img[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        img[2].imageView = out.view[i]; // history write (storage)
+        img[2].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        img[3].sampler = gbufferSampler_;
+        img[3].imageView = depth;
+        img[3].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        // blur: accumulated history -> the path's filtered AO target
+        img[4].sampler = gbufferSampler_;
+        img[4].imageView = out.view[i];
+        img[4].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        img[5].imageView = aoOut;
+        img[5].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+        VkWriteDescriptorSet w[6] = {};
+        for (uint32_t k = 0; k < 6; ++k) {
+            w[k].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            w[k].dstSet = k < 4 ? out.temporalSet[i] : out.blurSet[i];
+            w[k].dstBinding = k < 4 ? k : k - 4;
+            w[k].descriptorCount = 1;
+            w[k].descriptorType = (k == 2 || k == 5) ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
+                                                     : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            w[k].pImageInfo = &img[k];
+        }
+        vkUpdateDescriptorSets(ctx.device, 6, w, 0, nullptr);
+    }
+    return true;
+}
+
+void DeferredCore::destroyAoHistory(const VulkanContext& ctx, AoHistory& history) const {
+    for (uint32_t i = 0; i < 2; ++i) {
+        if (history.view[i]) {
+            vkDestroyImageView(ctx.device, history.view[i], nullptr);
+            history.view[i] = VK_NULL_HANDLE;
+        }
+        if (history.image[i]) {
+            vmaDestroyImage(ctx.allocator, history.image[i], history.memory[i]);
+            history.image[i] = VK_NULL_HANDLE;
+            history.memory[i] = VK_NULL_HANDLE;
+        }
+    }
+    history.temporalSet[0] = history.temporalSet[1] = VK_NULL_HANDLE; // pool-owned
+    history.blurSet[0] = history.blurSet[1] = VK_NULL_HANDLE;
+    history.width = history.height = 0;
 }
 
 // --- Hi-Z depth pyramid -------------------------------------------------------
@@ -1470,10 +1615,26 @@ uint32_t DeferredCore::depthPyramidMipCount(uint32_t w, uint32_t h) {
 }
 
 bool DeferredCore::createDepthPyramid(const VulkanContext& ctx, uint32_t w, uint32_t h,
-                                      DepthPyramid& out) const {
+                                      DepthPyramid& out, bool aoFilter, float nearZ,
+                                      float farZ) const {
     out.width = w;
     out.height = h;
     out.mipCount = depthPyramidMipCount(w, h);
+    out.aoFilter = aoFilter;
+    if (aoFilter) {
+        // viewZ = mul / (add - ndcDepth); same unpack as SsaoPush.
+        out.depthUnpack[0] = nearZ * farZ / (farZ - nearZ);
+        out.depthUnpack[1] = farZ / (farZ - nearZ);
+        // XeGTAO_DepthMIPFilter falloff (depthRangeScaleFactor 0.75, "found
+        // empirically"): weights fade out texels closer than the far surface
+        // by more than the effect falloff.
+        const float effectRadius =
+            kSsaoDepthMipRangeScale * kSsaoRadius * kSsaoRadiusMultiplier;
+        const float falloffRange = kSsaoFalloffRange * effectRadius;
+        const float falloffFrom = effectRadius * (1.0f - kSsaoFalloffRange);
+        out.falloff[0] = -1.0f / falloffRange;
+        out.falloff[1] = falloffFrom / falloffRange + 1.0f;
+    }
     if (createImage(ctx, w, h, kDepthPyramidFormat,
                     VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, out.image,
                     out.memory, out.mipCount) != VK_SUCCESS)
@@ -1578,9 +1739,15 @@ void DeferredCore::recordDepthPyramidPass(VkCommandBuffer cmd, const DepthPyrami
         }
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, hizPipelineLayout_, 0, 1,
                                 &pyramid.sets[level], 0, nullptr);
-        HiZPush push;
+        HiZPush push = {};
         push.srcSize[0] = static_cast<int32_t>(srcW);
         push.srcSize[1] = static_cast<int32_t>(srcH);
+        push.aoFilter = pyramid.aoFilter ? 1 : 0;
+        push.level = static_cast<int32_t>(level);
+        push.depthUnpack[0] = pyramid.depthUnpack[0];
+        push.depthUnpack[1] = pyramid.depthUnpack[1];
+        push.falloff[0] = pyramid.falloff[0];
+        push.falloff[1] = pyramid.falloff[1];
         vkCmdPushConstants(cmd, hizPipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push),
                            &push);
         const uint32_t dstW = std::max(1u, pyramid.width >> level);
@@ -1711,7 +1878,9 @@ void DeferredCore::recordColorPyramidPass(VkCommandBuffer cmd, const ColorPyrami
         }
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, hizPipelineLayout_, 0, 1,
                                 &pyramid.sets[level], 0, nullptr);
-        HiZPush push;
+        // Only srcSize is read by color_downsample.comp; zero the rest of the
+        // (now wider) HiZPush so no uninitialised bytes are pushed.
+        HiZPush push = {};
         push.srcSize[0] = static_cast<int32_t>(srcW);
         push.srcSize[1] = static_cast<int32_t>(srcH);
         vkCmdPushConstants(cmd, hizPipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push),
@@ -1813,7 +1982,28 @@ void DeferredCore::recordSsrPass(VkCommandBuffer cmd, VkDescriptorSet ssrSet,
 
 void DeferredCore::writeBloomSet(const VulkanContext& ctx, VkDescriptorSet set, VkImageView src,
                                  VkImageView dst) const {
-    writeSsaoBlurSet(ctx, set, src, dst);
+    VkDescriptorImageInfo img[2] = {};
+    img[0].sampler = gbufferSampler_;
+    img[0].imageView = src;
+    img[0].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    img[1].sampler = VK_NULL_HANDLE;
+    img[1].imageView = dst;
+    img[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+    VkWriteDescriptorSet w[2] = {};
+    w[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    w[0].dstSet = set;
+    w[0].dstBinding = 0;
+    w[0].descriptorCount = 1;
+    w[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    w[0].pImageInfo = &img[0];
+    w[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    w[1].dstSet = set;
+    w[1].dstBinding = 1;
+    w[1].descriptorCount = 1;
+    w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    w[1].pImageInfo = &img[1];
+    vkUpdateDescriptorSets(ctx.device, 2, w, 0, nullptr);
 }
 
 void DeferredCore::recordBloomPass(VkCommandBuffer cmd, VkDescriptorSet extractSet,
