@@ -159,6 +159,19 @@ private:
     Mat4 prevAoViewProjGt_ = Mat4::identity();
     uint32_t aoFramesGb_ = 0;
     uint32_t aoFramesGt_ = 0;
+    // Opaque SSR temporal state (Phase 2d), one per path: full-res trace
+    // target (rgb = composite delta, a = view |z|) + RGBA16F ping-pong
+    // history.  Per-path previous-frame view-projection (jittered for LR) and
+    // frame counters drive the temporal pass; a zero counter resets the
+    // history.  Same conventions as the GTAO temporal state above.
+    ImageResource gbSsrTrace_;
+    ImageResource gtSsrTrace_;
+    SsrHistory gbSsrHist_;
+    SsrHistory gtSsrHist_;
+    Mat4 prevSsrViewProjGb_ = Mat4::identity();
+    Mat4 prevSsrViewProjGt_ = Mat4::identity();
+    uint32_t ssrFramesGb_ = 0;
+    uint32_t ssrFramesGt_ = 0;
 
     // Shared deferred pipeline (shaders/layouts/pipelines/samplers + IBL maps).
     DeferredCore deferred_;

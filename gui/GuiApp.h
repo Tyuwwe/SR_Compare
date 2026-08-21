@@ -549,6 +549,23 @@ private:
     uint32_t aoFramesGb_ = 0;
     uint32_t aoFramesGt_ = 0;
     uint32_t aoFramesSsaa_ = 0;
+    // Opaque SSR temporal state (Phase 2d), one per path: full-res trace
+    // target (rgb = composite delta, a = view |z|) + RGBA16F ping-pong
+    // history; per-path previous-frame view-projection and frame counters
+    // drive the temporal pass (zero counter = reset).  Same conventions as
+    // the GTAO temporal state above.
+    ImageResource gbSsrTrace_;
+    ImageResource gtSsrTrace_;
+    ImageResource gtSsaaSsrTrace_; // compare GT SSAA only
+    SsrHistory gbSsrHist_;
+    SsrHistory gtSsrHist_;
+    SsrHistory gtSsaaSsrHist_; // compare GT SSAA only
+    Mat4 prevSsrViewProjGb_ = Mat4::identity();
+    Mat4 prevSsrViewProjGt_ = Mat4::identity();
+    Mat4 prevSsrViewProjSsaa_ = Mat4::identity();
+    uint32_t ssrFramesGb_ = 0;
+    uint32_t ssrFramesGt_ = 0;
+    uint32_t ssrFramesSsaa_ = 0;
     ImageResource composeImage_; // RGBA8 composite; presentation + screenshot source
     ImageResource uiShotImage_;  // BGRA8 debug screenshot target incl. ImGui
     VkImageLayout uiShotLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -626,6 +643,9 @@ private:
     VkImageLayout gtAoLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gtSsaaAoRawLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gtSsaaAoLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageLayout gbSsrTraceLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageLayout gtSsrTraceLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageLayout gtSsaaSsrTraceLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout composeLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
 
     VkBuffer materialUbo_ = VK_NULL_HANDLE;

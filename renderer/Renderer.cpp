@@ -270,6 +270,17 @@ bool Renderer::createRenderTargets() {
         return false;
     if (!deferred_.createAoHistory(ctx_, dw, dh, gtAoHist_))
         return false;
+    // Opaque SSR trace targets + temporal history (Phase 2d), one per path.
+    const VkImageUsageFlags ssrUsage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    if (!createRT(gbSsrTrace_, renderWidth_, renderHeight_, kSsrTraceFormat, ssrUsage,
+                  VK_IMAGE_ASPECT_COLOR_BIT))
+        return false;
+    if (!createRT(gtSsrTrace_, dw, dh, kSsrTraceFormat, ssrUsage, VK_IMAGE_ASPECT_COLOR_BIT))
+        return false;
+    if (!deferred_.createSsrHistory(ctx_, renderWidth_, renderHeight_, gbSsrHist_))
+        return false;
+    if (!deferred_.createSsrHistory(ctx_, dw, dh, gtSsrHist_))
+        return false;
     // Color mip chains for roughness-aware SSR (mip 0 = the lit-color copy).
     if (!deferred_.createColorPyramid(ctx_, renderWidth_, renderHeight_, gbColorPyramid_))
         return false;
@@ -330,23 +341,25 @@ bool Renderer::createSceneDescriptors() {
     sizes[0].descriptorCount = deferred::kMaxTextures + 1 + // texture array + present
                                11 * kFramesInFlight * 2 + // lighting sets (GB/GT), +1 shadow map
                                7 * kFramesInFlight * 2 +  // transparent sets (GB/GT), +SSR+shadow
-                               9 * kFramesInFlight * 2 +  // opaque-SSR sets (GB/GT)
+                               9 * kFramesInFlight * 2 +  // opaque-SSR trace sets (GB/GT)
                                2 * 2 + 3 * 4 + 1 * 4 +     // ssao + temporal + blur samplers
-                               8 +                        // bloom extract/blur/comp (GB/GT)
-                               1 +                        // auto-exposure HDR source
+                               3 * 4 +                     // ssr temporal samplers (GB/GT x2 sets)
+                               8 +                         // bloom extract/blur/comp (GB/GT)
+                               1 +                         // auto-exposure HDR source
                                hizSets + colorSets;
     sizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     sizes[1].descriptorCount = kFramesInFlight * 6; // scene + lighting + 2 transparent + 2 SSR UBOs
     sizes[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
     sizes[2].descriptorCount = kFramesInFlight;
     sizes[3].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    // ssao raw + temporal history + blur (GB/GT) + pyramid mips + SSR in-place color targets
-    sizes[3].descriptorCount = 10 + 8 + hizSets + colorSets + kFramesInFlight * 2;
+    // ssao raw + temporal history + blur (GB/GT) + pyramid mips + SSR trace
+    // targets + SSR temporal history write / scene-color RMW (GB/GT x2 sets)
+    sizes[3].descriptorCount = 10 + 8 + hizSets + colorSets + kFramesInFlight * 2 + 8;
     sizes[4].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     sizes[4].descriptorCount = 2; // auto-exposure histogram + state
     VkDescriptorPoolCreateInfo poolCi = {};
     poolCi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    poolCi.maxSets = kFramesInFlight * 7 + 12 + 8 + hizSets + colorSets + 1; // +12 ssao/temporal/blur, +8 bloom, +1 auto-exposure
+    poolCi.maxSets = kFramesInFlight * 7 + 12 + 8 + hizSets + colorSets + 1 + 4; // +12 ssao/temporal/blur, +8 bloom, +1 auto-exposure, +4 ssr temporal
     poolCi.poolSizeCount = 5;
     poolCi.pPoolSizes = sizes;
     if (vkCreateDescriptorPool(ctx_.device, &poolCi, nullptr, &descriptorPool_) != VK_SUCCESS)
@@ -629,10 +642,10 @@ bool Renderer::createSyncResources() {
             return false;
         deferred_.writeSsrSet(ctx_, frames_[i].ssrSetGb, frames_[i].lightingUbo, gbAlbedo_.view,
                               gbNormal_.view, gbMaterial_.view, gbDepth_.view, gbAo_.view,
-                              gbColorPyramid_.chainView, gbPyramid_.chainView, gbColor_.view);
+                              gbColorPyramid_.chainView, gbPyramid_.chainView, gbSsrTrace_.view);
         deferred_.writeSsrSet(ctx_, frames_[i].ssrSetGt, frames_[i].lightingUbo, gtAlbedo_.view,
                               gtNormal_.view, gtMaterial_.view, gtDepth_.view, gtAo_.view,
-                              gtColorPyramid_.chainView, gtPyramid_.chainView, finalImage_.view);
+                              gtColorPyramid_.chainView, gtPyramid_.chainView, gtSsrTrace_.view);
     }
 
     // SSAO sets (static bindings; per-frame data goes through push constants).
@@ -654,6 +667,12 @@ bool Renderer::createSyncResources() {
             return false;
         if (!deferred_.writeAoHistorySets(ctx_, descriptorPool_, gtAoRaw_.view, gtDepth_.view,
                                           gtAo_.view, gtAoHist_))
+            return false;
+        if (!deferred_.writeSsrHistorySets(ctx_, descriptorPool_, gbSsrTrace_.view,
+                                           gbDepth_.view, gbColor_.view, gbSsrHist_))
+            return false;
+        if (!deferred_.writeSsrHistorySets(ctx_, descriptorPool_, gtSsrTrace_.view,
+                                           gtDepth_.view, finalImage_.view, gtSsrHist_))
             return false;
     }
 
@@ -1021,13 +1040,27 @@ void Renderer::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                    sync::kColorAttach, sync::kColorWrite, sync::kCompute, sync::kSampled);
         deferred_.recordColorPyramidPass(cmd, gbuffer ? gbColorPyramid_ : gtColorPyramid_);
         if (opts_.ssr) {
-            // Opaque SSR (ssr_opaque.comp): Hi-Z march per pixel, composited
-            // in place on the lit target (GENERAL RMW); it replaces the IBL
-            // specular term instead of stacking on it.
-            transition(litTarget, VK_IMAGE_LAYOUT_GENERAL,
-                       sync::kCompute, sync::kSampled, sync::kCompute, sync::kStorageReadWrite);
+            // Opaque SSR, Phase 2d: trace into the path's full-res RT (rgb =
+            // composite delta, a = view |z|), then the temporal pass EMA-
+            // accumulates the delta and fuses the composite (in-place RMW add
+            // on the lit target) — first frame equals the old in-place pass.
+            ImageResource& ssrTrace = gbuffer ? gbSsrTrace_ : gtSsrTrace_;
+            SsrHistory& ssrHist = gbuffer ? gbSsrHist_ : gtSsrHist_;
+            Mat4& prevSsrVp = gbuffer ? prevSsrViewProjGb_ : prevSsrViewProjGt_;
+            uint32_t& ssrFrames = gbuffer ? ssrFramesGb_ : ssrFramesGt_;
+            transition(ssrTrace, VK_IMAGE_LAYOUT_GENERAL,
+                       sync::kCompute, sync::kSampled, sync::kCompute, sync::kStorageWrite);
             deferred_.recordSsrPass(cmd, gbuffer ? fr.ssrSetGb : fr.ssrSetGt, viewProjUsed,
                                     sceneW, sceneH);
+            transition(ssrTrace, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                       sync::kCompute, sync::kStorageWrite, sync::kCompute, sync::kSampled);
+            transition(litTarget, VK_IMAGE_LAYOUT_GENERAL,
+                       sync::kCompute, sync::kSampled, sync::kCompute, sync::kStorageReadWrite);
+            const uint32_t ssrWrite = ssrFrames & 1u;
+            deferred_.recordSsrTemporalPass(cmd, ssrHist, ssrWrite, invViewProjUsed, prevSsrVp,
+                                            sceneW, sceneH, /*reset=*/ssrFrames == 0);
+            prevSsrVp = viewProjUsed;
+            ++ssrFrames;
             transition(litTarget, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                        sync::kCompute, sync::kStorageWrite, sync::kColorAttach,
                        sync::kColorReadWrite);
@@ -1391,6 +1424,10 @@ void Renderer::shutdown() {
     deferred_.destroyDepthPyramid(ctx_, gtPyramidAo_);
     deferred_.destroyAoHistory(ctx_, gbAoHist_);
     deferred_.destroyAoHistory(ctx_, gtAoHist_);
+    deferred_.destroySsrHistory(ctx_, gbSsrHist_);
+    deferred_.destroySsrHistory(ctx_, gtSsrHist_);
+    gbSsrTrace_.destroy(ctx_);
+    gtSsrTrace_.destroy(ctx_);
     finalImage_.destroy(ctx_);
 
     if (shadowsActive_) { deferred_.destroyShadowTargets(ctx_, shadow_); shadowsActive_ = false; }
