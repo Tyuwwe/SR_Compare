@@ -19,22 +19,24 @@ VkSurfaceFormatKHR chooseFormat(const std::vector<VkSurfaceFormatKHR>& formats) 
     return formats[0];
 }
 
-VkPresentModeKHR choosePresentMode(const std::vector<VkPresentModeKHR>& modes, bool vsync) {
+VkPresentModeKHR choosePresentMode(const std::vector<VkPresentModeKHR>& modes, bool vsync,
+                                   bool allowMailbox) {
     const auto has = [&](VkPresentModeKHR m) {
         return std::find(modes.begin(), modes.end(), m) != modes.end();
     };
     if (!vsync) {
         if (has(VK_PRESENT_MODE_IMMEDIATE_KHR)) return VK_PRESENT_MODE_IMMEDIATE_KHR;
-        if (has(VK_PRESENT_MODE_MAILBOX_KHR)) return VK_PRESENT_MODE_MAILBOX_KHR;
-    } else {
-        if (has(VK_PRESENT_MODE_MAILBOX_KHR)) return VK_PRESENT_MODE_MAILBOX_KHR;
+        if (allowMailbox && has(VK_PRESENT_MODE_MAILBOX_KHR)) return VK_PRESENT_MODE_MAILBOX_KHR;
+    } else if (allowMailbox && has(VK_PRESENT_MODE_MAILBOX_KHR)) {
+        return VK_PRESENT_MODE_MAILBOX_KHR;
     }
     return VK_PRESENT_MODE_FIFO_KHR; // always available
 }
 
 } // namespace
 
-bool Swapchain::create(const VulkanContext& ctx, uint32_t width, uint32_t height, bool vsync) {
+bool Swapchain::create(const VulkanContext& ctx, uint32_t width, uint32_t height, bool vsync,
+                       bool allowMailbox) {
     VkSurfaceCapabilitiesKHR caps;
     if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(ctx.physicalDevice, ctx.surface, &caps) != VK_SUCCESS)
         return false;
@@ -70,7 +72,7 @@ bool Swapchain::create(const VulkanContext& ctx, uint32_t width, uint32_t height
     ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     ci.preTransform = caps.currentTransform;
     ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-    ci.presentMode = choosePresentMode(modes, vsync);
+    ci.presentMode = choosePresentMode(modes, vsync, allowMailbox);
     ci.clipped = VK_TRUE;
     ci.oldSwapchain = swapchain_;
 

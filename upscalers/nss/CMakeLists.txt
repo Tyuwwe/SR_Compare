@@ -4,7 +4,7 @@
 # without the DLL present.  The ML extensions (VK_ARM_tensors /
 # VK_ARM_data_graph) are provided on PC by Arm's ML Emulation Layer; see
 # run_with_nss.bat for the required runtime environment.
-add_library(upscaler_nss STATIC NssUpscaler.cpp)
+add_library(upscaler_nss STATIC NssUpscaler.cpp NfruFrameGen.cpp)
 sr_common_setup(upscaler_nss)
 target_compile_definitions(upscaler_nss PRIVATE SR_SHADER_DIR="${SR_SHADER_OUT_DIR}/")
 

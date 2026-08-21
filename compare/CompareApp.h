@@ -58,7 +58,7 @@ private:
     static constexpr uint32_t kMaxAlgos = 4;            // extra columns are truncated
     static constexpr uint32_t kMaxColumns = 1 + kMaxAlgos; // GT + algorithms
     static constexpr uint32_t kMetricFloats = 8;        // per-algorithm reduce record
-    static constexpr uint32_t kTextCharsPerColumn = 72; // 3 lines x 24 chars
+    static constexpr uint32_t kTextCharsPerColumn = 96; // 4 lines x 24 chars
 
     struct ImageResource {
         VkImage image = VK_NULL_HANDLE;

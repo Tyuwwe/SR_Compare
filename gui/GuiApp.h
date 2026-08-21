@@ -43,6 +43,7 @@
 #include "renderer/scene/SceneRegistry.h"
 
 #include "upscalers/IUpscaler.h"
+#include "upscalers/IFrameGen.h"
 
 #include <atomic>
 #include <chrono>
@@ -86,7 +87,7 @@ private:
     static constexpr uint32_t kMaxAlgos = 4;               // compare columns
     static constexpr uint32_t kMaxColumns = 1 + kMaxAlgos; // GT + algorithms
     static constexpr uint32_t kMetricFloats = 8;           // per-algo reduce record
-    static constexpr uint32_t kTextCharsPerColumn = 72;    // 3 lines x 24 chars
+    static constexpr uint32_t kTextCharsPerColumn = 96;    // 4 lines x 24 chars
     static constexpr uint32_t kMetricInterval = 15;        // frames between readbacks
     static constexpr uint32_t kHistoryLen = 240;           // PlotLines frame history
     static constexpr uint32_t kMaxRegistered = 16;         // UI checkbox capacity
@@ -143,8 +144,15 @@ private:
     struct AlgoColumn {
         std::string id;
         std::unique_ptr<IUpscaler> upscaler;
+        std::string fg; // empty / "fsr3" / "nfru"
+        std::unique_ptr<IFrameGen> frameGen;
         ImageResource output; // display-resolution RGBA16F
         VkImageLayout outputLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        ImageResource fgOutput; // interpolated display-res HDR
+        VkImageLayout fgOutputLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        VkDescriptorSet composeSetFg = VK_NULL_HANDLE;
+        bool fgHistory = false;
+        bool fgReady = false;
         VkBuffer blocksBuffer = VK_NULL_HANDLE;
         VkDeviceMemory blocksMemory = VK_NULL_HANDLE;
         VkDescriptorSet metricSet = VK_NULL_HANDLE;
@@ -161,7 +169,11 @@ private:
         float renderScale = 0.5f;
         uint32_t displayW = 1920;
         uint32_t displayH = 1080;
-        std::vector<std::string> algoNames; // viewer: 0 or 1; compare: up to 4
+        struct AlgoSpec {
+            std::string sr; // registered upscaler id
+            std::string fg; // empty, "fsr3", or "nfru"
+        };
+        std::vector<AlgoSpec> algos; // viewer: 0 or 1; compare: up to kMaxAlgos
         bool gtSsaa = false; // compare: GT rendered at 2x, downsampled
         // compare/viewer: GT rendered at the low input resolution
         // (renderWidth_ x renderHeight_), no AA, no upscale pass.  Mutually
@@ -178,7 +190,14 @@ private:
         int outputResIndex = 1; // index into kOutputResolutions
         char cameraPathFile[260] = {};
         int viewerUpscaler = 1; // 0 = native, 1..N = listUpscalers() entries
-        bool compareSelected[kMaxRegistered] = {};
+        int viewerFg = 0;       // 0 = none, 1 = FSR3, 2 = NFRU
+        struct CompareSlot {
+            int sr = 0; // index into upscalerNames_
+            int fg = 0; // 0 = none, 1 = FSR3, 2 = NFRU
+        };
+        std::vector<CompareSlot> compareSlots;
+        bool lockFps = true;
+        int lockFpsTarget = 30; // original (render) FPS, 15..120
         bool compareGtSsaa = false; // GT 200% SSAA reference (Reference section, instant)
         // GT (Apply scale) reference: GT rendered at the low input
         // resolution, no AA/upscale (Reference section, instant).
@@ -263,6 +282,16 @@ private:
     std::vector<Light> buildLightOverride() const;
     void updateCamera(float dt);
     void recordFrame(uint32_t frameIndex, uint32_t swapchainIndex);
+    // Compose columns into composeImage_ and copy to the swapchain with ImGui.
+    // preferGenerated: Viewer interpolator first present / Compare columns.
+    void recordComposePresent(VkCommandBuffer cmd, uint32_t swapchainIndex, bool preferGenerated);
+    void recordViewerTruePresent(uint32_t uiSlot, uint32_t swapchainIndex);
+    bool guiWantVsync() const;
+    bool guiAllowMailbox() const;
+    bool recreateGuiSwapchain();
+    void ensureGuiSwapchainMode();
+    void waitUntil(std::chrono::steady_clock::time_point t);
+    void noteDisplayPresents(int nPres, std::chrono::steady_clock::time_point frameStart);
     void captureScreenshotIntoStaging(VkCommandBuffer cmd);
     // Debug (SR_GUI_UI_SHOT=1): screenshot variant that includes the ImGui
     // overlay — re-renders the present block into a GUI-owned image whose
@@ -301,6 +330,14 @@ private:
     void drawViewerTab();
     void drawCompareTab();
     void drawBenchTab();
+    // Vendor-grouped upscaler combo. nativeIndex>=0 adds a "native" item.
+    // `index` is 0 = native when nativeIndex>=0, else 0 = first plugin.
+    bool drawGroupedUpscalerCombo(const char* label, int* index, bool includeNative);
+    void drawGroupedUpscalerCheckboxes(bool* selected, uint32_t count);
+    void drawFrameLockControls();
+    static const char* fgLabel(int fg); // 0 none / 1 FSR3 / 2 NFRU
+    static const char* fgId(int fg);    // empty / "fsr3" / "nfru"
+    int upscalerIndexById(const std::string& id) const;
     RenderConfig configFromUi(Mode mode) const;
     void requestRebuild(const RenderConfig& cfg);
     void applyRebuild();
@@ -316,7 +353,7 @@ private:
     //   targetsDirty — resolution/scale/gtSsaa/envMap changed: scene_ is
     //                  kept, everything else is rebuilt (worker still inits
     //                  the upscalers async, since DLSS/XeSS init is slow).
-    //   (neither)    — only algoNames/mode changed: fast path; the worker
+    //   (neither)    — only algos/mode changed: fast path; the worker
     //                  only initializes upscalers, finish swaps algos_ and
     //                  per-algo resources, scene/targets/descriptors persist.
     enum class LoadPhase { Idle, Loading, Ready, Failed };
@@ -388,6 +425,8 @@ private:
 
     Scene scene_;
     Camera camera_;
+    Camera prevCamera_;
+    bool havePrevCamera_ = false;
     CameraPath path_;
     bool pathPlaying_ = false;
     uint32_t pathFrame_ = 0;
@@ -543,6 +582,7 @@ private:
     VkDeviceMemory metricStagingMemory_[kFramesInFlight] = {};
     void* metricStagingMapped_[kFramesInFlight] = {};
     bool metricPending_[kFramesInFlight] = {};
+    uint32_t metricMask_[kFramesInFlight] = {};
 
     VkBuffer screenshotStaging_ = VK_NULL_HANDLE;
     VkDeviceMemory screenshotStagingMemory_ = VK_NULL_HANDLE;
@@ -565,6 +605,9 @@ private:
     uint32_t historyCount_ = 0;
     TimestampQuery::Timings lastTimings_;
     float fps_ = 0.f;
+    std::chrono::steady_clock::time_point fpsLockDeadline_{};
+    bool swapchainVsync_ = true;
+    bool swapchainMailbox_ = true;
     std::vector<TimestampQuery::Timings> frameTimesLog_; // for CSV export
 
     bool screenshotPending_ = false;

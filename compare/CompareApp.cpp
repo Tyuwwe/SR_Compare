@@ -1162,14 +1162,15 @@ void CompareApp::refreshOverlayText() {
         const uint32_t slot = i + 1;
         char line[25];
         writeLine(slot, 0, algo.upscaler->name());
+        writeLine(slot, 1, "FPS --");
         if (algo.hasMetric) {
             std::snprintf(line, sizeof(line), "PSNR %.2f dB", static_cast<double>(algo.psnr));
-            writeLine(slot, 1, line);
-            std::snprintf(line, sizeof(line), "SSIM %.4f", static_cast<double>(algo.ssim));
             writeLine(slot, 2, line);
+            std::snprintf(line, sizeof(line), "SSIM %.4f", static_cast<double>(algo.ssim));
+            writeLine(slot, 3, line);
         } else {
-            writeLine(slot, 1, "PSNR --");
-            writeLine(slot, 2, "SSIM --");
+            writeLine(slot, 2, "PSNR --");
+            writeLine(slot, 3, "SSIM --");
         }
     }
 }

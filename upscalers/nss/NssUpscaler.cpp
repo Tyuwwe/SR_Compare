@@ -50,6 +50,8 @@ using PFN_ffxDispatchDyn       = ffxReturnCode_t (*)(ffxContext*, const ffxDispa
 VkPhysicalDeviceTensorFeaturesARM g_tensorFeatures = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TENSOR_FEATURES_ARM};
 VkPhysicalDeviceDataGraphFeaturesARM g_dataGraphFeatures = {
     VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DATA_GRAPH_FEATURES_ARM};
+VkPhysicalDeviceDataGraphOpticalFlowFeaturesARM g_opticalFlowFeatures = {
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DATA_GRAPH_OPTICAL_FLOW_FEATURES_ARM};
 VkPhysicalDeviceShaderReplicatedCompositesFeaturesEXT g_replicatedCompositesFeatures = {
     VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_REPLICATED_COMPOSITES_FEATURES_EXT};
 bool g_featureChainInit = false;
@@ -62,7 +64,7 @@ bool nssRequestedOnCommandLine() {
     static const bool requested = sr::cmdline::pluginRequested("nss");
     // GUI mode flips the global override before device creation; the cached
     // command-line result alone would leave nss unavailable there.
-    return allPluginsEnabled() || requested;
+    return allPluginsEnabled() || requested || sr::cmdline::pluginRequested("nfru");
 }
 
 const void* nssFeatureChain() {
@@ -74,7 +76,10 @@ const void* nssFeatureChain() {
 
         g_dataGraphFeatures.dataGraph             = VK_TRUE;
         g_dataGraphFeatures.dataGraphShaderModule = VK_TRUE;  // SDK ships the VGF as a shader module
-        g_dataGraphFeatures.pNext                 = &g_replicatedCompositesFeatures;
+        g_dataGraphFeatures.pNext                 = &g_opticalFlowFeatures;
+
+        g_opticalFlowFeatures.dataGraphOpticalFlow = VK_TRUE;
+        g_opticalFlowFeatures.pNext                = &g_replicatedCompositesFeatures;
 
         g_replicatedCompositesFeatures.shaderReplicatedComposites = VK_TRUE;
         g_replicatedCompositesFeatures.pNext                      = nullptr;
@@ -92,6 +97,7 @@ void nssAppendDeviceExtensions(std::vector<const char*>& exts) {
     if (!nssRequestedOnCommandLine()) return;
     exts.push_back(VK_ARM_TENSORS_EXTENSION_NAME);
     exts.push_back(VK_ARM_DATA_GRAPH_EXTENSION_NAME);
+    exts.push_back(VK_ARM_DATA_GRAPH_OPTICAL_FLOW_EXTENSION_NAME);
     // Dependencies of VK_ARM_data_graph (dynamic rendering is core 1.3 and
     // already enabled by the renderer).
     exts.push_back(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);

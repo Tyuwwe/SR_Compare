@@ -13,6 +13,8 @@ upscaling algorithms, running the same scene under the same camera path.
 | NVIDIA DLSS 4.5 (Preset K / L / M) | ML (Transformer) | Streamline SDK (framework MIT; nvngx_dlss.dll closed, needs an NVIDIA Developer applicationId) |
 | Arm NSS v1.0.1 (high/mid_low int8) | ML (mobile) | arm/neural-graphics-sdk-for-game-engines (MIT) + HF models (Arm AI Model Community License) |
 | SGSR 1 / 2 | spatial / temporal (mobile) | SnapdragonGameStudios/snapdragon-gsr (BSD-3-Clause) |
+| FSR3 frame interpolation | frame gen (GUI) | AMD FidelityFX SDK 1.1.4 (MIT); dispatch to texture, no FI swapchain |
+| Arm NFRU | frame gen (GUI) | same Neural Graphics SDK + ML emu layer as NSS |
 
 Arm NSS runs on PC through the Vulkan ML Emulation Layer (software inference);
 its performance numbers are not representative of real hardware.
@@ -182,7 +184,12 @@ licenses — see `third_party/README.md` and the scene notes above.
 
 ## Notes
 
-- Frame generation (FSR3-FG / XeSS-FG / DLSS-FG) is out of scope.
+- Frame generation in the GUI only: FSR3 optical-flow + interpolation, or Arm
+  NFRU, after the upscaler (display rate ×2 of the locked render FPS). Bench
+  and CLI `compare` stay super-resolution only. DLSS-G and XeSS-FG are not
+  included (Present-bound / no Vulkan). NFRU on PC uses Arm's ML emulation
+  layer; its times are not representative of hardware. Compare PSNR for an
+  interpolator column is against a midpoint-time GT; columns without FG show `--`.
 - SGSR targets mobile Adreno; PC performance is indicative only.
 - Transparent surfaces are rendered at render resolution and upscaled with the
   frame (the industry-standard structure); per-pixel refraction/transmission

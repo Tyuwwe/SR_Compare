@@ -64,4 +64,37 @@ bool registerVulkanDeviceNeeds(const VulkanDeviceNeeds& needs) {
 
 std::vector<VulkanDeviceNeeds> collectVulkanDeviceNeeds() { return deviceNeeds(); }
 
+namespace {
+
+std::unordered_map<std::string, FrameGenCreateFn>& frameGenRegistry() {
+    static auto* map = new std::unordered_map<std::string, FrameGenCreateFn>();
+    return *map;
+}
+
+std::vector<std::string>& frameGenOrder() {
+    static auto* order = new std::vector<std::string>();
+    return *order;
+}
+
+} // namespace
+
+bool registerFrameGen(const char* name, FrameGenCreateFn fn) {
+    if (!name || !fn) return false;
+    auto& map = frameGenRegistry();
+    if (map.find(name) != map.end()) return false;
+    map.emplace(name, fn);
+    frameGenOrder().emplace_back(name);
+    return true;
+}
+
+std::unique_ptr<IFrameGen> createFrameGen(const char* name) {
+    if (!name || !*name) return nullptr;
+    auto& map = frameGenRegistry();
+    auto it = map.find(name);
+    if (it == map.end()) return nullptr;
+    return it->second();
+}
+
+std::vector<std::string> listFrameGens() { return frameGenOrder(); }
+
 } // namespace sr

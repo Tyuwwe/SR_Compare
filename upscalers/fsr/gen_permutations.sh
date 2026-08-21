@@ -36,6 +36,24 @@ FSR3_SHADERS=(fsr3upscaler/ffx_fsr3upscaler_accumulate_pass
               fsr3upscaler/ffx_fsr3upscaler_rcas_pass
               fsr3upscaler/ffx_fsr3upscaler_shading_change_pass
               fsr3upscaler/ffx_fsr3upscaler_shading_change_pyramid_pass)
+OF_SHADERS=(opticalflow/ffx_opticalflow_prepare_luma_pass
+            opticalflow/ffx_opticalflow_compute_luminance_pyramid_pass
+            opticalflow/ffx_opticalflow_generate_scd_histogram_pass
+            opticalflow/ffx_opticalflow_compute_scd_divergence_pass
+            opticalflow/ffx_opticalflow_compute_optical_flow_advanced_pass_v5
+            opticalflow/ffx_opticalflow_filter_optical_flow_pass_v5
+            opticalflow/ffx_opticalflow_scale_optical_flow_advanced_pass_v5)
+FI_SHADERS=(frameinterpolation/ffx_frameinterpolation_reconstruct_and_dilate_pass
+            frameinterpolation/ffx_frameinterpolation_disocclusion_mask_pass
+            frameinterpolation/ffx_frameinterpolation_reconstruct_previous_depth_pass
+            frameinterpolation/ffx_frameinterpolation_setup_pass
+            frameinterpolation/ffx_frameinterpolation_game_motion_vector_field_pass
+            frameinterpolation/ffx_frameinterpolation_optical_flow_vector_field_pass
+            frameinterpolation/ffx_frameinterpolation_pass
+            frameinterpolation/ffx_frameinterpolation_compute_game_vector_field_inpainting_pyramid_pass
+            frameinterpolation/ffx_frameinterpolation_compute_inpainting_pyramid_pass
+            frameinterpolation/ffx_frameinterpolation_inpainting_pass
+            frameinterpolation/ffx_frameinterpolation_debug_view_pass)
 
 # Emit one "comp|shader|name|half" job per (shader, variant) combo, then run
 # them in parallel via xargs.  run_job re-derives all argument arrays itself
@@ -58,9 +76,16 @@ emit_jobs() {
     done
 }
 
-emit_jobs FSR1_SHADERS fsr1
-emit_jobs FSR2_SHADERS fsr2
-emit_jobs FSR3_SHADERS fsr3upscaler
+if [[ "${1:-}" == "--fg-only" ]]; then
+    emit_jobs OF_SHADERS opticalflow
+    emit_jobs FI_SHADERS frameinterpolation
+else
+    emit_jobs FSR1_SHADERS fsr1
+    emit_jobs FSR2_SHADERS fsr2
+    emit_jobs FSR3_SHADERS fsr3upscaler
+    emit_jobs OF_SHADERS opticalflow
+    emit_jobs FI_SHADERS frameinterpolation
+fi
 
 run_job() {
     local comp shader name half
@@ -100,6 +125,19 @@ run_job() {
                    "-DFFX_FSR3UPSCALER_OPTION_INVERTED_DEPTH={0,1}"
                    "-DFFX_FSR3UPSCALER_OPTION_APPLY_SHARPENING={0,1}")
             inc=("-I$GPU" "-I$GPU/fsr3upscaler") ;;
+        opticalflow)
+            extra=("-DFFX_OPTICALFLOW_OPTION_HDR_COLOR_INPUT={0,1}")
+            inc=("-I$GPU" "-I$GPU/opticalflow") ;;
+        frameinterpolation)
+            extra=(-DFFX_FRAMEINTERPOLATION_OPTION_UPSAMPLE_SAMPLERS_USE_DATA_HALF=0
+                   -DFFX_FRAMEINTERPOLATION_OPTION_ACCUMULATE_SAMPLERS_USE_DATA_HALF=0
+                   -DFFX_FRAMEINTERPOLATION_OPTION_REPROJECT_SAMPLERS_USE_DATA_HALF=1
+                   -DFFX_FRAMEINTERPOLATION_OPTION_POSTPROCESSLOCKSTATUS_SAMPLERS_USE_DATA_HALF=0
+                   -DFFX_FRAMEINTERPOLATION_OPTION_UPSAMPLE_USE_LANCZOS_TYPE=2
+                   "-DFFX_FRAMEINTERPOLATION_OPTION_LOW_RES_MOTION_VECTORS={0,1}"
+                   "-DFFX_FRAMEINTERPOLATION_OPTION_JITTER_MOTION_VECTORS={0,1}"
+                   "-DFFX_FRAMEINTERPOLATION_OPTION_INVERTED_DEPTH={0,1}")
+            inc=("-I$GPU" "-I$GPU/frameinterpolation") ;;
     esac
 
     "$SC" -reflection -deps=gcc -DFFX_GPU=1 "${api[@]}" "${extra[@]}" \
@@ -113,7 +151,7 @@ xargs -a "$JOBS" -d '\n' -P 8 -I {} bash -c 'run_job "$@"' _ {}
 # The bundled SC tool (Arm NSS fork) reflects uniform-block TYPE names
 # (cbFSR2_t, ...) while the SDK host code matches on GLSL instance names
 # (cbFSR2, ...).  Rewrite the CBV resource names to the instance names.
-sed -i 's/"cbFSR1_t"/"cbFSR1"/g; s/"cbFSR2_t"/"cbFSR2"/g; s/"cbFSR3UPSCALER_t"/"cbFSR3Upscaler"/g; s/"cbRCAS_t"/"cbRCAS"/g; s/"cbSPD_t"/"cbSPD"/g; s/"cbGenerateReactive_t"/"cbGenerateReactive"/g' "$OUT"/*.h
+sed -i 's/"cbFSR1_t"/"cbFSR1"/g; s/"cbFSR2_t"/"cbFSR2"/g; s/"cbFSR3UPSCALER_t"/"cbFSR3Upscaler"/g; s/"cbRCAS_t"/"cbRCAS"/g; s/"cbSPD_t"/"cbSPD"/g; s/"cbGenerateReactive_t"/"cbGenerateReactive"/g; s/"cbFI_t"/"cbFI"/g; s/"cbOF_SPD_t"/"cbOF_SPD"/g; s/"cbOF_t"/"cbOF"/g' "$OUT"/*.h
 
 # Depfiles are only used by the SDK CMake dependency tracking; drop them.
 rm -f "$OUT"/*.d

@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <thread>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -64,6 +65,32 @@ constexpr VkFormat kComposeFormat = VK_FORMAT_R8G8B8A8_UNORM;
 const uint32_t kOutputResolutions[4][2] = {
     {1280, 720}, {1920, 1080}, {2560, 1440}, {3840, 2160}};
 const char* kOutputResNames[4] = {"1280x720", "1920x1080", "2560x1440", "3840x2160"};
+
+struct AlgoGroup {
+    const char* title;
+    const char* ids[4];
+    int count;
+};
+constexpr AlgoGroup kAlgoGroups[] = {
+    {"Basic", {"taa"}, 1},
+    {"NVIDIA", {"dlss-k", "dlss-m", "dlss-l"}, 3},
+    {"AMD", {"fsr3", "fsr2", "fsr1"}, 3},
+    {"Intel", {"xess"}, 1},
+    {"ARM", {"nss"}, 1},
+    {"Qualcomm", {"sgsr2", "sgsr1"}, 2},
+};
+constexpr int kFgCount = 3;
+const char* kFgLabels[kFgCount] = {"none", "FSR3", "NFRU"};
+const char* kFgIds[kFgCount] = {"", "fsr3", "nfru"};
+
+Camera lerpCamera(const Camera& a, const Camera& b, float t) {
+    Camera c = b;
+    c.position = a.position + (b.position - a.position) * t;
+    c.forward = normalize(a.forward + (b.forward - a.forward) * t);
+    const Vec3 up = a.up + (b.up - a.up) * t;
+    if (length(up) > 1e-8f) c.up = normalize(up);
+    return c;
+}
 
 // SceneUBO / MaterialUBO / LightingUBO / ScenePush and the GBuffer formats are
 // shared with the viewer renderer via renderer/deferred/DeferredCore.h.
@@ -255,7 +282,11 @@ bool GuiApp::init(const GuiOptions& opts) {
 
     refreshUpscalerAvailability();
 
-    if (!swapchain_.create(ctx_, active_.displayW, active_.displayH, true)) return false;
+    swapchainVsync_ = guiWantVsync();
+    swapchainMailbox_ = guiAllowMailbox();
+    if (!swapchain_.create(ctx_, active_.displayW, active_.displayH, swapchainVsync_,
+                           swapchainMailbox_))
+        return false;
     if (!createUiSync()) return false;
     if (!initImGui()) return false;
     window_.setWndProcHook(&guiWndProcHook);
@@ -265,11 +296,14 @@ bool GuiApp::init(const GuiOptions& opts) {
     for (uint32_t i = 0; i < upscalerNames_.size() && i < kMaxRegistered; ++i) {
         if (upscalerNames_[i] == "taa") {
             if (opts_.upscalerName.empty()) ui_.viewerUpscaler = static_cast<int>(i) + 1;
-            if (opts_.compareList.empty()) ui_.compareSelected[i] = true;
             if (opts_.benchList.empty()) ui_.benchSelected[i] = true;
         }
-        if (upscalerNames_[i] == "fsr2" && opts_.compareList.empty())
-            ui_.compareSelected[i] = true;
+    }
+    if (opts_.compareList.empty() && ui_.compareSlots.empty()) {
+        const int taa = upscalerIndexById("taa");
+        const int fsr2 = upscalerIndexById("fsr2");
+        if (taa >= 0) ui_.compareSlots.push_back({taa, 0});
+        if (fsr2 >= 0) ui_.compareSlots.push_back({fsr2, 0});
     }
 
     active_ = configFromUi(currentTab_ == 1 ? Mode::Compare : Mode::Viewer);
@@ -401,13 +435,19 @@ GuiApp::RenderConfig GuiApp::configFromUi(Mode mode) const {
     if (mode == Mode::Viewer) {
         if (ui_.viewerUpscaler > 0 &&
             ui_.viewerUpscaler <= static_cast<int>(upscalerNames_.size())) {
-            cfg.algoNames.push_back(
-                upscalerNames_[static_cast<size_t>(ui_.viewerUpscaler - 1)]);
+            RenderConfig::AlgoSpec spec;
+            spec.sr = upscalerNames_[static_cast<size_t>(ui_.viewerUpscaler - 1)];
+            spec.fg = ui_.viewerFg > 0 ? fgId(ui_.viewerFg) : "";
+            cfg.algos.push_back(std::move(spec));
         }
     } else {
-        for (uint32_t i = 0; i < upscalerNames_.size() && i < kMaxRegistered; ++i) {
-            if (ui_.compareSelected[i] && cfg.algoNames.size() < kMaxAlgos)
-                cfg.algoNames.push_back(upscalerNames_[i]);
+        for (const UiState::CompareSlot& slot : ui_.compareSlots) {
+            if (cfg.algos.size() >= kMaxAlgos) break;
+            if (slot.sr < 0 || slot.sr >= static_cast<int>(upscalerNames_.size())) continue;
+            RenderConfig::AlgoSpec spec;
+            spec.sr = upscalerNames_[static_cast<size_t>(slot.sr)];
+            spec.fg = slot.fg > 0 ? fgId(slot.fg) : "";
+            cfg.algos.push_back(std::move(spec));
         }
     }
     // The GT reference mode is global: it applies to the compare GT column
@@ -454,10 +494,11 @@ void GuiApp::applyLaunchOptions() {
     }
     if (opts_.compareGtSsaa) ui_.compareGtSsaa = true;
     if (!opts_.compareList.empty()) {
+        ui_.compareSlots.clear();
         for (const std::string& name : splitComma(opts_.compareList)) {
-            for (size_t i = 0; i < upscalerNames_.size() && i < kMaxRegistered; ++i) {
-                if (upscalerNames_[i] == name) ui_.compareSelected[i] = true;
-            }
+            const int idx = upscalerIndexById(name);
+            if (idx >= 0 && ui_.compareSlots.size() < kMaxAlgos)
+                ui_.compareSlots.push_back({idx, 0});
         }
         currentTab_ = 1;
         tabRequest_ = 1;
@@ -604,7 +645,7 @@ void GuiApp::loadWorkerMain(RenderConfig cfg) {
             return;
         }
         loadResult_.note = err; // non-fatal fallback note (may be empty)
-        loadDone_.store(static_cast<uint32_t>(cfg.algoNames.size()), std::memory_order_relaxed);
+        loadDone_.store(static_cast<uint32_t>(cfg.algos.size()), std::memory_order_relaxed);
         if (loadSceneDirty_) loadResult_.scene = std::move(scene);
         loadPhase_.store(LoadPhase::Ready, std::memory_order_release);
     } catch (const std::exception& e) {
@@ -623,6 +664,10 @@ void GuiApp::discardLoadResult() {
         if (algo.upscaler) {
             algo.upscaler->shutdown();
             algo.upscaler.reset();
+        }
+        if (algo.frameGen) {
+            algo.frameGen->shutdown();
+            algo.frameGen.reset();
         }
     }
     loadResult_.algos.clear();
@@ -799,11 +844,10 @@ bool GuiApp::beginStackConfig() {
         window_.setClientSize(static_cast<int>(active_.displayW),
                               static_cast<int>(active_.displayH));
     }
-    if (!swapchain_.create(ctx_, active_.displayW, active_.displayH, true)) {
+    if (!recreateGuiSwapchain()) {
         statusLine_ = "swapchain creation failed";
         return false;
     }
-    ensurePresentSemaphores();
     return true;
 }
 
@@ -883,8 +927,10 @@ bool GuiApp::buildStackTail() {
 void GuiApp::resetFrameState() {
     // Fresh stack: reset frame history so temporal upscalers get resetHistory.
     prevViewProj_ = Mat4::identity();
+    havePrevCamera_ = false;
     jitterX_ = jitterY_ = prevJitterX_ = prevJitterY_ = 0.f;
     metricPending_[0] = metricPending_[1] = false;
+    metricMask_[0] = metricMask_[1] = 0;
     frameTimesLog_.clear();
     historyHead_ = 0;
     historyCount_ = 0;
@@ -908,17 +954,17 @@ bool GuiApp::initAlgorithmsFor(const VulkanEnv& env, const RenderConfig& cfg, ui
                                uint32_t renderH, std::vector<AlgoColumn>& out, std::string& err,
                                const std::function<void(const char* name, uint32_t index,
                                                         uint32_t count)>& onAlgo) {
-    const uint32_t count = static_cast<uint32_t>(cfg.algoNames.size());
+    const uint32_t count = static_cast<uint32_t>(cfg.algos.size());
     for (uint32_t i = 0; i < count; ++i) {
-        const std::string& name = cfg.algoNames[i];
-        if (onAlgo) onAlgo(name.c_str(), i, count);
-        std::unique_ptr<IUpscaler> up = createUpscaler(name.c_str());
+        const RenderConfig::AlgoSpec& spec = cfg.algos[i];
+        if (onAlgo) onAlgo(spec.sr.c_str(), i, count);
+        std::unique_ptr<IUpscaler> up = createUpscaler(spec.sr.c_str());
         if (!up) {
-            err = "unknown upscaler: " + name;
+            err = "unknown upscaler: " + spec.sr;
             continue;
         }
         if (!up->isAvailable(env)) {
-            err = name + " is not available on this device";
+            err = spec.sr + " is not available on this device";
             continue;
         }
         UpscalerDesc desc;
@@ -930,12 +976,38 @@ bool GuiApp::initAlgorithmsFor(const VulkanEnv& env, const RenderConfig& cfg, ui
         desc.invertedDepth = false;
         desc.infiniteFarPlane = true;
         if (!up->init(env, desc)) {
-            err = name + " init failed";
+            err = spec.sr + " init failed";
             continue;
         }
         AlgoColumn col;
-        col.id = name;
+        col.id = spec.sr;
+        col.fg = spec.fg;
         col.upscaler = std::move(up);
+        if (!spec.fg.empty()) {
+            col.frameGen = createFrameGen(spec.fg.c_str());
+            if (!col.frameGen) {
+                err = spec.fg + " frame interpolator is not available";
+                col.fg.clear();
+            } else if (!col.frameGen->isAvailable(env)) {
+                err = spec.fg + " frame interpolator unavailable on this device";
+                col.frameGen.reset();
+                col.fg.clear();
+            } else {
+                FrameGenDesc fgDesc;
+                fgDesc.renderWidth = renderW;
+                fgDesc.renderHeight = renderH;
+                fgDesc.displayWidth = cfg.displayW;
+                fgDesc.displayHeight = cfg.displayH;
+                fgDesc.hdr = true;
+                fgDesc.invertedDepth = false;
+                fgDesc.infiniteFarPlane = true;
+                if (!col.frameGen->init(env, fgDesc)) {
+                    err = spec.fg + " frame interpolator init failed";
+                    col.frameGen.reset();
+                    col.fg.clear();
+                }
+            }
+        }
         out.push_back(std::move(col));
     }
 
@@ -1264,10 +1336,10 @@ bool GuiApp::createDescriptors() {
     VkDescriptorPoolSize sizes[5] = {};
     sizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     sizes[0].descriptorCount =
-        deferred::kMaxTextures + numColumns * 2 + 2 + numAlgos * 2 + 11 * kFramesInFlight * 4 +
+        deferred::kMaxTextures + numColumns * 2 + 2 + numAlgos * 6 + 11 * kFramesInFlight * 4 +
         5 * kFramesInFlight * 4 + 3 * 3;
     sizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    sizes[1].descriptorCount = kFramesInFlight * 3 + numColumns + kFramesInFlight * 4 +
+    sizes[1].descriptorCount = kFramesInFlight * 3 + numColumns + numAlgos + kFramesInFlight * 4 +
                                kFramesInFlight * 4;
     sizes[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
     sizes[2].descriptorCount = kFramesInFlight * 3;
@@ -1278,7 +1350,7 @@ bool GuiApp::createDescriptors() {
     VkDescriptorPoolCreateInfo poolCi = {};
     poolCi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     poolCi.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-    poolCi.maxSets = kFramesInFlight * 3 + 2 + numColumns + 1 + numAlgos + kFramesInFlight * 4 +
+    poolCi.maxSets = kFramesInFlight * 3 + 2 + numColumns + 1 + numAlgos * 3 + kFramesInFlight * 4 +
                      kFramesInFlight * 4 + // transparent sets (GB/GT/SSAA/spatial)
                      6;                     // ssao sets (GB/GT/SSAA, static)
     poolCi.poolSizeCount = 5;
@@ -1459,10 +1531,26 @@ bool GuiApp::createAlgoResources(AlgoColumn& algo, uint32_t index) {
 
     writeComposeSetInto(algo.composeSet, algo.output.view);
 
+    if (algo.frameGen) {
+        algo.fgOutput.width = active_.displayW;
+        algo.fgOutput.height = active_.displayH;
+        algo.fgOutput.format = deferred::kHdrColorFormat;
+        if (createImage(ctx_, active_.displayW, active_.displayH, deferred::kHdrColorFormat,
+                        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, algo.fgOutput.image,
+                        algo.fgOutput.memory) != VK_SUCCESS)
+            return false;
+        algo.fgOutput.view = createImageView(ctx_, algo.fgOutput.image, deferred::kHdrColorFormat,
+                                             VK_IMAGE_ASPECT_COLOR_BIT);
+        if (!algo.fgOutput.view) return false;
+        algo.fgOutputLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        if (!allocSet(composeSetLayout_, algo.composeSetFg)) return false;
+        writeComposeSetInto(algo.composeSetFg, algo.fgOutput.view);
+    }
+
     if (active_.mode == Mode::Compare) {
         VkDescriptorImageInfo testInfo = {};
         testInfo.sampler = linearSampler_;
-        testInfo.imageView = algo.output.view;
+        testInfo.imageView = algo.frameGen ? algo.fgOutput.view : algo.output.view;
         testInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         VkDescriptorImageInfo refInfo = {};
         refInfo.sampler = linearSampler_;
@@ -1807,7 +1895,12 @@ bool GuiApp::createScreenshotStaging() {
 void GuiApp::destroyAlgoResources() {
     for (AlgoColumn& algo : algos_) {
         if (algo.upscaler) { algo.upscaler->shutdown(); algo.upscaler.reset(); }
+        if (algo.frameGen) { algo.frameGen->shutdown(); algo.frameGen.reset(); }
         algo.output.destroy(ctx_);
+        algo.fgOutput.destroy(ctx_);
+        algo.fgOutputLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        algo.fgHistory = false;
+        algo.fgReady = false;
         if (algo.blocksBuffer) {
             vkDestroyBuffer(ctx_.device, algo.blocksBuffer, nullptr);
             vkFreeMemory(ctx_.device, algo.blocksMemory, nullptr);
@@ -1821,6 +1914,10 @@ void GuiApp::destroyAlgoResources() {
             if (algo.composeSet) {
                 vkFreeDescriptorSets(ctx_.device, descriptorPool_, 1, &algo.composeSet);
                 algo.composeSet = VK_NULL_HANDLE;
+            }
+            if (algo.composeSetFg) {
+                vkFreeDescriptorSets(ctx_.device, descriptorPool_, 1, &algo.composeSetFg);
+                algo.composeSetFg = VK_NULL_HANDLE;
             }
             if (algo.metricSet) {
                 vkFreeDescriptorSets(ctx_.device, descriptorPool_, 1, &algo.metricSet);
@@ -2280,7 +2377,8 @@ void GuiApp::handleCompareZoomInput() {
     if (changed) refreshOverlayText();
 }
 
-void GuiApp::updateCamera(float dt) {    if (pathPlaying_ && !path_.empty()) {
+void GuiApp::updateCamera(float dt) {
+    if (pathPlaying_ && !path_.empty()) {
         const CameraKeyframe& kf = path_[pathFrame_ % path_.size()];
         camera_.setPose(kf.position, kf.forward, kf.up);
         ++pathFrame_;
@@ -2328,7 +2426,12 @@ void GuiApp::captureScreenshotIntoStaging(VkCommandBuffer cmd) {
 void GuiApp::harvestMetrics(uint32_t slot) {
     const auto* f = static_cast<const float*>(metricStagingMapped_[slot]);
     const uint32_t numAlgos = static_cast<uint32_t>(algos_.size());
+    const uint32_t mask = metricMask_[slot];
     for (uint32_t i = 0; i < numAlgos; ++i) {
+        if ((mask & (1u << i)) == 0) {
+            algos_[i].hasMetric = false;
+            continue;
+        }
         const float* r = f + i * kMetricFloats;
         // PSNR = 10*log10(3*N / sumSqDiff), data range 1 (tonemapped domain).
         const double d2 = static_cast<double>(r[0]) + r[1] + r[2];
@@ -2357,16 +2460,41 @@ void GuiApp::refreshOverlayText() {
         for (uint32_t c = 0; c < 24 && text[c] != '\0'; ++c) row[c] = asciiUpper(text[c]);
     };
 
+    auto displayFps = [&](bool fg) {
+        // Viewer: measured present rate (true+interpolated).  Compare still
+        // presents once per true frame; FG columns show the ×2 equivalent.
+        if (active_.mode == Mode::Viewer) return fps_;
+        float n = ui_.lockFps ? static_cast<float>(std::max(15, std::min(120, ui_.lockFpsTarget)))
+                              : fps_;
+        if (fg) n *= 2.f;
+        return n;
+    };
+    auto columnTitle = [](const AlgoColumn& algo, char* out, size_t outSize) {
+        const char* sr = algo.upscaler ? algo.upscaler->name() : algo.id.c_str();
+        if (algo.fg.empty())
+            std::snprintf(out, outSize, "%s", sr);
+        else if (algo.fg == "nfru")
+            std::snprintf(out, outSize, "%s + NFRU", sr);
+        else if (algo.fg == "fsr3")
+            std::snprintf(out, outSize, "%s + FSR3", sr);
+        else
+            std::snprintf(out, outSize, "%s + %s", sr, algo.fg.c_str());
+    };
+
     char line[25];
     if (active_.mode == Mode::Viewer) {
         if (algos_.empty()) {
             writeLine(0, 0, "Native (GT)");
         } else {
-            writeLine(0, 0, algos_[0].upscaler->name());
-            std::snprintf(line, sizeof(line), "SCENE %.2f MS", lastTimings_.sceneMs);
+            columnTitle(algos_[0], line, sizeof(line));
+            writeLine(0, 0, line);
+            std::snprintf(line, sizeof(line), "FPS %.1f",
+                          static_cast<double>(displayFps(!algos_[0].fg.empty())));
             writeLine(0, 1, line);
-            std::snprintf(line, sizeof(line), "UPSCALE %.2f MS", lastTimings_.upscaleMs);
+            std::snprintf(line, sizeof(line), "SCENE %.2f MS", lastTimings_.sceneMs);
             writeLine(0, 2, line);
+            std::snprintf(line, sizeof(line), "UPSCALE %.2f MS", lastTimings_.upscaleMs);
+            writeLine(0, 3, line);
         }
         return;
     }
@@ -2379,19 +2507,28 @@ void GuiApp::refreshOverlayText() {
             writeLine(0, 2, "GT APPLY SCALE");
         else if (active_.gtSsaa)
             writeLine(0, 2, "GT SSAA 2X");
+        bool anyFg = false;
+        for (const AlgoColumn& a : algos_) {
+            if (!a.fg.empty()) anyFg = true;
+        }
+        if (anyFg) writeLine(0, 3, "GT MIDPOINT");
     }
     for (uint32_t i = 0; i < algos_.size(); ++i) {
         const AlgoColumn& algo = algos_[i];
         const uint32_t slot = i + 1;
-        writeLine(slot, 0, algo.upscaler->name());
+        columnTitle(algo, line, sizeof(line));
+        writeLine(slot, 0, line);
+        std::snprintf(line, sizeof(line), "FPS %.1f",
+                      static_cast<double>(displayFps(!algo.fg.empty())));
+        writeLine(slot, 1, line);
         if (algo.hasMetric) {
             std::snprintf(line, sizeof(line), "PSNR %.2f dB", static_cast<double>(algo.psnr));
-            writeLine(slot, 1, line);
-            std::snprintf(line, sizeof(line), "SSIM %.4f", static_cast<double>(algo.ssim));
             writeLine(slot, 2, line);
+            std::snprintf(line, sizeof(line), "SSIM %.4f", static_cast<double>(algo.ssim));
+            writeLine(slot, 3, line);
         } else {
-            writeLine(slot, 1, "PSNR --");
-            writeLine(slot, 2, "SSIM --");
+            writeLine(slot, 2, "PSNR --");
+            writeLine(slot, 3, "SSIM --");
         }
     }
 }
@@ -2416,7 +2553,9 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     const bool gbuffer = !algos_.empty();
     bool hasTemporal = false;
     bool hasSpatial = false;
+    bool anyFg = false;
     for (const AlgoColumn& a : algos_) {
+        if (a.frameGen) anyFg = true;
         if (!a.upscaler) continue;
         if (upscalerNeedsJitter(a.upscaler.get())) hasTemporal = true;
         else hasSpatial = true;
@@ -2429,6 +2568,13 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     const float aspect = static_cast<float>(dw) / static_cast<float>(dh);
     const Mat4 view = camera_.view();
     const Mat4 proj = camera_.proj(aspect);
+    // Any FG column: true frames stay at the current pose; GT is the midpoint
+    // between this pose and the previous true frame so PSNR matches the
+    // interpolated output.  No previous pose yet → same-time GT (no metric).
+    const Camera gtCam =
+        (anyFg && havePrevCamera_) ? lerpCamera(prevCamera_, camera_, 0.5f) : camera_;
+    const Mat4 viewGt = gtCam.view();
+    const Mat4 projGt = gtCam.proj(aspect);
     Mat4 projJittered = proj;
     prevJitterX_ = jitterX_;
     prevJitterY_ = jitterY_;
@@ -2449,7 +2595,7 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     }
     const uint32_t gtW = active_.gtSsaa ? dw * 2 : (active_.gtApplyScale ? renderWidth_ : dw);
     const uint32_t gtH = active_.gtSsaa ? dh * 2 : (active_.gtApplyScale ? renderHeight_ : dh);
-    updateSceneUBO(fr.uboGtMapped, false, gtW, gtH, view, proj, proj, prevViewProj_);
+    updateSceneUBO(fr.uboGtMapped, false, gtW, gtH, viewGt, projGt, projGt, prevViewProj_);
 
     // CSM sun shadows: the shadowed sun is picked from the same override
     // light list that fills the LightingUBO, so lightIndex refers to the
@@ -2477,7 +2623,7 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         updateLightingUBO(fr.lightingUboGbSpatialMapped, Mat4::inverse(Mat4::multiply(proj, view)),
                           lights, shadow);
     }
-    updateLightingUBO(fr.lightingUboGtMapped, Mat4::inverse(Mat4::multiply(proj, view)),
+    updateLightingUBO(fr.lightingUboGtMapped, Mat4::inverse(Mat4::multiply(projGt, viewGt)),
                       lights, shadow);
 
     auto transition = [&](VkImage image, VkImageLayout& current, VkImageLayout target,
@@ -2486,6 +2632,7 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         current = target;
     };
     const Mat4 cullViewProj = Mat4::multiply(proj, view); // un-jittered (sub-pixel)
+    const Mat4 cullViewProjGt = Mat4::multiply(projGt, viewGt);
 
     // --- Shadow pass (sun CSM, one 2048^2 layer per cascade) -------------------
     // Must run BEFORE any lighting pass: the LR lighting below samples the map
@@ -2680,6 +2827,33 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
 
             transition(algo.output.image, algo.outputLayout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                        VK_IMAGE_ASPECT_COLOR_BIT);
+
+            algo.fgReady = false;
+            if (algo.frameGen) {
+                if (frame.resetHistory) algo.fgHistory = false;
+                if (algo.fgHistory) {
+                    transition(algo.fgOutput.image, algo.fgOutputLayout, VK_IMAGE_LAYOUT_GENERAL,
+                               VK_IMAGE_ASPECT_COLOR_BIT);
+                    FrameGenResources fgRes;
+                    fgRes.color = algo.output.image;
+                    fgRes.colorView = algo.output.view;
+                    fgRes.depth = res.depth;
+                    fgRes.depthView = res.depthView;
+                    fgRes.motion = res.motion;
+                    fgRes.motionView = res.motionView;
+                    fgRes.output = algo.fgOutput.image;
+                    fgRes.outputView = algo.fgOutput.view;
+                    FrameParams fgFrame = frame;
+                    fgFrame.deltaTime = ui_.lockFps
+                                            ? 1.f / static_cast<float>(std::max(15, ui_.lockFpsTarget))
+                                            : (fps_ > 1.f ? 1.f / fps_ : 1.f / 30.f);
+                    algo.frameGen->dispatch(cmd, fgRes, spatialAlgo ? camSpatial : cam, fgFrame);
+                    transition(algo.fgOutput.image, algo.fgOutputLayout,
+                               VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+                    algo.fgReady = true;
+                }
+                algo.fgHistory = true;
+            }
         }
         timestamps_.upscaleEnd(cmd, slot);
     } else {
@@ -2722,7 +2896,7 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                                     VK_ATTACHMENT_LOAD_OP_CLEAR);
             beginRendering(cmd, sw, sh, 4, colors, &depth);
             deferred_.recordGBufferDraws(cmd, scene_, true, fr.sceneSetGt, textureSet_,
-                                         materialStride_, sw, sh, cullViewProj);
+                                         materialStride_, sw, sh, cullViewProjGt);
             vkCmdEndRendering(cmd);
         }
         transition(gtSsaaAlbedo_.image, gtSsaaAlbedoLayout_,
@@ -2739,7 +2913,7 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         // SSAO for the 2x GT path (un-jittered view-projection).
         transition(gtSsaaAoRaw_.image, gtSsaaAoRawLayout_, VK_IMAGE_LAYOUT_GENERAL,
                    VK_IMAGE_ASPECT_COLOR_BIT);
-        deferred_.recordSsaoPass(cmd, ssaoSetSsaa_, cullViewProj, frameIndex, sw, sh);
+        deferred_.recordSsaoPass(cmd, ssaoSetSsaa_, cullViewProjGt, frameIndex, sw, sh);
         transition(gtSsaaAoRaw_.image, gtSsaaAoRawLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                    VK_IMAGE_ASPECT_COLOR_BIT);
         transition(gtSsaaAo_.image, gtSsaaAoLayout_, VK_IMAGE_LAYOUT_GENERAL,
@@ -2768,7 +2942,7 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                 beginRendering(cmd, sw, sh, 1, &tColor, &tDepth);
                 deferred_.recordTransparentDraws(cmd, scene_, true, fr.sceneSetGt, textureSet_,
                                                  fr.transparentSetSsaa, materialStride_, sw, sh,
-                                                 cullViewProj, camera_.position);
+                                                 cullViewProjGt, gtCam.position);
                 vkCmdEndRendering(cmd);
             }
             transition(gtSsaaDepth_.image, gtSsaaDepthLayout_,
@@ -2824,7 +2998,7 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                                     VK_ATTACHMENT_LOAD_OP_CLEAR);
             beginRendering(cmd, gtW, gtH, 4, colors, &depth);
             deferred_.recordGBufferDraws(cmd, scene_, true, fr.sceneSetGt, textureSet_,
-                                         materialStride_, gtW, gtH, cullViewProj);
+                                         materialStride_, gtW, gtH, cullViewProjGt);
             vkCmdEndRendering(cmd);
         }
         transition(gtAlbedo_.image, gtAlbedoLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
@@ -2842,7 +3016,7 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         // "GT (Apply scale)" mode gtW/gtH are the low input resolution.
         transition(gtAoRaw_.image, gtAoRawLayout_, VK_IMAGE_LAYOUT_GENERAL,
                    VK_IMAGE_ASPECT_COLOR_BIT);
-        deferred_.recordSsaoPass(cmd, ssaoSetGt_, cullViewProj, frameIndex, gtW, gtH);
+        deferred_.recordSsaoPass(cmd, ssaoSetGt_, cullViewProjGt, frameIndex, gtW, gtH);
         transition(gtAoRaw_.image, gtAoRawLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                    VK_IMAGE_ASPECT_COLOR_BIT);
         transition(gtAo_.image, gtAoLayout_, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT);
@@ -2870,7 +3044,7 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                 beginRendering(cmd, gtW, gtH, 1, &tColor, &tDepth);
                 deferred_.recordTransparentDraws(cmd, scene_, true, fr.sceneSetGt, textureSet_,
                                                  fr.transparentSetGt, materialStride_, gtW, gtH,
-                                                 cullViewProj, camera_.position);
+                                                 cullViewProjGt, gtCam.position);
                 vkCmdEndRendering(cmd);
             }
             transition(gtDepth_.image, gtDepthLayout_,
@@ -2899,7 +3073,19 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     const uint32_t regBlocksPerRow = (regW + 7) / 8;
     const uint32_t regBlockCount = regBlocksPerRow * ((regH + 7) / 8);
     if (compareMode && !algos_.empty() && frameIndex % kMetricInterval == 0) {
+        uint32_t mask = 0;
+        uint32_t algoIndex = 0;
         for (AlgoColumn& algo : algos_) {
+            // Half-rate FG: only interpolator columns vs midpoint GT.  Other
+            // columns are a visual reference and show "--".
+            const bool eligible =
+                !anyFg ? true : (algo.frameGen != nullptr && algo.fgReady);
+            if (!eligible) {
+                ++algoIndex;
+                continue;
+            }
+            mask |= (1u << algoIndex);
+            ++algoIndex;
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, metricBlocksPipeline_);
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, metricPipelineLayout_, 0,
                                     1, &algo.metricSet, 0, nullptr);
@@ -2932,18 +3118,55 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
 
             computeBarrier(cmd, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
         }
-        computeBarrier(cmd, VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-        VkBufferCopy copyRegion = {};
-        copyRegion.srcOffset = 0;
-        copyRegion.dstOffset = 0;
-        copyRegion.size = static_cast<VkDeviceSize>(algos_.size()) * kMetricFloats * 4;
-        vkCmdCopyBuffer(cmd, metricResultBuf_, metricStaging_[slot], 1, &copyRegion);
-        metricPending_[slot] = true;
+        if (mask != 0) {
+            computeBarrier(cmd, VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+            VkBufferCopy copyRegion = {};
+            copyRegion.srcOffset = 0;
+            copyRegion.dstOffset = 0;
+            copyRegion.size = static_cast<VkDeviceSize>(algos_.size()) * kMetricFloats * 4;
+            vkCmdCopyBuffer(cmd, metricResultBuf_, metricStaging_[slot], 1, &copyRegion);
+            metricPending_[slot] = true;
+            metricMask_[slot] = mask;
+        }
     }
 
-    // --- 5) compose columns + overlay into the offscreen composite -----------------
-    transition(composeImage_.image, composeLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-               VK_IMAGE_ASPECT_COLOR_BIT);
+    // --- 5) compose + present.  Viewer interpolator: this pass is the
+    //     generated frame (t-0.5); the run loop presents the true frame after.
+    // Screenshot capture (composite; with SR_GUI_UI_SHOT also the ImGui UI).
+    // The readback+encode is deferred: the run loop polls this frame's fence
+    // and hands the pixels to a worker thread (see screenshotInFlight_).
+    const bool composeGenerated = compareMode || anyFg;
+    recordComposePresent(cmd, swapchainIndex, composeGenerated);
+    if (screenshotPending_) {
+        if (uiShot_)
+            captureUiScreenshotIntoStaging(cmd);
+        else
+            captureScreenshotIntoStaging(cmd);
+        screenshotSlot_ = slot;
+        screenshotInFlight_ = true;
+        screenshotPending_ = false;
+    }
+
+    timestamps_.frameEnd(cmd, slot);
+    vkEndCommandBuffer(cmd);
+
+    prevViewProj_ = Mat4::multiply(proj, view);
+    prevCamera_ = camera_;
+    havePrevCamera_ = true;
+}
+
+void GuiApp::recordComposePresent(VkCommandBuffer cmd, uint32_t swapchainIndex,
+                                  bool preferGenerated) {
+    const uint32_t dw = active_.displayW;
+    const uint32_t dh = active_.displayH;
+    const bool compareMode = active_.mode == Mode::Compare;
+    const uint32_t numColumns = compareMode ? (1 + static_cast<uint32_t>(algos_.size())) : 1;
+    const uint32_t layoutX0 = layoutOriginX();
+    const uint32_t colW = (dw - layoutX0) / numColumns;
+
+    imageBarrier(cmd, composeImage_.image, composeLayout_,
+                 VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    composeLayout_ = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     {
         VkRenderingAttachmentInfo color =
             makeColorAttachment(composeImage_.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
@@ -2966,9 +3189,16 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
 
             VkDescriptorSet set = gtComposeSet_;
             if (compareMode) {
-                set = (i == 0) ? gtComposeSet_ : algos_[i - 1].composeSet;
+                if (i == 0) set = gtComposeSet_;
+                else {
+                    const AlgoColumn& a = algos_[i - 1];
+                    set = (preferGenerated && a.fgReady && a.composeSetFg) ? a.composeSetFg
+                                                                          : a.composeSet;
+                }
             } else if (!algos_.empty()) {
-                set = algos_[0].composeSet;
+                const AlgoColumn& a = algos_[0];
+                set = (preferGenerated && a.fgReady && a.composeSetFg) ? a.composeSetFg
+                                                                      : a.composeSet;
             }
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, composePipelineLayout_,
                                     0, 1, &set, 0, nullptr);
@@ -2977,9 +3207,6 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
             push.colSize[1] = static_cast<float>(dh);
             push.textScale = textScale;
             push.textSlot = static_cast<float>(i);
-            // Aspect-preserving crop + zoom window over the source.  The GT
-            // column's source (gtColor_) is low-res in "GT (Apply scale)"
-            // mode; the region window is normalized so it stretches to fill.
             const bool isGtColumn = (set == gtComposeSet_);
             const float srcW =
                 (isGtColumn && active_.gtApplyScale) ? static_cast<float>(renderWidth_)
@@ -2995,9 +3222,6 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
             push.uvRect[3] = rect[3] / static_cast<float>(dh);
             push.srcSize[0] = srcW;
             push.srcSize[1] = srcH;
-            // Nearest sampling once the on-screen magnification passes 1:1
-            // (measured in source texels, so a low-res GT goes nearest only
-            // when its own pixels are magnified past 1:1).
             const float srcRegionW = rect[2] * (srcW / static_cast<float>(dw));
             push.nearest = (static_cast<float>(w) >= srcRegionW) ? 1.f : 0.f;
             push.pad = 0.f;
@@ -3007,23 +3231,9 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         }
         vkCmdEndRendering(cmd);
     }
-    transition(composeImage_.image, composeLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-               VK_IMAGE_ASPECT_COLOR_BIT);
+    imageBarrier(cmd, composeImage_.image, composeLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    composeLayout_ = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
-    // Screenshot capture (composite; with SR_GUI_UI_SHOT also the ImGui UI).
-    // The readback+encode is deferred: the run loop polls this frame's fence
-    // and hands the pixels to a worker thread (see screenshotInFlight_).
-    if (screenshotPending_) {
-        if (uiShot_)
-            captureUiScreenshotIntoStaging(cmd);
-        else
-            captureScreenshotIntoStaging(cmd);
-        screenshotSlot_ = slot;
-        screenshotInFlight_ = true;
-        screenshotPending_ = false;
-    }
-
-    // --- 6) copy composite + ImGui overlay into the swapchain -----------------------
     const VkImage swapImage = swapchain_.image(swapchainIndex);
     const VkImageView swapView = swapchain_.view(swapchainIndex);
     imageBarrier(cmd, swapImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
@@ -3042,19 +3252,69 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, copyPipelineLayout_, 0, 1,
                                 &copySet_, 0, nullptr);
         vkCmdDraw(cmd, 3, 1, 0, 0);
-
-        // The backend records its draws into the active dynamic-rendering block.
         ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cmd);
-
         vkCmdEndRendering(cmd);
     }
     imageBarrier(cmd, swapImage, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                  VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+}
 
-    timestamps_.frameEnd(cmd, slot);
+void GuiApp::recordViewerTruePresent(uint32_t uiSlot, uint32_t swapchainIndex) {
+    VkCommandBuffer cmd = uiFrames_[uiSlot].cmd;
+    vkResetCommandBuffer(cmd, 0);
+    VkCommandBufferBeginInfo begin = {};
+    begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &begin);
+    recordComposePresent(cmd, swapchainIndex, false);
     vkEndCommandBuffer(cmd);
+}
 
-    prevViewProj_ = Mat4::multiply(proj, view);
+bool GuiApp::guiWantVsync() const {
+    // Lock owns present cadence (15 → 30 with FG).  FIFO vsync on a 60 Hz
+    // panel would either cap us at refresh or stack extra waits on the sleep.
+    return !ui_.lockFps;
+}
+
+bool GuiApp::guiAllowMailbox() const {
+    if (!guiWantVsync()) return false;
+    if (active_.mode != Mode::Viewer) return true;
+    for (const RenderConfig::AlgoSpec& a : active_.algos) {
+        if (!a.fg.empty()) return false;
+    }
+    return true;
+}
+
+bool GuiApp::recreateGuiSwapchain() {
+    swapchainVsync_ = guiWantVsync();
+    swapchainMailbox_ = guiAllowMailbox();
+    if (!swapchain_.create(ctx_, active_.displayW, active_.displayH, swapchainVsync_,
+                           swapchainMailbox_))
+        return false;
+    ensurePresentSemaphores();
+    return true;
+}
+
+void GuiApp::ensureGuiSwapchainMode() {
+    if (swapchainVsync_ == guiWantVsync() && swapchainMailbox_ == guiAllowMailbox()) return;
+    vkDeviceWaitIdle(ctx_.device);
+    recreateGuiSwapchain();
+}
+
+void GuiApp::waitUntil(std::chrono::steady_clock::time_point t) {
+    if (std::chrono::steady_clock::now() < t) std::this_thread::sleep_until(t);
+}
+
+void GuiApp::noteDisplayPresents(int nPres, std::chrono::steady_clock::time_point frameStart) {
+    const float dt = std::chrono::duration<float>(std::chrono::steady_clock::now() - frameStart).count();
+    if (dt <= 0.f || nPres <= 0) return;
+    fps_ = fps_ * 0.95f + (static_cast<float>(nPres) / dt) * 0.05f;
+    const float dispMs = dt * 1000.f / static_cast<float>(nPres);
+    for (int i = 0; i < nPres; ++i) {
+        frameMsHistory_[historyHead_] = dispMs;
+        historyHead_ = (historyHead_ + 1) % kHistoryLen;
+        if (historyCount_ < kHistoryLen) ++historyCount_;
+    }
 }
 
 // Debug UI screenshot: replicate the present block (composite copy + ImGui
@@ -3242,10 +3502,22 @@ void GuiApp::run() {
     auto lastTime = std::chrono::steady_clock::now();
 
     while (window_.poll()) {
+        ensureGuiSwapchainMode();
+        const int lockN = std::max(15, std::min(120, ui_.lockFpsTarget));
+        if (currentTab_ != 2 && ui_.lockFps) {
+            const auto truePeriod = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                std::chrono::duration<double>(1.0 / static_cast<double>(lockN)));
+            const auto nowLock = std::chrono::steady_clock::now();
+            if (fpsLockDeadline_.time_since_epoch().count() == 0 ||
+                nowLock > fpsLockDeadline_ + truePeriod)
+                fpsLockDeadline_ = nowLock;
+        }
         const auto now = std::chrono::steady_clock::now();
-        const float dt = std::chrono::duration<float>(now - lastTime).count();
+        const float dtWall = std::chrono::duration<float>(now - lastTime).count();
         lastTime = now;
-        if (dt > 0.f) fps_ = fps_ * 0.95f + (1.f / dt) * 0.05f;
+        const float dt = (currentTab_ != 2 && ui_.lockFps)
+                             ? (1.f / static_cast<float>(lockN))
+                             : dtWall;
 
         if (pendingRebuild_) applyRebuild();
         // Async rebuild handoff: the worker is done (joined inside), swap the
@@ -3310,8 +3582,7 @@ void GuiApp::run() {
                 swapchain_.acquireNext(ctx_, uiFrames_[slot].imageAvailable, swapIndex);
             if (acq == VK_ERROR_OUT_OF_DATE_KHR || acq == VK_SUBOPTIMAL_KHR) {
                 vkDeviceWaitIdle(ctx_.device);
-                swapchain_.create(ctx_, active_.displayW, active_.displayH, true);
-                ensurePresentSemaphores();
+                recreateGuiSwapchain();
                 continue;
             }
             if (acq != VK_SUCCESS) break;
@@ -3338,12 +3609,21 @@ void GuiApp::run() {
             VkResult pres = swapchain_.present(ctx_, swapIndex, renderFinished_[swapIndex]);
             if (pres == VK_ERROR_OUT_OF_DATE_KHR || pres == VK_SUBOPTIMAL_KHR) {
                 vkDeviceWaitIdle(ctx_.device);
-                swapchain_.create(ctx_, active_.displayW, active_.displayH, true);
-                ensurePresentSemaphores();
+                recreateGuiSwapchain();
             } else if (pres != VK_SUCCESS) {
                 break;
             }
             ++uiFrameIndex_;
+            if (currentTab_ != 2 && ui_.lockFps) {
+                const auto period = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                    std::chrono::duration<double>(1.0 / static_cast<double>(lockN)));
+                auto nowLock = std::chrono::steady_clock::now();
+                if (fpsLockDeadline_.time_since_epoch().count() == 0 || nowLock > fpsLockDeadline_ + period)
+                    fpsLockDeadline_ = nowLock;
+                waitUntil(fpsLockDeadline_ + period);
+                fpsLockDeadline_ += period;
+            }
+            noteDisplayPresents(1, lastTime);
             continue;
         }
 
@@ -3357,9 +3637,6 @@ void GuiApp::run() {
         // complete; harvest GPU timings + metric readback before reuse.
         if (frameIndex >= kFramesInFlight) {
             lastTimings_ = timestamps_.read(ctx_, slot);
-            frameMsHistory_[historyHead_] = static_cast<float>(lastTimings_.frameMs);
-            historyHead_ = (historyHead_ + 1) % kHistoryLen;
-            if (historyCount_ < kHistoryLen) ++historyCount_;
             frameTimesLog_.push_back(lastTimings_);
             // Cap the log but keep the most recent half, so a CSV export never
             // loses the entire history when the runaway guard fires.
@@ -3380,8 +3657,7 @@ void GuiApp::run() {
         VkResult acq = swapchain_.acquireNext(ctx_, frames_[slot].imageAvailable, swapIndex);
         if (acq == VK_ERROR_OUT_OF_DATE_KHR || acq == VK_SUBOPTIMAL_KHR) {
             vkDeviceWaitIdle(ctx_.device);
-            swapchain_.create(ctx_, active_.displayW, active_.displayH, true);
-            ensurePresentSemaphores();
+            recreateGuiSwapchain();
             continue;
         }
         if (acq != VK_SUCCESS) break;
@@ -3418,8 +3694,7 @@ void GuiApp::run() {
         VkResult pres = swapchain_.present(ctx_, swapIndex, renderFinished_[swapIndex]);
         if (pres == VK_ERROR_OUT_OF_DATE_KHR || pres == VK_SUBOPTIMAL_KHR) {
             vkDeviceWaitIdle(ctx_.device);
-            swapchain_.create(ctx_, active_.displayW, active_.displayH, true);
-            ensurePresentSemaphores();
+            recreateGuiSwapchain();
         } else if (pres != VK_SUCCESS) {
             break;
         }
@@ -3437,6 +3712,73 @@ void GuiApp::run() {
             screenshotShared_->finished = 0;
         }
 
+        const bool viewerFg =
+            currentTab_ != 2 && active_.mode == Mode::Viewer && !algos_.empty() &&
+            algos_[0].fgReady;
+        const bool lock = currentTab_ != 2 && ui_.lockFps;
+        using clock = std::chrono::steady_clock;
+        const auto truePeriod = std::chrono::duration_cast<clock::duration>(
+            std::chrono::duration<double>(1.0 / static_cast<double>(lockN)));
+        const auto displayPeriod = std::chrono::duration_cast<clock::duration>(
+            std::chrono::duration<double>(1.0 / static_cast<double>(lockN * 2)));
+        if (!lock) fpsLockDeadline_ = {};
+
+        // Viewer interpolator: first present was the generated frame (t-0.5);
+        // second present is the true upscaled frame (t).  The gap between the
+        // two presents is 1/(2N) measured from the first present, so they
+        // cannot collapse into one monitor refresh (which looked like N fps).
+        bool didSecondPresent = false;
+        if (viewerFg && pres == VK_SUCCESS) {
+            vkWaitForFences(ctx_.device, 1, &frames_[slot].fence, VK_TRUE, UINT64_MAX);
+            const auto tAfterFirst = clock::now();
+            const uint32_t uiSlot = uiFrameIndex_ % kFramesInFlight;
+            vkWaitForFences(ctx_.device, 1, &uiFrames_[uiSlot].fence, VK_TRUE, UINT64_MAX);
+            uint32_t swapIndex2 = 0;
+            VkResult acq2 =
+                swapchain_.acquireNext(ctx_, uiFrames_[uiSlot].imageAvailable, swapIndex2);
+            if (acq2 == VK_ERROR_OUT_OF_DATE_KHR || acq2 == VK_SUBOPTIMAL_KHR) {
+                vkDeviceWaitIdle(ctx_.device);
+                recreateGuiSwapchain();
+            } else if (acq2 == VK_SUCCESS) {
+                vkResetFences(ctx_.device, 1, &uiFrames_[uiSlot].fence);
+                recordViewerTruePresent(uiSlot, swapIndex2);
+                if (lock) waitUntil(tAfterFirst + displayPeriod);
+                VkPipelineStageFlags waitStage2 = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+                VkSubmitInfo submit2 = {};
+                submit2.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+                submit2.waitSemaphoreCount = 1;
+                submit2.pWaitSemaphores = &uiFrames_[uiSlot].imageAvailable;
+                submit2.pWaitDstStageMask = &waitStage2;
+                submit2.commandBufferCount = 1;
+                submit2.pCommandBuffers = &uiFrames_[uiSlot].cmd;
+                submit2.signalSemaphoreCount = 1;
+                submit2.pSignalSemaphores = &renderFinished_[swapIndex2];
+                VkResult submitRes2;
+                {
+                    std::lock_guard<std::mutex> lk(ctx_.queueMutex);
+                    submitRes2 =
+                        vkQueueSubmit(ctx_.graphicsQueue, 1, &submit2, uiFrames_[uiSlot].fence);
+                }
+                if (submitRes2 == VK_SUCCESS) {
+                    VkResult pres2 =
+                        swapchain_.present(ctx_, swapIndex2, renderFinished_[swapIndex2]);
+                    if (pres2 == VK_ERROR_OUT_OF_DATE_KHR || pres2 == VK_SUBOPTIMAL_KHR) {
+                        vkDeviceWaitIdle(ctx_.device);
+                        recreateGuiSwapchain();
+                    } else if (pres2 == VK_SUCCESS) {
+                        didSecondPresent = true;
+                    }
+                }
+                ++uiFrameIndex_;
+            }
+        }
+
+        if (lock) {
+            waitUntil(fpsLockDeadline_ + truePeriod);
+            fpsLockDeadline_ += truePeriod;
+        }
+
+        noteDisplayPresents(didSecondPresent ? 2 : 1, lastTime);
         ++renderFrameIndex_;
     }
 
@@ -3454,6 +3796,94 @@ void GuiApp::run() {
 // ---------------------------------------------------------------------------
 // UI.
 // ---------------------------------------------------------------------------
+const char* GuiApp::fgLabel(int fg) {
+    if (fg < 0 || fg >= kFgCount) return kFgLabels[0];
+    return kFgLabels[fg];
+}
+
+const char* GuiApp::fgId(int fg) {
+    if (fg < 0 || fg >= kFgCount) return kFgIds[0];
+    return kFgIds[fg];
+}
+
+int GuiApp::upscalerIndexById(const std::string& id) const {
+    for (size_t i = 0; i < upscalerNames_.size(); ++i)
+        if (upscalerNames_[i] == id) return static_cast<int>(i);
+    return -1;
+}
+
+bool GuiApp::drawGroupedUpscalerCombo(const char* label, int* index, bool includeNative) {
+    const int n = static_cast<int>(upscalerNames_.size());
+    std::string preview;
+    if (includeNative && *index <= 0)
+        preview = "native (ground truth)";
+    else {
+        const int plugin = includeNative ? *index - 1 : *index;
+        if (plugin >= 0 && plugin < n) preview = upscalerLabels_[static_cast<size_t>(plugin)];
+        else preview = "(none)";
+    }
+    bool changed = false;
+    if (!ImGui::BeginCombo(label, preview.c_str())) return false;
+    if (includeNative) {
+        if (ImGui::Selectable("native (ground truth)", *index == 0)) {
+            *index = 0;
+            changed = true;
+        }
+    }
+    for (const AlgoGroup& g : kAlgoGroups) {
+        ImGui::Separator();
+        ImGui::TextDisabled("%s", g.title);
+        for (int k = 0; k < g.count; ++k) {
+            const int plugin = upscalerIndexById(g.ids[k]);
+            if (plugin < 0) continue;
+            const int stored = includeNative ? plugin + 1 : plugin;
+            ImGuiSelectableFlags flags = 0;
+            if (static_cast<size_t>(plugin) < upscalerAvailable_.size() &&
+                !upscalerAvailable_[static_cast<size_t>(plugin)])
+                flags |= ImGuiSelectableFlags_Disabled;
+            if (ImGui::Selectable(upscalerLabels_[static_cast<size_t>(plugin)].c_str(),
+                                  *index == stored, flags)) {
+                *index = stored;
+                changed = true;
+            }
+        }
+    }
+    ImGui::EndCombo();
+    return changed;
+}
+
+void GuiApp::drawGroupedUpscalerCheckboxes(bool* selected, uint32_t count) {
+    for (const AlgoGroup& g : kAlgoGroups) {
+        ImGui::TextDisabled("%s", g.title);
+        bool first = true;
+        for (int k = 0; k < g.count; ++k) {
+            const int plugin = upscalerIndexById(g.ids[k]);
+            if (plugin < 0 || static_cast<uint32_t>(plugin) >= count) continue;
+            if (!first) ImGui::SameLine();
+            first = false;
+            ImGui::PushID(plugin);
+            const bool unavailable = static_cast<size_t>(plugin) < upscalerAvailable_.size() &&
+                                     !upscalerAvailable_[static_cast<size_t>(plugin)] &&
+                                     !selected[plugin];
+            if (unavailable) ImGui::BeginDisabled();
+            ImGui::Checkbox(upscalerLabels_[static_cast<size_t>(plugin)].c_str(),
+                            &selected[plugin]);
+            if (unavailable) ImGui::EndDisabled();
+            ImGui::PopID();
+        }
+    }
+}
+
+void GuiApp::drawFrameLockControls() {
+    ImGui::Checkbox("lock frame rate", &ui_.lockFps);
+    if (!ui_.lockFps) ImGui::BeginDisabled();
+    ImGui::SliderInt("render FPS", &ui_.lockFpsTarget, 15, 120, "%d");
+    if (!ui_.lockFps) ImGui::EndDisabled();
+    const int n = std::max(15, std::min(120, ui_.lockFpsTarget));
+    ImGui::TextDisabled("lock %d → interpolator presents %d times/sec (true + generated)", n,
+                        n * 2);
+}
+
 void GuiApp::drawSharedControls() {
     // Scene: named registry entries + optional custom glTF path override.
     std::vector<const char*> sceneNames;
@@ -3494,26 +3924,17 @@ void GuiApp::drawViewerTab() {
     drawSharedControls();
     ImGui::Separator();
 
-    // Upscaler: native + every registered plugin (availability probed).
-    {
-        const std::string current =
-            ui_.viewerUpscaler == 0
-                ? "native (ground truth)"
-                : upscalerLabels_[static_cast<size_t>(ui_.viewerUpscaler - 1)];
-        if (ImGui::BeginCombo("upscaler", current.c_str())) {
-            if (ImGui::Selectable("native (ground truth)", ui_.viewerUpscaler == 0))
-                ui_.viewerUpscaler = 0;
-            for (uint32_t i = 0; i < upscalerNames_.size(); ++i) {
-                ImGuiSelectableFlags flags = 0;
-                if (i < upscalerAvailable_.size() && !upscalerAvailable_[i])
-                    flags |= ImGuiSelectableFlags_Disabled;
-                if (ImGui::Selectable(upscalerLabels_[i].c_str(),
-                                      ui_.viewerUpscaler == static_cast<int>(i) + 1, flags))
-                    ui_.viewerUpscaler = static_cast<int>(i) + 1;
-            }
-            ImGui::EndCombo();
+    drawGroupedUpscalerCombo("upscaler", &ui_.viewerUpscaler, true);
+    if (ui_.viewerUpscaler == 0) ImGui::BeginDisabled();
+    if (ImGui::BeginCombo("frame interpolator", fgLabel(ui_.viewerFg))) {
+        for (int i = 0; i < kFgCount; ++i) {
+            if (ImGui::Selectable(kFgLabels[i], ui_.viewerFg == i)) ui_.viewerFg = i;
         }
+        ImGui::EndCombo();
     }
+    if (ui_.viewerUpscaler == 0) ImGui::EndDisabled();
+    drawFrameLockControls();
+    ImGui::TextDisabled("Viewer presents interpolated, then the true frame (2x)");
 
     const bool loadInFlight = loadPhase_.load(std::memory_order_acquire) == LoadPhase::Loading;
     if (loadInFlight) ImGui::BeginDisabled();
@@ -3544,7 +3965,12 @@ void GuiApp::drawViewerTab() {
     ImGui::Separator();
 
     // Live performance readout.
-    ImGui::Text("frame   %6.2f ms  (%5.1f FPS)", lastTimings_.frameMs, static_cast<double>(fps_));
+    {
+        const float dispMs = fps_ > 1.f ? 1000.f / fps_ : lastTimings_.frameMs;
+        ImGui::Text("display %6.2f ms  (%5.1f FPS)", static_cast<double>(dispMs),
+                    static_cast<double>(fps_));
+    }
+    ImGui::Text("gpu     %6.2f ms", lastTimings_.frameMs);
     ImGui::Text("scene   %6.2f ms", lastTimings_.sceneMs);
     ImGui::Text("upscale %6.2f ms", lastTimings_.upscaleMs);
     if (historyCount_ > 1) {
@@ -3554,7 +3980,7 @@ void GuiApp::drawViewerTab() {
             ordered[i] = frameMsHistory_[(historyHead_ + kHistoryLen - historyCount_ + i) %
                                          kHistoryLen];
         }
-        ImGui::PlotLines("frame ms", ordered, static_cast<int>(historyCount_), 0, nullptr, 0.f,
+        ImGui::PlotLines("display ms", ordered, static_cast<int>(historyCount_), 0, nullptr, 0.f,
                          33.f, ImVec2(-1.f, 60.f));
     }
     ImGui::Separator();
@@ -3573,20 +3999,48 @@ void GuiApp::drawCompareTab() {
     drawSharedControls();
     ImGui::Separator();
 
-    // Multi-select up to kMaxAlgos columns; extra checkboxes are disabled.
-    uint32_t selected = 0;
-    for (uint32_t i = 0; i < upscalerNames_.size() && i < kMaxRegistered; ++i)
-        if (ui_.compareSelected[i]) ++selected;
-    ImGui::Text("algorithms (%u/%u):", selected, kMaxAlgos);
-    for (uint32_t i = 0; i < upscalerNames_.size() && i < kMaxRegistered; ++i) {
-        const bool unavailable =
-            i < upscalerAvailable_.size() && !upscalerAvailable_[i] && !ui_.compareSelected[i];
-        const bool capped = !ui_.compareSelected[i] && selected >= kMaxAlgos;
-        if (unavailable || capped) ImGui::BeginDisabled();
-        ImGui::Checkbox(upscalerLabels_[i].c_str(), &ui_.compareSelected[i]);
-        if (unavailable || capped) ImGui::EndDisabled();
+    const uint32_t selected = static_cast<uint32_t>(ui_.compareSlots.size());
+    ImGui::Text("algorithms (%u/%u)", selected, kMaxAlgos);
+    const bool canAdd = selected < kMaxAlgos && !upscalerNames_.empty();
+    if (!canAdd) ImGui::BeginDisabled();
+    if (ImGui::Button("+")) {
+        UiState::CompareSlot slot;
+        slot.sr = 0;
+        for (size_t i = 0; i < upscalerNames_.size(); ++i) {
+            if (i < upscalerAvailable_.size() && upscalerAvailable_[i]) {
+                slot.sr = static_cast<int>(i);
+                break;
+            }
+        }
+        ui_.compareSlots.push_back(slot);
     }
-    if (selected >= kMaxAlgos) ImGui::TextDisabled("max %u columns reached", kMaxAlgos);
+    if (!canAdd) ImGui::EndDisabled();
+    ImGui::SameLine();
+    ImGui::TextDisabled("sr / interpolator");
+
+    int removeAt = -1;
+    for (int row = 0; row < static_cast<int>(ui_.compareSlots.size()); ++row) {
+        UiState::CompareSlot& slot = ui_.compareSlots[static_cast<size_t>(row)];
+        ImGui::PushID(row);
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 10.f);
+        drawGroupedUpscalerCombo("##sr", &slot.sr, false);
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 6.f);
+        if (ImGui::BeginCombo("##fg", fgLabel(slot.fg))) {
+            for (int i = 0; i < kFgCount; ++i) {
+                if (ImGui::Selectable(kFgLabels[i], slot.fg == i)) slot.fg = i;
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("x")) removeAt = row;
+        ImGui::PopID();
+    }
+    if (removeAt >= 0)
+        ui_.compareSlots.erase(ui_.compareSlots.begin() + removeAt);
+
+    drawFrameLockControls();
+    ImGui::TextDisabled("FG columns: PSNR vs midpoint GT; columns without FG show --");
 
     ImGui::TextDisabled("GT reference: %s (Reference checkbox, above the tabs)",
                         ui_.compareGtSsaa ? "200% SSAA" : "native res");
@@ -3602,7 +4056,7 @@ void GuiApp::drawCompareTab() {
     }
     ImGui::TextDisabled("wheel: zoom at cursor, middle drag: pan");
 
-    const bool any = selected > 0;
+    const bool any = !ui_.compareSlots.empty();
     const bool loadInFlight = loadPhase_.load(std::memory_order_acquire) == LoadPhase::Loading;
     if (!any || loadInFlight) ImGui::BeginDisabled();
     if (ImGui::Button("apply (rebuild)", ImVec2(-1.f, 0.f)))
@@ -3613,15 +4067,25 @@ void GuiApp::drawCompareTab() {
     ImGui::Separator();
 
     // Live metrics (also drawn on the columns themselves).
-    if (ImGui::BeginTable("metrics", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
+    if (ImGui::BeginTable("metrics", 4, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
         ImGui::TableSetupColumn("algo");
+        ImGui::TableSetupColumn("FPS");
         ImGui::TableSetupColumn("PSNR dB");
         ImGui::TableSetupColumn("SSIM");
         ImGui::TableHeadersRow();
         for (const AlgoColumn& algo : algos_) {
+            const float n = ui_.lockFps ? static_cast<float>(std::max(15, std::min(120, ui_.lockFpsTarget)))
+                                        : fps_;
+            const float colFps = algo.fg.empty() ? n : n * 2.f;
             ImGui::TableNextRow();
             ImGui::TableNextColumn();
-            ImGui::TextUnformatted(algo.upscaler->name());
+            if (!algo.fg.empty())
+                ImGui::Text("%s + %s", algo.upscaler->name(),
+                            algo.fg == "nfru" ? "NFRU" : "FSR3");
+            else
+                ImGui::TextUnformatted(algo.upscaler->name());
+            ImGui::TableNextColumn();
+            ImGui::Text("%.0f", static_cast<double>(colFps));
             ImGui::TableNextColumn();
             if (algo.hasMetric) ImGui::Text("%.2f", static_cast<double>(algo.psnr));
             else ImGui::TextDisabled("--");
@@ -3709,9 +4173,7 @@ void GuiApp::drawBenchTab() {
     ImGui::Separator();
 
     ImGui::Text("algorithms:");
-    for (uint32_t i = 0; i < upscalerNames_.size() && i < kMaxRegistered; ++i) {
-        ImGui::Checkbox(upscalerLabels_[i].c_str(), &ui_.benchSelected[i]);
-    }
+    drawGroupedUpscalerCheckboxes(ui_.benchSelected, kMaxRegistered);
     ImGui::Checkbox("native (GT baseline)", &ui_.benchNative);
     ImGui::Separator();
 

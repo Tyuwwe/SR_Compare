@@ -13,7 +13,11 @@ namespace sr {
 
 class Swapchain {
 public:
-    bool create(const VulkanContext& ctx, uint32_t width, uint32_t height, bool vsync);
+    // allowMailbox: vsync on prefers MAILBOX then FIFO.  Viewer frame-gen
+    // dual-present needs FIFO so both the interpolated and true presents
+    // hit the display (MAILBOX would drop the first of the pair).
+    bool create(const VulkanContext& ctx, uint32_t width, uint32_t height, bool vsync,
+                bool allowMailbox = true);
     void destroy(const VulkanContext& ctx);
 
     VkResult acquireNext(const VulkanContext& ctx, VkSemaphore signal, uint32_t& imageIndex);

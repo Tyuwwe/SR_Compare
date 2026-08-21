@@ -3,8 +3,8 @@
 // an upscaler output) through a source-region window (aspect-preserving crop
 // + optional zoom/pan, computed on the CPU), applies Reinhard tonemap +
 // gamma 2.2 (same as the viewer present pass / CPU screenshot path) and blits
-// a 5x7 bitmap-font text overlay (algorithm name + live PSNR/SSIM) in the
-// top-left corner.
+// a 5x7 bitmap-font text overlay (algorithm name + FPS + live PSNR/SSIM)
+// in the top-left corner.
 //
 // The region window keeps the source aspect ratio: the CPU passes a
 // normalized (offset, size) rect that fills the column and crops the
@@ -12,12 +12,12 @@
 // sampled with nearest filtering (texelFetch) so individual source pixels
 // stay distinguishable for pixel-level algorithm comparison.
 //
-// Text comes in as packed ASCII codes in a UBO (5 slots x 72 chars); glyph
+// Text comes in as packed ASCII codes in a UBO (5 slots x 96 chars); glyph
 // pixels are sampled from an R8 atlas (16x6 grid of 8x8 cells, ASCII 32..127).
 
 layout(set = 0, binding = 0) uniform sampler2D uSource;
 layout(std140, set = 0, binding = 1) uniform TextUBO {
-    uvec4 text[5][18]; // 72 chars per column slot, row-major (3 lines x 24)
+    uvec4 text[5][24]; // 96 chars per column slot, row-major (4 lines x 24)
 } uText;
 layout(set = 0, binding = 2) uniform sampler2D uFont;
 
@@ -52,7 +52,7 @@ void main() {
     const float padY = 6.0;
     const float lineH = 8.0 * float(scale);   // 7px glyph + 1px leading
     const float bandW = 24.0 * 6.0 * float(scale) + padX;
-    const float bandH = 3.0 * lineH + padY;
+    const float bandH = 4.0 * lineH + padY;
 
     if (px.x < bandW && px.y < bandH) {
         c *= 0.35; // dim backdrop so white text stays readable on bright scenes
@@ -60,7 +60,7 @@ void main() {
         if (local.x >= 0.0 && local.y >= 0.0) {
             int ci = int(local.x / (6.0 * float(scale)));
             int line = int(local.y / lineH);
-            if (ci < 24 && line < 3) {
+            if (ci < 24 && line < 4) {
                 int charIdx = line * 24 + ci;
                 uint code = uText.text[slot][charIdx >> 2][charIdx & 3];
                 if (code != 0u && code >= 32u) {

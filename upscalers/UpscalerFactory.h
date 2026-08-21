@@ -13,6 +13,7 @@
 // SR_REGISTER_UPSCALER in one of its sources.
 // ============================================================================
 #include "upscalers/IUpscaler.h"
+#include "upscalers/IFrameGen.h"
 
 #include <memory>
 #include <string>
@@ -85,4 +86,10 @@ std::vector<VulkanDeviceNeeds> collectVulkanDeviceNeeds();
     namespace {                                                                        \
     const bool SR_CONCAT(kSrNeeds_, __LINE__) =                                        \
         ::sr::registerVulkanDeviceNeeds(needsValue);                                   \
+    }
+
+#define SR_REGISTER_FRAMEGEN(pluginName, createFn)                                     \
+    namespace {                                                                        \
+    const bool SR_CONCAT(kSrFrameGen_, __LINE__) =                                     \
+        ::sr::registerFrameGen(pluginName, createFn);                                  \
     }
