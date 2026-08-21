@@ -32,6 +32,7 @@ void printUsage() {
                  "  --compare-zoom <f>        preset compare-tab zoom 1..16 (automation)\n"
                  "  --compare-gt-ssaa         preset the compare-tab GT 200%% SSAA checkbox\n"
                  "  --env-map <hdr>           IBL environment map (default san_giuseppe_bridge)\n"
+                 "  --exposure <f>            display exposure (default: scene preset)\n"
                  "  --bench <a,b,...>         start in the Bench tab and auto-run\n"
                  "viewer options:\n"
                  "  --scene <name|gltf path>     scene: boxes, sponza, or a glTF path (--list-scenes)\n"
@@ -43,7 +44,9 @@ void printUsage() {
                  "  --frames <N>                     render N frames then exit\n"
                  "  --screenshot <out.png>           save the final frame as PNG\n"
                  "  --no-shadows                     disable CSM sun shadows\n"
-                 "  --shadow-debug                   tint pixels per shadow cascade\n");
+                 "  --shadow-debug                   tint pixels per shadow cascade\n"
+                 "  --exposure <f>                   display exposure (default 1; ACES input)\n"
+                 "  --no-bloom                       disable HDR bloom\n");
 }
 
 int runViewer(int argc, char** argv) {
@@ -93,6 +96,13 @@ int runViewer(int argc, char** argv) {
             opts.shadows = false;
         } else if (a == "--shadow-debug") {
             opts.shadowDebug = true;
+        } else if (a == "--exposure") {
+            if (!sr::parseExposure(sr::nextArg(i, argc, argv, "--exposure"), opts.exposure)) {
+                std::fprintf(stderr, "invalid --exposure value\n");
+                return 1;
+            }
+        } else if (a == "--no-bloom") {
+            opts.bloom = false;
         } else {
             std::fprintf(stderr, "unknown viewer option: %s\n", a.c_str());
             return 1;
@@ -146,6 +156,11 @@ int runGui(int argc, char** argv) {
             opts.frames = std::atoi(sr::nextArg(i, argc, argv, "--frames"));
         } else if (a == "--screenshot") {
             opts.screenshotPath = sr::nextArg(i, argc, argv, "--screenshot");
+        } else if (a == "--exposure") {
+            if (!sr::parseExposure(sr::nextArg(i, argc, argv, "--exposure"), opts.exposure)) {
+                std::fprintf(stderr, "invalid --exposure value\n");
+                return 1;
+            }
         } else {
             std::fprintf(stderr, "unknown gui option: %s\n", a.c_str());
             return 1;

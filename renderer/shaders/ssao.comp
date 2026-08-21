@@ -1,34 +1,70 @@
 #version 450
-// SSAO pass (Crytek / John Chapman style): for each GBuffer pixel, 16 samples
-// in a normal-oriented hemisphere are projected to the screen and tested
-// against the depth buffer.  Positions are reconstructed in world space with
-// the inverse of the exact view-projection of this path (jittered for the
-// low-res upscaler input).  Sky pixels (far plane) get AO = 1.
-// Output: raw (noisy) AO, R16F; ssao_blur.comp filters it afterwards.
+// GTAO main pass (Jimenez et al. 2016, XeGTAO-style).
+// Replaces the previous Crytek hemisphere SSAO.  Same descriptor layout:
+//   binding 0 = GBuffer depth, 1 = world normal, 2 = RG16F working target
+//     R = raw visibility, G = view-space |z| (clip.w) for the bilateral denoise.
+// Three slices × three steps/side (XeGTAO High, 18 depth samples).  No depth
+// MIP chain: samples round to pixel centres and texelFetch the full-res depth.
+// Spatial-only Hilbert+R2 noise (no per-frame spin) so spatial upscalers do
+// not shimmer.  ssao_blur.comp is the 5×5 depth-aware denoise.
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 layout(set = 0, binding = 0) uniform sampler2D gbDepth;
 layout(set = 0, binding = 1) uniform sampler2D gbNormal;
-layout(set = 0, binding = 2, r16f) uniform writeonly image2D outAO;
+layout(set = 0, binding = 2, rg16f) uniform writeonly image2D outAO;
 
 layout(push_constant) uniform Push {
     mat4 viewProj;    // matches the GBuffer pass of this path
-    vec4 params;      // x = radius (m), y = bias (m), z = intensity, w = power
-    vec4 params2;     // x = frame index (per-frame rotation), y/z/w unused
+    vec4 params;      // x = radius (m), w = final power
+    vec4 params2;     // unused (frame index reserved)
 } pc;
 
-const int kSamples = 16;
-const float GOLDEN_ANGLE = 2.39996323;
+const float PI = 3.14159265359;
+const float PI_HALF = 1.57079632679;
+const int kSliceCount = 3;
+const int kStepsPerSlice = 3;
+const float kSampleDistributionPower = 2.0;
+const float kFalloffRange = 0.615;
+const float kRadiusMultiplier = 1.457;
+const float kPixelTooClose = 1.3;
 
-// Stable integer hash -> [0,1); avoids the precision pitfalls of sin-hashes.
-float hash01(uvec2 v) {
-    uint h = v.x * 1973u ^ v.y * 9277u;
-    h = h * 747796405u + 2891336453u;
-    h ^= h >> 16u;
-    h *= 2246822519u;
-    h ^= h >> 13u;
-    return float(h & 0x00FFFFFFu) / 16777216.0;
+// 64×64 Hilbert index (XeGTAO / shadertoy paniq).
+uint hilbertIndex(uint posX, uint posY) {
+    posX &= 63u;
+    posY &= 63u;
+    uint index = 0u;
+    for (uint curLevel = 32u; curLevel > 0u; curLevel >>= 1u) {
+        uint regionX = uint((posX & curLevel) != 0u);
+        uint regionY = uint((posY & curLevel) != 0u);
+        index += curLevel * curLevel * ((3u * regionX) ^ regionY);
+        if (regionY == 0u) {
+            if (regionX == 1u) {
+                posX = 63u - posX;
+                posY = 63u - posY;
+            }
+            uint tmp = posX;
+            posX = posY;
+            posY = tmp;
+        }
+    }
+    return index;
+}
+
+float fastSqrt(float x) {
+    return uintBitsToFloat(0x1fbd1df5u + (floatBitsToUint(x) >> 1u));
+}
+
+// [-1,1] -> [0, PI]
+float fastACos(float inX) {
+    float x = abs(inX);
+    float res = (-0.156583 * x + PI_HALF) * fastSqrt(1.0 - x);
+    return inX >= 0.0 ? res : PI - res;
+}
+
+vec3 reconstructWorld(mat4 invVP, vec2 uv, float depth) {
+    vec4 w = invVP * vec4(uv * 2.0 - 1.0, depth, 1.0);
+    return w.xyz / w.w;
 }
 
 void main() {
@@ -37,67 +73,121 @@ void main() {
     if (pix.x >= size.x || pix.y >= size.y) return;
 
     float depth = texelFetch(gbDepth, pix, 0).r;
-    if (depth >= 1.0) { // sky: no occlusion
-        imageStore(outAO, pix, vec4(1.0));
+    if (depth >= 1.0) {
+        imageStore(outAO, pix, vec4(1.0, 1e5, 0.0, 0.0));
         return;
     }
 
-    const mat4 invViewProj = inverse(pc.viewProj);
+    const mat4 invVP = inverse(pc.viewProj);
     const vec2 invSize = 1.0 / vec2(size);
-
-    // World position of this pixel.
     vec2 uv = (vec2(pix) + 0.5) * invSize;
-    vec4 wp4 = invViewProj * vec4(uv * 2.0 - 1.0, depth, 1.0);
-    vec3 P = wp4.xyz / wp4.w;
-    // A2B10G10R10 stores the normal remapped to [0,1]; unpack back to [-1,1].
+
+    vec3 P = reconstructWorld(invVP, uv, depth);
+    float viewZ = abs((pc.viewProj * vec4(P, 1.0)).w);
+    viewZ = max(viewZ, 1e-3);
+
     vec3 N = normalize(texelFetch(gbNormal, pix, 0).xyz * 2.0 - 1.0);
 
-    const float radius = pc.params.x;
-    const float bias = pc.params.y;
+    vec4 nearC = invVP * vec4(uv * 2.0 - 1.0, 0.0, 1.0);
+    vec4 farC = invVP * vec4(uv * 2.0 - 1.0, 1.0, 1.0);
+    nearC /= nearC.w;
+    farC /= farC.w;
+    vec3 viewVec = normalize(nearC.xyz - farC.xyz); // toward camera
+    if (dot(N, viewVec) < 0.0) N = -N;
 
-    // Per-pixel random rotation only.  A per-frame extra spin was designed to
-    // be averaged out by temporal upscalers; spatial plugins (FSR1 / SGSR1)
-    // have no history, so it showed up as full-frame AO shimmer.
-    float angle = 6.2831853 * hash01(uvec2(pix));
+    const float effectRadius = pc.params.x * kRadiusMultiplier;
+    const float falloffRange = kFalloffRange * effectRadius;
+    const float falloffFrom = effectRadius * (1.0 - kFalloffRange);
+    const float falloffMul = -1.0 / max(falloffRange, 1e-4);
+    const float falloffAdd = falloffFrom / max(falloffRange, 1e-4) + 1.0;
 
-    // TBN around the world-space normal.
-    vec3 up = abs(N.y) < 0.999 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
-    vec3 T = normalize(cross(up, N));
-    vec3 B = cross(N, T);
-    mat3 TBN = mat3(T, B, N);
+    vec3 pRight = reconstructWorld(invVP, uv + vec2(invSize.x, 0.0), depth);
+    float worldPerPixel = max(length(pRight - P), 1e-5);
+    float screenspaceRadius = effectRadius / worldPerPixel;
 
-    float occlusion = 0.0;
-    for (int i = 0; i < kSamples; ++i) {
-        float fi = float(i);
-        // Golden-angle spiral over the unit disk, lifted to the hemisphere and
-        // rotated by the per-pixel angle; bias samples towards the center.
-        float r = sqrt((fi + 0.5) / float(kSamples));
-        float theta = fi * GOLDEN_ANGLE + angle;
-        vec2 disk = r * vec2(cos(theta), sin(theta));
-        float z = sqrt(max(0.0, 1.0 - dot(disk, disk)));
-        float scale = mix(0.1, 1.0, (fi / float(kSamples)) * (fi / float(kSamples)));
-        vec3 samplePos = P + N * bias + TBN * vec3(disk, z) * (radius * scale);
+    uint h = hilbertIndex(uint(pix.x), uint(pix.y));
+    // R2 sequence (Roberts).  Spatial only: temporal offsets shimmer under
+    // FSR1 / SGSR1, which have no history to average them out.
+    float noiseSlice = fract(0.5 + float(h) * 0.7548776662466927);
+    float noiseSample = fract(0.5 + float(h) * 0.5698402739369613);
 
-        vec4 sc = pc.viewProj * vec4(samplePos, 1.0);
-        if (sc.w <= 0.0) continue;
-        vec3 sndc = sc.xyz / sc.w;
-        vec2 suv = sndc.xy * 0.5 + 0.5;
-        if (any(lessThan(suv, vec2(0.0))) || any(greaterThan(suv, vec2(1.0)))) continue;
+    float visibility = clamp((10.0 - screenspaceRadius) / 100.0, 0.0, 1.0) * 0.5;
+    const float minS = kPixelTooClose / max(screenspaceRadius, kPixelTooClose);
 
-        float sampleDepth = texelFetch(gbDepth, ivec2(suv * vec2(size)), 0).r;
-        if (sampleDepth >= 1.0) continue; // sample points at the sky
-        // Occluded when the stored surface is nearer than the sample point.
-        if (sampleDepth < sndc.z) {
-            // Range check with the true world-space distance (Chapman):
-            // ignore occluders farther than one radius away.
-            vec4 swp4 = invViewProj * vec4(suv * 2.0 - 1.0, sampleDepth, 1.0);
-            vec3 storedP = swp4.xyz / swp4.w;
-            float rangeW = clamp(1.0 - length(storedP - P) / radius, 0.0, 1.0);
-            occlusion += rangeW;
+    for (int slice = 0; slice < kSliceCount; ++slice) {
+        float sliceK = (float(slice) + noiseSlice) / float(kSliceCount);
+        float phi = sliceK * PI;
+        float cosPhi = cos(phi);
+        float sinPhi = sin(phi);
+        vec2 omega = vec2(cosPhi, -sinPhi) * screenspaceRadius;
+
+        vec3 pixelRight = pRight - P;
+        vec3 camRight = pixelRight - viewVec * dot(pixelRight, viewVec);
+        camRight = length(camRight) > 1e-6 ? normalize(camRight) : vec3(1.0, 0.0, 0.0);
+        vec3 camUp = normalize(cross(viewVec, camRight));
+        vec3 directionVec = camRight * cosPhi + camUp * sinPhi;
+        vec3 orthoDirectionVec = directionVec - dot(directionVec, viewVec) * viewVec;
+        vec3 axisVec = normalize(cross(orthoDirectionVec, viewVec));
+        vec3 projectedNormalVec = N - axisVec * dot(N, axisVec);
+
+        float signNorm = sign(dot(orthoDirectionVec, projectedNormalVec));
+        float projectedNormalVecLength = length(projectedNormalVec);
+        float cosNorm = clamp(dot(projectedNormalVec, viewVec) /
+                              max(projectedNormalVecLength, 1e-5), 0.0, 1.0);
+        float n = signNorm * fastACos(cosNorm);
+
+        float lowHorizonCos0 = cos(n + PI_HALF);
+        float lowHorizonCos1 = cos(n - PI_HALF);
+        float horizonCos0 = lowHorizonCos0;
+        float horizonCos1 = lowHorizonCos1;
+
+        for (int step = 0; step < kStepsPerSlice; ++step) {
+            float stepBaseNoise = float(slice + step * kStepsPerSlice) * 0.6180339887498948;
+            float stepNoise = fract(noiseSample + stepBaseNoise);
+            float s = (float(step) + stepNoise) / float(kStepsPerSlice);
+            s = pow(s, kSampleDistributionPower);
+            s += minS;
+
+            vec2 sampleOffset = round(s * omega);
+
+            vec2 uv0 = uv + sampleOffset * invSize;
+            vec2 uv1 = uv - sampleOffset * invSize;
+            uv0 = clamp(uv0, vec2(0.0), vec2(1.0));
+            uv1 = clamp(uv1, vec2(0.0), vec2(1.0));
+
+            float d0 = texelFetch(gbDepth, ivec2(uv0 * vec2(size)), 0).r;
+            float d1 = texelFetch(gbDepth, ivec2(uv1 * vec2(size)), 0).r;
+            vec3 samplePos0 = reconstructWorld(invVP, uv0, min(d0, 0.9999));
+            vec3 samplePos1 = reconstructWorld(invVP, uv1, min(d1, 0.9999));
+
+            vec3 sampleDelta0 = samplePos0 - P;
+            vec3 sampleDelta1 = samplePos1 - P;
+            float sampleDist0 = length(sampleDelta0);
+            float sampleDist1 = length(sampleDelta1);
+
+            vec3 sampleHorizonVec0 = sampleDelta0 / max(sampleDist0, 1e-6);
+            vec3 sampleHorizonVec1 = sampleDelta1 / max(sampleDist1, 1e-6);
+
+            float weight0 = clamp(sampleDist0 * falloffMul + falloffAdd, 0.0, 1.0);
+            float weight1 = clamp(sampleDist1 * falloffMul + falloffAdd, 0.0, 1.0);
+
+            float shc0 = mix(lowHorizonCos0, dot(sampleHorizonVec0, viewVec), weight0);
+            float shc1 = mix(lowHorizonCos1, dot(sampleHorizonVec1, viewVec), weight1);
+
+            horizonCos0 = max(horizonCos0, shc0);
+            horizonCos1 = max(horizonCos1, shc1);
         }
+
+        projectedNormalVecLength = mix(projectedNormalVecLength, 1.0, 0.05);
+        float h0 = -fastACos(clamp(horizonCos1, -1.0, 1.0));
+        float h1 = fastACos(clamp(horizonCos0, -1.0, 1.0));
+        float iarc0 = (cosNorm + 2.0 * h0 * sin(n) - cos(2.0 * h0 - n)) * 0.25;
+        float iarc1 = (cosNorm + 2.0 * h1 * sin(n) - cos(2.0 * h1 - n)) * 0.25;
+        visibility += projectedNormalVecLength * (iarc0 + iarc1);
     }
 
-    float ao = clamp(1.0 - (occlusion / float(kSamples)) * pc.params.z, 0.0, 1.0);
-    ao = pow(ao, pc.params.w);
-    imageStore(outAO, pix, vec4(ao));
+    visibility /= float(kSliceCount);
+    visibility = pow(clamp(visibility, 0.0, 1.0), pc.params.w);
+    visibility = max(visibility, 0.03);
+    imageStore(outAO, pix, vec4(visibility, viewZ, 0.0, 0.0));
 }

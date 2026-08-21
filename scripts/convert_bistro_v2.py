@@ -1,6 +1,6 @@
 """Blender CLI script: convert Amazon Lumberyard Bistro FBX to glTF with
 full PBR texture channels (baseColor+alpha, normal, ORM->MR+occlusion,
-emissive, alpha MASK).
+emissive, alpha MASK) and KHR_lights_punctual.
 
 Usage (Git Bash):
   "/c/Program Files/Blender Foundation/Blender 5.1/blender.exe" \
@@ -342,6 +342,21 @@ def postprocess_gltf(gltf_path, clip_mats, blend_mats, zero_alpha_mats, out_dir)
             pbr = m.get("pbrMetallicRoughness", {})
             if pbr.get("baseColorFactor", [1, 1, 1, 1])[3] >= OPAQUE_ALPHA_THRESHOLD:
                 m.pop("alphaMode", None)
+    em_boost = 0
+    used = j.setdefault("extensionsUsed", [])
+    for m in mats:
+        name = (m.get("name") or "").lower()
+        if "lantern" not in name and "streetlight" not in name and "emissive" not in name:
+            continue
+        m.setdefault("extensions", {})["KHR_materials_emissive_strength"] = {
+            "emissiveStrength": 8.0
+        }
+        em_boost += 1
+    if em_boost and "KHR_materials_emissive_strength" not in used:
+        used.append("KHR_materials_emissive_strength")
+    n_lights = 0
+    ext = (j.get("extensions") or {}).get("KHR_lights_punctual") or {}
+    n_lights = len(ext.get("lights") or [])
     # Verify every referenced image file exists.
     for img in j.get("images", []):
         uri = img.get("uri")
@@ -349,8 +364,9 @@ def postprocess_gltf(gltf_path, clip_mats, blend_mats, zero_alpha_mats, out_dir)
             missing_uri.append(uri)
     with open(gltf_path, "w", encoding="utf-8") as f:
         json.dump(j, f, separators=(",", ":"))
-    print("[v2] post: occlusionTexture injected on %d, MASK on %d, BLEND on %d"
-          % (occ, mask, blend))
+    print("[v2] post: occlusionTexture injected on %d, MASK on %d, BLEND on %d, "
+          "emissive-boost %d, KHR_lights %d"
+          % (occ, mask, blend, em_boost, n_lights))
     if missing_uri:
         print("[v2] WARNING: %d image URIs missing on disk: %s"
               % (len(missing_uri), missing_uri[:10]))
@@ -396,6 +412,7 @@ def main():
         export_yup=True,
         export_apply=False,
         export_animations=False,
+        export_lights=True,  # KHR_lights_punctual (street lamps / strings)
     )
 
     flipped = flip_normal_pngs(args.output, normal_img_names)
@@ -428,6 +445,8 @@ def main():
         "normal_pngs_flipped": flipped,
         "orm_ao_neutralized": ao_neutral,
         "orm_ao_kept": ao_kept,
+        "lights_punctual": len(((j.get("extensions") or {}).get("KHR_lights_punctual") or {})
+                               .get("lights") or []),
         "missing_image_uris": missing_uri,
         "materials": stats["materials"],
     }

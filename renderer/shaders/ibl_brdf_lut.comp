@@ -1,12 +1,14 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
+#include "brdf.glsl"
 // BRDF integration LUT (split-sum second sum): for each (NdV, roughness)
-// stores (scale, bias) for F0.  Standard Epic Games integration.
+// stores (scale, bias) for F0.  Uses Heitz height-correlated Smith V so the
+// LUT matches lighting.frag / transparent.frag.
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 layout(set = 0, binding = 0, rgba16f) uniform writeonly image2D dstLut;
 
-const float PI = 3.14159265359;
 const uint SAMPLE_COUNT = 128u;
 
 float radicalInverseVdC(uint bits) {
@@ -30,11 +32,6 @@ vec3 importanceSampleGGX(vec2 xi, float roughness) {
     return vec3(cos(phi) * sinTheta, sin(phi) * sinTheta, cosTheta); // tangent space, N = +Z
 }
 
-float geometrySchlickIBL(float NdX, float roughness) {
-    float k = roughness * roughness / 2.0; // IBL variant
-    return NdX / (NdX * (1.0 - k) + k);
-}
-
 vec2 integrateBRDF(float NdV, float roughness) {
     vec3 V = vec3(sqrt(1.0 - NdV * NdV), 0.0, NdV);
     float a = 0.0, b = 0.0;
@@ -45,8 +42,9 @@ vec2 integrateBRDF(float NdV, float roughness) {
         if (NdL > 0.0) {
             float NdH = max(H.z, 0.0);
             float VdH = max(dot(V, H), 0.0);
-            float G = geometrySchlickIBL(NdV, roughness) * geometrySchlickIBL(NdL, roughness);
-            float GVis = G * VdH / max(NdH * NdV, 1e-5);
+            // V already includes 1/(4 NdV NdL); G_Vis = 4 NdL V VoH / NoH.
+            float Vis = V_SmithGGXCorrelated(NdV, NdL, roughness);
+            float GVis = (4.0 * NdL * Vis * VdH) / max(NdH, 1e-5);
             float Fc = pow(1.0 - VdH, 5.0);
             a += (1.0 - Fc) * GVis;
             b += Fc * GVis;

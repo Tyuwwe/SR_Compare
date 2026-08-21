@@ -1,9 +1,11 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
+#include "tonemap.glsl"
 // Metrics pass 1: per-block reduction of PSNR/SSIM intermediate quantities.
 //
 // Metric convention (matches the offline metrics pipeline, metrics/
 // compute_metrics.py, which reads tonemapped PNGs): both images are linear
-// HDR, mapped to [0,1] via Reinhard tonemap + gamma 2.2 (identical to the
+// HDR, mapped to [0,1] via Hill fitted ACES + gamma 2.2 (identical to the
 // present pass / screenshot path), then compared in that sRGB-like domain
 // with data_range = 1.  SSIM is approximated block-wise: each 8x8 workgroup
 // covers one non-overlapping block and produces the standard SSIM terms with
@@ -27,16 +29,14 @@ layout(push_constant) uniform Push {
              // y  = 1 => uRef is low-res (GT Apply scale): sample via
              //      normalized UVs instead of texelFetch
              // zw = test image full size (px), for the normalized UVs
+    vec4 exposure; // x = display exposure (must match compose / present)
 } pc;
 
 const float C1 = 0.01 * 0.01;
 const float C2 = 0.03 * 0.03;
 
-// Reinhard + gamma 2.2 -> [0,1], same as present.frag / savePngFromHalfRgba.
-vec3 metricDomain(vec3 hdr) {
-    vec3 c = hdr / (1.0 + hdr);
-    return pow(max(c, vec3(0.0)), vec3(1.0 / 2.2));
-}
+// Shared display transform -> [0,1], same as present.frag / savePngFromHalfRgba.
+vec3 metricDomain(vec3 hdr) { return tonemapToDisplay(hdr, pc.exposure.x); }
 
 shared vec3 sX[64];
 shared vec3 sY[64];

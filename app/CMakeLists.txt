@@ -17,10 +17,10 @@ add_custom_command(TARGET sr_compare POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory
         "${SR_SHADER_OUT_DIR}" "${SR_EXE_DIR}/shaders")
 
-# One-click GUI launcher next to the exe (part of the packaged layout).
+# One-click GUI launcher next to the exe (packaged as sr_run_gui.bat).
 add_custom_command(TARGET sr_compare POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${CMAKE_SOURCE_DIR}/cmake/run_gui.bat" "${SR_EXE_DIR}/run_gui.bat")
+        "${CMAKE_SOURCE_DIR}/cmake/run_gui.bat" "${SR_EXE_DIR}/sr_run_gui.bat")
 
 if(EXISTS "${SR_THIRD_PARTY_DIR}/arm-nss/prebuilt_binaries/ngsdk_windows_x64.dll")
     add_custom_command(TARGET sr_compare POST_BUILD

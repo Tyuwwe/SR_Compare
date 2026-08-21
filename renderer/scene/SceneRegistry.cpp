@@ -36,6 +36,37 @@ std::string resolveSceneArg(const std::string& arg) {
     return resolveAssetPath(arg);  // treat as a glTF path (may still be CWD-relative)
 }
 
+LightingPreset defaultLightingPreset() { return LightingPreset{}; }
+
+LightingPreset goldenHourPreset() {
+    LightingPreset p;
+    // Low warm sun in front-left of the BistroExterior start camera (looking
+    // down -Z): long shadows toward the camera-right, matching the ORCA shot.
+    p.sunElevationDeg = 22.f;
+    p.sunAzimuthDeg = 215.f;
+    p.sunIntensity = 4.5f;
+    p.sunColor = {1.f, 0.72f, 0.45f};
+    p.sunEnabled = true;
+    p.fillEnabled = false;
+    p.iblIntensity = 0.45f;
+    p.exposure = 1.f;
+    p.preferPresetSun = true;
+    return p;
+}
+
+LightingPreset lightingPresetForScene(const std::string& scenePath) {
+    if (scenePath.find("BistroExterior") != std::string::npos) return goldenHourPreset();
+    return defaultLightingPreset();
+}
+
+std::vector<Light> lightsFromPreset(const LightingPreset& p) {
+    std::vector<Light> v;
+    if (p.sunEnabled)
+        v.push_back(makeSunLight(p.sunElevationDeg, p.sunAzimuthDeg, p.sunIntensity, p.sunColor));
+    if (p.fillEnabled) v.push_back(defaultFillLight());
+    return v;
+}
+
 bool initialCameraPose(const std::string& scenePath, Vec3& pos, Vec3& fwd) {
     // BistroExterior: on the street looking into the patisserie block.
     // (Reported repro location; the generic glTF start pose sits in a wall.)

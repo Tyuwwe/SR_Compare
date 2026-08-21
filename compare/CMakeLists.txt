@@ -15,7 +15,12 @@ set(COMPARE_SHADERS
 )
 set(COMPARE_SPV "")
 foreach(SHADER ${COMPARE_SHADERS})
-    sr_compile_shader(SPV ${SHADER})
+    if(SHADER STREQUAL "shaders/compare_compose.frag" OR
+       SHADER STREQUAL "shaders/compare_metrics_blocks.comp")
+        sr_compile_shader(SPV ${SHADER} "${SR_TONE_MAP_GLSL}")
+    else()
+        sr_compile_shader(SPV ${SHADER})
+    endif()
     list(APPEND COMPARE_SPV ${SPV})
 endforeach()
 add_custom_target(compare_shaders DEPENDS ${COMPARE_SPV})

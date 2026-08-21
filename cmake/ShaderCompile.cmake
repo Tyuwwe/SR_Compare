@@ -17,6 +17,10 @@ endif()
 set(SR_SHADER_OUT_DIR "${CMAKE_BINARY_DIR}/shaders" CACHE INTERNAL "SPIR-V output directory")
 file(MAKE_DIRECTORY "${SR_SHADER_OUT_DIR}")
 
+# Shared GLSL include root (present/compose/metrics #include "tonemap.glsl").
+set(SR_SHADER_INCLUDE_DIR "${CMAKE_SOURCE_DIR}/renderer/shaders")
+set(SR_TONE_MAP_GLSL "${SR_SHADER_INCLUDE_DIR}/tonemap.glsl")
+
 # sr_compile_shader(<out_var> <glsl_source> [extra_depends...])
 # Creates a custom command that compiles <glsl_source> to
 # ${SR_SHADER_OUT_DIR}/<basename>.spv and returns the .spv path in <out_var>.
@@ -41,7 +45,7 @@ function(sr_compile_shader OUT_VAR GLSL_SOURCE)
 
     add_custom_command(
         OUTPUT "${SPV}"
-        COMMAND "${SR_GLSLANG_VALIDATOR}" -V "${SRC_ABS}" -o "${SPV}" --target-env vulkan1.3
+        COMMAND "${SR_GLSLANG_VALIDATOR}" -V "-I${SR_SHADER_INCLUDE_DIR}" "${SRC_ABS}" -o "${SPV}" --target-env vulkan1.3
         DEPENDS "${SRC_ABS}" ${ARGN}
         COMMENT "Compiling shader ${FNAME} -> SPIR-V"
         VERBATIM)

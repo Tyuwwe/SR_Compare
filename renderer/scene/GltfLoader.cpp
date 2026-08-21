@@ -1,7 +1,9 @@
 #include "renderer/scene/Scene.h"
 
 #include "renderer/core/VkUtil.h"
+#include "renderer/scene/SceneRegistry.h"
 
+#include <cctype>
 #include <cmath>
 #include <set>
 #include <string>
@@ -217,6 +219,17 @@ bool Scene::loadGltf(const VulkanContext& ctx, const char* path, VkCommandPool p
         if (m->has_emissive_strength) {
             const float s = m->emissive_strength.emissive_strength;
             mat.emissiveFactor = mat.emissiveFactor * s;
+        } else if (m->name) {
+            // Bistro street/lantern materials ship with strength 1; without a
+            // reconvert they stay dim.  Skip this path when the glTF already
+            // authored KHR_materials_emissive_strength.
+            std::string lower(m->name);
+            for (char& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            if (lower.find("lantern") != std::string::npos ||
+                lower.find("streetlight") != std::string::npos ||
+                lower.find("emissive") != std::string::npos) {
+                mat.emissiveFactor = mat.emissiveFactor * 8.f;
+            }
         }
         if (m->alpha_mode == cgltf_alpha_mode_mask) mat.alphaCutoff = m->alpha_cutoff;
         if (m->alpha_mode == cgltf_alpha_mode_blend) mat.blend = true;
@@ -340,10 +353,32 @@ bool Scene::loadGltf(const VulkanContext& ctx, const char* path, VkCommandPool p
         lights.push_back(l);
     }
 
-    // Shared fallback lights when the file provides none (keeps the scene
-    // visible; same default the procedural scene and the UBO fillers use).
+    // Merge authored KHR_lights with the scene lighting preset.  Empty files
+    // take the full preset (sun + optional fill).  Bistro's golden-hour sun
+    // replaces authored directionals so the FBX key light cannot override it;
+    // authored point lights (lanterns, strings) are kept.
+    const LightingPreset preset = lightingPresetForScene(path);
     if (lights.empty()) {
-        lights = defaultLights();
+        lights = lightsFromPreset(preset);
+    } else if (preset.preferPresetSun) {
+        std::vector<Light> merged = lightsFromPreset(preset);
+        for (const Light& l : lights) {
+            if (l.type != LightType::Directional) merged.push_back(l);
+        }
+        lights = std::move(merged);
+    } else {
+        bool hasDir = false;
+        for (const Light& l : lights) {
+            if (l.type == LightType::Directional) {
+                hasDir = true;
+                break;
+            }
+        }
+        if (!hasDir && preset.sunEnabled) {
+            lights.insert(lights.begin(),
+                          makeSunLight(preset.sunElevationDeg, preset.sunAzimuthDeg,
+                                       preset.sunIntensity, preset.sunColor));
+        }
     }
 
     cgltf_free(data);

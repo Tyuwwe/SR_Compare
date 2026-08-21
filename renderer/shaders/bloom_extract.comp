@@ -1,0 +1,28 @@
+#version 450
+// Half-resolution bright-pass extract (quadratic knee).  Input is full-res
+// linear HDR; output is half-res RGBA16F.  Must match BloomPush in DeferredCore.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D srcHdr;
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D outBright;
+
+layout(push_constant) uniform Push {
+    vec4 params; // x = threshold, y = knee, zw unused
+} pc;
+
+void main() {
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(outBright);
+    if (pix.x >= size.x || pix.y >= size.y) return;
+
+    vec2 uv = (vec2(pix) + 0.5) / vec2(size);
+    vec3 c = texture(srcHdr, uv).rgb;
+    float lum = max(dot(c, vec3(0.2126, 0.7152, 0.0722)), 1e-4);
+    float threshold = pc.params.x;
+    float knee = max(pc.params.y, 1e-4);
+    float soft = clamp(lum - threshold + knee, 0.0, 2.0 * knee);
+    soft = soft * soft / (4.0 * knee);
+    float contrib = max(soft, lum - threshold) / lum;
+    imageStore(outBright, pix, vec4(c * contrib, 1.0));
+}

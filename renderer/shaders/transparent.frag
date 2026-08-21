@@ -1,4 +1,7 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
+#include "brdf.glsl"
+#include "ssr.glsl"
 // Forward transparency pass (upscaler input path).  Shades alpha-blended
 // surfaces (glass, bottles) with the same Cook-Torrance GGX + point lights +
 // IBL split-sum as the deferred lighting pass, combined through an
@@ -43,7 +46,7 @@ struct LightGPU {
 layout(set = 2, binding = 0) uniform LightingUBO {
     mat4 invViewProj;
     vec4 cameraPos;
-    LightGPU lights[8];
+    LightGPU lights[16]; // must match kMaxLights in DeferredCore.h
     vec4 lightCounts; // x = active light count, yzw reserved
     vec4 ambient;
     vec4 iblParams;   // x = env intensity, y = prefilter max lod
@@ -59,6 +62,9 @@ layout(set = 2, binding = 3) uniform sampler2D iblBrdfLut;
 // Screen-space AO (R16F, same resolution as this path's GBuffer).
 layout(set = 2, binding = 4) uniform sampler2D ssaoTex;
 layout(set = 2, binding = 5) uniform sampler2DArrayShadow shadowMap; // CSM, comparison sampler
+// Opaque HDR + depth copied before this pass writes color (SSR).
+layout(set = 2, binding = 6) uniform sampler2D ssrColor;
+layout(set = 2, binding = 7) uniform sampler2D ssrDepth;
 
 layout(location = 0) in vec3 vWorldPos;
 layout(location = 1) in vec3 vNormal;
@@ -70,36 +76,7 @@ layout(location = 0) out vec4 outColor;
 layout(location = 1) out vec2 outMotion;
 layout(location = 2) out float outMask;
 
-const float PI = 3.14159265359;
-
 int texIndex(float f) { return int(floor(f + 0.5)); }
-
-float distributionGGX(vec3 N, vec3 H, float roughness) {
-    float a = roughness * roughness;
-    float a2 = a * a;
-    float NdH = max(dot(N, H), 0.0);
-    float d = NdH * NdH * (a2 - 1.0) + 1.0;
-    return a2 / (PI * d * d);
-}
-
-float geometrySchlickGGX(float NdX, float roughness) {
-    float k = (roughness + 1.0) * (roughness + 1.0) / 8.0;
-    return NdX / (NdX * (1.0 - k) + k);
-}
-
-float geometrySmith(vec3 N, vec3 V, vec3 L, float roughness) {
-    return geometrySchlickGGX(max(dot(N, V), 0.0), roughness) *
-           geometrySchlickGGX(max(dot(N, L), 0.0), roughness);
-}
-
-vec3 fresnelSchlick(float cosTheta, vec3 F0) {
-    return F0 + (1.0 - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
-}
-
-vec3 fresnelSchlickRoughness(float cosTheta, vec3 F0, float roughness) {
-    vec3 F1 = max(vec3(1.0 - roughness), F0);
-    return F0 + (F1 - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
-}
 
 // Returns one punctual light's BRDF split into its diffuse and specular lobes.
 // The glass model weights them differently: specular is surface reflection,
@@ -130,17 +107,12 @@ void shadeLight(vec3 N, vec3 V, vec3 worldPos, vec3 albedo, float metallic,
         radiance *= atten;
     }
 
-    vec3 H = normalize(V + L);
     float NdL = max(dot(N, L), 0.0);
     if (NdL <= 0.0) return;
 
-    float D = distributionGGX(N, H, roughness);
-    float G = geometrySmith(N, V, L, roughness);
-    vec3 F = fresnelSchlick(max(dot(H, V), 0.0), F0);
-    specular = (D * G * F) / max(4.0 * max(dot(N, V), 0.0) * NdL, 1e-4) * radiance * NdL;
-
-    vec3 kd = (vec3(1.0) - F) * (1.0 - metallic);
-    diffuse = kd * albedo / PI * radiance * NdL;
+    evalBrdf(N, V, L, albedo, metallic, roughness, F0, diffuse, specular);
+    diffuse *= radiance * NdL;
+    specular *= radiance * NdL;
 }
 
 // --- CSM sun shadow sampling (keep in sync with lighting.frag) --------------
@@ -212,8 +184,19 @@ void main() {
 
     vec3 albedo = base.rgb;
     vec3 V = normalize(ubo.cameraPos.xyz - vWorldPos);
+    // Two-sided glass (cull is none): the far pane of a shop is drawn with
+    // inverted geometric normals, which made NdV = 0 and lit as black.
+    if (dot(N, V) < 0.0) N = -N;
     vec3 F0 = mix(vec3(0.04), albedo, metallic);
     roughness = max(roughness, 0.04);
+    // Shop windows: Bistro ORM is too rough, and uncoated F0=0.04 lets the
+    // dark interior punch through.  A mild coating + sharp roughness matches
+    // the NVIDIA exterior reference better (more "mirror", less "hole").
+    const bool shopGlass = base.a < 0.40 && metallic < 0.2;
+    if (shopGlass) {
+        roughness = min(roughness, 0.05);
+        F0 = mix(vec3(0.04), vec3(0.22), 0.75);
+    }
 
     vec3 lightDiffuse = vec3(0.0);
     vec3 lightSpecular = vec3(0.0);
@@ -234,36 +217,52 @@ void main() {
     }
 
     float NdV = max(dot(N, V), 0.0);
-    vec3 F = fresnelSchlickRoughness(NdV, F0, roughness);
+    vec3 F = F_SchlickRoughness(NdV, F0, roughness);
     vec3 kd = (vec3(1.0) - F) * (1.0 - metallic);
-    vec3 diffuseIbl = texture(iblIrradiance, N).rgb * albedo;
+    vec3 diffuseIbl = texture(iblIrradiance, N).rgb * albedo * (1.0 + albedo * (0.1159 * roughness));
     vec3 R = reflect(-V, N);
     vec3 prefiltered = textureLod(iblPrefilter, R, roughness * lighting.iblParams.y).rgb;
     vec2 brdf = texture(iblBrdfLut, vec2(NdV, roughness)).rg;
-    vec3 specularIbl = prefiltered * (F * brdf.x + brdf.y);
+    vec3 envBrdf = F * brdf.x + brdf.y; // UE EnvBRDF, applied at SSR composite
+    vec3 specularIbl = prefiltered * envBrdf;
 
     float ssao = texelFetch(ssaoTex, ivec2(gl_FragCoord.xy), 0).r;
     float ambientScale = ao * ssao * lighting.iblParams.x;
 
-    // Energy-conserving dielectric glass model:
-    //  - Specular lobes (direct + IBL) are surface reflections: their energy
-    //    is independent of transmission, so they are NOT scaled by opacity.
-    //    Scaling them by base.a (~0.1-0.4 for glass) would crush point-light
-    //    highlights and leave only the IBL mirror, reading as metal.
-    //  - specularIbl is weighted by the un-roughened Fresnel Fg so head-on
-    //    reflections stay near F0 (~4%) and only grow toward grazing angles;
-    //    an unweighted full-strength sample of the sharpest prefilter mip
-    //    (roughness ~0.04) would mirror the sky's sun disk almost losslessly.
-    //  - The diffuse/emissive terms approximate the transmitted, tinted part
-    //    (glass albedo is a tint, not a milky diffuse lobe) and keep the
-    //    opacity scale.
-    //  - Opacity is max(base.a, Fg): Fresnel reflection still turns panes
-    //    more opaque at grazing angles, but moderate angles no longer
-    //    saturate to a fully opaque mirror.
-    vec3 Fg = fresnelSchlick(NdV, F0);
-    float alpha = clamp(max(base.a, Fg.r), 0.0, 1.0);
-    vec3 glassColor = (lightDiffuse + emissive + kd * diffuseIbl * ambientScale) * base.a +
-                      lightSpecular + specularIbl * Fg * ambientScale;
+    // Dielectric shop-window model:
+    //  - Specular lobes (direct + IBL/SSR) are surface reflections and are
+    //    NOT scaled by opacity.
+    //  - SSR hits are the reflected scene; UE composites them with EnvBRDF
+    //    (not a second Fresnel multiply).  Misses fall back to IBL.
+    //  - Transmission scales with opacity and is attenuated by SSR confidence
+    //    so dark furniture does not silhouette through a successful hit.
+    //  - Opacity is max(base.a, Fg, ssrHit).
+    vec3 Fg = F_Schlick(NdV, F0);
+
+    vec3 specSsr = specularIbl * ambientScale;
+    float ssrHit = 0.0;
+    if (roughness < 0.45) {
+        vec4 ssr = traceSsr(ssrColor, ssrDepth, ubo.viewProj, lighting.invViewProj,
+                            ubo.cameraPos.xyz, vWorldPos, N, R, ubo.renderSizeJitter.xy);
+        ssrHit = clamp(ssr.a, 0.0, 1.0);
+        // UE applies EnvBRDF on the hit (not D*G*F).  Shop glass is a
+        // coated mirror: lerp EnvBRDF toward 1 with hit confidence so a
+        // solid trace is not crushed back to F0 (~0.22).
+        specSsr = mix(specSsr, ssr.rgb * mix(envBrdf, vec3(1.0), ssrHit * 0.8), ssrHit);
+    }
+
+    // Hide the dark interior: SSR confidence and Fresnel both raise opacity.
+    // Head-on panes reflect behind the camera (not in the colour buffer), so
+    // a miss still has to read as a dark mirror (IBL) rather than a hole.
+    float alpha = clamp(max(base.a, max(Fg.r, ssrHit * 0.88)), 0.0, 1.0);
+    if (shopGlass && ssrHit < 0.35)
+        alpha = max(alpha, mix(0.84, 1.0, Fg.r));
+    float transmit = base.a * (1.0 - max(ssrHit, shopGlass ? 0.75 : 0.0) * 0.92);
+
+    // Premultiplied: transmissive terms scale with opacity, specular does not
+    // (blend uses ONE, ONE_MINUS_SRC_ALPHA).
+    vec3 glassColor = (lightDiffuse + emissive + kd * diffuseIbl * ambientScale) * transmit +
+                      lightSpecular + specSsr;
 
     outColor = vec4(glassColor, alpha);
     outMotion = vMotion;

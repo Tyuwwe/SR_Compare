@@ -39,6 +39,8 @@ struct RendererOptions {
     std::string envMapPath = kDefaultEnvMapPath;
     bool shadows = true;      // CSM sun shadows (CLI: --no-shadows)
     bool shadowDebug = false; // cascade tint overlay (CLI: --shadow-debug)
+    float exposure = 1.f;     // display-domain ACES input multiplier
+    bool bloom = true;        // HDR bloom before upscale (CLI: --no-bloom)
 };
 
 class Renderer {
@@ -118,11 +120,17 @@ private:
     ImageResource gtMaterial_;
     ImageResource gtEmissive_;
     ImageResource finalImage_;
-    // SSAO (raw + blurred) for the LR and GT paths, R16_SFLOAT, GBuffer res.
+    // GTAO working target (RG16F: AO + view Z) and filtered R16F, GBuffer res.
     ImageResource gbAoRaw_;
     ImageResource gbAo_;
     ImageResource gtAoRaw_;
     ImageResource gtAo_;
+    ImageResource gbBloomA_; // half-res ping-pong
+    ImageResource gbBloomB_;
+    ImageResource gtBloomA_;
+    ImageResource gtBloomB_;
+    ImageResource gbSsrSrc_; // opaque HDR copy for glass SSR
+    ImageResource gtSsrSrc_;
 
     // Shared deferred pipeline (shaders/layouts/pipelines/samplers + IBL maps).
     DeferredCore deferred_;
@@ -132,6 +140,7 @@ private:
     // then keeps shadowParams.z = 0 and the shaders short-circuit.
     ShadowTargets shadow_;
     bool shadowsActive_ = false;
+    float iblIntensity_ = 1.f; // from lightingPresetForScene; not a CLI flag
 
     VkDescriptorSetLayout presentSetLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout presentPipelineLayout_ = VK_NULL_HANDLE;
@@ -152,6 +161,14 @@ private:
     VkDescriptorSet ssaoBlurSetGb_ = VK_NULL_HANDLE;
     VkDescriptorSet ssaoSetGt_ = VK_NULL_HANDLE;
     VkDescriptorSet ssaoBlurSetGt_ = VK_NULL_HANDLE;
+    VkDescriptorSet bloomExtractGb_ = VK_NULL_HANDLE;
+    VkDescriptorSet bloomBlurHGb_ = VK_NULL_HANDLE;
+    VkDescriptorSet bloomBlurVGb_ = VK_NULL_HANDLE;
+    VkDescriptorSet bloomCompGb_ = VK_NULL_HANDLE;
+    VkDescriptorSet bloomExtractGt_ = VK_NULL_HANDLE;
+    VkDescriptorSet bloomBlurHGt_ = VK_NULL_HANDLE;
+    VkDescriptorSet bloomBlurVGt_ = VK_NULL_HANDLE;
+    VkDescriptorSet bloomCompGt_ = VK_NULL_HANDLE;
 
     VkBuffer screenshotStaging_ = VK_NULL_HANDLE;
     VkDeviceMemory screenshotStagingMemory_ = VK_NULL_HANDLE;

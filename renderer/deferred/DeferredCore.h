@@ -74,7 +74,7 @@ struct LightGPU {
 };
 static_assert(sizeof(LightGPU) == 48, "LightGPU std140 size mismatch");
 
-constexpr uint32_t kMaxLights = 8;
+constexpr uint32_t kMaxLights = 16; // must match lights[] in lighting/transparent shaders
 
 // --- CSM sun shadows (AC Unity reference: 4 cascades, 2048^2 each) -----------
 constexpr uint32_t kShadowCascadeCount = 4;
@@ -139,7 +139,7 @@ struct LightingUBO {
                             // z = shadowsEnabled, w = debugCascades
     float viewForward[4];   // xyz = camera forward (world); w = shadowed sun light index (-1 = none)
 };
-static_assert(sizeof(LightingUBO) == 816, "LightingUBO std140 size mismatch");
+static_assert(sizeof(LightingUBO) == 1200, "LightingUBO std140 size mismatch");
 
 struct ScenePush {
     float model[16];
@@ -158,21 +158,34 @@ struct ShadowPush {
 };
 static_assert(sizeof(ShadowPush) == 128, "ShadowPush size mismatch");
 
-// Push constants of the SSAO compute pass (ssao.comp), 96 bytes.
+// Push constants of the GTAO compute pass (ssao.comp), 96 bytes.  The
+// filename is historical; the shader is a XeGTAO-style GTAO main pass.
 struct SsaoPush {
     float viewProj[16]; // matches the GBuffer pass of this path (jittered for LR)
-    float params[4];    // radius (m), bias (m), intensity, power
-    float params2[4];   // frame index (per-frame noise rotation), unused x3
+    float params[4];    // x = radius (m), y = unused, z = unused, w = final power
+    float params2[4];   // x = frame index (reserved; spatial-only noise), yzw unused
 };
 static_assert(sizeof(SsaoPush) == 96, "SsaoPush size mismatch");
 
-// SSAO defaults (scene scale: Bistro street ~180 m, sponza ~20 m).  0.5 m is
-// a contact-shadow radius; bias pushes samples off the surface along the
-// normal to avoid self-occlusion acne.
+// GTAO defaults (Jimenez 2016 / XeGTAO heuristics).  0.5 m is a near-field
+// contact radius at Bistro street scale; FinalValuePower 2.2 is XeGTAO High.
 constexpr float kSsaoRadius = 0.5f;
-constexpr float kSsaoBias = 0.03f;
-constexpr float kSsaoIntensity = 1.5f;
-constexpr float kSsaoPower = 1.0f;
+constexpr float kSsaoBias = 0.03f;      // unused (kept so SsaoPush comments stay stable)
+constexpr float kSsaoIntensity = 1.5f;  // unused
+constexpr float kSsaoPower = 2.2f;
+
+// Working GTAO target: R = visibility, G = view-space |z| for the bilateral
+// denoise.  The filtered output (gbAo_) stays R16F for lighting/transparent.
+constexpr VkFormat kAoRawFormat = VK_FORMAT_R16G16_SFLOAT;
+
+// Bloom (half-res extract + separable Gaussian, added back before upscale).
+struct BloomPush {
+    float params[4]; // extract: threshold, knee; blur: dir.xy; composite: strength
+};
+static_assert(sizeof(BloomPush) == 16, "BloomPush size mismatch");
+constexpr float kBloomThreshold = 1.0f;
+constexpr float kBloomKnee = 0.5f;
+constexpr float kBloomStrength = 0.15f;
 
 class DeferredCore {
 public:
@@ -190,13 +203,16 @@ public:
     // overrideLights (optional): pack this list instead of scene.lights — the
     // GUI sun controls rebuild the list per frame without touching the scene.
     // The fallback-to-defaultLights() rule applies only when no override is
-    // given; an override is used as-is (still truncated at kMaxLights).
+    // given.  Packed order: shadowed sun first, then other lights scored by
+    // intensity/distance² (truncated at kMaxLights).  The GPU sun index is
+    // remapped to slot 0.
     // shadow (optional): non-null enables CSM sampling in the shaders
     // (shadowParams.z = 1); null writes identity cascades with shadows off.
     void fillLightingUBO(LightingUBO& out, const Scene& scene, const Camera& camera,
                          const Mat4& invViewProj,
                          const std::vector<Light>* overrideLights = nullptr,
-                         const ShadowFrame* shadow = nullptr) const;
+                         const ShadowFrame* shadow = nullptr,
+                         float iblIntensity = 1.f) const;
 
     // Uploads the dynamic-offset material UBO array (one entry per material).
     bool createMaterialUbo(const VulkanContext& ctx, const Scene& scene, VkBuffer& buffer,
@@ -232,7 +248,8 @@ public:
     // shadow follows the same VK_NULL_HANDLE convention as writeLightingSet
     // (binding 5 left unwritten).
     void writeTransparentSet(const VulkanContext& ctx, VkDescriptorSet set,
-                             VkBuffer lightingUbo, VkImageView ssao, VkImageView shadow) const;
+                             VkBuffer lightingUbo, VkImageView ssao, VkImageView shadow,
+                             VkImageView ssrColor, VkImageView ssrDepth) const;
     // Draws all BLEND-material instances back-to-front over the lit scene.
     // LR path (gtPass=false): 3 attachments = color (alpha blend) + motion
     // (overwrite) + reactive mask (additive).  GT path: color only.  The
@@ -245,22 +262,36 @@ public:
 
     const IblMaps& ibl() const { return ibl_; }
 
-    // --- SSAO pass (between the GBuffer and the lighting pass) ----------------
-    // ssao set: depth + normal samplers + raw-AO storage image (R16_SFLOAT).
+    // --- GTAO pass (between the GBuffer and the lighting pass) ----------------
+    // ssao set: depth + normal samplers + working RG16F storage (R=AO, G=|z|).
     void writeSsaoSet(const VulkanContext& ctx, VkDescriptorSet set, VkImageView depth,
                       VkImageView normal, VkImageView aoRaw) const;
-    // ssao-blur set: raw-AO sampler + blurred-AO storage image.
+    // denoise set: working target sampler + filtered R16F storage image.
     void writeSsaoBlurSet(const VulkanContext& ctx, VkDescriptorSet set, VkImageView aoRaw,
                           VkImageView ao) const;
-    // Dispatches ssao.comp.  The caller owns all layout transitions: depth and
-    // normal in SHADER_READ_ONLY, aoRaw in GENERAL.  viewProj must match the
-    // GBuffer pass of this path (jittered for the low-res path).
+    // Dispatches ssao.comp (GTAO main pass).  The caller owns all layout
+    // transitions: depth and normal in SHADER_READ_ONLY, aoRaw in GENERAL.
+    // viewProj must match the GBuffer pass of this path (jittered for LR).
     void recordSsaoPass(VkCommandBuffer cmd, VkDescriptorSet ssaoSet, const Mat4& viewProj,
                         uint32_t frameIndex, uint32_t width, uint32_t height) const;
-    // Dispatches ssao_blur.comp (cross box filter): aoRaw SHADER_READ_ONLY,
-    // ao GENERAL.
+    // Dispatches ssao_blur.comp (5x5 depth-aware denoise): aoRaw
+    // SHADER_READ_ONLY, ao GENERAL.
     void recordSsaoBlurPass(VkCommandBuffer cmd, VkDescriptorSet blurSet, uint32_t width,
                             uint32_t height) const;
+
+    // --- Bloom (after lighting+transparency, before upscale) ------------------
+    // Reuses ssaoBlurSetLayout (sampler + storage).  writeBloomSet binds src
+    // (sampled) and dst (GENERAL storage).
+    void writeBloomSet(const VulkanContext& ctx, VkDescriptorSet set, VkImageView src,
+                       VkImageView dst) const;
+    // Extract + H blur + V blur + composite.  colorLayout must be
+    // SHADER_READ_ONLY on entry; it is left SHADER_READ_ONLY.  bloomA/B layouts
+    // are tracked across frames.  No-op when strength <= 0.
+    void recordBloomPass(VkCommandBuffer cmd, VkDescriptorSet extractSet, VkDescriptorSet blurHSet,
+                         VkDescriptorSet blurVSet, VkDescriptorSet compositeSet, VkImage bloomA,
+                         VkImage bloomB, VkImage color, VkImageLayout& bloomALayout,
+                         VkImageLayout& bloomBLayout, VkImageLayout& colorLayout, uint32_t fullW,
+                         uint32_t fullH, float strength = kBloomStrength) const;
 
     // --- CSM sun shadow pass (between the GBuffer and the lighting pass) ------
     // Creates the 2048^2 x kShadowCascadeCount D32 array + views.  The
@@ -295,6 +326,7 @@ public:
     VkDescriptorSetLayout transparentSetLayout() const { return transparentSetLayout_; }
     VkDescriptorSetLayout ssaoSetLayout() const { return ssaoSetLayout_; }
     VkDescriptorSetLayout ssaoBlurSetLayout() const { return ssaoBlurSetLayout_; }
+    VkDescriptorSetLayout bloomSetLayout() const { return ssaoBlurSetLayout_; }
     VkPipelineLayout scenePipelineLayout() const { return scenePipelineLayout_; }
     VkPipelineLayout lightingPipelineLayout() const { return lightingPipelineLayout_; }
     VkPipeline gbufferPipeline() const { return gbufferPipeline_; }
@@ -330,6 +362,10 @@ private:
     VkPipeline transparentGtPipeline_ = VK_NULL_HANDLE;
     VkPipeline ssaoPipeline_ = VK_NULL_HANDLE;
     VkPipeline ssaoBlurPipeline_ = VK_NULL_HANDLE;
+    VkPipelineLayout bloomPipelineLayout_ = VK_NULL_HANDLE;
+    VkPipeline bloomExtractPipeline_ = VK_NULL_HANDLE;
+    VkPipeline bloomBlurPipeline_ = VK_NULL_HANDLE;
+    VkPipeline bloomCompositePipeline_ = VK_NULL_HANDLE;
     VkPipeline shadowPipeline_ = VK_NULL_HANDLE;
     VkShaderModule gbufferVert_ = VK_NULL_HANDLE;
     VkShaderModule gbufferFrag_ = VK_NULL_HANDLE;
@@ -341,6 +377,9 @@ private:
     VkShaderModule transparentGtFrag_ = VK_NULL_HANDLE;
     VkShaderModule ssaoComp_ = VK_NULL_HANDLE;
     VkShaderModule ssaoBlurComp_ = VK_NULL_HANDLE;
+    VkShaderModule bloomExtractComp_ = VK_NULL_HANDLE;
+    VkShaderModule bloomBlurComp_ = VK_NULL_HANDLE;
+    VkShaderModule bloomCompositeComp_ = VK_NULL_HANDLE;
     VkShaderModule shadowDepthVert_ = VK_NULL_HANDLE;
     VkShaderModule shadowDepthFrag_ = VK_NULL_HANDLE;
     VkSampler textureSampler_ = VK_NULL_HANDLE;

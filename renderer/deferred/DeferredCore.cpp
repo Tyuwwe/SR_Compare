@@ -133,6 +133,9 @@ bool DeferredCore::init(const VulkanContext& ctx, const char* envMapPath) {
         !loadShader(ctx, "transparent_gt.frag.spv", transparentGtFrag_) ||
         !loadShader(ctx, "ssao.comp.spv", ssaoComp_) ||
         !loadShader(ctx, "ssao_blur.comp.spv", ssaoBlurComp_) ||
+        !loadShader(ctx, "bloom_extract.comp.spv", bloomExtractComp_) ||
+        !loadShader(ctx, "bloom_blur.comp.spv", bloomBlurComp_) ||
+        !loadShader(ctx, "bloom_composite.comp.spv", bloomCompositeComp_) ||
         !loadShader(ctx, "shadow_depth.vert.spv", shadowDepthVert_) ||
         !loadShader(ctx, "shadow_depth.frag.spv", shadowDepthFrag_))
         return false;
@@ -217,15 +220,14 @@ bool DeferredCore::createLayouts(const VulkanContext& ctx) {
         VK_SUCCESS)
         return false;
 
-    // Transparency pass: binding 0 = LightingUBO (lights array + iblParams
-    // read); 1-3 = IBL (irradiance/prefilter/LUT); 4 = SSAO texture of this
-    // path; 5 = CSM shadow map array (glass direct light is occluded too).
-    VkDescriptorSetLayoutBinding transparentBindings[6] = {};
+    // Transparency pass: binding 0 = LightingUBO; 1-3 = IBL; 4 = SSAO;
+    // 5 = CSM shadow map; 6 = opaque HDR copy (SSR); 7 = opaque depth (SSR).
+    VkDescriptorSetLayoutBinding transparentBindings[8] = {};
     transparentBindings[0].binding = 0;
     transparentBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     transparentBindings[0].descriptorCount = 1;
     transparentBindings[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-    for (uint32_t i = 1; i < 6; ++i) {
+    for (uint32_t i = 1; i < 8; ++i) {
         transparentBindings[i].binding = i;
         transparentBindings[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         transparentBindings[i].descriptorCount = 1;
@@ -233,13 +235,13 @@ bool DeferredCore::createLayouts(const VulkanContext& ctx) {
     }
     VkDescriptorSetLayoutCreateInfo transparentLayoutCi = {};
     transparentLayoutCi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    transparentLayoutCi.bindingCount = 6;
+    transparentLayoutCi.bindingCount = 8;
     transparentLayoutCi.pBindings = transparentBindings;
     if (vkCreateDescriptorSetLayout(ctx.device, &transparentLayoutCi, nullptr,
                                     &transparentSetLayout_) != VK_SUCCESS)
         return false;
 
-    // SSAO: binding 0 = depth, 1 = normal (samplers), 2 = raw AO (storage).
+    // GTAO: binding 0 = depth, 1 = normal (samplers), 2 = working RG16F (storage).
     VkDescriptorSetLayoutBinding ssaoBindings[3] = {};
     for (uint32_t i = 0; i < 3; ++i) {
         ssaoBindings[i].binding = i;
@@ -256,7 +258,7 @@ bool DeferredCore::createLayouts(const VulkanContext& ctx) {
         VK_SUCCESS)
         return false;
 
-    // SSAO blur: binding 0 = raw AO (sampler), 1 = blurred AO (storage).
+    // GTAO denoise / bloom: binding 0 = src (sampler), 1 = dst (storage).
     VkDescriptorSetLayoutBinding ssaoBlurBindings[2] = {};
     ssaoBlurBindings[0].binding = 0;
     ssaoBlurBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
@@ -503,7 +505,9 @@ bool DeferredCore::createPipelines(const VulkanContext& ctx) {
                            VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
     }
     transparentBlend[0].blendEnable = VK_TRUE;
-    transparentBlend[0].srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+    // Premultiplied: RGB already contains unscaled specular (SSR / highlights)
+    // so SRC_ALPHA would crush shop-window reflections.
+    transparentBlend[0].srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
     transparentBlend[0].dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
     transparentBlend[0].colorBlendOp = VK_BLEND_OP_ADD;
     transparentBlend[0].srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
@@ -572,7 +576,7 @@ bool DeferredCore::createPipelines(const VulkanContext& ctx) {
                                   &transparentGtPipeline_) != VK_SUCCESS)
         return false;
 
-    // --- SSAO compute passes (ssao + cross-box blur) ---------------------------
+    // --- GTAO compute passes (main + 5x5 bilateral denoise) --------------------
     VkPushConstantRange ssaoPushRange = {};
     ssaoPushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     ssaoPushRange.offset = 0;
@@ -609,6 +613,39 @@ bool DeferredCore::createPipelines(const VulkanContext& ctx) {
     ssaoCi.layout = ssaoBlurPipelineLayout_;
     if (vkCreateComputePipelines(ctx.device, VK_NULL_HANDLE, 1, &ssaoCi, nullptr,
                                  &ssaoBlurPipeline_) != VK_SUCCESS)
+        return false;
+
+    // --- Bloom (reuses ssaoBlur set layout: sampler + storage) ----------------
+    VkPushConstantRange bloomPushRange = {};
+    bloomPushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    bloomPushRange.offset = 0;
+    bloomPushRange.size = sizeof(BloomPush);
+    VkPipelineLayoutCreateInfo bloomLayoutCi = {};
+    bloomLayoutCi.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    bloomLayoutCi.setLayoutCount = 1;
+    bloomLayoutCi.pSetLayouts = &ssaoBlurSetLayout_;
+    bloomLayoutCi.pushConstantRangeCount = 1;
+    bloomLayoutCi.pPushConstantRanges = &bloomPushRange;
+    if (vkCreatePipelineLayout(ctx.device, &bloomLayoutCi, nullptr, &bloomPipelineLayout_) !=
+        VK_SUCCESS)
+        return false;
+    VkComputePipelineCreateInfo bloomCi = {};
+    bloomCi.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    bloomCi.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    bloomCi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    bloomCi.stage.pName = "main";
+    bloomCi.layout = bloomPipelineLayout_;
+    bloomCi.stage.module = bloomExtractComp_;
+    if (vkCreateComputePipelines(ctx.device, VK_NULL_HANDLE, 1, &bloomCi, nullptr,
+                                 &bloomExtractPipeline_) != VK_SUCCESS)
+        return false;
+    bloomCi.stage.module = bloomBlurComp_;
+    if (vkCreateComputePipelines(ctx.device, VK_NULL_HANDLE, 1, &bloomCi, nullptr,
+                                 &bloomBlurPipeline_) != VK_SUCCESS)
+        return false;
+    bloomCi.stage.module = bloomCompositeComp_;
+    if (vkCreateComputePipelines(ctx.device, VK_NULL_HANDLE, 1, &bloomCi, nullptr,
+                                 &bloomCompositePipeline_) != VK_SUCCESS)
         return false;
 
     // --- CSM shadow depth pass ------------------------------------------------
@@ -675,12 +712,16 @@ void DeferredCore::destroy(const VulkanContext& ctx) {
     if (transparentGtPipeline_) { vkDestroyPipeline(ctx.device, transparentGtPipeline_, nullptr); transparentGtPipeline_ = VK_NULL_HANDLE; }
     if (ssaoPipeline_) { vkDestroyPipeline(ctx.device, ssaoPipeline_, nullptr); ssaoPipeline_ = VK_NULL_HANDLE; }
     if (ssaoBlurPipeline_) { vkDestroyPipeline(ctx.device, ssaoBlurPipeline_, nullptr); ssaoBlurPipeline_ = VK_NULL_HANDLE; }
+    if (bloomExtractPipeline_) { vkDestroyPipeline(ctx.device, bloomExtractPipeline_, nullptr); bloomExtractPipeline_ = VK_NULL_HANDLE; }
+    if (bloomBlurPipeline_) { vkDestroyPipeline(ctx.device, bloomBlurPipeline_, nullptr); bloomBlurPipeline_ = VK_NULL_HANDLE; }
+    if (bloomCompositePipeline_) { vkDestroyPipeline(ctx.device, bloomCompositePipeline_, nullptr); bloomCompositePipeline_ = VK_NULL_HANDLE; }
     if (shadowPipeline_) { vkDestroyPipeline(ctx.device, shadowPipeline_, nullptr); shadowPipeline_ = VK_NULL_HANDLE; }
     if (scenePipelineLayout_) { vkDestroyPipelineLayout(ctx.device, scenePipelineLayout_, nullptr); scenePipelineLayout_ = VK_NULL_HANDLE; }
     if (lightingPipelineLayout_) { vkDestroyPipelineLayout(ctx.device, lightingPipelineLayout_, nullptr); lightingPipelineLayout_ = VK_NULL_HANDLE; }
     if (transparentPipelineLayout_) { vkDestroyPipelineLayout(ctx.device, transparentPipelineLayout_, nullptr); transparentPipelineLayout_ = VK_NULL_HANDLE; }
     if (ssaoPipelineLayout_) { vkDestroyPipelineLayout(ctx.device, ssaoPipelineLayout_, nullptr); ssaoPipelineLayout_ = VK_NULL_HANDLE; }
     if (ssaoBlurPipelineLayout_) { vkDestroyPipelineLayout(ctx.device, ssaoBlurPipelineLayout_, nullptr); ssaoBlurPipelineLayout_ = VK_NULL_HANDLE; }
+    if (bloomPipelineLayout_) { vkDestroyPipelineLayout(ctx.device, bloomPipelineLayout_, nullptr); bloomPipelineLayout_ = VK_NULL_HANDLE; }
     if (gbufferVert_) { vkDestroyShaderModule(ctx.device, gbufferVert_, nullptr); gbufferVert_ = VK_NULL_HANDLE; }
     if (gbufferFrag_) { vkDestroyShaderModule(ctx.device, gbufferFrag_, nullptr); gbufferFrag_ = VK_NULL_HANDLE; }
     if (gbufferGtFrag_) { vkDestroyShaderModule(ctx.device, gbufferGtFrag_, nullptr); gbufferGtFrag_ = VK_NULL_HANDLE; }
@@ -691,6 +732,9 @@ void DeferredCore::destroy(const VulkanContext& ctx) {
     if (transparentGtFrag_) { vkDestroyShaderModule(ctx.device, transparentGtFrag_, nullptr); transparentGtFrag_ = VK_NULL_HANDLE; }
     if (ssaoComp_) { vkDestroyShaderModule(ctx.device, ssaoComp_, nullptr); ssaoComp_ = VK_NULL_HANDLE; }
     if (ssaoBlurComp_) { vkDestroyShaderModule(ctx.device, ssaoBlurComp_, nullptr); ssaoBlurComp_ = VK_NULL_HANDLE; }
+    if (bloomExtractComp_) { vkDestroyShaderModule(ctx.device, bloomExtractComp_, nullptr); bloomExtractComp_ = VK_NULL_HANDLE; }
+    if (bloomBlurComp_) { vkDestroyShaderModule(ctx.device, bloomBlurComp_, nullptr); bloomBlurComp_ = VK_NULL_HANDLE; }
+    if (bloomCompositeComp_) { vkDestroyShaderModule(ctx.device, bloomCompositeComp_, nullptr); bloomCompositeComp_ = VK_NULL_HANDLE; }
     if (shadowDepthVert_) { vkDestroyShaderModule(ctx.device, shadowDepthVert_, nullptr); shadowDepthVert_ = VK_NULL_HANDLE; }
     if (shadowDepthFrag_) { vkDestroyShaderModule(ctx.device, shadowDepthFrag_, nullptr); shadowDepthFrag_ = VK_NULL_HANDLE; }
     if (sceneSetLayout_) { vkDestroyDescriptorSetLayout(ctx.device, sceneSetLayout_, nullptr); sceneSetLayout_ = VK_NULL_HANDLE; }
@@ -732,7 +776,7 @@ void DeferredCore::fillSceneUBO(SceneUBO& out, const Scene& scene, const Camera&
 void DeferredCore::fillLightingUBO(LightingUBO& out, const Scene& scene, const Camera& camera,
                                    const Mat4& invViewProj,
                                    const std::vector<Light>* overrideLights,
-                                   const ShadowFrame* shadow) const {
+                                   const ShadowFrame* shadow, float iblIntensity) const {
     std::memcpy(out.invViewProj, invViewProj.m, sizeof(out.invViewProj));
 
     out.cameraPos[0] = camera.position.x;
@@ -740,19 +784,73 @@ void DeferredCore::fillLightingUBO(LightingUBO& out, const Scene& scene, const C
     out.cameraPos[2] = camera.position.z;
     out.cameraPos[3] = 1.f;
 
-    // Pack the typed scene lights into the fixed-size GPU array.  Scenes
-    // without authored lights fall back to the shared default set so all
-    // three hosts stay identical; extra lights are dropped (lightCounts gates
-    // the shader loop).  An override list (GUI sun controls) replaces the
-    // scene/fallback selection entirely.
+    // Pack into the fixed-size GPU array: the shadowed sun (if any) is always
+    // slot 0 so CSM lightIndex remaps cleanly; remaining lights are scored by
+    // intensity / distance² from the camera so the nearest lanterns survive
+    // truncation at kMaxLights.
     const std::vector<Light>& lights =
         overrideLights ? *overrideLights
                        : (scene.lights.empty() ? defaultLights() : scene.lights);
-    const uint32_t count =
-        static_cast<uint32_t>(std::min(lights.size(), static_cast<size_t>(kMaxLights)));
+
+    int sunSrc = -1;
+    if (shadow && shadow->lightIndex >= 0 &&
+        static_cast<size_t>(shadow->lightIndex) < lights.size() &&
+        lights[static_cast<size_t>(shadow->lightIndex)].type == LightType::Directional) {
+        sunSrc = shadow->lightIndex;
+    } else {
+        for (int i = 0; i < static_cast<int>(lights.size()); ++i) {
+            if (lights[static_cast<size_t>(i)].type == LightType::Directional &&
+                lights[static_cast<size_t>(i)].castShadow) {
+                sunSrc = i;
+                break;
+            }
+        }
+        if (sunSrc < 0) {
+            for (int i = 0; i < static_cast<int>(lights.size()); ++i) {
+                if (lights[static_cast<size_t>(i)].type == LightType::Directional) {
+                    sunSrc = i;
+                    break;
+                }
+            }
+        }
+    }
+
+    struct Scored {
+        int index;
+        float score;
+    };
+    std::vector<Scored> rest;
+    rest.reserve(lights.size());
+    const Vec3 camPos = camera.position;
+    for (int i = 0; i < static_cast<int>(lights.size()); ++i) {
+        if (i == sunSrc) continue;
+        const Light& l = lights[static_cast<size_t>(i)];
+        float score = l.intensity;
+        if (l.type == LightType::Point) {
+            const Vec3 d = l.positionOrDirection - camPos;
+            const float dist2 = std::max(dot(d, d), 1.f);
+            score = l.intensity / dist2;
+            if (l.range > 0.f && std::sqrt(dist2) > l.range) score *= 0.01f;
+        } else {
+            score = l.intensity * 1000.f; // leftover directionals stay near the front
+        }
+        rest.push_back({i, score});
+    }
+    std::sort(rest.begin(), rest.end(),
+              [](const Scored& a, const Scored& b) { return a.score > b.score; });
+
+    std::vector<int> order;
+    order.reserve(kMaxLights);
+    if (sunSrc >= 0) order.push_back(sunSrc);
+    for (const Scored& s : rest) {
+        if (order.size() >= kMaxLights) break;
+        order.push_back(s.index);
+    }
+
+    const uint32_t count = static_cast<uint32_t>(order.size());
     std::memset(out.lights, 0, sizeof(out.lights)); // deterministic unused slots
     for (uint32_t i = 0; i < count; ++i) {
-        const Light& l = lights[i];
+        const Light& l = lights[static_cast<size_t>(order[static_cast<size_t>(i)])];
         LightGPU& g = out.lights[i];
         g.posOrDir[0] = l.positionOrDirection.x;
         g.posOrDir[1] = l.positionOrDirection.y;
@@ -761,7 +859,7 @@ void DeferredCore::fillLightingUBO(LightingUBO& out, const Scene& scene, const C
         g.color[0] = l.color.x;
         g.color[1] = l.color.y;
         g.color[2] = l.color.z;
-        // Intensities are scaled by PI so the PBR Lambert term (albedo/PI)
+        // Intensities are scaled by PI so Hammon's single-scatter 1/PI term
         // matches the brightness of the legacy forward pass.
         g.color[3] = l.intensity * 3.14159265f;
         g.params[0] = l.range;
@@ -775,7 +873,7 @@ void DeferredCore::fillLightingUBO(LightingUBO& out, const Scene& scene, const C
     out.lightCounts[3] = 0.f;
 
     out.ambient[0] = 0.08f; out.ambient[1] = 0.08f; out.ambient[2] = 0.10f; out.ambient[3] = 1.f;
-    out.iblParams[0] = 1.f; // env intensity
+    out.iblParams[0] = iblIntensity;
     out.iblParams[1] = static_cast<float>(ibl_.prefilterMaxLod);
     out.iblParams[2] = 1.f; // skybox enabled
     out.iblParams[3] = 0.f;
@@ -797,7 +895,8 @@ void DeferredCore::fillLightingUBO(LightingUBO& out, const Scene& scene, const C
         }
         out.shadowParams[2] = 1.f; // shadows enabled
         out.shadowParams[3] = shadow->debugCascades ? 1.f : 0.f;
-        out.viewForward[3] = static_cast<float>(shadow->lightIndex);
+        // Packed index: the sun is always slot 0 when present.
+        out.viewForward[3] = (sunSrc >= 0) ? 0.f : -1.f;
     } else {
         // Deterministic disabled state: identity VPs, infinite splits; the
         // shaders short-circuit on shadowParams.z before touching the map.
@@ -1017,13 +1116,14 @@ bool DeferredCore::sceneHasTransparency(const Scene& scene) const {
 
 void DeferredCore::writeTransparentSet(const VulkanContext& ctx, VkDescriptorSet set,
                                        VkBuffer lightingUbo, VkImageView ssao,
-                                       VkImageView shadow) const {
+                                       VkImageView shadow, VkImageView ssrColor,
+                                       VkImageView ssrDepth) const {
     VkDescriptorBufferInfo lightBuf = {};
     lightBuf.buffer = lightingUbo;
     lightBuf.offset = 0;
     lightBuf.range = sizeof(LightingUBO);
 
-    VkDescriptorImageInfo img[5] = {};
+    VkDescriptorImageInfo img[7] = {};
     img[0].sampler = ibl_.cubeSampler;
     img[0].imageView = ibl_.irradianceView;
     img[0].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
@@ -1039,24 +1139,50 @@ void DeferredCore::writeTransparentSet(const VulkanContext& ctx, VkDescriptorSet
     img[4].sampler = shadowSampler_;
     img[4].imageView = shadow;
     img[4].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    img[5].sampler = gbufferSampler_;
+    img[5].imageView = ssrColor;
+    img[5].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    img[6].sampler = gbufferSampler_;
+    img[6].imageView = ssrDepth;
+    img[6].imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
 
-    VkWriteDescriptorSet w[6] = {};
+    VkWriteDescriptorSet w[8] = {};
     w[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     w[0].dstSet = set;
     w[0].dstBinding = 0;
     w[0].descriptorCount = 1;
     w[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     w[0].pBufferInfo = &lightBuf;
-    const uint32_t samplerCount = shadow ? 5u : 4u; // skip binding 5 without a shadow map
-    for (uint32_t k = 0; k < samplerCount; ++k) {
-        w[k + 1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        w[k + 1].dstSet = set;
-        w[k + 1].dstBinding = k + 1;
-        w[k + 1].descriptorCount = 1;
-        w[k + 1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        w[k + 1].pImageInfo = &img[k];
+    // Bindings 1-4 always; 5 (shadow) skipped if no map; 6-7 SSR always.
+    uint32_t n = 1;
+    for (uint32_t k = 0; k < 4; ++k) {
+        w[n].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w[n].dstSet = set;
+        w[n].dstBinding = k + 1;
+        w[n].descriptorCount = 1;
+        w[n].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        w[n].pImageInfo = &img[k];
+        ++n;
     }
-    vkUpdateDescriptorSets(ctx.device, 1 + samplerCount, w, 0, nullptr);
+    if (shadow) {
+        w[n].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w[n].dstSet = set;
+        w[n].dstBinding = 5;
+        w[n].descriptorCount = 1;
+        w[n].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        w[n].pImageInfo = &img[4];
+        ++n;
+    }
+    for (uint32_t k = 0; k < 2; ++k) {
+        w[n].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w[n].dstSet = set;
+        w[n].dstBinding = 6 + k;
+        w[n].descriptorCount = 1;
+        w[n].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        w[n].pImageInfo = &img[5 + k];
+        ++n;
+    }
+    vkUpdateDescriptorSets(ctx.device, n, w, 0, nullptr);
 }
 
 void DeferredCore::writeSsaoSet(const VulkanContext& ctx, VkDescriptorSet set, VkImageView depth,
@@ -1120,8 +1246,8 @@ void DeferredCore::recordSsaoPass(VkCommandBuffer cmd, VkDescriptorSet ssaoSet,
     SsaoPush push;
     std::memcpy(push.viewProj, viewProj.m, sizeof(push.viewProj));
     push.params[0] = kSsaoRadius;
-    push.params[1] = kSsaoBias;
-    push.params[2] = kSsaoIntensity;
+    push.params[1] = 0.f;
+    push.params[2] = 0.f;
     push.params[3] = kSsaoPower;
     push.params2[0] = static_cast<float>(frameIndex);
     push.params2[1] = push.params2[2] = push.params2[3] = 0.f;
@@ -1136,6 +1262,70 @@ void DeferredCore::recordSsaoBlurPass(VkCommandBuffer cmd, VkDescriptorSet blurS
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ssaoBlurPipelineLayout_, 0, 1,
                             &blurSet, 0, nullptr);
     vkCmdDispatch(cmd, (width + 7) / 8, (height + 7) / 8, 1);
+}
+
+void DeferredCore::writeBloomSet(const VulkanContext& ctx, VkDescriptorSet set, VkImageView src,
+                                 VkImageView dst) const {
+    writeSsaoBlurSet(ctx, set, src, dst);
+}
+
+void DeferredCore::recordBloomPass(VkCommandBuffer cmd, VkDescriptorSet extractSet,
+                                   VkDescriptorSet blurHSet, VkDescriptorSet blurVSet,
+                                   VkDescriptorSet compositeSet, VkImage bloomA, VkImage bloomB,
+                                   VkImage color, VkImageLayout& bloomALayout,
+                                   VkImageLayout& bloomBLayout, VkImageLayout& colorLayout,
+                                   uint32_t fullW, uint32_t fullH, float strength) const {
+    if (strength <= 0.f || fullW == 0 || fullH == 0) return;
+    const uint32_t halfW = std::max(1u, fullW / 2);
+    const uint32_t halfH = std::max(1u, fullH / 2);
+    const uint32_t hx = (halfW + 7) / 8;
+    const uint32_t hy = (halfH + 7) / 8;
+
+    auto dispatch = [&](VkPipeline pipe, VkDescriptorSet set, const BloomPush& push, uint32_t gx,
+                        uint32_t gy) {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, bloomPipelineLayout_, 0, 1,
+                                &set, 0, nullptr);
+        vkCmdPushConstants(cmd, bloomPipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push),
+                           &push);
+        vkCmdDispatch(cmd, gx, gy, 1);
+    };
+
+    imageBarrier(cmd, bloomA, bloomALayout, VK_IMAGE_LAYOUT_GENERAL);
+    bloomALayout = VK_IMAGE_LAYOUT_GENERAL;
+    BloomPush extractPush{};
+    extractPush.params[0] = kBloomThreshold;
+    extractPush.params[1] = kBloomKnee;
+    dispatch(bloomExtractPipeline_, extractSet, extractPush, hx, hy);
+
+    imageBarrier(cmd, bloomA, bloomALayout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    bloomALayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    imageBarrier(cmd, bloomB, bloomBLayout, VK_IMAGE_LAYOUT_GENERAL);
+    bloomBLayout = VK_IMAGE_LAYOUT_GENERAL;
+    BloomPush blurH{};
+    blurH.params[0] = 1.f;
+    blurH.params[1] = 0.f;
+    dispatch(bloomBlurPipeline_, blurHSet, blurH, hx, hy);
+
+    imageBarrier(cmd, bloomB, bloomBLayout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    bloomBLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    imageBarrier(cmd, bloomA, bloomALayout, VK_IMAGE_LAYOUT_GENERAL);
+    bloomALayout = VK_IMAGE_LAYOUT_GENERAL;
+    BloomPush blurV{};
+    blurV.params[0] = 0.f;
+    blurV.params[1] = 1.f;
+    dispatch(bloomBlurPipeline_, blurVSet, blurV, hx, hy);
+
+    imageBarrier(cmd, bloomA, bloomALayout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    bloomALayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    imageBarrier(cmd, color, colorLayout, VK_IMAGE_LAYOUT_GENERAL);
+    colorLayout = VK_IMAGE_LAYOUT_GENERAL;
+    BloomPush comp{};
+    comp.params[0] = strength;
+    dispatch(bloomCompositePipeline_, compositeSet, comp, (fullW + 7) / 8, (fullH + 7) / 8);
+
+    imageBarrier(cmd, color, colorLayout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    colorLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 }
 
 void DeferredCore::recordTransparentDraws(VkCommandBuffer cmd, const Scene& scene, bool gtPass,

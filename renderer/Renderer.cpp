@@ -87,6 +87,7 @@ bool Renderer::init(const RendererOptions& opts) {
     if (!sceneOk) sceneOk = scene_.loadProcedural(ctx_);
     if (!sceneOk) return false;
     hasTransparency_ = deferred_.sceneHasTransparency(scene_);
+    iblIntensity_ = lightingPresetForScene(opts.scenePath).iblIntensity;
 
     if (scene_.materials.empty()) {
         Material fallback;
@@ -175,7 +176,8 @@ bool Renderer::createRenderTargets() {
     // color/depth/motion into internal buffers instead of just sampling them.
     if (!createRT(gbColor_, renderWidth_, renderHeight_, deferred::kHdrColorFormat,
                   VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
-                      VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                      VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                      VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                   VK_IMAGE_ASPECT_COLOR_BIT))
         return false;
     if (!createRT(gbMotion_, renderWidth_, renderHeight_, deferred::kMotionFormat,
@@ -222,17 +224,41 @@ bool Renderer::createRenderTargets() {
                       VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                   VK_IMAGE_ASPECT_DEPTH_BIT))
         return false;
-    // SSAO targets (raw + blurred) for both GBuffer paths.
+    // GTAO targets (working RG16F + filtered R16F) for both GBuffer paths.
     const VkImageUsageFlags aoUsage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-    if (!createRT(gbAoRaw_, renderWidth_, renderHeight_, VK_FORMAT_R16_SFLOAT, aoUsage,
+    if (!createRT(gbAoRaw_, renderWidth_, renderHeight_, kAoRawFormat, aoUsage,
                   VK_IMAGE_ASPECT_COLOR_BIT))
         return false;
     if (!createRT(gbAo_, renderWidth_, renderHeight_, VK_FORMAT_R16_SFLOAT, aoUsage,
                   VK_IMAGE_ASPECT_COLOR_BIT))
         return false;
-    if (!createRT(gtAoRaw_, dw, dh, VK_FORMAT_R16_SFLOAT, aoUsage, VK_IMAGE_ASPECT_COLOR_BIT))
+    if (!createRT(gtAoRaw_, dw, dh, kAoRawFormat, aoUsage, VK_IMAGE_ASPECT_COLOR_BIT))
         return false;
     if (!createRT(gtAo_, dw, dh, VK_FORMAT_R16_SFLOAT, aoUsage, VK_IMAGE_ASPECT_COLOR_BIT))
+        return false;
+    const VkImageUsageFlags bloomUsage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    const uint32_t gbHalfW = std::max(1u, renderWidth_ / 2);
+    const uint32_t gbHalfH = std::max(1u, renderHeight_ / 2);
+    const uint32_t gtHalfW = std::max(1u, dw / 2);
+    const uint32_t gtHalfH = std::max(1u, dh / 2);
+    if (!createRT(gbBloomA_, gbHalfW, gbHalfH, deferred::kHdrColorFormat, bloomUsage,
+                  VK_IMAGE_ASPECT_COLOR_BIT))
+        return false;
+    if (!createRT(gbBloomB_, gbHalfW, gbHalfH, deferred::kHdrColorFormat, bloomUsage,
+                  VK_IMAGE_ASPECT_COLOR_BIT))
+        return false;
+    if (!createRT(gtBloomA_, gtHalfW, gtHalfH, deferred::kHdrColorFormat, bloomUsage,
+                  VK_IMAGE_ASPECT_COLOR_BIT))
+        return false;
+    if (!createRT(gtBloomB_, gtHalfW, gtHalfH, deferred::kHdrColorFormat, bloomUsage,
+                  VK_IMAGE_ASPECT_COLOR_BIT))
+        return false;
+    const VkImageUsageFlags ssrUsage =
+        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    if (!createRT(gbSsrSrc_, renderWidth_, renderHeight_, deferred::kHdrColorFormat, ssrUsage,
+                  VK_IMAGE_ASPECT_COLOR_BIT))
+        return false;
+    if (!createRT(gtSsrSrc_, dw, dh, deferred::kHdrColorFormat, ssrUsage, VK_IMAGE_ASPECT_COLOR_BIT))
         return false;
     if (!createRT(finalImage_, dw, dh, deferred::kHdrColorFormat,
                   VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
@@ -284,18 +310,18 @@ bool Renderer::createSceneDescriptors() {
     sizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     sizes[0].descriptorCount = deferred::kMaxTextures + 1 + // texture array + present
                                11 * kFramesInFlight * 2 + // lighting sets (GB/GT), +1 shadow map
-                               5 * kFramesInFlight * 2 +  // transparent sets (GB/GT), +1 shadow map
-                               2 * 2 + 1 * 2;             // ssao + blur samplers
+                               7 * kFramesInFlight * 2 +  // transparent sets (GB/GT), +SSR+shadow
+                               2 * 2 + 1 * 2 +            // ssao + blur samplers
+                               8;                         // bloom extract/blur/comp (GB/GT)
     sizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     sizes[1].descriptorCount = kFramesInFlight * 4; // scene + lighting + 2 transparent UBOs
     sizes[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
     sizes[2].descriptorCount = kFramesInFlight;
     sizes[3].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    sizes[3].descriptorCount = 4; // ssao raw + blurred outputs (GB/GT)
+    sizes[3].descriptorCount = 4 + 8; // ssao + bloom (GB/GT)
     VkDescriptorPoolCreateInfo poolCi = {};
     poolCi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    poolCi.maxSets = kFramesInFlight * 5 + 6; // scene + lighting(GB/GT) + transparent(GB/GT)
-                                              // + texture + present + 4 ssao sets
+    poolCi.maxSets = kFramesInFlight * 5 + 6 + 8; // + 8 bloom sets
     poolCi.poolSizeCount = 4;
     poolCi.pPoolSizes = sizes;
     if (vkCreateDescriptorPool(ctx_.device, &poolCi, nullptr, &descriptorPool_) != VK_SUCCESS)
@@ -354,10 +380,16 @@ bool Renderer::createSceneDescriptors() {
 bool Renderer::createPipelines() {
     // The GBuffer/GT/lighting pipelines live in DeferredCore; only the
     // swapchain present pipeline (fullscreen triangle + tonemap) remains here.
+    VkPushConstantRange presentPush = {};
+    presentPush.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    presentPush.offset = 0;
+    presentPush.size = 16; // vec4: exposure.x
     VkPipelineLayoutCreateInfo presentLayoutCi = {};
     presentLayoutCi.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     presentLayoutCi.setLayoutCount = 1;
     presentLayoutCi.pSetLayouts = &presentSetLayout_;
+    presentLayoutCi.pushConstantRangeCount = 1;
+    presentLayoutCi.pPushConstantRanges = &presentPush;
     if (vkCreatePipelineLayout(ctx_.device, &presentLayoutCi, nullptr, &presentPipelineLayout_) != VK_SUCCESS)
         return false;
 
@@ -528,9 +560,9 @@ bool Renderer::createSyncResources() {
                                      &frames_[i].transparentSetGt) != VK_SUCCESS)
             return false;
         deferred_.writeTransparentSet(ctx_, frames_[i].transparentSetGb, frames_[i].lightingUbo,
-                                      gbAo_.view, shadowView);
+                                      gbAo_.view, shadowView, gbSsrSrc_.view, gbDepth_.view);
         deferred_.writeTransparentSet(ctx_, frames_[i].transparentSetGt, frames_[i].lightingUbo,
-                                      gtAo_.view, shadowView);
+                                      gtAo_.view, shadowView, gtSsrSrc_.view, gtDepth_.view);
     }
 
     // SSAO sets (static bindings; per-frame data goes through push constants).
@@ -551,6 +583,31 @@ bool Renderer::createSyncResources() {
         deferred_.writeSsaoSet(ctx_, ssaoSetGt_, gtDepth_.view, gtNormal_.view, gtAoRaw_.view);
         deferred_.writeSsaoBlurSet(ctx_, ssaoBlurSetGb_, gbAoRaw_.view, gbAo_.view);
         deferred_.writeSsaoBlurSet(ctx_, ssaoBlurSetGt_, gtAoRaw_.view, gtAo_.view);
+    }
+
+    {
+        VkDescriptorSetAllocateInfo bloomAlloc = {};
+        bloomAlloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        bloomAlloc.descriptorPool = descriptorPool_;
+        bloomAlloc.descriptorSetCount = 1;
+        const VkDescriptorSetLayout bloomLayout = deferred_.bloomSetLayout();
+        bloomAlloc.pSetLayouts = &bloomLayout;
+        auto allocBloom = [&](VkDescriptorSet& set) {
+            return vkAllocateDescriptorSets(ctx_.device, &bloomAlloc, &set) == VK_SUCCESS;
+        };
+        if (!allocBloom(bloomExtractGb_) || !allocBloom(bloomBlurHGb_) ||
+            !allocBloom(bloomBlurVGb_) || !allocBloom(bloomCompGb_) ||
+            !allocBloom(bloomExtractGt_) || !allocBloom(bloomBlurHGt_) ||
+            !allocBloom(bloomBlurVGt_) || !allocBloom(bloomCompGt_))
+            return false;
+        deferred_.writeBloomSet(ctx_, bloomExtractGb_, gbColor_.view, gbBloomA_.view);
+        deferred_.writeBloomSet(ctx_, bloomBlurHGb_, gbBloomA_.view, gbBloomB_.view);
+        deferred_.writeBloomSet(ctx_, bloomBlurVGb_, gbBloomB_.view, gbBloomA_.view);
+        deferred_.writeBloomSet(ctx_, bloomCompGb_, gbBloomA_.view, gbColor_.view);
+        deferred_.writeBloomSet(ctx_, bloomExtractGt_, finalImage_.view, gtBloomA_.view);
+        deferred_.writeBloomSet(ctx_, bloomBlurHGt_, gtBloomA_.view, gtBloomB_.view);
+        deferred_.writeBloomSet(ctx_, bloomBlurVGt_, gtBloomB_.view, gtBloomA_.view);
+        deferred_.writeBloomSet(ctx_, bloomCompGt_, gtBloomA_.view, finalImage_.view);
     }
 
     // One renderFinished semaphore per swapchain image: the submit signals the
@@ -614,7 +671,7 @@ void Renderer::updateLightingUBO(uint32_t frameIndex, const Mat4& invViewProj,
                                  const ShadowFrame* shadow) {
     FrameResources& fr = frames_[frameIndex % kFramesInFlight];
     LightingUBO ubo;
-    deferred_.fillLightingUBO(ubo, scene_, camera_, invViewProj, nullptr, shadow);
+    deferred_.fillLightingUBO(ubo, scene_, camera_, invViewProj, nullptr, shadow, iblIntensity_);
     std::memcpy(fr.lightingUboMapped, &ubo, sizeof(ubo));
 }
 
@@ -649,7 +706,7 @@ void Renderer::captureScreenshotIntoStaging(VkCommandBuffer cmd) {
 void Renderer::saveScreenshot(const std::string& path) {
     if (!screenshotMapped_) return;
     if (!savePngFromHalfRgba(path.c_str(), static_cast<const uint8_t*>(screenshotMapped_),
-                             opts_.displayWidth, opts_.displayHeight)) {
+                             opts_.displayWidth, opts_.displayHeight, opts_.exposure)) {
         std::fprintf(stderr, "failed to save screenshot %s\n", path.c_str());
     }
 }
@@ -804,7 +861,7 @@ void Renderer::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         transition(gbMotion_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     }
 
-    // --- SSAO (depth + normal -> raw AO -> cross-box blur) ----------------------
+    // --- GTAO (depth + normal -> working AO/Z -> 5x5 bilateral denoise) ---------
     transition(tgtAoRaw, VK_IMAGE_LAYOUT_GENERAL);
     deferred_.recordSsaoPass(cmd, gbuffer ? ssaoSetGb_ : ssaoSetGt_, viewProjUsed, frameIndex,
                              sceneW, sceneH);
@@ -819,9 +876,17 @@ void Renderer::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                                  litTarget.view, sceneW, sceneH);
 
     // --- Transparency pass (alpha-blended surfaces over the lit scene) --------
-    // The LR path also overwrites motion (static glass = camera motion, the
-    // "Output Velocity" equivalent) and accumulates the translucent coverage
-    // mask consumed by upscalers as the reactive / TC / bias mask.
+    // Copy opaque HDR for SSR: the transparent pass writes the same color
+    // target, so glass cannot sample it in-place.
+    if (hasTransparency_) {
+        transition(litTarget, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        ImageResource& ssrSrc = gbuffer ? gbSsrSrc_ : gtSsrSrc_;
+        transition(ssrSrc, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        copyColorImage(cmd, litTarget.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, ssrSrc.image,
+                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, sceneW, sceneH);
+        transition(ssrSrc, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        transition(litTarget, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    }
     if (hasTransparency_) {
         if (gbuffer) {
             transition(gbMotion_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
@@ -860,6 +925,19 @@ void Renderer::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     }
 
     transition(litTarget, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    if (opts_.bloom) {
+        if (gbuffer) {
+            deferred_.recordBloomPass(cmd, bloomExtractGb_, bloomBlurHGb_, bloomBlurVGb_,
+                                      bloomCompGb_, gbBloomA_.image, gbBloomB_.image, gbColor_.image,
+                                      gbBloomA_.layout, gbBloomB_.layout, gbColor_.layout,
+                                      renderWidth_, renderHeight_);
+        } else {
+            deferred_.recordBloomPass(cmd, bloomExtractGt_, bloomBlurHGt_, bloomBlurVGt_,
+                                      bloomCompGt_, gtBloomA_.image, gtBloomB_.image,
+                                      finalImage_.image, gtBloomA_.layout, gtBloomB_.layout,
+                                      finalImage_.layout, opts_.displayWidth, opts_.displayHeight);
+        }
+    }
     timestamps_.sceneEnd(cmd, slot);
 
     if (!gbuffer) {
@@ -930,6 +1008,9 @@ void Renderer::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     vkCmdSetScissor(cmd, 0, 1, &psc);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, presentPipelineLayout_, 0, 1,
                             &presentSet_, 0, nullptr);
+    const float presentPush[4] = {opts_.exposure, 0.f, 0.f, 0.f};
+    vkCmdPushConstants(cmd, presentPipelineLayout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                       sizeof(presentPush), presentPush);
     vkCmdDraw(cmd, 3, 1, 0, 0);
     vkCmdEndRendering(cmd);
 
@@ -1103,6 +1184,12 @@ void Renderer::shutdown() {
     gbAo_.destroy(ctx_);
     gtAoRaw_.destroy(ctx_);
     gtAo_.destroy(ctx_);
+    gbBloomA_.destroy(ctx_);
+    gbBloomB_.destroy(ctx_);
+    gtBloomA_.destroy(ctx_);
+    gtBloomB_.destroy(ctx_);
+    gbSsrSrc_.destroy(ctx_);
+    gtSsrSrc_.destroy(ctx_);
     finalImage_.destroy(ctx_);
 
     if (shadowsActive_) { deferred_.destroyShadowTargets(ctx_, shadow_); shadowsActive_ = false; }

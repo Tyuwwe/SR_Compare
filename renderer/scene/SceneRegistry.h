@@ -6,6 +6,7 @@
 //   --scene <path>      any glTF file path (passed through unchanged)
 // ============================================================================
 #include "renderer/math/Math.h"
+#include "renderer/scene/Scene.h"
 
 #include <string>
 #include <vector>
@@ -18,6 +19,29 @@ struct SceneEntry {
     std::string path;         // glTF path; empty = procedural generator
     bool available = true;    // false when the asset file is missing on disk
 };
+
+// Per-scene default look (sun + optional fill + IBL + display exposure).
+// Applied by the glTF/procedural loaders (full preset when the file has no
+// lights; Bistro also replaces authored directionals with the golden-hour sun
+// while keeping point lights) and by the GUI lighting sliders on scene load.
+struct LightingPreset {
+    float sunElevationDeg = 65.3f;
+    float sunAzimuthDeg = 49.4f;
+    float sunIntensity = 3.f;
+    Vec3 sunColor{1.f, 0.95f, 0.85f};
+    bool sunEnabled = true;
+    bool fillEnabled = true;   // defaultLights() blue point fill
+    float iblIntensity = 1.f;
+    float exposure = 1.f;      // display-domain multiplier (ACES input)
+    // When true and the glTF has KHR_lights, authored directionals are
+    // replaced by this preset's sun so Bistro keeps the golden-hour key.
+    bool preferPresetSun = false;
+};
+
+LightingPreset defaultLightingPreset();
+LightingPreset goldenHourPreset(); // Bistro-exterior look; GUI "golden hour" button
+LightingPreset lightingPresetForScene(const std::string& scenePath);
+std::vector<Light> lightsFromPreset(const LightingPreset& p);
 
 // All named scenes, procedural first.
 std::vector<SceneEntry> listScenes();

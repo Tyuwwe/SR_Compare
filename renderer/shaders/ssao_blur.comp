@@ -1,8 +1,8 @@
 #version 450
-// SSAO blur: 9-tap cross box filter (center + arms at +-1/+-2 px) over the raw
-// AO texture, matching the classic SSAO pipeline (per-pixel noise rotation in
-// ssao.comp turns into soft AO here).  Input and output are the same
-// resolution; sky pixels carry AO = 1 through the filter.
+// GTAO denoise: 5×5 depth-aware bilateral over the working target (R = AO,
+// G = view-space |z|).  Matches XeGTAO's "rely on a spatial filter, TAA does
+// the temporal part" split; we stay spatial-only so FSR1 / SGSR1 do not
+// shimmer.  Output is R16F visibility for lighting.frag / transparent.frag.
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
@@ -14,13 +14,25 @@ void main() {
     ivec2 size = imageSize(outAO);
     if (pix.x >= size.x || pix.y >= size.y) return;
 
-    const ivec2 taps[9] = ivec2[9](ivec2(0, 0),
-                                   ivec2(1, 0), ivec2(-1, 0), ivec2(0, 1), ivec2(0, -1),
-                                   ivec2(2, 0), ivec2(-2, 0), ivec2(0, 2), ivec2(0, -2));
+    vec2 center = texelFetch(rawAO, pix, 0).rg;
+    float zc = max(center.g, 1e-3);
+    // Relative depth sigma: ~8 % of view Z, so contact shadows stay sharp
+    // while the Hilbert noise averages out on flat walls.
+    float sigmaZ = 0.08 * zc;
+    float invTwoSigmaZ2 = 1.0 / max(2.0 * sigmaZ * sigmaZ, 1e-6);
+
     float sum = 0.0;
-    for (int i = 0; i < 9; ++i) {
-        ivec2 p = clamp(pix + taps[i], ivec2(0), size - 1);
-        sum += texelFetch(rawAO, p, 0).r;
+    float wsum = 0.0;
+    for (int y = -2; y <= 2; ++y) {
+        for (int x = -2; x <= 2; ++x) {
+            ivec2 p = clamp(pix + ivec2(x, y), ivec2(0), size - 1);
+            vec2 s = texelFetch(rawAO, p, 0).rg;
+            float spatial = exp(-0.5 * float(x * x + y * y) / 2.25);
+            float range = exp(-(s.g - zc) * (s.g - zc) * invTwoSigmaZ2);
+            float w = spatial * range;
+            sum += s.r * w;
+            wsum += w;
+        }
     }
-    imageStore(outAO, pix, vec4(sum / 9.0));
+    imageStore(outAO, pix, vec4(sum / max(wsum, 1e-5)));
 }

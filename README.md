@@ -21,13 +21,24 @@ its performance numbers are not representative of real hardware.
 
 ## Renderer
 
-- Deferred PBR: Cook-Torrance GGX, two point lights, full IBL (irradiance +
-  prefiltered specular + BRDF LUT), normal/ORM/AO/emissive maps, alphaMode
-  MASK cutouts, mipmaps + 16x anisotropy, frustum culling, merged scene buffers
-- SSAO (16-sample normal-hemisphere + cross blur, ~0.5 ms @1080p)
+- Deferred PBR: Heitz height-correlated GGX + Hammon 2017 diffuse (no Lambert),
+  punctual lights, full IBL (irradiance + prefiltered specular + BRDF LUT),
+  normal/ORM/AO/emissive maps, alphaMode MASK cutouts, mipmaps + 16x anisotropy,
+  frustum culling, merged scene buffers
+- Display transform: Stephen Hill fitted ACES + gamma 2.2 (shared by present,
+  compare compose, GPU metrics, and CPU screenshots); display exposure is a
+  push-constant multiplier (CLI `--exposure`, GUI slider)
+- Scene lighting presets: Bistro exterior uses a low warm sun and reduced IBL
+  (golden hour); other scenes keep the generic high sun + cool fill
+- Up to 16 punctual lights packed per frame (shadowed sun always kept; extra
+  point lights scored by intensity/distance).  Bistro street lamps need a
+  reconvert with `export_lights=True` to appear as `KHR_lights_punctual`
+- GTAO (XeGTAO-style, Jimenez 2016: 3 slices × 3 steps/side + 5×5 depth-aware
+  denoise). Replaces the previous Crytek SSAO; same GBuffer→lighting slot
 - Forward transparency pass (after lighting, before upscaling): dielectric
-  glass model (Fresnel-driven opacity), back-to-front sorted, writes camera
-  motion and a translucent coverage mask
+  shop-window model (coated Fresnel, clip-space SSR / McGuire DDA against the
+  opaque HDR, EnvBRDF composite), back-to-front sorted, writes camera motion
+  and a translucent coverage mask
 - The coverage mask is wired into every upscaler interface that officially
   supports it: TAA (history weight), FSR2/FSR3 (reactive + T&C mask), DLSS
   (bias-current-color / reactive / transparency hints), XeSS (responsive
@@ -158,7 +169,7 @@ plugin simply disables itself.
 run (no source or build tools needed):
 
 - `sr_compare.exe` + all runtime DLLs (XeSS / Streamline / DLSS / NSS, CRT)
-- `run_gui.bat` (one-click GUI)
+- `sr_run_gui.bat` (one-click GUI)
 - `shaders/`, `assets/` (Bistro full-PBR ≈ 1.3 GB, trim as needed), `nss-emu/`
 
 Assets and shaders resolve relative to the exe, so the package works from any
@@ -168,7 +179,7 @@ an RTX 20+ GPU (other algorithms are unaffected without one).
 ## Directory layout
 
 - `renderer/` — Vulkan renderer core (context/frame loop/glTF scene/deferred
-  GBuffer/lighting/transparency/SSAO/IBL/camera paths)
+  GBuffer/lighting/transparency/GTAO/IBL/camera paths)
 - `upscalers/` — unified upscaler plugin layer (`IUpscaler.h` is the contract,
   one subdirectory per algorithm)
 - `compare/`, `bench/`, `gui/`, `app/` — front ends and entry point

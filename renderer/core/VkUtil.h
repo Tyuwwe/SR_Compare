@@ -36,6 +36,17 @@ void imageBarrier(VkCommandBuffer cmd, VkImage image, VkImageLayout oldLayout,
                   uint32_t baseMip = 0, uint32_t levelCount = 1, uint32_t baseLayer = 0,
                   uint32_t layerCount = 1);
 
+inline void copyColorImage(VkCommandBuffer cmd, VkImage src, VkImageLayout srcLayout, VkImage dst,
+                           VkImageLayout dstLayout, uint32_t width, uint32_t height) {
+    VkImageCopy region = {};
+    region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.srcSubresource.layerCount = 1;
+    region.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.dstSubresource.layerCount = 1;
+    region.extent = {width, height, 1};
+    vkCmdCopyImage(cmd, src, srcLayout, dst, dstLayout, 1, &region);
+}
+
 // Copy a host-visible buffer into a 2D image and leave it SHADER_READ_ONLY.
 void copyBufferToImage(VkCommandBuffer cmd, VkBuffer src, VkImage dst, uint32_t width,
                        uint32_t height, VkFormat format);

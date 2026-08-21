@@ -1,5 +1,7 @@
 #include "renderer/scene/Scene.h"
 
+#include "renderer/scene/SceneRegistry.h"
+
 #include <cmath>
 #include <cstdint>
 
@@ -135,9 +137,7 @@ bool Scene::loadProcedural(const VulkanContext& ctx, VkCommandPool pool) {
         }
     }
 
-    // Shared fallback lighting (slanted sun + weak cool point fill), the same
-    // default the glTF loader and the DeferredCore UBO fillers use.
-    lights = defaultLights();
+    lights = lightsFromPreset(lightingPresetForScene(""));
 
     updatePrevTransforms();
     finalizeInstances();

@@ -17,12 +17,22 @@ Arm NSS 在 PC 上经 Vulkan ML Emulation Layer 软件模拟推理，性能数�
 
 ## 渲染器
 
-- Deferred PBR：Cook-Torrance GGX、双点光、完整 IBL（irradiance + prefiltered
-  specular + BRDF LUT）、法线/ORM/AO/自发光贴图、MASK 镂空、mipmap + 16x 各向异性、
-  视锥剔除、合并场景缓冲
-- SSAO（16 采样法线半球 + 十字模糊，约 0.5ms @1080p）
-- 前向透明 pass（lighting 之后、upscale 之前）：电介质玻璃模型（菲涅尔驱动不透明度）、
-  后往前排序、写相机运动矢量与半透明覆盖度 mask
+- Deferred PBR：Heitz 高度相关 GGX + Hammon 2017 漫反射（不用 Lambert）、punctual
+  灯、完整 IBL（irradiance + prefiltered specular + BRDF LUT）、法线/ORM/AO/
+  自发光贴图、MASK 镂空、mipmap + 16x 各向异性、视锥剔除、合并场景缓冲
+- 显示变换：Stephen Hill fitted ACES + gamma 2.2（present / compare compose /
+  GPU 指标 / CPU 截图共用同一套）；显示曝光为 push constant（CLI `--exposure`，
+  GUI 滑条）
+- 场景光预设：Bistro 室外为低角度暖太阳 + 降低 IBL（黄昏）；其余场景仍是高太阳
+  + 冷补光
+- 每帧最多打包 16 盏 punctual 灯（CSM 太阳始终保留；多余点光按强度/距离排序）。
+  Bistro 路灯需要用 `export_lights=True` 重新转换才会作为 `KHR_lights_punctual`
+  进场景
+- GTAO（XeGTAO 风格，Jimenez 2016：3 切片 × 每侧 3 步 + 5×5 深度双边滤波）。
+  替换原先的 Crytek SSAO，仍插在 GBuffer 与 lighting 之间
+- 前向透明 pass（lighting 之后、upscale 之前）：电介质橱窗模型（镀膜菲涅尔、
+  McGuire clip-space DDA SSR，合成时乘 EnvBRDF）、后往前排序、写相机运动矢量与
+  半透明覆盖度 mask
 - 覆盖度 mask 接入了所有官方支持的接口：TAA（历史权重）、FSR2/FSR3（reactive + T&C
   mask）、DLSS（bias-current-color / reactive / transparency hint）、XeSS（responsive
   pixel mask）。NSS 与 SGSR2 无此输入。
@@ -141,7 +151,7 @@ Python 3）。缺失时主工程照常编译，NSS 插件自动禁用。
 `build/app/Release/` 构建后即为自包含目录，整体复制即可运行（无需源码与构建环境）：
 
 - `sr_compare.exe` + 全部运行时 DLL（XeSS/Streamline/DLSS/NSS、CRT）
-- `run_gui.bat`（一键启动 GUI）
+- `sr_run_gui.bat`（一键启动 GUI）
 - `shaders/`、`assets/`（Bistro 全 PBR 约 1.3GB 可裁剪）、`nss-emu/`
 
 着色器/资产按 exe 相对路径解析，打包目录从任何工作目录启动都能工作。目标机器
@@ -151,7 +161,7 @@ Python 3）。缺失时主工程照常编译，NSS 插件自动禁用。
 ## 目录结构
 
 - `renderer/` — Vulkan 渲染器核心（设备/帧循环/glTF 场景/deferred GBuffer/lighting/
-  透明 pass/SSAO/IBL/相机路径）
+  透明 pass/GTAO/IBL/相机路径）
 - `upscalers/` — 统一超分插件层（`IUpscaler.h` 为契约，各算法一个子目录）
 - `compare/`、`bench/`、`gui/`、`app/` — 各前端与入口
 - `metrics/` — Python 离线指标复核与 Markdown 报告生成

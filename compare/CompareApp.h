@@ -41,10 +41,12 @@ struct CompareOptions {
     bool gtSsaa = false;                // render GT at 2x and downsample to 1080p
     bool shadows = true;                // CSM sun shadows (all paths share one map)
     bool shadowDebug = false;           // tint pixels per shadow cascade
+    bool bloom = true;                  // HDR bloom before upscale
     float zoom = 1.f;                   // compare-view zoom (1..16)
     float zoomCenterU = 0.5f;           // zoom window center, normalized source UV
     float zoomCenterV = 0.5f;
     std::string envMapPath = kDefaultEnvMapPath; // equirect HDR for IBL/skybox
+    float exposure = 1.f;                       // display-domain ACES input multiplier
 };
 
 class CompareApp {
@@ -172,13 +174,22 @@ private:
     ImageResource gtSsaaNormal_;
     ImageResource gtSsaaMaterial_;
     ImageResource gtSsaaEmissive_;
-    // SSAO (raw + blurred) per GBuffer path, R16_SFLOAT, path resolution.
+    // GTAO working target (RG16F: AO + view Z) and filtered R16F, path res.
     ImageResource gbAoRaw_;
     ImageResource gbAo_;
     ImageResource gtAoRaw_;
     ImageResource gtAo_;
     ImageResource gtSsaaAoRaw_; // gtSsaa only
     ImageResource gtSsaaAo_;
+    ImageResource gbBloomA_;
+    ImageResource gbBloomB_;
+    ImageResource gtBloomA_;
+    ImageResource gtBloomB_;
+    ImageResource gtSsaaBloomA_;
+    ImageResource gtSsaaBloomB_;
+    ImageResource gbSsrSrc_;
+    ImageResource gtSsrSrc_;
+    ImageResource gtSsaaSsrSrc_;
     ImageResource composeImage_; // RGBA8, tonemapped columns + overlay
     ImageResource fontAtlas_;
 
@@ -189,6 +200,7 @@ private:
     // degrades to no shadows (bindings stay unwritten, sampling stays off).
     ShadowTargets shadow_;
     bool shadowsActive_ = false;
+    float iblIntensity_ = 1.f; // from lightingPresetForScene
 
     VkDescriptorSetLayout composeSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout copySetLayout_ = VK_NULL_HANDLE;
@@ -221,6 +233,18 @@ private:
     VkDescriptorSet ssaoBlurSetGt_ = VK_NULL_HANDLE;
     VkDescriptorSet ssaoSetSsaa_ = VK_NULL_HANDLE;     // gtSsaa only
     VkDescriptorSet ssaoBlurSetSsaa_ = VK_NULL_HANDLE; // gtSsaa only
+    VkDescriptorSet bloomExtractGb_ = VK_NULL_HANDLE;
+    VkDescriptorSet bloomBlurHGb_ = VK_NULL_HANDLE;
+    VkDescriptorSet bloomBlurVGb_ = VK_NULL_HANDLE;
+    VkDescriptorSet bloomCompGb_ = VK_NULL_HANDLE;
+    VkDescriptorSet bloomExtractGt_ = VK_NULL_HANDLE;
+    VkDescriptorSet bloomBlurHGt_ = VK_NULL_HANDLE;
+    VkDescriptorSet bloomBlurVGt_ = VK_NULL_HANDLE;
+    VkDescriptorSet bloomCompGt_ = VK_NULL_HANDLE;
+    VkDescriptorSet bloomExtractSsaa_ = VK_NULL_HANDLE;
+    VkDescriptorSet bloomBlurHSsaa_ = VK_NULL_HANDLE;
+    VkDescriptorSet bloomBlurVSsaa_ = VK_NULL_HANDLE;
+    VkDescriptorSet bloomCompSsaa_ = VK_NULL_HANDLE;
     VkSampler linearSampler_ = VK_NULL_HANDLE;
     VkSampler fontSampler_ = VK_NULL_HANDLE;
 
@@ -247,6 +271,15 @@ private:
     VkImageLayout gtSsaaEmissiveLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gbAoRawLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gbAoLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageLayout gbBloomALayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageLayout gbBloomBLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageLayout gbSsrSrcLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageLayout gtSsrSrcLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageLayout gtSsaaSsrSrcLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageLayout gtBloomALayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageLayout gtBloomBLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageLayout gtSsaaBloomALayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageLayout gtSsaaBloomBLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gtAoRawLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gtAoLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gtSsaaAoRawLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;

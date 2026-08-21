@@ -53,6 +53,14 @@ inline std::vector<std::string> splitCsv(const char* s) {
 
 // Parse a render-resolution scale and validate it is in (0, 1].  NaN is
 // rejected via !(v > 0) (NaN compares false against any value).
+// Display-domain exposure (ACES input multiplier).  Must be finite and > 0.
+inline bool parseExposure(const char* s, float& out) {
+    const float v = static_cast<float>(std::atof(s));
+    if (!(v > 0.0f) || v > 16.0f) return false;
+    out = v;
+    return true;
+}
+
 inline bool parseRenderScale(const char* s, float& out) {
     const float v = static_cast<float>(std::atof(s));
     if (!(v > 0.0f) || v > 1.0f) return false;

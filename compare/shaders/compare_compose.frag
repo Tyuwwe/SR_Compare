@@ -1,8 +1,11 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
+#include "tonemap.glsl"
 // Compare-mode column compose: samples the column's HDR source (native GT or
 // an upscaler output) through a source-region window (aspect-preserving crop
-// + optional zoom/pan, computed on the CPU), applies Reinhard tonemap +
-// gamma 2.2 (same as the viewer present pass / CPU screenshot path) and blits
+// + optional zoom/pan, computed on the CPU), applies the shared display
+// transform (Hill fitted ACES + gamma 2.2, same as the viewer present pass /
+// CPU screenshot path) and blits
 // a 5x7 bitmap-font text overlay (algorithm name + FPS + live PSNR/SSIM)
 // in the top-left corner.
 //
@@ -24,7 +27,8 @@ layout(set = 0, binding = 2) uniform sampler2D uFont;
 layout(push_constant) uniform Push {
     vec4 colSize;  // xy = column size in pixels, z = scale, w = textSlot
     vec4 uvRect;   // xy = source region offset (normalized), zw = region size
-    vec4 params;   // xy = source image size in pixels, z = 1 => nearest sampling
+    vec4 params;   // xy = source image size in pixels, z = 1 => nearest sampling,
+                   // w = display exposure
 } pc;
 
 layout(location = 0) in vec2 vUV;
@@ -41,8 +45,7 @@ void main() {
     } else {
         c = texture(uSource, suv).rgb;
     }
-    c = c / (1.0 + c);            // Reinhard
-    c = pow(max(c, vec3(0.0)), vec3(1.0 / 2.2));
+    c = tonemapToDisplay(c, pc.params.w);
 
     const uint scale = uint(pc.colSize.z);
     const uint slot = uint(pc.colSize.w);

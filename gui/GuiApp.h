@@ -74,6 +74,7 @@ struct GuiOptions {
     float compareZoom = 0.f;   // > 0: preset compare-tab zoom (automation)
     bool compareGtSsaa = false; // preset the compare-tab GT SSAA checkbox
     std::string envMapPath;    // empty = kDefaultEnvMapPath
+    float exposure = 0.f;      // > 0 overrides the scene lighting preset
 };
 
 class GuiApp {
@@ -280,6 +281,7 @@ private:
     // the CSM shadowed-sun index, so it is built once per frame in
     // recordFrame and shared by both lighting UBOs.
     std::vector<Light> buildLightOverride() const;
+    void applyLightingPreset(const LightingPreset& p);
     void updateCamera(float dt);
     void recordFrame(uint32_t frameIndex, uint32_t swapchainIndex);
     // Compose columns into composeImage_ and copy to the swapchain with ImGui.
@@ -452,9 +454,13 @@ private:
     // (normalize(0.35, 1, 0.3)) exactly, so the first frame with the override
     // active looks identical to the unmodified scene.
     bool sunEnabled_ = true;
-    float sunElevationDeg_ = 65.3f; // asin(1 / sqrt(1.2125)) ~= 65.26 deg
-    float sunAzimuthDeg_ = 49.4f;   // atan2(0.35, 0.3) ~= 49.40 deg
-    float sunIntensity_ = 3.f;      // matches defaultLights() sun
+    float sunElevationDeg_ = 65.3f; // matches defaultLightingPreset()
+    float sunAzimuthDeg_ = 49.4f;
+    float sunIntensity_ = 3.f;
+    Vec3 sunColor_{1.f, 0.95f, 0.85f};
+    bool fillEnabled_ = true;       // defaultLights() blue point fill
+    float iblIntensity_ = 1.f;
+    float exposure_ = 1.f;          // display-domain ACES input multiplier
     // CSM sun shadows (Viewer-tab lighting section, per-frame, no rebuild).
     bool shadowsEnabled_ = true;
     bool shadowDebugCascades_ = false; // tint pixels per shadow cascade
@@ -480,13 +486,16 @@ private:
     ImageResource gtSsaaMaterial_;
     ImageResource gtSsaaEmissive_;
     ImageResource gtSsaaDepth_;
-    // SSAO (raw + blurred) per GBuffer path, R16_SFLOAT, path resolution.
+    // GTAO working target (RG16F: AO + view Z) and filtered R16F, path res.
     ImageResource gbAoRaw_;
     ImageResource gbAo_;
     ImageResource gtAoRaw_;
     ImageResource gtAo_;
     ImageResource gtSsaaAoRaw_; // compare GT SSAA only
     ImageResource gtSsaaAo_;
+    ImageResource gbSsrSrc_;
+    ImageResource gtSsrSrc_;
+    ImageResource gtSsaaSsrSrc_;
     ImageResource composeImage_; // RGBA8 composite; presentation + screenshot source
     ImageResource uiShotImage_;  // BGRA8 debug screenshot target incl. ImGui
     VkImageLayout uiShotLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -566,6 +575,9 @@ private:
     VkImageLayout gtAoLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gtSsaaAoRawLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gtSsaaAoLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageLayout gbSsrSrcLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageLayout gtSsrSrcLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageLayout gtSsaaSsrSrcLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout composeLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
 
     VkBuffer materialUbo_ = VK_NULL_HANDLE;

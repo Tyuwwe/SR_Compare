@@ -15,7 +15,12 @@ OPAQUE_ALPHA_THRESHOLD = 0.95
 
 
 def glass_alpha(name):
-    """Constant alpha for BLEND glass (textures carry no usable opacity)."""
+    """Constant alpha for BLEND glass (textures carry no usable opacity).
+
+    Exterior shop windows are denser than interior / bottle glass so the dark
+    unlit interior does not punch through as a black silhouette; SSR then
+    reads as a mirror instead of a tinted hole.
+    """
     n = name.lower()
     if "frosted" in n or "frozen" in n:
         return 0.45
@@ -23,4 +28,6 @@ def glass_alpha(name):
         return 0.10
     if "liquorbottle" in n or "wine" in n:
         return 0.25
-    return 0.18
+    if "exterior" in n:
+        return 0.55
+    return 0.22

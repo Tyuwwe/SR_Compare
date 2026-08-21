@@ -37,6 +37,9 @@ set(RENDERER_SHADERS
     shaders/shadow_depth.frag
     shaders/ssao.comp
     shaders/ssao_blur.comp
+    shaders/bloom_extract.comp
+    shaders/bloom_blur.comp
+    shaders/bloom_composite.comp
     shaders/ibl_equirect.comp
     shaders/ibl_irradiance.comp
     shaders/ibl_prefilter.comp
@@ -44,7 +47,15 @@ set(RENDERER_SHADERS
 )
 set(RENDERER_SPV "")
 foreach(SHADER ${RENDERER_SHADERS})
-    sr_compile_shader(SPV ${SHADER})
+    if(SHADER STREQUAL "shaders/present.frag")
+        sr_compile_shader(SPV ${SHADER} "${SR_TONE_MAP_GLSL}")
+    elseif(SHADER STREQUAL "shaders/transparent.frag" OR SHADER STREQUAL "shaders/transparent_gt.frag")
+        sr_compile_shader(SPV ${SHADER} "${SR_SHADER_INCLUDE_DIR}/ssr.glsl" "${SR_SHADER_INCLUDE_DIR}/brdf.glsl")
+    elseif(SHADER STREQUAL "shaders/lighting.frag" OR SHADER STREQUAL "shaders/ibl_brdf_lut.comp")
+        sr_compile_shader(SPV ${SHADER} "${SR_SHADER_INCLUDE_DIR}/brdf.glsl")
+    else()
+        sr_compile_shader(SPV ${SHADER})
+    endif()
     list(APPEND RENDERER_SPV ${SPV})
 endforeach()
 add_custom_target(renderer_shaders DEPENDS ${RENDERER_SPV})

@@ -1,0 +1,23 @@
+#version 450
+// Add half-res bloom back onto full-res linear HDR (in-place storage).
+// Same BloomPush layout as bloom_extract.comp; params.x = strength.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D bloom;
+layout(set = 0, binding = 1, rgba16f) uniform image2D color;
+
+layout(push_constant) uniform Push {
+    vec4 params; // x = strength
+} pc;
+
+void main() {
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(color);
+    if (pix.x >= size.x || pix.y >= size.y) return;
+
+    vec2 uv = (vec2(pix) + 0.5) / vec2(size);
+    vec3 hdr = imageLoad(color, pix).rgb;
+    vec3 b = texture(bloom, uv).rgb;
+    imageStore(color, pix, vec4(hdr + b * pc.params.x, 1.0));
+}

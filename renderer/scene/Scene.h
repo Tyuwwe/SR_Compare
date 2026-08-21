@@ -83,30 +83,43 @@ struct Light {
     bool castShadow = false; // consumed by the C2 shadow pass; stored only for now
 };
 
+// Elevation (deg above horizon) / azimuth (deg, 0 = +Z, 90 = +X) to a unit
+// direction *towards* the sun.  Matches the GUI lighting sliders.
+inline Vec3 sunDirectionFromElevAzimuth(float elevationDeg, float azimuthDeg) {
+    const float el = elevationDeg * (3.14159265f / 180.f);
+    const float az = azimuthDeg * (3.14159265f / 180.f);
+    return normalize(Vec3{std::cos(el) * std::sin(az), std::sin(el),
+                          std::cos(el) * std::cos(az)});
+}
+
+inline Light makeSunLight(float elevationDeg, float azimuthDeg, float intensity, Vec3 color) {
+    Light sun;
+    sun.type = LightType::Directional;
+    sun.positionOrDirection = sunDirectionFromElevAzimuth(elevationDeg, azimuthDeg);
+    sun.color = color;
+    sun.intensity = intensity;
+    sun.castShadow = true;
+    return sun;
+}
+
+inline Light defaultFillLight() {
+    Light fill;
+    fill.type = LightType::Point;
+    fill.positionOrDirection = {-4.f, 5.f, -3.f};
+    fill.color = {0.6f, 0.7f, 1.f};
+    fill.intensity = 55.f; // candela-like units (inverse-square falloff)
+    return fill;
+}
+
 // Shared fallback lighting for scenes without authored lights (procedural
 // scene, glTF files without KHR_lights_punctual, and the DeferredCore UBO
 // filler safety net).  Single source of truth so the three hosts and all
-// loaders stay identical.
+// loaders stay identical.  Angles match the GUI lighting-slider defaults.
 inline const std::vector<Light>& defaultLights() {
     static const std::vector<Light> lights = [] {
         std::vector<Light> v;
-        Light sun;
-        sun.type = LightType::Directional;
-        // Slanted sun; the direction points *towards* the light, so the y is
-        // positive (light travels down).  Intensity ~3 matches the perceived
-        // brightness of the old 140-intensity point key light at typical
-        // scene distances (140 / d^2 with d ~ 7 m).  Tweak to taste.
-        sun.positionOrDirection = normalize(Vec3{0.35f, 1.f, 0.3f});
-        sun.color = {1.f, 0.95f, 0.85f};
-        sun.intensity = 3.f;
-        sun.castShadow = true; // the sun drives the CSM pass (C2)
-        Light fill;
-        fill.type = LightType::Point;
-        fill.positionOrDirection = {-4.f, 5.f, -3.f};
-        fill.color = {0.6f, 0.7f, 1.f};
-        fill.intensity = 55.f; // candela-like units (inverse-square falloff)
-        v.push_back(sun);
-        v.push_back(fill);
+        v.push_back(makeSunLight(65.3f, 49.4f, 3.f, {1.f, 0.95f, 0.85f}));
+        v.push_back(defaultFillLight());
         return v;
     }();
     return lights;

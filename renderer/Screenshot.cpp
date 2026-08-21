@@ -1,6 +1,7 @@
 #include "renderer/Screenshot.h"
 
 #include "renderer/core/PathUtil.h"
+#include "renderer/math/Tonemap.h"
 
 #include <algorithm>
 #include <cmath>
@@ -47,9 +48,7 @@ float halfToFloat(uint16_t h) {
     return out;
 }
 
-uint8_t tonemapByte(float v) {
-    v = v / (1.f + v);
-    v = std::pow(v, 1.f / 2.2f);
+uint8_t toByte(float v) {
     v = std::clamp(v, 0.f, 1.f);
     return static_cast<uint8_t>(v * 255.f + 0.5f);
 }
@@ -57,7 +56,7 @@ uint8_t tonemapByte(float v) {
 } // namespace
 
 bool savePngFromHalfRgba(const char* path, const uint8_t* halfRgba, uint32_t width,
-                         uint32_t height) {
+                         uint32_t height, float exposure) {
     if (!path || !halfRgba || width == 0 || height == 0) return false;
     ensureParentDir(path);
 
@@ -69,9 +68,11 @@ bool savePngFromHalfRgba(const char* path, const uint8_t* halfRgba, uint32_t wid
         std::memcpy(&r, src, 2);
         std::memcpy(&g, src + 2, 2);
         std::memcpy(&b, src + 4, 2);
-        rgba[i * 4 + 0] = tonemapByte(halfToFloat(r));
-        rgba[i * 4 + 1] = tonemapByte(halfToFloat(g));
-        rgba[i * 4 + 2] = tonemapByte(halfToFloat(b));
+        const Vec3 ldr =
+            tonemapToDisplay({halfToFloat(r), halfToFloat(g), halfToFloat(b)}, exposure);
+        rgba[i * 4 + 0] = toByte(ldr.x);
+        rgba[i * 4 + 1] = toByte(ldr.y);
+        rgba[i * 4 + 2] = toByte(ldr.z);
         rgba[i * 4 + 3] = 255;
     }
 

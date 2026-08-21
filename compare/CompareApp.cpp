@@ -6,6 +6,7 @@
 #include "renderer/Screenshot.h"
 #include "renderer/core/PathUtil.h"
 #include "renderer/core/VkUtil.h"
+#include "renderer/scene/SceneRegistry.h"
 #include "upscalers/UpscalerFactory.h"
 
 #include <algorithm>
@@ -35,7 +36,7 @@ struct ComposePush {
     float uvRect[4];  // normalized source region: offset xy, size zw
     float srcSize[2]; // source image pixels
     float nearest;    // != 0: sample nearest (magnification >= 1:1)
-    float pad;
+    float exposure;   // display-domain ACES input multiplier
 };
 static_assert(sizeof(ComposePush) == 48, "ComposePush size mismatch");
 
@@ -43,7 +44,10 @@ static_assert(sizeof(ComposePush) == 48, "ComposePush size mismatch");
 struct MetricPush {
     uint32_t x = 0, y = 0, z = 0, w = 0;      // region offset xy, extent zw
     uint32_t x2 = 0, y2 = 0, z2 = 0, w2 = 0;  // x2 = blocks per row (region)
+    float exposure = 1.f;
+    float pad[3] = {};
 };
+static_assert(sizeof(MetricPush) == 48, "MetricPush std140/push size mismatch");
 
 VkRenderingAttachmentInfo makeColorAttachment(VkImageView view, VkImageLayout layout,
                                               VkAttachmentLoadOp loadOp,
@@ -156,6 +160,7 @@ bool CompareApp::init(const CompareOptions& opts) {
     if (!sceneOk) sceneOk = scene_.loadProcedural(ctx_);
     if (!sceneOk) return false;
     hasTransparency_ = deferred_.sceneHasTransparency(scene_);
+    iblIntensity_ = lightingPresetForScene(opts.scenePath).iblIntensity;
 
     if (scene_.materials.empty()) {
         Material fallback;
@@ -269,7 +274,8 @@ bool CompareApp::createRenderTargets() {
     // into internal buffers instead of just sampling them.
     if (!createRT(gbColor_, renderWidth_, renderHeight_, deferred::kHdrColorFormat,
                   VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
-                      VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                      VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                      VK_IMAGE_USAGE_STORAGE_BIT,
                   VK_IMAGE_ASPECT_COLOR_BIT))
         return false;
     // Unjittered LR color for spatial plugins when mixed with temporal ones
@@ -310,19 +316,27 @@ bool CompareApp::createRenderTargets() {
                   VK_IMAGE_ASPECT_COLOR_BIT))
         return false;
 
-    // SSAO targets (raw + blurred) for the low-res path.
+    // GTAO targets (working RG16F + filtered R16F) for the low-res path.
     const VkImageUsageFlags aoUsage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-    if (!createRT(gbAoRaw_, renderWidth_, renderHeight_, VK_FORMAT_R16_SFLOAT, aoUsage,
+    if (!createRT(gbAoRaw_, renderWidth_, renderHeight_, kAoRawFormat, aoUsage,
                   VK_IMAGE_ASPECT_COLOR_BIT))
         return false;
     if (!createRT(gbAo_, renderWidth_, renderHeight_, VK_FORMAT_R16_SFLOAT, aoUsage,
                   VK_IMAGE_ASPECT_COLOR_BIT))
         return false;
+    const VkImageUsageFlags ssrUsage =
+        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    if (!createRT(gbSsrSrc_, renderWidth_, renderHeight_, deferred::kHdrColorFormat, ssrUsage,
+                  VK_IMAGE_ASPECT_COLOR_BIT))
+        return false;
+    if (!createRT(gtSsrSrc_, dw, dh, deferred::kHdrColorFormat, ssrUsage, VK_IMAGE_ASPECT_COLOR_BIT))
+        return false;
 
     // Native-resolution ground truth (same camera, no jitter).  The lighting
     // pass samples the GT GBuffer depth, so it needs the SAMPLED bit.
     if (!createRT(gtColor_, dw, dh, deferred::kHdrColorFormat,
-                  VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                  VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                      VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_STORAGE_BIT,
                   VK_IMAGE_ASPECT_COLOR_BIT))
         return false;
     if (!createRT(gtDepth_, dw, dh, deferred::kDepthFormat,
@@ -339,7 +353,7 @@ bool CompareApp::createRenderTargets() {
     if (!createRT(gtEmissive_, dw, dh, deferred::kEmissiveFormat, gbUsage,
                   VK_IMAGE_ASPECT_COLOR_BIT))
         return false;
-    if (!createRT(gtAoRaw_, dw, dh, VK_FORMAT_R16_SFLOAT, aoUsage, VK_IMAGE_ASPECT_COLOR_BIT))
+    if (!createRT(gtAoRaw_, dw, dh, kAoRawFormat, aoUsage, VK_IMAGE_ASPECT_COLOR_BIT))
         return false;
     if (!createRT(gtAo_, dw, dh, VK_FORMAT_R16_SFLOAT, aoUsage, VK_IMAGE_ASPECT_COLOR_BIT))
         return false;
@@ -347,7 +361,8 @@ bool CompareApp::createRenderTargets() {
     // 200% SSAA ground truth: render at 2x, downsample into gtColor_.
     if (opts_.gtSsaa) {
         if (!createRT(gtSsaaColor_, dw * 2, dh * 2, deferred::kHdrColorFormat,
-                      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                          VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_STORAGE_BIT,
                       VK_IMAGE_ASPECT_COLOR_BIT))
             return false;
         if (!createRT(gtSsaaDepth_, dw * 2, dh * 2, deferred::kDepthFormat,
@@ -366,10 +381,13 @@ bool CompareApp::createRenderTargets() {
         if (!createRT(gtSsaaEmissive_, dw * 2, dh * 2, deferred::kEmissiveFormat, gbUsage,
                       VK_IMAGE_ASPECT_COLOR_BIT))
             return false;
-        if (!createRT(gtSsaaAoRaw_, dw * 2, dh * 2, VK_FORMAT_R16_SFLOAT, aoUsage,
+        if (!createRT(gtSsaaAoRaw_, dw * 2, dh * 2, kAoRawFormat, aoUsage,
                       VK_IMAGE_ASPECT_COLOR_BIT))
             return false;
         if (!createRT(gtSsaaAo_, dw * 2, dh * 2, VK_FORMAT_R16_SFLOAT, aoUsage,
+                      VK_IMAGE_ASPECT_COLOR_BIT))
+            return false;
+        if (!createRT(gtSsaaSsrSrc_, dw * 2, dh * 2, deferred::kHdrColorFormat, ssrUsage,
                       VK_IMAGE_ASPECT_COLOR_BIT))
             return false;
     }
@@ -547,7 +565,7 @@ bool CompareApp::createDescriptors() {
     sizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     sizes[0].descriptorCount = deferred::kMaxTextures + numColumns * 2 + 2 + numAlgos * 2 +
                                11 * kFramesInFlight * 4 + // lighting sets (GB/GT/SSAA/spatial), +1 shadow
-                               5 * kFramesInFlight * 4 +  // transparent sets (GB/GT/SSAA/spatial), +1 shadow
+                               7 * kFramesInFlight * 4 +  // transparent sets + SSR
                                3 * 3;                     // ssao + blur samplers (per path)
     sizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     sizes[1].descriptorCount = kFramesInFlight * 2 + numColumns +
@@ -1018,14 +1036,15 @@ bool CompareApp::createSyncResources() {
         // The transparency shader reads iblParams (identical in both lighting
         // UBOs) plus the path's own SSAO texture: one set per path.
         deferred_.writeTransparentSet(ctx_, fr.transparentSetGb, fr.lightingUboGb, gbAo_.view,
-                                      shadowView);
+                                      shadowView, gbSsrSrc_.view, gbDepth_.view);
         deferred_.writeTransparentSet(ctx_, fr.transparentSetGbSpatial, fr.lightingUboGbSpatial,
-                                      gbAo_.view, shadowView);
-        deferred_.writeTransparentSet(ctx_, fr.transparentSetGt, fr.lightingUboGb, gtAo_.view,
-                                      shadowView);
+                                      gbAo_.view, shadowView, gbSsrSrc_.view, gbDepth_.view);
+        deferred_.writeTransparentSet(ctx_, fr.transparentSetGt, fr.lightingUboGt, gtAo_.view,
+                                      shadowView, gtSsrSrc_.view, gtDepth_.view);
         if (opts_.gtSsaa) {
-            deferred_.writeTransparentSet(ctx_, fr.transparentSetSsaa, fr.lightingUboGb,
-                                          gtSsaaAo_.view, shadowView);
+            deferred_.writeTransparentSet(ctx_, fr.transparentSetSsaa, fr.lightingUboGt,
+                                          gtSsaaAo_.view, shadowView, gtSsaaSsrSrc_.view,
+                                          gtSsaaDepth_.view);
         }
     }
 
@@ -1074,7 +1093,7 @@ void CompareApp::updateSceneUBO(void* mapped, bool jitter, uint32_t renderW, uin
 void CompareApp::updateLightingUBO(void* mapped, const Mat4& invViewProj,
                                    const ShadowFrame* shadow) {
     LightingUBO ubo;
-    deferred_.fillLightingUBO(ubo, scene_, camera_, invViewProj, nullptr, shadow);
+    deferred_.fillLightingUBO(ubo, scene_, camera_, invViewProj, nullptr, shadow, iblIntensity_);
     std::memcpy(mapped, &ubo, sizeof(ubo));
 }
 
@@ -1327,6 +1346,20 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                    VK_IMAGE_ASPECT_COLOR_BIT);
         deferred_.recordLightingPass(cmd, lightingSet, gbColor_.view, renderWidth_, renderHeight_);
 
+        if (hasTransparency_) {
+            transition(gbColor_.image, gbColorLayout_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       VK_IMAGE_ASPECT_COLOR_BIT);
+            transition(gbSsrSrc_.image, gbSsrSrcLayout_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                       VK_IMAGE_ASPECT_COLOR_BIT);
+            copyColorImage(cmd, gbColor_.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           gbSsrSrc_.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, renderWidth_,
+                           renderHeight_);
+            transition(gbSsrSrc_.image, gbSsrSrcLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                       VK_IMAGE_ASPECT_COLOR_BIT);
+            transition(gbColor_.image, gbColorLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                       VK_IMAGE_ASPECT_COLOR_BIT);
+        }
+
         // Overwrites motion (static glass = camera motion) and accumulates the
         // translucent coverage mask consumed by upscalers as the reactive / TC mask.
         if (hasTransparency_) {
@@ -1529,6 +1562,19 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                    VK_IMAGE_ASPECT_COLOR_BIT);
         deferred_.recordLightingPass(cmd, fr.lightingSetSsaa, gtSsaaColor_.view, sw, sh);
 
+        if (hasTransparency_) {
+            transition(gtSsaaColor_.image, gtSsaaColorLayout_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       VK_IMAGE_ASPECT_COLOR_BIT);
+            transition(gtSsaaSsrSrc_.image, gtSsaaSsrSrcLayout_,
+                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+            copyColorImage(cmd, gtSsaaColor_.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           gtSsaaSsrSrc_.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, sw, sh);
+            transition(gtSsaaSsrSrc_.image, gtSsaaSsrSrcLayout_,
+                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+            transition(gtSsaaColor_.image, gtSsaaColorLayout_,
+                       VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+        }
+
         // Transparency pass: alpha-blended surfaces over the lit scene (GT
         // path: color only, no motion/mask outputs).
         if (hasTransparency_) {
@@ -1630,6 +1676,19 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                    VK_IMAGE_ASPECT_COLOR_BIT);
         deferred_.recordLightingPass(cmd, fr.lightingSetGt, gtColor_.view, dw, dh);
 
+        if (hasTransparency_) {
+            transition(gtColor_.image, gtColorLayout_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       VK_IMAGE_ASPECT_COLOR_BIT);
+            transition(gtSsrSrc_.image, gtSsrSrcLayout_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                       VK_IMAGE_ASPECT_COLOR_BIT);
+            copyColorImage(cmd, gtColor_.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           gtSsrSrc_.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, dw, dh);
+            transition(gtSsrSrc_.image, gtSsrSrcLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                       VK_IMAGE_ASPECT_COLOR_BIT);
+            transition(gtColor_.image, gtColorLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                       VK_IMAGE_ASPECT_COLOR_BIT);
+        }
+
         // Transparency pass: alpha-blended surfaces over the lit scene (GT
         // path: color only, no motion/mask outputs).
         if (hasTransparency_) {
@@ -1684,6 +1743,7 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
             push.z = regW;
             push.w = regH;
             push.x2 = regBlocksPerRow;
+            push.exposure = opts_.exposure;
             vkCmdPushConstants(cmd, metricPipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                                sizeof(push), &push);
             vkCmdDispatch(cmd, regBlocksPerRow, (regH + 7) / 8, 1);
@@ -1750,7 +1810,7 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
             push.srcSize[1] = static_cast<float>(dh);
             // Nearest sampling once the on-screen magnification passes 1:1.
             push.nearest = (static_cast<float>(w) >= rect[2]) ? 1.f : 0.f;
-            push.pad = 0.f;
+            push.exposure = opts_.exposure;
             vkCmdPushConstants(cmd, composePipelineLayout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                                sizeof(push), &push);
             vkCmdDraw(cmd, 3, 1, 0, 0);
@@ -2017,6 +2077,9 @@ void CompareApp::shutdown() {
 
     gbColor_.destroy(ctx_);
     gbColorSpatial_.destroy(ctx_);
+    gbSsrSrc_.destroy(ctx_);
+    gtSsrSrc_.destroy(ctx_);
+    gtSsaaSsrSrc_.destroy(ctx_);
     gbAlbedo_.destroy(ctx_);
     gbNormal_.destroy(ctx_);
     gbMaterial_.destroy(ctx_);

@@ -104,7 +104,7 @@ struct ComposePush {
     float uvRect[4];  // normalized source region: offset xy, size zw
     float srcSize[2]; // source image pixels
     float nearest;    // != 0: sample nearest (magnification >= 1:1)
-    float pad;
+    float exposure;   // display-domain ACES input multiplier
 };
 static_assert(sizeof(ComposePush) == 48, "ComposePush size mismatch");
 
@@ -114,7 +114,10 @@ struct MetricPush {
     uint32_t x2 = 0, y2 = 0, z2 = 0, w2 = 0;  // x2 = blocks per row (region);
                                               // y2 = 1 => ref is low-res (normalized sampling);
                                               // z2/w2 = test image full size (px)
+    float exposure = 1.f;
+    float pad[3] = {};
 };
+static_assert(sizeof(MetricPush) == 48, "MetricPush std140/push size mismatch");
 
 VkRenderingAttachmentInfo makeColorAttachment(VkImageView view, VkImageLayout layout,
                                               VkAttachmentLoadOp loadOp,
@@ -753,7 +756,10 @@ void GuiApp::finishAsyncRebuild() {
             }
         }
 
-        if (loadSceneDirty_) hasTransparency_ = deferred_.sceneHasTransparency(scene_);
+        if (loadSceneDirty_) {
+            hasTransparency_ = deferred_.sceneHasTransparency(scene_);
+            applyLightingPreset(lightingPresetForScene(active_.scenePath));
+        }
         gtActive_ = active_.mode == Mode::Compare || algos_.empty();
         if (!beginStackConfig()) {
             stackOk_ = false;
@@ -862,6 +868,8 @@ bool GuiApp::buildRenderStack() {
         return false;
     }
     hasTransparency_ = deferred_.sceneHasTransparency(scene_);
+    applyLightingPreset(lightingPresetForScene(active_.scenePath));
+    if (opts_.exposure > 0.f) exposure_ = opts_.exposure;
 
     std::string err;
     if (!initAlgorithms(err)) {
@@ -1037,7 +1045,8 @@ bool GuiApp::createRenderTargets() {
     // inputs into internal buffers instead of just sampling them.
     if (!createRT(gbColor_, renderWidth_, renderHeight_, deferred::kHdrColorFormat,
                   VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
-                      VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                      VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                      VK_IMAGE_USAGE_STORAGE_BIT,
                   VK_IMAGE_ASPECT_COLOR_BIT))
         return false;
     // Unjittered LR color for spatial plugins when mixed with temporal ones
@@ -1082,9 +1091,9 @@ bool GuiApp::createRenderTargets() {
                   VK_IMAGE_ASPECT_DEPTH_BIT))
         return false;
 
-    // SSAO targets (raw + blurred) for the low-res path.
+    // GTAO targets (working RG16F + filtered R16F) for the low-res path.
     const VkImageUsageFlags aoUsage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-    if (!createRT(gbAoRaw_, renderWidth_, renderHeight_, VK_FORMAT_R16_SFLOAT, aoUsage,
+    if (!createRT(gbAoRaw_, renderWidth_, renderHeight_, kAoRawFormat, aoUsage,
                   VK_IMAGE_ASPECT_COLOR_BIT))
         return false;
     if (!createRT(gbAo_, renderWidth_, renderHeight_, VK_FORMAT_R16_SFLOAT, aoUsage,
@@ -1097,7 +1106,8 @@ bool GuiApp::createRenderTargets() {
     const uint32_t gtW = active_.gtApplyScale ? renderWidth_ : dw;
     const uint32_t gtH = active_.gtApplyScale ? renderHeight_ : dh;
     if (!createRT(gtColor_, gtW, gtH, deferred::kHdrColorFormat,
-                  VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                  VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                      VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_STORAGE_BIT,
                   VK_IMAGE_ASPECT_COLOR_BIT))
         return false;
     if (!createRT(gtAlbedo_, gtW, gtH, deferred::kAlbedoFormat,
@@ -1120,15 +1130,23 @@ bool GuiApp::createRenderTargets() {
                   VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
                   VK_IMAGE_ASPECT_DEPTH_BIT))
         return false;
-    if (!createRT(gtAoRaw_, gtW, gtH, VK_FORMAT_R16_SFLOAT, aoUsage, VK_IMAGE_ASPECT_COLOR_BIT))
+    if (!createRT(gtAoRaw_, gtW, gtH, kAoRawFormat, aoUsage, VK_IMAGE_ASPECT_COLOR_BIT))
         return false;
     if (!createRT(gtAo_, gtW, gtH, VK_FORMAT_R16_SFLOAT, aoUsage, VK_IMAGE_ASPECT_COLOR_BIT))
+        return false;
+    const VkImageUsageFlags ssrUsage =
+        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    if (!createRT(gbSsrSrc_, renderWidth_, renderHeight_, deferred::kHdrColorFormat, ssrUsage,
+                  VK_IMAGE_ASPECT_COLOR_BIT))
+        return false;
+    if (!createRT(gtSsrSrc_, gtW, gtH, deferred::kHdrColorFormat, ssrUsage, VK_IMAGE_ASPECT_COLOR_BIT))
         return false;
 
     // 200% SSAA ground truth: deferred render at 2x, downsample into gtColor_.
     if (active_.gtSsaa) {
         if (!createRT(gtSsaaColor_, dw * 2, dh * 2, deferred::kHdrColorFormat,
-                      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                          VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_STORAGE_BIT,
                       VK_IMAGE_ASPECT_COLOR_BIT))
             return false;
         if (!createRT(gtSsaaAlbedo_, dw * 2, dh * 2, deferred::kAlbedoFormat,
@@ -1151,10 +1169,13 @@ bool GuiApp::createRenderTargets() {
                       VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
                       VK_IMAGE_ASPECT_DEPTH_BIT))
             return false;
-        if (!createRT(gtSsaaAoRaw_, dw * 2, dh * 2, VK_FORMAT_R16_SFLOAT, aoUsage,
+        if (!createRT(gtSsaaAoRaw_, dw * 2, dh * 2, kAoRawFormat, aoUsage,
                       VK_IMAGE_ASPECT_COLOR_BIT))
             return false;
         if (!createRT(gtSsaaAo_, dw * 2, dh * 2, VK_FORMAT_R16_SFLOAT, aoUsage,
+                      VK_IMAGE_ASPECT_COLOR_BIT))
+            return false;
+        if (!createRT(gtSsaaSsrSrc_, dw * 2, dh * 2, deferred::kHdrColorFormat, ssrUsage,
                       VK_IMAGE_ASPECT_COLOR_BIT))
             return false;
     }
@@ -1337,7 +1358,7 @@ bool GuiApp::createDescriptors() {
     sizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     sizes[0].descriptorCount =
         deferred::kMaxTextures + numColumns * 2 + 2 + numAlgos * 6 + 11 * kFramesInFlight * 4 +
-        5 * kFramesInFlight * 4 + 3 * 3;
+        7 * kFramesInFlight * 4 + 3 * 3;
     sizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     sizes[1].descriptorCount = kFramesInFlight * 3 + numColumns + numAlgos + kFramesInFlight * 4 +
                                kFramesInFlight * 4;
@@ -1844,14 +1865,15 @@ bool GuiApp::createSyncResources() {
         // The transparency shader reads iblParams (identical in both lighting
         // UBOs) plus the path's own SSAO texture: one set per path.
         deferred_.writeTransparentSet(ctx_, fr.transparentSetGb, fr.lightingUboGb, gbAo_.view,
-                                      shadowView);
+                                      shadowView, gbSsrSrc_.view, gbDepth_.view);
         deferred_.writeTransparentSet(ctx_, fr.transparentSetGbSpatial, fr.lightingUboGbSpatial,
-                                      gbAo_.view, shadowView);
-        deferred_.writeTransparentSet(ctx_, fr.transparentSetGt, fr.lightingUboGb, gtAo_.view,
-                                      shadowView);
+                                      gbAo_.view, shadowView, gbSsrSrc_.view, gbDepth_.view);
+        deferred_.writeTransparentSet(ctx_, fr.transparentSetGt, fr.lightingUboGt, gtAo_.view,
+                                      shadowView, gtSsrSrc_.view, gtDepth_.view);
         if (active_.gtSsaa) {
-            deferred_.writeTransparentSet(ctx_, fr.transparentSetSsaa, fr.lightingUboGb,
-                                          gtSsaaAo_.view, shadowView);
+            deferred_.writeTransparentSet(ctx_, fr.transparentSetSsaa, fr.lightingUboGt,
+                                          gtSsaaAo_.view, shadowView, gtSsaaSsrSrc_.view,
+                                          gtSsaaDepth_.view);
         }
     }
 
@@ -2097,6 +2119,9 @@ void GuiApp::destroyStackResources() {
     gtAo_.destroy(ctx_);
     gtSsaaAoRaw_.destroy(ctx_);
     gtSsaaAo_.destroy(ctx_);
+    gbSsrSrc_.destroy(ctx_);
+    gtSsrSrc_.destroy(ctx_);
+    gtSsaaSsrSrc_.destroy(ctx_);
     composeImage_.destroy(ctx_);
     uiShotImage_.destroy(ctx_);
     uiShotLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -2129,6 +2154,9 @@ void GuiApp::destroyStackResources() {
     gtAoLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     gtSsaaAoRawLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     gtSsaaAoLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+    gbSsrSrcLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+    gtSsrSrcLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+    gtSsaaSsrSrcLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     composeLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
 }
 
@@ -2227,11 +2255,7 @@ std::vector<Light> GuiApp::buildLightOverride() const {
     // copying it keeps every non-directional light untouched.
     std::vector<Light> lights = scene_.lights;
     if (sunEnabled_) {
-        // Direction *towards* the sun from elevation/azimuth (degrees).
-        const float el = sunElevationDeg_ * (3.14159265f / 180.f);
-        const float az = sunAzimuthDeg_ * (3.14159265f / 180.f);
-        const Vec3 dir{std::cos(el) * std::sin(az), std::sin(el),
-                       std::cos(el) * std::cos(az)};
+        const Vec3 dir = sunDirectionFromElevAzimuth(sunElevationDeg_, sunAzimuthDeg_);
         Light* sun = nullptr;
         for (Light& l : lights) {
             if (l.type == LightType::Directional) {
@@ -2247,7 +2271,8 @@ std::vector<Light> GuiApp::buildLightOverride() const {
             sun->type = LightType::Directional;
         }
         sun->positionOrDirection = dir;
-        sun->intensity = sunIntensity_; // color/range keep the scene's values
+        sun->intensity = sunIntensity_;
+        sun->color = sunColor_;
         // The UI-driven sun is the CSM caster: Light{} defaults castShadow to
         // false and glTF suns may leave it unauthored.  (LightGPU.params.y is
         // reserved in the shaders; only the ShadowFrame light index matters.)
@@ -2259,13 +2284,37 @@ std::vector<Light> GuiApp::buildLightOverride() const {
                                     }),
                      lights.end());
     }
+    if (!fillEnabled_) {
+        // Drop the canned default fill only; authored point lights (PR3) stay.
+        const Light canned = defaultFillLight();
+        lights.erase(std::remove_if(lights.begin(), lights.end(),
+                                    [&](const Light& l) {
+                                        return l.type == LightType::Point &&
+                                               l.positionOrDirection.x == canned.positionOrDirection.x &&
+                                               l.positionOrDirection.y == canned.positionOrDirection.y &&
+                                               l.positionOrDirection.z == canned.positionOrDirection.z;
+                                    }),
+                     lights.end());
+    }
     return lights;
+}
+
+void GuiApp::applyLightingPreset(const LightingPreset& p) {
+    sunEnabled_ = p.sunEnabled;
+    sunElevationDeg_ = p.sunElevationDeg;
+    sunAzimuthDeg_ = p.sunAzimuthDeg;
+    sunIntensity_ = p.sunIntensity;
+    sunColor_ = p.sunColor;
+    fillEnabled_ = p.fillEnabled;
+    iblIntensity_ = p.iblIntensity;
+    exposure_ = p.exposure;
 }
 
 void GuiApp::updateLightingUBO(void* mapped, const Mat4& invViewProj,
                                const std::vector<Light>& lights, const ShadowFrame* shadow) {
     LightingUBO ubo;
-    deferred_.fillLightingUBO(ubo, scene_, camera_, invViewProj, &lights, shadow);
+    deferred_.fillLightingUBO(ubo, scene_, camera_, invViewProj, &lights, shadow,
+                              iblIntensity_);
     std::memcpy(mapped, &ubo, sizeof(ubo));
 }
 
@@ -2721,6 +2770,20 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         deferred_.recordLightingPass(cmd, lightingSet, gbColor_.view, renderWidth_, renderHeight_);
 
         if (hasTransparency_) {
+            transition(gbColor_.image, gbColorLayout_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       VK_IMAGE_ASPECT_COLOR_BIT);
+            transition(gbSsrSrc_.image, gbSsrSrcLayout_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                       VK_IMAGE_ASPECT_COLOR_BIT);
+            copyColorImage(cmd, gbColor_.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           gbSsrSrc_.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, renderWidth_,
+                           renderHeight_);
+            transition(gbSsrSrc_.image, gbSsrSrcLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                       VK_IMAGE_ASPECT_COLOR_BIT);
+            transition(gbColor_.image, gbColorLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                       VK_IMAGE_ASPECT_COLOR_BIT);
+        }
+
+        if (hasTransparency_) {
             transition(gbMotion_.image, gbMotionLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                        VK_IMAGE_ASPECT_COLOR_BIT);
             transition(gbReactive_.image, gbReactiveLayout_,
@@ -2926,6 +2989,19 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                    VK_IMAGE_ASPECT_COLOR_BIT);
         deferred_.recordLightingPass(cmd, fr.lightingSetSsaa, gtSsaaColor_.view, sw, sh);
 
+        if (hasTransparency_) {
+            transition(gtSsaaColor_.image, gtSsaaColorLayout_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       VK_IMAGE_ASPECT_COLOR_BIT);
+            transition(gtSsaaSsrSrc_.image, gtSsaaSsrSrcLayout_,
+                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+            copyColorImage(cmd, gtSsaaColor_.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           gtSsaaSsrSrc_.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, sw, sh);
+            transition(gtSsaaSsrSrc_.image, gtSsaaSsrSrcLayout_,
+                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+            transition(gtSsaaColor_.image, gtSsaaColorLayout_,
+                       VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+        }
+
         // Transparency pass: alpha-blended surfaces over the lit scene (GT
         // path: color only, no motion/mask outputs).
         if (hasTransparency_) {
@@ -3028,6 +3104,19 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                    VK_IMAGE_ASPECT_COLOR_BIT);
         deferred_.recordLightingPass(cmd, fr.lightingSetGt, gtColor_.view, gtW, gtH);
 
+        if (hasTransparency_) {
+            transition(gtColor_.image, gtColorLayout_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       VK_IMAGE_ASPECT_COLOR_BIT);
+            transition(gtSsrSrc_.image, gtSsrSrcLayout_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                       VK_IMAGE_ASPECT_COLOR_BIT);
+            copyColorImage(cmd, gtColor_.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           gtSsrSrc_.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, gtW, gtH);
+            transition(gtSsrSrc_.image, gtSsrSrcLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                       VK_IMAGE_ASPECT_COLOR_BIT);
+            transition(gtColor_.image, gtColorLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                       VK_IMAGE_ASPECT_COLOR_BIT);
+        }
+
         // Transparency pass: alpha-blended surfaces over the lit scene (GT
         // path: color only, no motion/mask outputs).
         if (hasTransparency_) {
@@ -3101,6 +3190,7 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
             push.y2 = active_.gtApplyScale ? 1u : 0u;
             push.z2 = dw;
             push.w2 = dh;
+            push.exposure = exposure_;
             vkCmdPushConstants(cmd, metricPipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                                sizeof(push), &push);
             vkCmdDispatch(cmd, regBlocksPerRow, (regH + 7) / 8, 1);
@@ -3224,7 +3314,7 @@ void GuiApp::recordComposePresent(VkCommandBuffer cmd, uint32_t swapchainIndex,
             push.srcSize[1] = srcH;
             const float srcRegionW = rect[2] * (srcW / static_cast<float>(dw));
             push.nearest = (static_cast<float>(w) >= srcRegionW) ? 1.f : 0.f;
-            push.pad = 0.f;
+            push.exposure = exposure_;
             vkCmdPushConstants(cmd, composePipelineLayout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                                sizeof(push), &push);
             vkCmdDraw(cmd, 3, 1, 0, 0);
@@ -3944,9 +4034,9 @@ void GuiApp::drawViewerTab() {
     if (loadInFlight) ImGui::TextDisabled("loading... (apply disabled)");
     ImGui::Separator();
 
-    // Lighting: sun direction/intensity.  Takes effect immediately through
-    // the per-frame lighting UBO (no rebuild).  Defaults reproduce the
-    // Scene.h defaultLights() sun exactly.
+    // Lighting: sun / IBL / exposure.  Per-frame UBO, no rebuild.  Scene
+    // load applies lightingPresetForScene(); "golden hour" writes the Bistro
+    // exterior look onto the sliders.
     ImGui::Text("lighting");
     ImGui::Checkbox("sun", &sunEnabled_);
     if (!sunEnabled_) ImGui::BeginDisabled();
@@ -3954,6 +4044,13 @@ void GuiApp::drawViewerTab() {
     ImGui::SliderFloat("azimuth", &sunAzimuthDeg_, 0.f, 360.f, "%.0f deg");
     ImGui::SliderFloat("intensity", &sunIntensity_, 0.f, 10.f, "%.2f");
     if (!sunEnabled_) ImGui::EndDisabled();
+    ImGui::Checkbox("fill light", &fillEnabled_);
+    ImGui::SliderFloat("IBL intensity", &iblIntensity_, 0.f, 3.f, "%.2f");
+    ImGui::SliderFloat("exposure", &exposure_, 0.1f, 4.f, "%.2f");
+    if (ImGui::Button("golden hour")) applyLightingPreset(goldenHourPreset());
+    ImGui::SameLine();
+    if (ImGui::Button("scene default"))
+        applyLightingPreset(lightingPresetForScene(active_.scenePath));
     // CSM sun shadows: per-frame UBO flag + one extra depth pass (no
     // rebuild).  Unavailable when the shadow targets failed to create.
     if (!shadowsActive_) ImGui::BeginDisabled();
