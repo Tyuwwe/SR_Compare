@@ -1,6 +1,7 @@
 #include "upscalers/UpscalerFactory.h"
 #include "upscalers/sgsr/Sgsr1Upscaler.h"
 #include "renderer/core/PathUtil.h"
+#include "upscalers/VkHelpers.h"
 #include "upscalers/sgsr/SgsrCommon.h"
 
 #include <cstring>
@@ -247,8 +248,7 @@ bool Sgsr1Upscaler::init(const VulkanEnv& env, const UpscalerDesc& desc) {
     pipeCi.pColorBlendState = &cb;
     pipeCi.pDynamicState = &dyn;
     pipeCi.layout = impl_->pipelineLayout;
-    const VkResult res = vkCreateGraphicsPipelines(env.device, VK_NULL_HANDLE, 1, &pipeCi, nullptr,
-                                                   &impl_->pipeline);
+    const VkResult res = sr::createGraphicsPipeline(env, pipeCi, impl_->pipeline);
     vkDestroyShaderModule(env.device, vert, nullptr);
     vkDestroyShaderModule(env.device, frag, nullptr);
     if (res != VK_SUCCESS) {

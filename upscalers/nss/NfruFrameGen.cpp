@@ -413,7 +413,7 @@ private:
             cpci.stage.module = module;
             cpci.stage.pName = "main";
             cpci.layout = convertLayout_;
-            const VkResult r = vkCreateComputePipelines(env.device, VK_NULL_HANDLE, 1, &cpci, nullptr, out);
+            const VkResult r = createComputePipeline(env, cpci, *out);
             vkDestroyShaderModule(env.device, module, nullptr);
             return r == VK_SUCCESS;
         };

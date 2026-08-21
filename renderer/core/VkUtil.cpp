@@ -114,6 +114,18 @@ VkAccessFlags accessForLayout(VkImageLayout layout, bool isSource) {
 
 } // namespace
 
+VkResult createGraphicsPipeline(const VulkanContext& ctx, const VkGraphicsPipelineCreateInfo& ci,
+                                VkPipeline& out) {
+    std::lock_guard<std::mutex> lk(ctx.pipelineMutex);
+    return vkCreateGraphicsPipelines(ctx.device, ctx.pipelineCache, 1, &ci, nullptr, &out);
+}
+
+VkResult createComputePipeline(const VulkanContext& ctx, const VkComputePipelineCreateInfo& ci,
+                               VkPipeline& out) {
+    std::lock_guard<std::mutex> lk(ctx.pipelineMutex);
+    return vkCreateComputePipelines(ctx.device, ctx.pipelineCache, 1, &ci, nullptr, &out);
+}
+
 void imageBarrier(VkCommandBuffer cmd, VkImage image, VkImageLayout oldLayout,
                   VkImageLayout newLayout, VkImageAspectFlags aspect, uint32_t baseMip,
                   uint32_t levelCount, uint32_t baseLayer, uint32_t layerCount) {

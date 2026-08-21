@@ -259,7 +259,7 @@ bool TaaUpscaler::init(const VulkanEnv& env, const UpscalerDesc& desc) {
     pipeCi.stage.module = module;
     pipeCi.stage.pName = "main";
     pipeCi.layout = impl_->pipelineLayout;
-    if (vkCreateComputePipelines(env.device, VK_NULL_HANDLE, 1, &pipeCi, nullptr, &impl_->pipeline) != VK_SUCCESS) {
+    if (createComputePipeline(env, pipeCi, impl_->pipeline) != VK_SUCCESS) {
         vkDestroyShaderModule(env.device, module, nullptr);
         shutdown();
         return false;

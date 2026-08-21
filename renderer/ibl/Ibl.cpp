@@ -191,8 +191,7 @@ bool IblMaps::build(const VulkanContext& ctx, const char* hdrPath) {
         pipeCi.stage.module = module;
         pipeCi.stage.pName = "main";
         pipeCi.layout = out.layout;
-        return vkCreateComputePipelines(ctx.device, VK_NULL_HANDLE, 1, &pipeCi, nullptr,
-                                        &out.pipeline) == VK_SUCCESS;
+        return createComputePipeline(ctx, pipeCi, out.pipeline) == VK_SUCCESS;
     };
 
     const bool stagesOk =

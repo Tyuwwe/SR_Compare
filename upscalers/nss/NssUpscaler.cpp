@@ -489,8 +489,7 @@ bool NssUpscaler::init(const VulkanEnv& env, const UpscalerDesc& desc) {
             cpci.stage.module       = module;
             cpci.stage.pName        = "main";
             cpci.layout             = impl_->convertLayout;
-            const VkResult res =
-                vkCreateComputePipelines(env.device, VK_NULL_HANDLE, 1, &cpci, nullptr, pass.out);
+            const VkResult res = createComputePipeline(env, cpci, *pass.out);
             vkDestroyShaderModule(env.device, module, nullptr);
             if (res != VK_SUCCESS) {
                 shutdown();

@@ -30,6 +30,14 @@ VkImageView createImageView(const VulkanContext& ctx, VkImage image, VkFormat fo
 VkSampler createSampler(const VulkanContext& ctx, VkFilter filter, VkSamplerAddressMode addressMode,
                         float maxAnisotropy = 0.f, float maxLod = 0.f);
 
+// vkCreateGraphicsPipelines / vkCreateComputePipelines through the context's
+// persistent pipeline cache; host access to the cache is serialized through
+// ctx.pipelineMutex (the GUI async loader creates pipelines off-thread).
+VkResult createGraphicsPipeline(const VulkanContext& ctx, const VkGraphicsPipelineCreateInfo& ci,
+                                VkPipeline& out);
+VkResult createComputePipeline(const VulkanContext& ctx, const VkComputePipelineCreateInfo& ci,
+                               VkPipeline& out);
+
 // Insert an image memory barrier.  Stage/access masks are derived from the two
 // layouts (coarse but correct); aspect defaults to COLOR.
 void imageBarrier(VkCommandBuffer cmd, VkImage image, VkImageLayout oldLayout,

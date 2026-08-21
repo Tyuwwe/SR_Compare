@@ -345,7 +345,7 @@ bool Sgsr2Upscaler::init(const VulkanEnv& env, const UpscalerDesc& desc) {
         VkShaderModule module = sgsr::loadShaderModule(env, job.path.c_str());
         if (!module) { shutdown(); return false; }
         job.pass->pipeline =
-            sgsr::createComputePipeline(env.device, job.pass->pipelineLayout, module);
+            sgsr::createComputePipeline(env, job.pass->pipelineLayout, module);
         vkDestroyShaderModule(env.device, module, nullptr);
         if (!job.pass->pipeline) { shutdown(); return false; }
     }

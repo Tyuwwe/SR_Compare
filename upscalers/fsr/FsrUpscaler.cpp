@@ -261,8 +261,7 @@ bool initUnjitter(const VulkanEnv& env, uint32_t w, uint32_t h, UnjitterPass& p)
     ci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
     ci.stage = st;
     ci.layout = p.pipeLayout;
-    const VkResult pr = vkCreateComputePipelines(env.device, VK_NULL_HANDLE, 1, &ci, nullptr,
-                                                 &p.pipeline);
+    const VkResult pr = createComputePipeline(env, ci, p.pipeline);
     vkDestroyShaderModule(env.device, mod, nullptr);
     if (pr != VK_SUCCESS) return false;
 

@@ -883,7 +883,7 @@ bool CompareApp::createPipelines() {
     composeRendering.pColorAttachmentFormats = &kComposeFormat;
     fsCi.pNext = &composeRendering;
     fsCi.layout = composePipelineLayout_;
-    if (vkCreateGraphicsPipelines(ctx_.device, VK_NULL_HANDLE, 1, &fsCi, nullptr, &composePipeline_) != VK_SUCCESS)
+    if (createGraphicsPipeline(ctx_, fsCi, composePipeline_) != VK_SUCCESS)
         return false;
 
     fsStages[1].module = copyFrag_;
@@ -894,7 +894,7 @@ bool CompareApp::createPipelines() {
     copyRendering.pColorAttachmentFormats = &presentFormat;
     fsCi.pNext = &copyRendering;
     fsCi.layout = copyPipelineLayout_;
-    if (vkCreateGraphicsPipelines(ctx_.device, VK_NULL_HANDLE, 1, &fsCi, nullptr, &copyPipeline_) != VK_SUCCESS)
+    if (createGraphicsPipeline(ctx_, fsCi, copyPipeline_) != VK_SUCCESS)
         return false;
 
     // GT SSAA downsample: same passthrough fragment shader, HDR target.
@@ -903,8 +903,7 @@ bool CompareApp::createPipelines() {
     downsampleRendering.colorAttachmentCount = 1;
     downsampleRendering.pColorAttachmentFormats = &deferred::kHdrColorFormat;
     fsCi.pNext = &downsampleRendering;
-    if (vkCreateGraphicsPipelines(ctx_.device, VK_NULL_HANDLE, 1, &fsCi, nullptr,
-                                  &downsamplePipeline_) != VK_SUCCESS)
+    if (createGraphicsPipeline(ctx_, fsCi, downsamplePipeline_) != VK_SUCCESS)
         return false;
 
     // --- metric compute pipelines ----------------------------------------------
@@ -915,12 +914,10 @@ bool CompareApp::createPipelines() {
     compCi.stage.module = metricBlocksComp_;
     compCi.stage.pName = "main";
     compCi.layout = metricPipelineLayout_;
-    if (vkCreateComputePipelines(ctx_.device, VK_NULL_HANDLE, 1, &compCi, nullptr,
-                                 &metricBlocksPipeline_) != VK_SUCCESS)
+    if (createComputePipeline(ctx_, compCi, metricBlocksPipeline_) != VK_SUCCESS)
         return false;
     compCi.stage.module = metricReduceComp_;
-    if (vkCreateComputePipelines(ctx_.device, VK_NULL_HANDLE, 1, &compCi, nullptr,
-                                 &metricReducePipeline_) != VK_SUCCESS)
+    if (createComputePipeline(ctx_, compCi, metricReducePipeline_) != VK_SUCCESS)
         return false;
 
     return true;

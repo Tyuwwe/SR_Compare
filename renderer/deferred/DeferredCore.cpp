@@ -415,8 +415,7 @@ bool DeferredCore::createPipelines(const VulkanContext& ctx) {
     gbRendering.pColorAttachmentFormats = gbColorFormats;
     gbRendering.depthAttachmentFormat = deferred::kDepthFormat;
     sceneCi.pNext = &gbRendering;
-    if (vkCreateGraphicsPipelines(ctx.device, VK_NULL_HANDLE, 1, &sceneCi, nullptr,
-                                  &gbufferPipeline_) != VK_SUCCESS)
+    if (createGraphicsPipeline(ctx, sceneCi, gbufferPipeline_) != VK_SUCCESS)
         return false;
 
     // GT GBuffer pipeline: same minus the motion attachment.
@@ -428,8 +427,7 @@ bool DeferredCore::createPipelines(const VulkanContext& ctx) {
     sceneCi.pNext = &gtRendering;
     colorBlend.attachmentCount = 4;
     stages[1].module = gbufferGtFrag_; // GT shader has no motion output
-    if (vkCreateGraphicsPipelines(ctx.device, VK_NULL_HANDLE, 1, &sceneCi, nullptr,
-                                  &gbufferGtPipeline_) != VK_SUCCESS)
+    if (createGraphicsPipeline(ctx, sceneCi, gbufferGtPipeline_) != VK_SUCCESS)
         return false;
 
     // Deferred lighting pipeline: fullscreen triangle, GBuffer + IBL -> HDR color.
@@ -475,8 +473,7 @@ bool DeferredCore::createPipelines(const VulkanContext& ctx) {
     lightingRendering.colorAttachmentCount = 1;
     lightingRendering.pColorAttachmentFormats = &deferred::kHdrColorFormat;
     lightingCi.pNext = &lightingRendering;
-    if (vkCreateGraphicsPipelines(ctx.device, VK_NULL_HANDLE, 1, &lightingCi, nullptr,
-                                  &lightingPipeline_) != VK_SUCCESS)
+    if (createGraphicsPipeline(ctx, lightingCi, lightingPipeline_) != VK_SUCCESS)
         return false;
 
     // --- Transparency pass ---------------------------------------------------
@@ -560,8 +557,7 @@ bool DeferredCore::createPipelines(const VulkanContext& ctx) {
     transparentRendering.pColorAttachmentFormats = transparentFormats;
     transparentRendering.depthAttachmentFormat = deferred::kDepthFormat;
     transparentCi.pNext = &transparentRendering;
-    if (vkCreateGraphicsPipelines(ctx.device, VK_NULL_HANDLE, 1, &transparentCi, nullptr,
-                                  &transparentPipeline_) != VK_SUCCESS)
+    if (createGraphicsPipeline(ctx, transparentCi, transparentPipeline_) != VK_SUCCESS)
         return false;
 
     // GT variant: blended color only.
@@ -573,8 +569,7 @@ bool DeferredCore::createPipelines(const VulkanContext& ctx) {
     transparentCi.pNext = &transparentGtRendering;
     transparentColorBlend.attachmentCount = 1;
     transparentStages[1].module = transparentGtFrag_;
-    if (vkCreateGraphicsPipelines(ctx.device, VK_NULL_HANDLE, 1, &transparentCi, nullptr,
-                                  &transparentGtPipeline_) != VK_SUCCESS)
+    if (createGraphicsPipeline(ctx, transparentCi, transparentGtPipeline_) != VK_SUCCESS)
         return false;
 
     // --- GTAO compute passes (main + 5x5 bilateral denoise) --------------------
@@ -607,13 +602,11 @@ bool DeferredCore::createPipelines(const VulkanContext& ctx) {
     ssaoCi.stage.module = ssaoComp_;
     ssaoCi.stage.pName = "main";
     ssaoCi.layout = ssaoPipelineLayout_;
-    if (vkCreateComputePipelines(ctx.device, VK_NULL_HANDLE, 1, &ssaoCi, nullptr,
-                                 &ssaoPipeline_) != VK_SUCCESS)
+    if (createComputePipeline(ctx, ssaoCi, ssaoPipeline_) != VK_SUCCESS)
         return false;
     ssaoCi.stage.module = ssaoBlurComp_;
     ssaoCi.layout = ssaoBlurPipelineLayout_;
-    if (vkCreateComputePipelines(ctx.device, VK_NULL_HANDLE, 1, &ssaoCi, nullptr,
-                                 &ssaoBlurPipeline_) != VK_SUCCESS)
+    if (createComputePipeline(ctx, ssaoCi, ssaoBlurPipeline_) != VK_SUCCESS)
         return false;
 
     // --- Bloom (reuses ssaoBlur set layout: sampler + storage) ----------------
@@ -637,16 +630,13 @@ bool DeferredCore::createPipelines(const VulkanContext& ctx) {
     bloomCi.stage.pName = "main";
     bloomCi.layout = bloomPipelineLayout_;
     bloomCi.stage.module = bloomExtractComp_;
-    if (vkCreateComputePipelines(ctx.device, VK_NULL_HANDLE, 1, &bloomCi, nullptr,
-                                 &bloomExtractPipeline_) != VK_SUCCESS)
+    if (createComputePipeline(ctx, bloomCi, bloomExtractPipeline_) != VK_SUCCESS)
         return false;
     bloomCi.stage.module = bloomBlurComp_;
-    if (vkCreateComputePipelines(ctx.device, VK_NULL_HANDLE, 1, &bloomCi, nullptr,
-                                 &bloomBlurPipeline_) != VK_SUCCESS)
+    if (createComputePipeline(ctx, bloomCi, bloomBlurPipeline_) != VK_SUCCESS)
         return false;
     bloomCi.stage.module = bloomCompositeComp_;
-    if (vkCreateComputePipelines(ctx.device, VK_NULL_HANDLE, 1, &bloomCi, nullptr,
-                                 &bloomCompositePipeline_) != VK_SUCCESS)
+    if (createComputePipeline(ctx, bloomCi, bloomCompositePipeline_) != VK_SUCCESS)
         return false;
 
     // --- CSM shadow depth pass ------------------------------------------------
@@ -700,8 +690,7 @@ bool DeferredCore::createPipelines(const VulkanContext& ctx) {
     shadowRendering.colorAttachmentCount = 0;
     shadowRendering.depthAttachmentFormat = deferred::kDepthFormat;
     shadowCi.pNext = &shadowRendering;
-    return vkCreateGraphicsPipelines(ctx.device, VK_NULL_HANDLE, 1, &shadowCi, nullptr,
-                                     &shadowPipeline_) == VK_SUCCESS;
+    return createGraphicsPipeline(ctx, shadowCi, shadowPipeline_) == VK_SUCCESS;
 }
 
 void DeferredCore::destroy(const VulkanContext& ctx) {

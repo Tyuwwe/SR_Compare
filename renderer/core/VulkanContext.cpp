@@ -1,5 +1,6 @@
 #include "renderer/core/VulkanContext.h"
 
+#include "renderer/core/PathUtil.h"
 #include "renderer/core/Vma.h"
 #include "renderer/core/Window.h"
 #include "upscalers/UpscalerFactory.h"
@@ -298,6 +299,30 @@ bool VulkanContext::create(Window& window) {
         return false;
     }
 
+    // Persistent pipeline cache next to the exe.  Incompatible or corrupt
+    // initial data is silently discarded by the driver (empty cache).
+    {
+        const std::string cachePath = exeDir() + "/pipeline.cache";
+        std::vector<char> initialData;
+        if (FILE* f = std::fopen(cachePath.c_str(), "rb")) {
+            std::fseek(f, 0, SEEK_END);
+            const long len = std::ftell(f);
+            std::fseek(f, 0, SEEK_SET);
+            if (len > 0) {
+                initialData.resize(static_cast<size_t>(len));
+                const size_t got = std::fread(initialData.data(), 1, initialData.size(), f);
+                initialData.resize(got);
+            }
+            std::fclose(f);
+        }
+        VkPipelineCacheCreateInfo cacheCi = {};
+        cacheCi.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+        cacheCi.initialDataSize = initialData.size();
+        cacheCi.pInitialData = initialData.empty() ? nullptr : initialData.data();
+        if (vkCreatePipelineCache(device, &cacheCi, nullptr, &pipelineCache) != VK_SUCCESS)
+            std::fprintf(stderr, "warning: vkCreatePipelineCache failed, caching disabled\n");
+    }
+
     return true;
 }
 
@@ -310,6 +335,23 @@ void VulkanContext::destroy() {
     }
     if (oneShotPool) { vkDestroyCommandPool(device, oneShotPool, nullptr); oneShotPool = VK_NULL_HANDLE; }
     if (framePool) { vkDestroyCommandPool(device, framePool, nullptr); framePool = VK_NULL_HANDLE; }
+    if (pipelineCache) {
+        // Persist the merged cache next to the exe for the next run.
+        std::lock_guard<std::mutex> lk(pipelineMutex);
+        size_t size = 0;
+        if (vkGetPipelineCacheData(device, pipelineCache, &size, nullptr) == VK_SUCCESS && size > 0) {
+            std::vector<char> data(size);
+            if (vkGetPipelineCacheData(device, pipelineCache, &size, data.data()) == VK_SUCCESS) {
+                const std::string cachePath = exeDir() + "/pipeline.cache";
+                if (FILE* f = std::fopen(cachePath.c_str(), "wb")) {
+                    std::fwrite(data.data(), 1, size, f);
+                    std::fclose(f);
+                }
+            }
+        }
+        vkDestroyPipelineCache(device, pipelineCache, nullptr);
+        pipelineCache = VK_NULL_HANDLE;
+    }
     if (allocator) { vmaDestroyAllocator(allocator); allocator = VK_NULL_HANDLE; }
     vkDestroyDevice(device, nullptr);
     device = VK_NULL_HANDLE;

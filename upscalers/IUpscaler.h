@@ -71,6 +71,10 @@ struct VulkanEnv {
     // 非空时：对 graphicsQueue 的 vkQueueSubmit/vkQueueWaitIdle 必须持锁
     // （GUI 异步加载期间工作线程与主线程会并发提交同一队列）。
     std::mutex*      queueMutex = nullptr;
+    // 渲染器共享的持久化管线缓存；非空时经 pipelineMutex 持锁后传给
+    // vkCreateGraphicsPipelines / vkCreateComputePipelines。
+    VkPipelineCache  pipelineCache = VK_NULL_HANDLE;
+    std::mutex*      pipelineMutex = nullptr;
     PFN_vkGetInstanceProcAddr getInstanceProcAddr = nullptr;
 };
 

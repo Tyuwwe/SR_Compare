@@ -462,7 +462,7 @@ bool Renderer::createPipelines() {
     const VkFormat presentFormat = swapchain_.format();
     presentRendering.pColorAttachmentFormats = &presentFormat;
     presentCi.pNext = &presentRendering;
-    if (vkCreateGraphicsPipelines(ctx_.device, VK_NULL_HANDLE, 1, &presentCi, nullptr, &presentPipeline_) != VK_SUCCESS)
+    if (createGraphicsPipeline(ctx_, presentCi, presentPipeline_) != VK_SUCCESS)
         return false;
 
     return true;
