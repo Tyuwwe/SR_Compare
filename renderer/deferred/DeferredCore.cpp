@@ -147,6 +147,7 @@ bool DeferredCore::init(const VulkanContext& ctx, const char* envMapPath) {
         !loadShader(ctx, "hiz_downsample.comp.spv", hizDownsampleComp_) ||
         !loadShader(ctx, "color_downsample.comp.spv", colorDownsampleComp_) ||
         !loadShader(ctx, "ssr_opaque.comp.spv", ssrOpaqueComp_) ||
+        !loadShader(ctx, "ssr_temporal.comp.spv", ssrTemporalComp_) ||
         !loadShader(ctx, "bloom_extract.comp.spv", bloomExtractComp_) ||
         !loadShader(ctx, "bloom_blur.comp.spv", bloomBlurComp_) ||
         !loadShader(ctx, "bloom_composite.comp.spv", bloomCompositeComp_) ||
@@ -332,11 +333,12 @@ bool DeferredCore::createLayouts(const VulkanContext& ctx) {
         VK_SUCCESS)
         return false;
 
-    // Opaque SSR (compute): binding 0 = LightingUBO (only the invViewProj /
-    // cameraPos / iblParams prefix is read); 1-4 = GBuffer albedo / normal /
-    // material / depth; 5 = SSAO; 6 = IBL prefilter cube; 7 = BRDF LUT;
-    // 8 = lit-color pyramid chain; 9 = Hi-Z depth pyramid; 10 = lit HDR
-    // target as a storage image (in-place read-modify-write).
+    // Opaque SSR trace (compute): binding 0 = LightingUBO (only the
+    // invViewProj / cameraPos / iblParams prefix is read); 1-4 = GBuffer
+    // albedo / normal / material / depth; 5 = SSAO; 6 = IBL prefilter cube;
+    // 7 = BRDF LUT; 8 = lit-color pyramid chain; 9 = Hi-Z depth pyramid;
+    // 10 = the path's full-res trace target (write-only storage; rgb =
+    // composite delta, a = view |z|).
     VkDescriptorSetLayoutBinding ssrBindings[11] = {};
     ssrBindings[0].binding = 0;
     ssrBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
@@ -358,6 +360,27 @@ bool DeferredCore::createLayouts(const VulkanContext& ctx) {
     ssrLayoutCi.pBindings = ssrBindings;
     if (vkCreateDescriptorSetLayout(ctx.device, &ssrLayoutCi, nullptr, &ssrSetLayout_) !=
         VK_SUCCESS)
+        return false;
+
+    // SSR temporal filter + fused composite: binding 0 = trace target
+    // (sampler), 1 = history read (sampler, GENERAL), 2 = history write
+    // (storage), 3 = GBuffer depth (sampler, reprojection reconstruction),
+    // 4 = lit HDR scene colour (storage, in-place RMW composite add).
+    VkDescriptorSetLayoutBinding ssrTemporalBindings[5] = {};
+    for (uint32_t i = 0; i < 5; ++i) {
+        ssrTemporalBindings[i].binding = i;
+        ssrTemporalBindings[i].descriptorCount = 1;
+        ssrTemporalBindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        ssrTemporalBindings[i].descriptorType =
+            (i == 2 || i == 4) ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
+                               : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    }
+    VkDescriptorSetLayoutCreateInfo ssrTemporalLayoutCi = {};
+    ssrTemporalLayoutCi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    ssrTemporalLayoutCi.bindingCount = 5;
+    ssrTemporalLayoutCi.pBindings = ssrTemporalBindings;
+    if (vkCreateDescriptorSetLayout(ctx.device, &ssrTemporalLayoutCi, nullptr,
+                                    &ssrTemporalSetLayout_) != VK_SUCCESS)
         return false;
 
     // Auto exposure: one shared set for both passes.  binding 0 = lit HDR
@@ -763,7 +786,7 @@ bool DeferredCore::createPipelines(const VulkanContext& ctx) {
     if (createComputePipeline(ctx, hizCi, colorDownsamplePipeline_) != VK_SUCCESS)
         return false;
 
-    // --- Opaque SSR (fullscreen compute, in-place on the lit HDR target) ------
+    // --- Opaque SSR trace (fullscreen compute -> trace target) ----------------
     VkPushConstantRange ssrPushRange = {};
     ssrPushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     ssrPushRange.offset = 0;
@@ -785,6 +808,26 @@ bool DeferredCore::createPipelines(const VulkanContext& ctx) {
     ssrCi.stage.pName = "main";
     ssrCi.layout = ssrPipelineLayout_;
     if (createComputePipeline(ctx, ssrCi, ssrPipeline_) != VK_SUCCESS)
+        return false;
+
+    // --- SSR temporal filter + fused composite (ssr_temporal.comp) ------------
+    // Same push layout as the GTAO temporal pass (SsaoTemporalPush, 144 B).
+    VkPushConstantRange ssrTemporalPushRange = {};
+    ssrTemporalPushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    ssrTemporalPushRange.offset = 0;
+    ssrTemporalPushRange.size = sizeof(SsaoTemporalPush);
+    VkPipelineLayoutCreateInfo ssrTemporalLayoutCi = {};
+    ssrTemporalLayoutCi.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    ssrTemporalLayoutCi.setLayoutCount = 1;
+    ssrTemporalLayoutCi.pSetLayouts = &ssrTemporalSetLayout_;
+    ssrTemporalLayoutCi.pushConstantRangeCount = 1;
+    ssrTemporalLayoutCi.pPushConstantRanges = &ssrTemporalPushRange;
+    if (vkCreatePipelineLayout(ctx.device, &ssrTemporalLayoutCi, nullptr,
+                               &ssrTemporalPipelineLayout_) != VK_SUCCESS)
+        return false;
+    ssrCi.stage.module = ssrTemporalComp_;
+    ssrCi.layout = ssrTemporalPipelineLayout_;
+    if (createComputePipeline(ctx, ssrCi, ssrTemporalPipeline_) != VK_SUCCESS)
         return false;
 
     // --- Bloom (reuses ssaoBlur set layout: sampler + storage) ----------------
@@ -929,6 +972,7 @@ void DeferredCore::destroy(const VulkanContext& ctx) {
     if (hizPipeline_) { vkDestroyPipeline(ctx.device, hizPipeline_, nullptr); hizPipeline_ = VK_NULL_HANDLE; }
     if (colorDownsamplePipeline_) { vkDestroyPipeline(ctx.device, colorDownsamplePipeline_, nullptr); colorDownsamplePipeline_ = VK_NULL_HANDLE; }
     if (ssrPipeline_) { vkDestroyPipeline(ctx.device, ssrPipeline_, nullptr); ssrPipeline_ = VK_NULL_HANDLE; }
+    if (ssrTemporalPipeline_) { vkDestroyPipeline(ctx.device, ssrTemporalPipeline_, nullptr); ssrTemporalPipeline_ = VK_NULL_HANDLE; }
     if (bloomExtractPipeline_) { vkDestroyPipeline(ctx.device, bloomExtractPipeline_, nullptr); bloomExtractPipeline_ = VK_NULL_HANDLE; }
     if (bloomBlurPipeline_) { vkDestroyPipeline(ctx.device, bloomBlurPipeline_, nullptr); bloomBlurPipeline_ = VK_NULL_HANDLE; }
     if (bloomCompositePipeline_) { vkDestroyPipeline(ctx.device, bloomCompositePipeline_, nullptr); bloomCompositePipeline_ = VK_NULL_HANDLE; }
@@ -943,6 +987,7 @@ void DeferredCore::destroy(const VulkanContext& ctx) {
     if (ssaoTemporalPipelineLayout_) { vkDestroyPipelineLayout(ctx.device, ssaoTemporalPipelineLayout_, nullptr); ssaoTemporalPipelineLayout_ = VK_NULL_HANDLE; }
     if (hizPipelineLayout_) { vkDestroyPipelineLayout(ctx.device, hizPipelineLayout_, nullptr); hizPipelineLayout_ = VK_NULL_HANDLE; }
     if (ssrPipelineLayout_) { vkDestroyPipelineLayout(ctx.device, ssrPipelineLayout_, nullptr); ssrPipelineLayout_ = VK_NULL_HANDLE; }
+    if (ssrTemporalPipelineLayout_) { vkDestroyPipelineLayout(ctx.device, ssrTemporalPipelineLayout_, nullptr); ssrTemporalPipelineLayout_ = VK_NULL_HANDLE; }
     if (bloomPipelineLayout_) { vkDestroyPipelineLayout(ctx.device, bloomPipelineLayout_, nullptr); bloomPipelineLayout_ = VK_NULL_HANDLE; }
     if (histogramPipelineLayout_) { vkDestroyPipelineLayout(ctx.device, histogramPipelineLayout_, nullptr); histogramPipelineLayout_ = VK_NULL_HANDLE; }
     if (exposureSolvePipelineLayout_) { vkDestroyPipelineLayout(ctx.device, exposureSolvePipelineLayout_, nullptr); exposureSolvePipelineLayout_ = VK_NULL_HANDLE; }
@@ -960,6 +1005,7 @@ void DeferredCore::destroy(const VulkanContext& ctx) {
     if (hizDownsampleComp_) { vkDestroyShaderModule(ctx.device, hizDownsampleComp_, nullptr); hizDownsampleComp_ = VK_NULL_HANDLE; }
     if (colorDownsampleComp_) { vkDestroyShaderModule(ctx.device, colorDownsampleComp_, nullptr); colorDownsampleComp_ = VK_NULL_HANDLE; }
     if (ssrOpaqueComp_) { vkDestroyShaderModule(ctx.device, ssrOpaqueComp_, nullptr); ssrOpaqueComp_ = VK_NULL_HANDLE; }
+    if (ssrTemporalComp_) { vkDestroyShaderModule(ctx.device, ssrTemporalComp_, nullptr); ssrTemporalComp_ = VK_NULL_HANDLE; }
     if (bloomExtractComp_) { vkDestroyShaderModule(ctx.device, bloomExtractComp_, nullptr); bloomExtractComp_ = VK_NULL_HANDLE; }
     if (bloomBlurComp_) { vkDestroyShaderModule(ctx.device, bloomBlurComp_, nullptr); bloomBlurComp_ = VK_NULL_HANDLE; }
     if (bloomCompositeComp_) { vkDestroyShaderModule(ctx.device, bloomCompositeComp_, nullptr); bloomCompositeComp_ = VK_NULL_HANDLE; }
@@ -976,6 +1022,7 @@ void DeferredCore::destroy(const VulkanContext& ctx) {
     if (ssaoTemporalSetLayout_) { vkDestroyDescriptorSetLayout(ctx.device, ssaoTemporalSetLayout_, nullptr); ssaoTemporalSetLayout_ = VK_NULL_HANDLE; }
     if (hizSetLayout_) { vkDestroyDescriptorSetLayout(ctx.device, hizSetLayout_, nullptr); hizSetLayout_ = VK_NULL_HANDLE; }
     if (ssrSetLayout_) { vkDestroyDescriptorSetLayout(ctx.device, ssrSetLayout_, nullptr); ssrSetLayout_ = VK_NULL_HANDLE; }
+    if (ssrTemporalSetLayout_) { vkDestroyDescriptorSetLayout(ctx.device, ssrTemporalSetLayout_, nullptr); ssrTemporalSetLayout_ = VK_NULL_HANDLE; }
     if (exposureSetLayout_) { vkDestroyDescriptorSetLayout(ctx.device, exposureSetLayout_, nullptr); exposureSetLayout_ = VK_NULL_HANDLE; }
     if (textureSampler_) { vkDestroySampler(ctx.device, textureSampler_, nullptr); textureSampler_ = VK_NULL_HANDLE; }
     if (gbufferSampler_) { vkDestroySampler(ctx.device, gbufferSampler_, nullptr); gbufferSampler_ = VK_NULL_HANDLE; }
@@ -1905,7 +1952,7 @@ void DeferredCore::writeSsrSet(const VulkanContext& ctx, VkDescriptorSet set,
                                VkBuffer lightingUbo, VkImageView albedo, VkImageView normal,
                                VkImageView material, VkImageView depth, VkImageView ssao,
                                VkImageView ssrColor, VkImageView depthPyramid,
-                               VkImageView sceneColor) const {
+                               VkImageView ssrTraceOut) const {
     VkDescriptorBufferInfo ubo = {};
     ubo.buffer = lightingUbo;
     ubo.offset = 0;
@@ -1941,8 +1988,8 @@ void DeferredCore::writeSsrSet(const VulkanContext& ctx, VkDescriptorSet set,
     img[8].imageLayout = VK_IMAGE_LAYOUT_GENERAL; // pyramid lives in GENERAL
 
     VkDescriptorImageInfo storage = {};
-    storage.imageView = sceneColor;
-    storage.imageLayout = VK_IMAGE_LAYOUT_GENERAL; // in-place RMW
+    storage.imageView = ssrTraceOut;
+    storage.imageLayout = VK_IMAGE_LAYOUT_GENERAL; // write-only trace target
 
     VkWriteDescriptorSet w[11] = {};
     w[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -1978,6 +2025,120 @@ void DeferredCore::recordSsrPass(VkCommandBuffer cmd, VkDescriptorSet ssrSet,
     vkCmdPushConstants(cmd, ssrPipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push),
                        &push);
     vkCmdDispatch(cmd, (width + 7) / 8, (height + 7) / 8, 1);
+}
+
+// --- SSR temporal accumulation (Phase 2d; same model as the GTAO history) -----
+
+bool DeferredCore::createSsrHistory(const VulkanContext& ctx, uint32_t w, uint32_t h,
+                                    SsrHistory& out) const {
+    out.width = w;
+    out.height = h;
+    for (uint32_t i = 0; i < 2; ++i) {
+        if (createImage(ctx, w, h, kSsrTraceFormat,
+                        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, out.image[i],
+                        out.memory[i], 1) != VK_SUCCESS)
+            return false;
+        out.view[i] = createImageView(ctx, out.image[i], kSsrTraceFormat,
+                                      VK_IMAGE_ASPECT_COLOR_BIT, 0, 1);
+        if (!out.view[i]) return false;
+    }
+    // GENERAL for life (same model as the depth pyramids): each buffer
+    // ping-pongs between temporal storage writes and temporal reads.
+    submitOneShot(ctx, [&](VkCommandBuffer cmd) {
+        for (uint32_t i = 0; i < 2; ++i)
+            imageBarrier(cmd, out.image[i], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                         VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                         VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, VK_IMAGE_ASPECT_COLOR_BIT, 0, 1);
+    });
+    return true;
+}
+
+bool DeferredCore::writeSsrHistorySets(const VulkanContext& ctx, VkDescriptorPool pool,
+                                       VkImageView ssrTrace, VkImageView depth,
+                                       VkImageView sceneColor, SsrHistory& out) const {
+    for (uint32_t i = 0; i < 2; ++i) {
+        VkDescriptorSetAllocateInfo alloc = {};
+        alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        alloc.descriptorPool = pool;
+        alloc.descriptorSetCount = 1;
+        alloc.pSetLayouts = &ssrTemporalSetLayout_;
+        if (vkAllocateDescriptorSets(ctx.device, &alloc, &out.temporalSet[i]) != VK_SUCCESS)
+            return false;
+
+        VkDescriptorImageInfo img[5] = {};
+        img[0].sampler = gbufferSampler_;
+        img[0].imageView = ssrTrace;
+        img[0].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        img[1].sampler = gbufferSampler_;
+        img[1].imageView = out.view[1 - i]; // history read (the OTHER buffer)
+        img[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        img[2].imageView = out.view[i]; // history write (storage)
+        img[2].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        img[3].sampler = gbufferSampler_;
+        img[3].imageView = depth;
+        img[3].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        img[4].imageView = sceneColor; // lit HDR target (storage RMW composite)
+        img[4].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+        VkWriteDescriptorSet w[5] = {};
+        for (uint32_t k = 0; k < 5; ++k) {
+            w[k].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            w[k].dstSet = out.temporalSet[i];
+            w[k].dstBinding = k;
+            w[k].descriptorCount = 1;
+            w[k].descriptorType = (k == 2 || k == 4) ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
+                                                     : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            w[k].pImageInfo = &img[k];
+        }
+        vkUpdateDescriptorSets(ctx.device, 5, w, 0, nullptr);
+    }
+    return true;
+}
+
+void DeferredCore::destroySsrHistory(const VulkanContext& ctx, SsrHistory& history) const {
+    for (uint32_t i = 0; i < 2; ++i) {
+        if (history.view[i]) {
+            vkDestroyImageView(ctx.device, history.view[i], nullptr);
+            history.view[i] = VK_NULL_HANDLE;
+        }
+        if (history.image[i]) {
+            vmaDestroyImage(ctx.allocator, history.image[i], history.memory[i]);
+            history.image[i] = VK_NULL_HANDLE;
+            history.memory[i] = VK_NULL_HANDLE;
+        }
+    }
+    history.temporalSet[0] = history.temporalSet[1] = VK_NULL_HANDLE; // pool-owned
+    history.width = history.height = 0;
+}
+
+void DeferredCore::recordSsrTemporalPass(VkCommandBuffer cmd, const SsrHistory& history,
+                                         uint32_t writeIndex, const Mat4& invViewProj,
+                                         const Mat4& prevViewProj, uint32_t width,
+                                         uint32_t height, bool reset) const {
+    if (!history.image[0]) return;
+    const uint32_t i = writeIndex & 1u;
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ssrTemporalPipeline_);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ssrTemporalPipelineLayout_, 0, 1,
+                            &history.temporalSet[i], 0, nullptr);
+    // WAR: last frame's temporal pass sampled this buffer before it becomes
+    // the storage target again.  Same-layout barrier; GENERAL for life.
+    imageBarrier(cmd, history.image[i], VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+                 sync::kCompute, sync::kSampled, sync::kCompute, sync::kStorageWrite,
+                 VK_IMAGE_ASPECT_COLOR_BIT, 0, 1);
+    SsaoTemporalPush push; // identical layout: invViewProj + prevViewProj + params
+    std::memcpy(push.invViewProj, invViewProj.m, sizeof(push.invViewProj));
+    std::memcpy(push.prevViewProj, prevViewProj.m, sizeof(push.prevViewProj));
+    push.params[0] = kSsrTemporalBlend;
+    push.params[1] = reset ? 1.f : 0.f;
+    push.params[2] = push.params[3] = 0.f;
+    vkCmdPushConstants(cmd, ssrTemporalPipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                       sizeof(push), &push);
+    vkCmdDispatch(cmd, (width + 7) / 8, (height + 7) / 8, 1);
+    // Next frame's temporal pass samples the just-written buffer.
+    imageBarrier(cmd, history.image[i], VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+                 sync::kCompute, sync::kStorageWrite, sync::kCompute, sync::kSampled,
+                 VK_IMAGE_ASPECT_COLOR_BIT, 0, 1);
 }
 
 void DeferredCore::writeBloomSet(const VulkanContext& ctx, VkDescriptorSet set, VkImageView src,

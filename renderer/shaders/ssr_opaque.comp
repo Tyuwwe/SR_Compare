@@ -2,31 +2,42 @@
 #extension GL_GOOGLE_include_directive : require
 #include "brdf.glsl"
 #include "ssr.glsl"
-// Full-screen SSR for opaque surfaces (UE4-style ScreenSpaceReflections,
-// Phase 1b-3): one compute pass after the deferred lighting pass and before
-// the transparency pass.  Every pixel marches reflect(-V, N) through the Hi-Z
-// pyramid (traceSsr, ssr.glsl) and reads the hit colour from the box-filtered
-// lit-colour mip chain at a roughness-driven LOD.
+// Full-screen SSR trace for opaque surfaces (UE4-style ScreenSpaceReflections,
+// Phase 1b-3; split into trace + temporal/composite in Phase 2d): one compute
+// pass after the deferred lighting pass and before the transparency pass.
+// Every pixel marches reflect(-V, N) through the Hi-Z pyramid (traceSsr,
+// ssr.glsl) and reads the hit colour from the box-filtered lit-colour mip
+// chain at a roughness-driven LOD.
 //
-// Composite: the lighting pass already added the split-sum IBL specular term
-// to the scene colour, so SSR REPLACES it (energy conservation — SSR must not
-// stack on top of IBL) instead of adding:
-//     out = old + conf * (ssrColor * envBRDF - iblSpec)
-// which equals mix(iblSpec, ssrColor * envBRDF, conf) on the specular term;
-// misses (conf = 0) keep the original IBL.  iblSpec is recomputed here from
-// the same GBuffer / LUT / prefilter inputs lighting.frag used, so the
-// subtraction is exact — this avoids both a second lighting output and any
-// new GBuffer channel (the material RT's free alpha is UNORM8 and could not
-// hold the HDR term anyway).
+// Phase 2d: instead of compositing in place, this pass writes the per-pixel
+// composite DELTA to a full-res RGBA16F trace target:
+//     rgb = conf * (ssrColor * envBRDF - specIbl)   (what the old in-place
+//                                                     pass added to the pixel)
+//     a   = view |z| of the pixel                   (reprojection depth key)
+// The delta form premultiplies the hit confidence, so the temporal pass
+// (ssr_temporal.comp) filters hit/miss flicker and hit-colour noise with one
+// EMA, and the composite degenerates to a single add that exactly reproduces
+// the old energy-conserving mix(iblSpec, ssrColor * envBRDF, conf) on the
+// specular term.  specIbl is recomputed here from the same GBuffer / LUT /
+// prefilter inputs lighting.frag used, so the subtraction stays exact — no
+// second lighting output and no new GBuffer channel.  The SSR side keeps
+// skipping the env-intensity multiplier (the hit colour is real scene
+// radiance, not the environment map) and the AO terms (the marched radiance
+// already carries the scene's own occlusion).
 //
-// Why in-place imageLoad/imageStore: each invocation reads and rewrites only
-// its own texel, so a single storage binding replaces the classic
-// trace-into-SSR-target + blend-composite two-pass arrangement with no extra
-// full-res target and no feedback hazard.
+// Why full-res trace (not the half-res 2020 default): the marcher is
+// deterministic single-ray with a roughness-driven colour-mip read, so the
+// half-res + bilateral-upsampling machinery would cost more than it saves at
+// our ray counts; the full-res RT also keeps the temporal reprojection texel-
+// aligned with the GBuffer.  The half-res trace remains the documented
+// optimisation point if this pass ever shows up in profiles.
 //
-// Perf note: the march runs at full resolution.  Half-res trace + full-res
-// composite (the common 2020 setup) is the documented optimisation point if
-// this pass ever shows up in profiles.
+// Misses and no-energy pixels write rgb = 0 with a VALID view |z| (not an
+// early-out), so the temporal pass can fade stale hits out smoothly instead
+// of hard-cutting; only sky writes a = 0 (invalidates the depth test).
+//
+// Ref: Stachowiak, Stochastic SSR, SIGGRAPH 2015 (temporal reuse of SSR)
+//      UE4 SSRTReflections.usf / ScreenSpaceReflectionsTemporal
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
@@ -55,7 +66,7 @@ layout(set = 0, binding = 6) uniform samplerCube iblPrefilter;
 layout(set = 0, binding = 7) uniform sampler2D iblBrdfLut;
 layout(set = 0, binding = 8) uniform sampler2D ssrColor; // lit HDR colour mip chain
 layout(set = 0, binding = 9) uniform sampler2D ssrHiZ;   // max-reduced depth pyramid
-layout(set = 0, binding = 10, rgba16f) uniform image2D sceneColor; // in/out, in-place RMW
+layout(set = 0, binding = 10, rgba16f) uniform writeonly image2D ssrOut; // trace target
 
 // The path's view-projection (jittered for the LR path), matching the GBuffer
 // pass; the inverse ships in the lighting UBO.
@@ -69,12 +80,22 @@ void main() {
     if (pix.x >= int(renderSize.x) || pix.y >= int(renderSize.y)) return;
 
     const float depth = texelFetch(gbDepth, pix, 0).r;
-    if (depth == 1.0) return; // sky pixels keep the skybox
+    if (depth == 1.0) {
+        // Sky keeps the skybox: zero delta, a = 0 sentinel invalidates the
+        // temporal depth test so history never leaks onto the sky.
+        imageStore(ssrOut, pix, vec4(0.0));
+        return;
+    }
 
     // Same world-position reconstruction as lighting.frag.
     const vec2 uv = (vec2(pix) + 0.5) / renderSize;
     vec4 wp = u.invViewProj * vec4(uv * 2.0 - 1.0, depth, 1.0);
     wp /= wp.w;
+
+    // View |z| of this pixel = clip w of the view-projection (the jitter only
+    // shifts clip x/y, so this is jitter-independent); the temporal pass keys
+    // its depth rejection on it.
+    const float viewZ = abs((push.viewProj * vec4(wp.xyz, 1.0)).w);
 
     vec3 V = normalize(u.cameraPos.xyz - wp.xyz);
     // A2B10G10R10 stores the normal remapped to [0,1]; unpack back to [-1,1].
@@ -98,23 +119,27 @@ void main() {
     // Early-out where the specular lobe carries no energy: roughness ~ 1 and
     // diffuse-dominated dielectrics push envBrdf to ~0, so the composite below
     // would be a no-op even on a hit.  This is the "SSR weight -> 0" skip.
-    if (dot(envBrdf, vec3(1.0)) < 0.01) return;
+    if (dot(envBrdf, vec3(1.0)) < 0.01) {
+        imageStore(ssrOut, pix, vec4(0.0, 0.0, 0.0, viewZ));
+        return;
+    }
 
     const vec3 R = reflect(-V, N);
     const vec4 ssr = traceSsr(ssrColor, textureQueryLevels(ssrColor), ssrHiZ,
                               textureQueryLevels(ssrHiZ), push.viewProj, u.invViewProj,
                               u.cameraPos.xyz, wp.xyz, N, R, roughness, renderSize);
     const float conf = clamp(ssr.a, 0.0, 1.0);
-    if (conf <= 0.0) return; // miss: keep the IBL specular term as-is
+    if (conf <= 0.0) {
+        // Miss: zero delta keeps the IBL specular term; the valid view |z|
+        // lets the temporal pass fade a stale hit out over the EMA window.
+        imageStore(ssrOut, pix, vec4(0.0, 0.0, 0.0, viewZ));
+        return;
+    }
 
     // The exact specular term lighting.frag added to this pixel.
     const float ssao = texelFetch(ssaoTex, pix, 0).r;
     const vec3 prefiltered = textureLod(iblPrefilter, R, roughness * u.iblParams.y).rgb;
     const vec3 specIbl = prefiltered * envBrdf * (ao * ssao * u.iblParams.x);
 
-    // The SSR side deliberately skips the env-intensity multiplier (the hit
-    // colour is real scene radiance, not the environment map) and the AO terms
-    // (the marched radiance already carries the scene's own occlusion).
-    const vec4 old = imageLoad(sceneColor, pix);
-    imageStore(sceneColor, pix, vec4(old.rgb + conf * (ssr.rgb * envBrdf - specIbl), old.a));
+    imageStore(ssrOut, pix, vec4(conf * (ssr.rgb * envBrdf - specIbl), viewZ));
 }

@@ -1,0 +1,121 @@
+#version 450
+// Temporal filter + composite for opaque SSR (Phase 2d).
+//
+// The trace pass (ssr_opaque.comp) is a deterministic single-ray march: under
+// a moving camera the Hi-Z binary refinement lands on different pixels frame
+// to frame and the hit confidence flickers, which reads as reflection
+// shimmering.  The standard 2020 cure is temporal reuse — reproject the
+// previous frame's filtered result, reject stale history, clamp it to the
+// current neighbourhood, and blend with an exponential moving average
+// (Stachowiak, Stochastic SSR, SIGGRAPH 2015; UE's ScreenSpaceReflections
+// temporal pass).  This is the SSR mirror of ssao_temporal.comp and shares
+// its reprojection / rejection model and its determinism contract: every
+// input derives from the frame index — no wall clock, no real randomness.
+//
+// What is filtered: the trace target carries the composite DELTA
+// conf*(ssrColor*envBRDF - specIbl), i.e. the confidence is premultiplied, so
+// one EMA smooths hit/miss flicker and hit-colour noise together (a ray that
+// alternates hit/miss converges to the confidence-weighted average instead of
+// blinking).  The alpha channel carries the CURRENT frame's view |z| (never
+// blended — same convention as AoHistory's G channel) for the depth
+// rejection.
+//
+// Rejection: camera-only reprojection (the current pixel's world position,
+// rebuilt from the GBuffer depth, projected with the PREVIOUS frame's
+// view-projection); history is dropped on screen exit, on a relative view-Z
+// mismatch (disocclusion / different surface; normal rejection is subsumed —
+// a different surface at this pixel must differ in depth along the ray), and
+// on the first frame of the path (reset).  Valid history is neighbourhood-
+// clamped to the 3x3 RGB min/max of the current trace (anti-ghosting; the
+// delta can be negative, which plain min/max handles) before the EMA blend.
+//
+// The composite is fused into this pass: each invocation read-modify-writes
+// only its own texel of the lit HDR target (out = old + delta), so a third
+// pass / descriptor set is unnecessary and there is no feedback hazard — the
+// same argument the pre-Phase-2d in-place pass relied on.
+//
+// bindings: 0 = trace target (rgb = delta, a = view |z|; SHADER_READ_ONLY)
+//           1 = history read  (the OTHER ping-pong buffer, GENERAL)
+//           2 = history write (this frame's buffer, GENERAL storage)
+//           3 = GBuffer depth (NDC, SHADER_READ_ONLY) for reconstruction
+//           4 = lit HDR scene colour (GENERAL storage, in/out RMW composite)
+//
+// Ref: Stachowiak, Stochastic SSR, SIGGRAPH 2015
+//      UE4 ScreenSpaceReflectionsTemporal / SSRTReflections.usf
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D traceTex;
+layout(set = 0, binding = 1) uniform sampler2D history;
+layout(set = 0, binding = 2, rgba16f) uniform writeonly image2D outHistory;
+layout(set = 0, binding = 3) uniform sampler2D gbDepth;
+layout(set = 0, binding = 4, rgba16f) uniform image2D sceneColor;
+
+layout(push_constant) uniform Push {
+    mat4 invViewProj;  // current frame (this path's convention; jittered for LR)
+    mat4 prevViewProj; // previous frame, same path/convention
+    vec4 params;       // x = EMA blend weight, y = reset (1 = pass-through)
+} pc;
+
+const float kDepthReject = 0.04; // relative view-Z tolerance (mirror of the host constant)
+
+void main() {
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(outHistory);
+    if (pix.x >= size.x || pix.y >= size.y) return;
+
+    vec4 cur = texelFetch(traceTex, pix, 0);
+    float depth = texelFetch(gbDepth, pix, 0).r;
+    // First frame of the path (history uninitialised) and sky pixels pass
+    // through unblended; storing cur verbatim keeps a = current view |z| (0
+    // for sky, which also breaks the depth test) so the NEXT frame can
+    // already accumulate.
+    if (pc.params.y > 0.5 || depth >= 1.0) {
+        imageStore(outHistory, pix, cur);
+        if (depth < 1.0) {
+            vec4 old = imageLoad(sceneColor, pix);
+            imageStore(sceneColor, pix, vec4(old.rgb + cur.rgb, old.a));
+        }
+        return;
+    }
+
+    vec2 uv = (vec2(pix) + 0.5) / vec2(size);
+    vec4 w = pc.invViewProj * vec4(uv * 2.0 - 1.0, depth, 1.0);
+    vec3 worldPos = w.xyz / w.w;
+    vec4 prevClip = pc.prevViewProj * vec4(worldPos, 1.0);
+
+    vec3 delta = cur.rgb;
+    if (prevClip.w > 0.0) {
+        vec2 prevUv = prevClip.xy / prevClip.w * 0.5 + 0.5;
+        if (all(greaterThan(prevUv, vec2(0.0))) && all(lessThan(prevUv, vec2(1.0)))) {
+            float prevViewZ = abs(prevClip.w);
+            ivec2 hp = clamp(ivec2(prevUv * vec2(size)), ivec2(0), size - 1);
+            vec4 hist = texelFetch(history, hp, 0);
+            // Depth rejection: the reprojected history texel must be the same
+            // surface; otherwise restart the EMA from the current frame.
+            float tol = max(prevViewZ * kDepthReject, 0.01);
+            if (abs(hist.a - prevViewZ) <= tol) {
+                // Neighbourhood clamp to the current trace's 3x3 RGB min/max:
+                // bounds stale history (disocclusion ghosting) to what the
+                // current frame can still explain.
+                vec3 bmin = cur.rgb;
+                vec3 bmax = cur.rgb;
+                for (int dy = -1; dy <= 1; ++dy) {
+                    for (int dx = -1; dx <= 1; ++dx) {
+                        ivec2 np = clamp(pix + ivec2(dx, dy), ivec2(0), size - 1);
+                        vec3 n = texelFetch(traceTex, np, 0).rgb;
+                        bmin = min(bmin, n);
+                        bmax = max(bmax, n);
+                    }
+                }
+                delta = mix(clamp(hist.rgb, bmin, bmax), cur.rgb, pc.params.x);
+            }
+        }
+    }
+    imageStore(outHistory, pix, vec4(delta, cur.a));
+
+    // Fused composite: adding the filtered delta reproduces the old in-place
+    // mix(iblSpec, ssrColor*envBRDF, conf) on the specular term.
+    vec4 old = imageLoad(sceneColor, pix);
+    imageStore(sceneColor, pix, vec4(old.rgb + delta, old.a));
+}

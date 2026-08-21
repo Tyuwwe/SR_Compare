@@ -245,6 +245,11 @@ void main() {
     // the box-filtered colour mip chain at lod = roughness * (mipCount - 1),
     // so rough glass gets a blurred reflection instead of the old hard cutoff
     // that fell back to IBL above roughness 0.45.
+    // Unlike the opaque path (Phase 2d: trace -> RT -> ssr_temporal.comp EMA),
+    // this inline trace deliberately stays single-frame: the pass has no
+    // opaque-only RT to accumulate into, glass already stabilises temporally
+    // through the reactive/TC mask the upscalers get, and reprojection of a
+    // transmissive surface would key on the wrong (front-most) depth layer.
     vec4 ssr = traceSsr(ssrColor, textureQueryLevels(ssrColor), ssrHiZ,
                         textureQueryLevels(ssrHiZ), ubo.viewProj,
                         lighting.invViewProj, ubo.cameraPos.xyz, vWorldPos, N, R, roughness,

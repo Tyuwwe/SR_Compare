@@ -263,6 +263,32 @@ struct AoHistory {
     uint32_t height = 0;
 };
 
+// --- Temporal SSR accumulation (Phase 2d) --------------------------------------
+// Same ownership/layout model as AoHistory: two RGBA16F ping-pong buffers,
+// GENERAL for life.  Layout: rgb = filtered composite delta
+// conf*(ssrColor*envBRDF - specIbl) — the confidence is premultiplied, so one
+// EMA smooths hit/miss flicker and hit-colour noise together; a = CURRENT
+// frame's view |z| (never blended) for the reprojection depth rejection.
+// The trace pass (ssr_opaque.comp) writes the raw per-frame delta + view |z|
+// into a host-owned full-res trace target; ssr_temporal.comp reprojects
+// buffer 1-i, depth-rejects + neighbourhood-clamps + EMA-blends into buffer i
+// and fuses the composite (in-place RMW add on the lit HDR target).
+// Camera-only reprojection, frame-index driven — deterministic.
+// Ref: Stachowiak, Stochastic SSR, SIGGRAPH 2015; UE SSR temporal.
+struct SsrHistory {
+    VkImage image[2] = {};
+    VmaAllocation memory[2] = {};
+    VkImageView view[2] = {};
+    VkDescriptorSet temporalSet[2] = {}; // [i]: reads view[1-i] + trace, writes view[i], RMW sceneColor
+    uint32_t width = 0;
+    uint32_t height = 0;
+};
+constexpr VkFormat kSsrTraceFormat = deferred::kHdrColorFormat; // RGBA16F trace target + history
+// Temporal accumulation constants (same ~8-frame EMA window and relative
+// view-Z tolerance as the GTAO temporal pass; see ssao_temporal.comp).
+constexpr float kSsrTemporalBlend = 0.125f;
+constexpr float kSsrTemporalDepthReject = 0.04f;
+
 // --- HDR color mip chain (box-filtered lit-color pyramid) --------------------
 // Roughness-aware SSR (Phase 1b-2) samples this chain at lod = roughness *
 // (mipCount - 1) instead of a single sharp mip-0 read, so one ray
@@ -565,24 +591,53 @@ public:
     void recordColorPyramidPass(VkCommandBuffer cmd, const ColorPyramid& pyramid) const;
 
     // --- Opaque SSR (after lighting + color pyramid, before transparency) -----
-    // Full-screen compute pass (ssr_opaque.comp): Hi-Z march per opaque pixel,
-    // composited energy-conservingly by replacing the IBL specular term the
-    // lighting pass already wrote (mix(iblSpec, ssrColor*envBRDF, conf)).
+    // Phase 2d: two passes instead of the old single in-place pass.
+    //   1. Trace (ssr_opaque.comp): full-screen Hi-Z march per opaque pixel;
+    //      writes the composite delta conf*(ssrColor*envBRDF - specIbl) plus
+    //      the pixel's view |z| into a full-res RGBA16F trace target.
+    //   2. Temporal + composite (ssr_temporal.comp, see SsrHistory): EMA-
+    //      accumulates the delta and adds the filtered result to the lit HDR
+    //      target (energy-conserving IBL-specular replacement, same maths as
+    //      the old in-place pass on the first frame).
     // ssr set: binding 0 = the path's LightingUBO (only the invViewProj /
     // cameraPos / iblParams prefix is read); 1-4 = GBuffer albedo/normal/
     // material/depth; 5 = SSAO; 6-7 = IBL prefilter + BRDF LUT; 8 = color
-    // pyramid chain (GENERAL); 9 = depth pyramid chain (GENERAL); 10 = the lit
-    // HDR target as a storage image (in-place read-modify-write, GENERAL).
+    // pyramid chain (GENERAL); 9 = depth pyramid chain (GENERAL); 10 = the
+    // path's trace target as a write-only storage image (GENERAL).
     void writeSsrSet(const VulkanContext& ctx, VkDescriptorSet set, VkBuffer lightingUbo,
                      VkImageView albedo, VkImageView normal, VkImageView material,
                      VkImageView depth, VkImageView ssao, VkImageView ssrColor,
-                     VkImageView depthPyramid, VkImageView sceneColor) const;
-    // Dispatches ssr_opaque.comp.  viewProj must be the exact view-projection
-    // of this path's GBuffer pass (jittered for LR).  The caller owns all
-    // layout transitions: sceneColor in GENERAL on entry, the GBuffer + SSAO
-    // textures shader-readable by compute, both pyramids already rebuilt.
+                     VkImageView depthPyramid, VkImageView ssrTraceOut) const;
+    // Dispatches ssr_opaque.comp (trace stage).  viewProj must be the exact
+    // view-projection of this path's GBuffer pass (jittered for LR).  The
+    // caller owns all layout transitions: the trace target in GENERAL on
+    // entry, the GBuffer + SSAO textures shader-readable by compute, both
+    // pyramids already rebuilt.
     void recordSsrPass(VkCommandBuffer cmd, VkDescriptorSet ssrSet, const Mat4& viewProj,
                        uint32_t width, uint32_t height) const;
+    // Temporal accumulation state (host-owned; see SsrHistory).  Creates the
+    // two RGBA16F ping-pong images (GENERAL for life); descriptor sets are
+    // written by writeSsrHistorySets once the host's pool exists.
+    bool createSsrHistory(const VulkanContext& ctx, uint32_t w, uint32_t h, SsrHistory& out) const;
+    // Allocates temporalSet[2] from the caller's pool: binds the path's trace
+    // target (SHADER_READ_ONLY), the two history buffers, the path's GBuffer
+    // depth (SHADER_READ_ONLY) and the lit HDR target (GENERAL storage RMW).
+    // The sets are pool-owned; destroySsrHistory only releases images/views.
+    bool writeSsrHistorySets(const VulkanContext& ctx, VkDescriptorPool pool, VkImageView ssrTrace,
+                             VkImageView depth, VkImageView sceneColor, SsrHistory& out) const;
+    void destroySsrHistory(const VulkanContext& ctx, SsrHistory& history) const;
+    // Dispatches ssr_temporal.comp (reprojection + depth rejection + 3x3
+    // neighbourhood clamp + EMA, fused composite RMW on the lit HDR target).
+    // The trace target must be SHADER_READ_ONLY (trace pass done), the GBuffer
+    // depth SHADER_READ_ONLY, sceneColor GENERAL.  Both history barriers
+    // (last frame's readers -> storage write -> next frame's temporal read)
+    // are handled inside.  reset = first frame of this path: history is
+    // bypassed.  Hosts track prevViewProj per path (jittered for LR, matching
+    // invViewProj).  Reuses the SsaoTemporalPush layout.
+    void recordSsrTemporalPass(VkCommandBuffer cmd, const SsrHistory& history,
+                               uint32_t writeIndex, const Mat4& invViewProj,
+                               const Mat4& prevViewProj, uint32_t width, uint32_t height,
+                               bool reset) const;
 
     // --- Auto exposure (after lighting + bloom, before upscale/present) -------
     // Creates the histogram + state buffers; initialEV seeds the smoothed EV
@@ -649,6 +704,7 @@ public:
     VkDescriptorSetLayout ssaoBlurSetLayout() const { return ssaoBlurSetLayout_; }
     VkDescriptorSetLayout hizSetLayout() const { return hizSetLayout_; }
     VkDescriptorSetLayout ssrSetLayout() const { return ssrSetLayout_; }
+    VkDescriptorSetLayout ssrTemporalSetLayout() const { return ssrTemporalSetLayout_; }
     VkDescriptorSetLayout bloomSetLayout() const { return ssaoBlurSetLayout_; }
     VkDescriptorSetLayout exposureSetLayout() const { return exposureSetLayout_; }
     VkPipelineLayout scenePipelineLayout() const { return scenePipelineLayout_; }
@@ -677,6 +733,7 @@ private:
     VkDescriptorSetLayout ssaoTemporalSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout hizSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout ssrSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout ssrTemporalSetLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout scenePipelineLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout lightingPipelineLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout transparentPipelineLayout_ = VK_NULL_HANDLE;
@@ -696,6 +753,8 @@ private:
     VkPipeline colorDownsamplePipeline_ = VK_NULL_HANDLE; // reuses hizPipelineLayout_
     VkPipelineLayout ssrPipelineLayout_ = VK_NULL_HANDLE;
     VkPipeline ssrPipeline_ = VK_NULL_HANDLE;
+    VkPipelineLayout ssrTemporalPipelineLayout_ = VK_NULL_HANDLE;
+    VkPipeline ssrTemporalPipeline_ = VK_NULL_HANDLE;
     VkPipelineLayout bloomPipelineLayout_ = VK_NULL_HANDLE;
     VkPipeline bloomExtractPipeline_ = VK_NULL_HANDLE;
     VkPipeline bloomBlurPipeline_ = VK_NULL_HANDLE;
@@ -720,6 +779,7 @@ private:
     VkShaderModule hizDownsampleComp_ = VK_NULL_HANDLE;
     VkShaderModule colorDownsampleComp_ = VK_NULL_HANDLE;
     VkShaderModule ssrOpaqueComp_ = VK_NULL_HANDLE;
+    VkShaderModule ssrTemporalComp_ = VK_NULL_HANDLE;
     VkShaderModule bloomExtractComp_ = VK_NULL_HANDLE;
     VkShaderModule bloomBlurComp_ = VK_NULL_HANDLE;
     VkShaderModule bloomCompositeComp_ = VK_NULL_HANDLE;

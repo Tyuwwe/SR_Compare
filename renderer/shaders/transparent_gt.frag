@@ -216,6 +216,8 @@ void main() {
     vec3 specSsr = specularIbl * ambientScale;
     // Full roughness range (same as transparent.frag — keep in sync): the hit
     // colour comes from the colour mip chain at lod = roughness * (mips - 1).
+    // Single-frame on purpose: only the opaque path accumulates SSR temporally
+    // (Phase 2d) — see the note in transparent.frag.
     vec4 ssr = traceSsr(ssrColor, textureQueryLevels(ssrColor), ssrHiZ,
                         textureQueryLevels(ssrHiZ), ubo.viewProj,
                         lighting.invViewProj, ubo.cameraPos.xyz, vWorldPos, N, R, roughness,
