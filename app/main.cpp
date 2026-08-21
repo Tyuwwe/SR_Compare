@@ -32,7 +32,7 @@ void printUsage() {
                  "  --compare-zoom <f>        preset compare-tab zoom 1..16 (automation)\n"
                  "  --compare-gt-ssaa         preset the compare-tab GT 200%% SSAA checkbox\n"
                  "  --env-map <hdr>           IBL environment map (default san_giuseppe_bridge)\n"
-                 "  --exposure <f>            display exposure (default: scene preset)\n"
+                 "  --exposure <f>            manual display exposure (disables auto exposure)\n"
                  "  --bench <a,b,...>         start in the Bench tab and auto-run\n"
                  "viewer options:\n"
                  "  --scene <name|gltf path>     scene: boxes, sponza, or a glTF path (--list-scenes)\n"
@@ -45,7 +45,7 @@ void printUsage() {
                  "  --screenshot <out.png>           save the final frame as PNG\n"
                  "  --no-shadows                     disable CSM sun shadows\n"
                  "  --shadow-debug                   tint pixels per shadow cascade\n"
-                 "  --exposure <f>                   display exposure (default 1; ACES input)\n"
+                 "  --exposure <f>                   manual display exposure (disables auto exposure)\n"
                  "  --no-bloom                       disable HDR bloom\n"
                  "  --no-ssr                         disable opaque screen-space reflections\n");
 }
@@ -98,10 +98,12 @@ int runViewer(int argc, char** argv) {
         } else if (a == "--shadow-debug") {
             opts.shadowDebug = true;
         } else if (a == "--exposure") {
+            // Manual override: a given value switches off auto exposure.
             if (!sr::parseExposure(sr::nextArg(i, argc, argv, "--exposure"), opts.exposure)) {
                 std::fprintf(stderr, "invalid --exposure value\n");
                 return 1;
             }
+            opts.autoExposure = false;
         } else if (a == "--no-bloom") {
             opts.bloom = false;
         } else if (a == "--no-ssr") {

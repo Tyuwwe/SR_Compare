@@ -45,8 +45,9 @@ static_assert(sizeof(ComposePush) == 48, "ComposePush size mismatch");
 struct MetricPush {
     uint32_t x = 0, y = 0, z = 0, w = 0;      // region offset xy, extent zw
     uint32_t x2 = 0, y2 = 0, z2 = 0, w2 = 0;  // x2 = blocks per row (region)
-    float exposure = 1.f;
-    float pad[3] = {};
+    float exposureTest = 1.f; // test image (upscaler column / LR path)
+    float exposureRef = 1.f;  // reference image (GT column / GT path)
+    float pad[2] = {};
 };
 static_assert(sizeof(MetricPush) == 48, "MetricPush std140/push size mismatch");
 
@@ -189,6 +190,7 @@ bool CompareApp::init(const CompareOptions& opts) {
     if (!createMetricResources()) return false;
     if (!createShaders()) return false;
     if (!createDescriptors()) return false;
+    if (!createAutoExposureResources()) return false;
     if (!createPipelines()) return false;
     if (!createSyncResources()) return false;
     if (!createScreenshotStaging()) return false;
@@ -575,6 +577,7 @@ bool CompareApp::createDescriptors() {
                                7 * kFramesInFlight * 4 +  // transparent sets + SSR
                                9 * kFramesInFlight * 4 +  // opaque-SSR sets (GB/GT/SSAA/spatial)
                                3 * 3 +                    // ssao + blur samplers (per path)
+                               2 +                        // auto-exposure HDR sources (LR + GT)
                                hizSets + colorSets;
     sizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     sizes[1].descriptorCount = kFramesInFlight * 2 + numColumns +
@@ -585,7 +588,7 @@ bool CompareApp::createDescriptors() {
     sizes[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
     sizes[2].descriptorCount = kFramesInFlight * 3; // Gb + Gt + spatial scene sets
     sizes[3].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    sizes[3].descriptorCount = numAlgos * 2;
+    sizes[3].descriptorCount = numAlgos * 2 + 4; // metric blocks/result + auto-exposure (LR + GT)
     sizes[4].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     // ssao raw + blurred outputs (GB/GT/SSAA) + pyramid mips + SSR in-place color targets
     sizes[4].descriptorCount = 6 + hizSets + colorSets + kFramesInFlight * 4;
@@ -595,6 +598,7 @@ bool CompareApp::createDescriptors() {
                      kFramesInFlight * 3 + // transparent sets (GB/GT/SSAA)
                      kFramesInFlight * 4 + // opaque-SSR sets (GB/GT/SSAA/spatial)
                      6 +                    // ssao sets (GB/GT/SSAA, static)
+                     2 +                    // auto-exposure sets (LR + GT)
                      3 * kFramesInFlight + // spatial scene + lighting + transparent
                      hizSets + colorSets;
     poolCi.poolSizeCount = 5;
@@ -811,6 +815,19 @@ bool CompareApp::createDescriptors() {
     }
 
     return true;
+}
+
+bool CompareApp::createAutoExposureResources() {
+    if (!opts_.autoExposure) return true;
+    // Seed both solvers with the manual/preset exposure so the frames before
+    // the first readback match the old fixed-exposure look.
+    const float initialEV = -std::log2(opts_.exposure);
+    if (!deferred_.createExposureChannel(ctx_, descriptorPool_, gbColor_.view, renderWidth_,
+                                         renderHeight_, initialEV, lrExposure_))
+        return false;
+    const ImageResource& gtSrc = opts_.gtSsaa ? gtSsaaColor_ : gtColor_;
+    return deferred_.createExposureChannel(ctx_, descriptorPool_, gtSrc.view, gtSrc.width,
+                                           gtSrc.height, initialEV, gtExposure_);
 }
 
 bool CompareApp::createPipelines() {
@@ -1562,6 +1579,21 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                          Mat4::multiply(projJittered, view));
     }
 
+    // --- Auto exposure: LR histogram of this frame's lit HDR (gbColor_) --------
+    // Feeds the upscaler preExposure + the algorithm columns.  The applied
+    // value is the solve harvested kFramesInFlight frames ago (engine-style
+    // latency; deterministic under a fixed camera path).  gbColor_ is
+    // SHADER_READ_ONLY here with compute in the sampled-dst scope.
+    if (opts_.autoExposure) {
+        ExposureSolvePush solve;
+        solve.minEV = opts_.exposureMinEV;
+        solve.maxEV = opts_.exposureMaxEV;
+        solve.resetState = (frameIndex == 0) ? 1.f : 0.f; // snap on the first frame
+        deferred_.recordAutoExposurePass(cmd, lrExposure_.gpu, solve,
+                                         lrExposure_.staging[slot]);
+        lrExposure_.pending[slot] = true;
+    }
+
     // --- 2) per-algorithm dispatch into its own output texture -----------------
     CameraParams cam;
     std::memcpy(cam.view, view.m, sizeof(cam.view));
@@ -1578,7 +1610,9 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     FrameParams frame;
     frame.frameIndex = static_cast<int>(frameIndex);
     frame.deltaTime = 1.f / 60.f;
-    frame.preExposure = 1.f;
+    // Real exposure input (was hardcoded 1): the LR path's display exposure —
+    // see InputAdapter.h for the preExposure convention.
+    frame.preExposure = lrExposure();
     frame.resetHistory = (frameIndex == 0);
 
     for (AlgoColumn& algo : algos_) {
@@ -1906,6 +1940,21 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                    VK_IMAGE_ASPECT_COLOR_BIT);
     }
 
+    // --- Auto exposure: GT histogram (own HDR source; gtSsaa uses its 2x HDR) --
+    // The GT column gets its own solver, independent of the LR one — both are
+    // separate render pipelines, so differing column exposures are the correct
+    // engine behaviour.  Sources are SHADER_READ_ONLY here (SSAA's
+    // gtSsaaColor_ stays sampled after the box downsample).
+    if (opts_.autoExposure) {
+        ExposureSolvePush solve;
+        solve.minEV = opts_.exposureMinEV;
+        solve.maxEV = opts_.exposureMaxEV;
+        solve.resetState = (frameIndex == 0) ? 1.f : 0.f;
+        deferred_.recordAutoExposurePass(cmd, gtExposure_.gpu, solve,
+                                         gtExposure_.staging[slot]);
+        gtExposure_.pending[slot] = true;
+    }
+
     // --- 4) GPU metric reduction (every metricInterval frames) -------------------
     // Metric region: full image at zoom 1; the zoomed view window otherwise.
     const uint32_t numColumns = 1 + static_cast<uint32_t>(algos_.size());
@@ -1933,7 +1982,12 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
             push.z = regW;
             push.w = regH;
             push.x2 = regBlocksPerRow;
-            push.exposure = opts_.exposure;
+            // Each image is tonemapped with its own path's exposure (test =
+            // LR auto exposure, ref = GT auto exposure): with auto exposure
+            // on, the PSNR/SSIM numbers include the exposure difference the
+            // user actually sees between the columns.
+            push.exposureTest = lrExposure();
+            push.exposureRef = gtExposure();
             vkCmdPushConstants(cmd, metricPipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                                sizeof(push), &push);
             vkCmdDispatch(cmd, regBlocksPerRow, (regH + 7) / 8, 1);
@@ -2001,7 +2055,10 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
             push.srcSize[1] = static_cast<float>(dh);
             // Nearest sampling once the on-screen magnification passes 1:1.
             push.nearest = (static_cast<float>(w) >= rect[2]) ? 1.f : 0.f;
-            push.exposure = opts_.exposure;
+            // Per-column exposure: the GT column uses the GT path's solver,
+            // algorithm columns the LR path's (auto mode; manual mode shares
+            // opts_.exposure everywhere).
+            push.exposure = (i == 0) ? gtExposure() : lrExposure();
             vkCmdPushConstants(cmd, composePipelineLayout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                                sizeof(push), &push);
             vkCmdDraw(cmd, 3, 1, 0, 0);
@@ -2076,6 +2133,10 @@ void CompareApp::run() {
             harvestMetrics(slot);
             metricPending_[slot] = false;
         }
+        // Same completion event: harvest the auto-exposure solves recorded in
+        // that frame (deterministic per frame index: fixed slot schedule).
+        deferred_.harvestExposureChannel(lrExposure_, slot);
+        deferred_.harvestExposureChannel(gtExposure_, slot);
 
         uint32_t swapIndex = 0;
         VkResult acq = swapchain_.acquireNext(ctx_, frames_[slot].imageAvailable, swapIndex);
@@ -2168,6 +2229,9 @@ void CompareApp::shutdown() {
         screenshotStaging_ = VK_NULL_HANDLE;
         screenshotStagingMemory_ = VK_NULL_HANDLE;
     }
+
+    deferred_.destroyExposureChannel(ctx_, lrExposure_);
+    deferred_.destroyExposureChannel(ctx_, gtExposure_);
     for (uint32_t i = 0; i < kFramesInFlight; ++i) {
         if (metricStaging_[i]) {
             vmaDestroyBuffer(ctx_.allocator, metricStaging_[i], metricStagingMemory_[i]);

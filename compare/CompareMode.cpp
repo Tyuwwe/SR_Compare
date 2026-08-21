@@ -30,7 +30,7 @@ void printCompareUsage() {
                  "  --no-ssr                       disable opaque screen-space reflections\n"
                  "  --shadow-debug                 tint pixels per shadow cascade\n"
                  "  --env-map <hdr>                IBL environment map (default san_giuseppe_bridge)\n"
-                 "  --exposure <f>                 display exposure (default 1; ACES input)\n"
+                 "  --exposure <f>                 manual display exposure (disables auto exposure)\n"
                  "  --zoom <f>                     compare-view zoom 1..16 (default 1)\n"
                  "  --zoom-center <u,v>            zoom window center, normalized (default 0.5,0.5)\n"
                  "  --list-upscalers               print registered upscalers and exit\n");
@@ -80,10 +80,12 @@ int runCompareMode(int argc, char** argv) {
         } else if (a == "--env-map") {
             opts.envMapPath = nextArg(i, argc, argv, "--env-map");
         } else if (a == "--exposure") {
+            // Manual override: a given value switches off auto exposure.
             if (!parseExposure(nextArg(i, argc, argv, "--exposure"), opts.exposure)) {
                 std::fprintf(stderr, "invalid --exposure value\n");
                 return 1;
             }
+            opts.autoExposure = false;
         } else if (a == "--zoom") {
             opts.zoom = static_cast<float>(std::atof(nextArg(i, argc, argv, "--zoom")));
         } else if (a == "--zoom-center") {

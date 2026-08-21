@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -132,6 +133,7 @@ bool Renderer::init(const RendererOptions& opts) {
     }
     if (!createShaders()) return false;
     if (!createSceneDescriptors()) return false;
+    if (!createAutoExposureResources()) return false;
     if (!createPipelines()) return false;
     if (!createSyncResources()) return false;
     if (!createScreenshotStaging()) return false;
@@ -308,7 +310,7 @@ bool Renderer::createSceneDescriptors() {
     if (vkCreateDescriptorSetLayout(ctx_.device, &presentLayoutCi, nullptr, &presentSetLayout_) != VK_SUCCESS)
         return false;
 
-    VkDescriptorPoolSize sizes[4] = {};
+    VkDescriptorPoolSize sizes[5] = {};
     // Hi-Z / color downsample sets: one per mip per pyramid (sampler + storage image).
     const uint32_t hizSets = gbPyramid_.mipCount + gtPyramid_.mipCount;
     const uint32_t colorSets = gbColorPyramid_.mipCount + gtColorPyramid_.mipCount;
@@ -319,6 +321,7 @@ bool Renderer::createSceneDescriptors() {
                                9 * kFramesInFlight * 2 +  // opaque-SSR sets (GB/GT)
                                2 * 2 + 1 * 2 +            // ssao + blur samplers
                                8 +                        // bloom extract/blur/comp (GB/GT)
+                               1 +                        // auto-exposure HDR source
                                hizSets + colorSets;
     sizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     sizes[1].descriptorCount = kFramesInFlight * 6; // scene + lighting + 2 transparent + 2 SSR UBOs
@@ -327,10 +330,12 @@ bool Renderer::createSceneDescriptors() {
     sizes[3].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     // ssao + bloom (GB/GT) + pyramid mips + SSR in-place color targets
     sizes[3].descriptorCount = 4 + 8 + hizSets + colorSets + kFramesInFlight * 2;
+    sizes[4].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    sizes[4].descriptorCount = 2; // auto-exposure histogram + state
     VkDescriptorPoolCreateInfo poolCi = {};
     poolCi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    poolCi.maxSets = kFramesInFlight * 7 + 6 + 8 + hizSets + colorSets; // + 8 bloom sets
-    poolCi.poolSizeCount = 4;
+    poolCi.maxSets = kFramesInFlight * 7 + 6 + 8 + hizSets + colorSets + 1; // + 8 bloom, + 1 auto-exposure
+    poolCi.poolSizeCount = 5;
     poolCi.pPoolSizes = sizes;
     if (vkCreateDescriptorPool(ctx_.device, &poolCi, nullptr, &descriptorPool_) != VK_SUCCESS)
         return false;
@@ -393,6 +398,17 @@ bool Renderer::createSceneDescriptors() {
     }
 
     return true;
+}
+
+bool Renderer::createAutoExposureResources() {
+    if (!opts_.autoExposure) return true;
+    // Seed the smoothed EV with the (preset/manual) exposure so the frames
+    // before the first readback match the old fixed-exposure look.
+    const float initialEV = -std::log2(opts_.exposure);
+    const bool useUpscaler = opts_.upscalerName != "none" && upscaler_ != nullptr;
+    const ImageResource& src = useUpscaler ? gbColor_ : finalImage_;
+    return deferred_.createExposureChannel(ctx_, descriptorPool_, src.view, src.width,
+                                           src.height, initialEV, exposureChannel_);
 }
 
 bool Renderer::createPipelines() {
@@ -748,8 +764,10 @@ void Renderer::captureScreenshotIntoStaging(VkCommandBuffer cmd) {
 
 void Renderer::saveScreenshot(const std::string& path) {
     if (!screenshotMapped_) return;
+    // Same exposure as the present pass of the captured frame, so the CPU
+    // tonemap matches the on-screen (GPU) result bit-for-bit.
     if (!savePngFromHalfRgba(path.c_str(), static_cast<const uint8_t*>(screenshotMapped_),
-                             opts_.displayWidth, opts_.displayHeight, opts_.exposure)) {
+                             opts_.displayWidth, opts_.displayHeight, displayExposure())) {
         std::fprintf(stderr, "failed to save screenshot %s\n", path.c_str());
     }
 }
@@ -1042,6 +1060,25 @@ void Renderer::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                                       finalImage_.layout, opts_.displayWidth, opts_.displayHeight);
         }
     }
+    // --- Auto exposure (lit HDR -> histogram -> smoothed EV) -------------------
+    // Runs on this path's HDR source (gbColor_ for LR, finalImage_ for GT),
+    // which is SHADER_READ_ONLY here with compute in the sampled-dst scope.
+    // The solved state is copied to the slot's staging buffer and harvested by
+    // the run loop once the slot's fence signals — so the exposure APPLIED to
+    // this frame (present push, upscaler preExposure, CPU screenshot) is the
+    // value solved kFramesInFlight frames ago.  This is the engine convention
+    // (earlier frames' luminance drives the current exposure) and keeps the
+    // applied value CPU-known, which the deterministic CPU screenshot path
+    // requires.
+    if (opts_.autoExposure) {
+        ExposureSolvePush solve;
+        solve.minEV = opts_.exposureMinEV;
+        solve.maxEV = opts_.exposureMaxEV;
+        solve.resetState = (frameIndex == 0) ? 1.f : 0.f; // snap on the first frame
+        deferred_.recordAutoExposurePass(cmd, exposureChannel_.gpu, solve,
+                                         exposureChannel_.staging[slot]);
+        exposureChannel_.pending[slot] = true;
+    }
     timestamps_.sceneEnd(cmd, slot);
 
     if (!gbuffer) {
@@ -1088,7 +1125,9 @@ void Renderer::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         FrameParams frame;
         frame.frameIndex = static_cast<int>(frameIndex);
         frame.deltaTime = deltaTime_;
-        frame.preExposure = 1.f;
+        // Real exposure input (was hardcoded 1): the display exposure applied
+        // to this frame — see InputAdapter.h for the preExposure convention.
+        frame.preExposure = displayExposure();
         frame.resetHistory = (frameIndex == 0);
 
         timestamps_.upscaleBegin(cmd, slot);
@@ -1117,7 +1156,7 @@ void Renderer::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     vkCmdSetScissor(cmd, 0, 1, &psc);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, presentPipelineLayout_, 0, 1,
                             &presentSet_, 0, nullptr);
-    const float presentPush[4] = {opts_.exposure, 0.f, 0.f, 0.f};
+    const float presentPush[4] = {displayExposure(), 0.f, 0.f, 0.f};
     vkCmdPushConstants(cmd, presentPipelineLayout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                        sizeof(presentPush), presentPush);
     vkCmdDraw(cmd, 3, 1, 0, 0);
@@ -1181,6 +1220,9 @@ void Renderer::run() {
         if (!opts_.frameTimesPath.empty() && frameIndex >= kFramesInFlight) {
             frameTimes_.push_back(timestamps_.read(ctx_, slot));
         }
+        // Same completion event: harvest the auto-exposure state solved in
+        // that frame.  Deterministic per frame index (fixed slot schedule).
+        deferred_.harvestExposureChannel(exposureChannel_, slot);
 
         uint32_t swapIndex = 0;
         VkResult acq = swapchain_.acquireNext(ctx_, frames_[slot].imageAvailable, swapIndex);
@@ -1259,6 +1301,8 @@ void Renderer::shutdown() {
     if (upscaler_) { upscaler_->shutdown(); upscaler_.reset(); }
 
     if (screenshotStaging_) { vmaDestroyBuffer(ctx_.allocator, screenshotStaging_, screenshotStagingMemory_); screenshotStaging_ = VK_NULL_HANDLE; screenshotStagingMemory_ = VK_NULL_HANDLE; }
+
+    deferred_.destroyExposureChannel(ctx_, exposureChannel_);
 
     timestamps_.destroy(ctx_);
 

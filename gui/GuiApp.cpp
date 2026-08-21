@@ -115,8 +115,9 @@ struct MetricPush {
     uint32_t x2 = 0, y2 = 0, z2 = 0, w2 = 0;  // x2 = blocks per row (region);
                                               // y2 = 1 => ref is low-res (normalized sampling);
                                               // z2/w2 = test image full size (px)
-    float exposure = 1.f;
-    float pad[3] = {};
+    float exposureTest = 1.f; // test image (upscaler column / LR path)
+    float exposureRef = 1.f;  // reference image (GT column / GT path)
+    float pad[2] = {};
 };
 static_assert(sizeof(MetricPush) == 48, "MetricPush std140/push size mismatch");
 
@@ -260,6 +261,8 @@ void GuiApp::computeViewRegion(uint32_t srcW, uint32_t srcH, uint32_t colW, uint
 // ---------------------------------------------------------------------------
 bool GuiApp::init(const GuiOptions& opts) {
     opts_ = opts;
+    // CLI --exposure is a manual override: start in manual exposure mode.
+    if (opts_.exposure > 0.f) autoExposureEnabled_ = false;
     if (const char* f = std::getenv("SR_GUI_INPUT_FILE")) inputFile_ = f;
     uiShot_ = std::getenv("SR_GUI_UI_SHOT") != nullptr;
     scenes_ = listScenes();
@@ -939,6 +942,7 @@ void GuiApp::resetFrameState() {
     jitterX_ = jitterY_ = prevJitterX_ = prevJitterY_ = 0.f;
     metricPending_[0] = metricPending_[1] = false;
     metricMask_[0] = metricMask_[1] = 0;
+    autoExposureJustEnabled_ = false; // fresh channels re-seed from exposure_
     frameTimesLog_.clear();
     historyHead_ = 0;
     historyCount_ = 0;
@@ -1368,14 +1372,15 @@ bool GuiApp::createDescriptors() {
     sizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     sizes[0].descriptorCount =
         deferred::kMaxTextures + numColumns * 2 + 2 + numAlgos * 6 + 11 * kFramesInFlight * 4 +
-        7 * kFramesInFlight * 4 + 9 * kFramesInFlight * 4 + 3 * 3 + hizSets + colorSets;
+        7 * kFramesInFlight * 4 + 9 * kFramesInFlight * 4 + 3 * 3 + hizSets + colorSets +
+        2; // auto-exposure HDR sources (LR + GT)
     sizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     sizes[1].descriptorCount = kFramesInFlight * 3 + numColumns + numAlgos + kFramesInFlight * 4 +
                                kFramesInFlight * 4 + kFramesInFlight * 4; // + opaque-SSR UBOs
     sizes[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
     sizes[2].descriptorCount = kFramesInFlight * 3;
     sizes[3].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    sizes[3].descriptorCount = numAlgos * 2;
+    sizes[3].descriptorCount = numAlgos * 2 + 4; // metric blocks/result + auto-exposure (LR + GT)
     sizes[4].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     // ssao raw + blurred outputs (GB/GT/SSAA) + pyramid mips + SSR in-place color targets
     sizes[4].descriptorCount = 6 + hizSets + colorSets + kFramesInFlight * 4;
@@ -1386,6 +1391,7 @@ bool GuiApp::createDescriptors() {
                      kFramesInFlight * 4 + // transparent sets (GB/GT/SSAA/spatial)
                      kFramesInFlight * 4 + // opaque-SSR sets (GB/GT/SSAA/spatial)
                      6 +                   // ssao sets (GB/GT/SSAA, static)
+                     2 +                   // auto-exposure sets (LR + GT)
                      hizSets + colorSets;
     poolCi.poolSizeCount = 5;
     poolCi.pPoolSizes = sizes;
@@ -1409,6 +1415,8 @@ bool GuiApp::createDescriptors() {
         !deferred_.writeColorPyramidSets(ctx_, descriptorPool_, gtSsaaColor_.view,
                                          gtSsaaColorPyramid_))
         return false;
+
+    if (!createAutoExposureResources()) return false;
 
     linearSampler_ = createSampler(ctx_, VK_FILTER_LINEAR, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
     fontSampler_ = createSampler(ctx_, VK_FILTER_LINEAR, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
@@ -1643,6 +1651,18 @@ bool GuiApp::createAlgoResources(AlgoColumn& algo, uint32_t index) {
         vkUpdateDescriptorSets(ctx_.device, 4, writes, 0, nullptr);
     }
     return true;
+}
+
+bool GuiApp::createAutoExposureResources() {
+    // Seed both solvers with the current (preset/slider) exposure so the
+    // frames before the first readback match the fixed-exposure look.
+    const float initialEV = -std::log2(std::max(exposure_, 1e-4f));
+    if (!deferred_.createExposureChannel(ctx_, descriptorPool_, gbColor_.view, renderWidth_,
+                                         renderHeight_, initialEV, lrExposure_))
+        return false;
+    const ImageResource& gtSrc = active_.gtSsaa ? gtSsaaColor_ : gtColor_;
+    return deferred_.createExposureChannel(ctx_, descriptorPool_, gtSrc.view, gtSrc.width,
+                                           gtSrc.height, initialEV, gtExposure_);
 }
 
 bool GuiApp::createPipelines() {
@@ -2031,6 +2051,9 @@ void GuiApp::destroyStackResources() {
         metricResultBuf_ = VK_NULL_HANDLE;
         metricResultMemory_ = VK_NULL_HANDLE;
     }
+
+    deferred_.destroyExposureChannel(ctx_, lrExposure_);
+    deferred_.destroyExposureChannel(ctx_, gtExposure_);
     if (textUbo_) {
         vmaDestroyBuffer(ctx_.allocator, textUbo_, textUboMemory_);
         textUbo_ = VK_NULL_HANDLE;
@@ -2944,6 +2967,21 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                          Mat4::multiply(projJittered, view));
     }
 
+    // --- Auto exposure: LR histogram of this frame's lit HDR (gbColor_) --------
+    // Feeds the upscaler preExposure + the algorithm columns.  The applied
+    // value is the solve harvested kFramesInFlight frames ago (engine-style
+    // latency).  gbColor_ is SHADER_READ_ONLY here with compute in the
+    // sampled-dst scope.
+    if (gbuffer && autoExposureEnabled_) {
+        ExposureSolvePush solve;
+        solve.minEV = exposureMinEV_;
+        solve.maxEV = exposureMaxEV_;
+        solve.resetState = (frameIndex == 0 || autoExposureJustEnabled_) ? 1.f : 0.f;
+        deferred_.recordAutoExposurePass(cmd, lrExposure_.gpu, solve,
+                                         lrExposure_.staging[slot]);
+        lrExposure_.pending[slot] = true;
+    }
+
     // --- 2) per-algorithm dispatch ---------------------------------------------
     if (gbuffer) {
         timestamps_.upscaleBegin(cmd, slot);
@@ -2966,7 +3004,9 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         FrameParams frame;
         frame.frameIndex = static_cast<int>(frameIndex);
         frame.deltaTime = 1.f / 60.f;
-        frame.preExposure = 1.f;
+        // Real exposure input (was hardcoded 1): the LR path's display
+        // exposure — see InputAdapter.h for the preExposure convention.
+        frame.preExposure = lrExposureNow();
         frame.resetHistory = (frameIndex == 0);
 
         for (AlgoColumn& algo : algos_) {
@@ -3322,6 +3362,19 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                    sync::kColorAttach, sync::kColorWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
     }
+    // --- Auto exposure: GT histogram (own HDR source; gtSsaa uses its 2x HDR) --
+    // The GT column solves independently of the LR path — separate pipelines,
+    // so differing column exposures are the correct engine behaviour.
+    if (gtActive_ && autoExposureEnabled_) {
+        ExposureSolvePush solve;
+        solve.minEV = exposureMinEV_;
+        solve.maxEV = exposureMaxEV_;
+        solve.resetState = (frameIndex == 0 || autoExposureJustEnabled_) ? 1.f : 0.f;
+        deferred_.recordAutoExposurePass(cmd, gtExposure_.gpu, solve,
+                                         gtExposure_.staging[slot]);
+        gtExposure_.pending[slot] = true;
+    }
+    autoExposureJustEnabled_ = false;
     timestamps_.sceneEnd(cmd, slot);
 
     // --- 4) GPU metric reduction (compare only, every kMetricInterval frames) ----
@@ -3369,7 +3422,11 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
             push.y2 = active_.gtApplyScale ? 1u : 0u;
             push.z2 = dw;
             push.w2 = dh;
-            push.exposure = exposure_;
+            // Each image is tonemapped with its own path's exposure (test =
+            // LR, ref = GT): with auto exposure the PSNR/SSIM numbers include
+            // the exposure difference the user actually sees between columns.
+            push.exposureTest = lrExposureNow();
+            push.exposureRef = gtExposureNow();
             vkCmdPushConstants(cmd, metricPipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                                sizeof(push), &push);
             vkCmdDispatch(cmd, regBlocksPerRow, (regH + 7) / 8, 1);
@@ -3494,7 +3551,9 @@ void GuiApp::recordComposePresent(VkCommandBuffer cmd, uint32_t swapchainIndex,
             push.srcSize[1] = srcH;
             const float srcRegionW = rect[2] * (srcW / static_cast<float>(dw));
             push.nearest = (static_cast<float>(w) >= srcRegionW) ? 1.f : 0.f;
-            push.exposure = exposure_;
+            // Per-column exposure: GT column uses the GT path's solver,
+            // algorithm columns the LR path's (manual mode shares the slider).
+            push.exposure = isGtColumn ? gtExposureNow() : lrExposureNow();
             vkCmdPushConstants(cmd, composePipelineLayout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                                sizeof(push), &push);
             vkCmdDraw(cmd, 3, 1, 0, 0);
@@ -3932,6 +3991,10 @@ void GuiApp::run() {
             harvestMetrics(slot);
             metricPending_[slot] = false;
         }
+        // Same completion event: harvest the auto-exposure solves recorded in
+        // that frame (2 frames of latency, engine-style).
+        deferred_.harvestExposureChannel(lrExposure_, slot);
+        deferred_.harvestExposureChannel(gtExposure_, slot);
 
         uint32_t swapIndex = 0;
         VkResult acq = swapchain_.acquireNext(ctx_, frames_[slot].imageAvailable, swapIndex);
@@ -4236,7 +4299,28 @@ void GuiApp::drawViewerTab() {
     if (!sunEnabled_) ImGui::EndDisabled();
     ImGui::Checkbox("fill light", &fillEnabled_);
     ImGui::SliderFloat("IBL intensity", &iblIntensity_, 0.f, 3.f, "%.2f");
-    ImGui::SliderFloat("exposure", &exposure_, 0.1f, 4.f, "%.2f");
+    // Auto exposure: histogram-based EV solver (UE4 AutoExposure style),
+    // per-frame parameters — no rebuild.  The manual slider applies when the
+    // checkbox is off; switching back to manual keeps the current auto value.
+    if (ImGui::Checkbox("auto exposure", &autoExposureEnabled_)) {
+        if (autoExposureEnabled_)
+            autoExposureJustEnabled_ = true; // snap the solver next frame
+        else
+            exposure_ = lrExposure_.value; // keep the current look
+    }
+    if (autoExposureEnabled_) {
+        ImGui::SliderFloat("min EV", &exposureMinEV_, -16.f, 16.f, "%.1f");
+        ImGui::SliderFloat("max EV", &exposureMaxEV_, -16.f, 16.f, "%.1f");
+        exposureMinEV_ = std::min(exposureMinEV_, exposureMaxEV_);
+        exposureMaxEV_ = std::max(exposureMinEV_, exposureMaxEV_);
+        ImGui::Text("exposure  lr %.2f  gt %.2f (auto)", static_cast<double>(lrExposure_.value),
+                    static_cast<double>(gtExposure_.value));
+        ImGui::BeginDisabled();
+        ImGui::SliderFloat("exposure", &exposure_, 0.1f, 4.f, "%.2f");
+        ImGui::EndDisabled();
+    } else {
+        ImGui::SliderFloat("exposure", &exposure_, 0.1f, 4.f, "%.2f");
+    }
     if (ImGui::Button("golden hour")) applyLightingPreset(goldenHourPreset());
     ImGui::SameLine();
     if (ImGui::Button("scene default"))

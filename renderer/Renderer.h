@@ -39,7 +39,13 @@ struct RendererOptions {
     std::string envMapPath = kDefaultEnvMapPath;
     bool shadows = true;      // CSM sun shadows (CLI: --no-shadows)
     bool shadowDebug = false; // cascade tint overlay (CLI: --shadow-debug)
-    float exposure = 1.f;     // display-domain ACES input multiplier
+    float exposure = 1.f;     // manual display exposure (ACES input multiplier);
+                              // also the seed value for auto exposure
+    // Histogram-based auto exposure (UE4 AutoExposure style; see DeferredCore's
+    // AutoExposure).  On by default; CLI --exposure switches to manual mode.
+    bool autoExposure = true;
+    float exposureMinEV = -8.f; // auto-exposure EV clamp range
+    float exposureMaxEV = 8.f;
     bool bloom = true;        // HDR bloom before upscale (CLI: --no-bloom)
     bool ssr = true;          // opaque screen-space reflections (CLI: --no-ssr)
 };
@@ -180,6 +186,11 @@ private:
     VkDescriptorSet bloomBlurVGt_ = VK_NULL_HANDLE;
     VkDescriptorSet bloomCompGt_ = VK_NULL_HANDLE;
 
+    // Auto exposure: one channel bound to the active path's lit HDR target
+    // (gbColor_ for the LR path, finalImage_ for native GT).  The harvested
+    // value lags the GPU by kFramesInFlight frames — see ExposureChannel.
+    ExposureChannel exposureChannel_;
+
     VkBuffer screenshotStaging_ = VK_NULL_HANDLE;
     VmaAllocation screenshotStagingMemory_ = VK_NULL_HANDLE;
     void* screenshotMapped_ = nullptr;
@@ -194,6 +205,14 @@ private:
     bool createPipelines();
     bool createSyncResources();
     bool createScreenshotStaging();
+    // Auto-exposure buffers + descriptor set (needs the descriptor pool, so
+    // runs after createSceneDescriptors).
+    bool createAutoExposureResources();
+    // Display exposure for the current frame: harvested auto value, or the
+    // manual --exposure override when auto exposure is off.
+    float displayExposure() const {
+        return opts_.autoExposure ? exposureChannel_.value : opts_.exposure;
+    }
     bool recreateSwapchain(uint32_t width, uint32_t height, bool vsync);
     void updateSceneUBO(uint32_t frameIndex, bool jitter, uint32_t renderW, uint32_t renderH,
                         const Mat4& view, const Mat4& proj, const Mat4& projJittered,

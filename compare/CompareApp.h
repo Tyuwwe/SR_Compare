@@ -47,7 +47,15 @@ struct CompareOptions {
     float zoomCenterU = 0.5f;           // zoom window center, normalized source UV
     float zoomCenterV = 0.5f;
     std::string envMapPath = kDefaultEnvMapPath; // equirect HDR for IBL/skybox
-    float exposure = 1.f;                       // display-domain ACES input multiplier
+    float exposure = 1.f;                       // manual display exposure (ACES input);
+                                                // also the seed value for auto exposure
+    // Histogram-based auto exposure (UE4 AutoExposure style; see DeferredCore's
+    // AutoExposure).  On by default; CLI --exposure switches to manual mode.
+    // Each path (LR / GT) auto-exposes from its own HDR target, so compare
+    // columns legitimately use different exposures (independent pipelines).
+    bool autoExposure = true;
+    float exposureMinEV = -8.f;                 // auto-exposure EV clamp range
+    float exposureMaxEV = 8.f;
 };
 
 class CompareApp {
@@ -316,6 +324,15 @@ private:
     VmaAllocation screenshotStagingMemory_ = VK_NULL_HANDLE;
     void* screenshotMapped_ = nullptr;
 
+    // Auto exposure: the LR path (gbColor_) feeds the upscaler preExposure and
+    // the algorithm columns; the GT path (gtSsaaColor_ when gtSsaa, else
+    // gtColor_) feeds the GT column + metric reference.  Two independent
+    // solvers — each column is its own render pipeline (engine behaviour), so
+    // per-column exposures may differ.  Harvested values lag the GPU by
+    // kFramesInFlight frames; see ExposureChannel.
+    ExposureChannel lrExposure_;
+    ExposureChannel gtExposure_;
+
     bool initAlgorithms();
     bool createRenderTargets();
     bool createShaders();
@@ -326,6 +343,17 @@ private:
     bool createFontAtlas();
     bool createMetricResources();
     bool createScreenshotStaging();
+    // Auto-exposure channels + sets (needs the descriptor pool; called from
+    // createDescriptors once the pool exists).
+    bool createAutoExposureResources();
+    // Per-path display exposure: harvested auto value, or the manual
+    // --exposure override when auto exposure is off.
+    float lrExposure() const {
+        return opts_.autoExposure ? lrExposure_.value : opts_.exposure;
+    }
+    float gtExposure() const {
+        return opts_.autoExposure ? gtExposure_.value : opts_.exposure;
+    }
     void updateSceneUBO(void* mapped, bool jitter, uint32_t renderW, uint32_t renderH,
                         const Mat4& view, const Mat4& proj, const Mat4& projJittered,
                         const Mat4& prevViewProj);

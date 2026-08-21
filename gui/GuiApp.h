@@ -270,6 +270,17 @@ private:
     bool loadShader(const char* name, VkShaderModule& out);
     bool createShaders();
     bool createDescriptors();
+    // Auto-exposure channels + sets (needs the descriptor pool; called from
+    // createDescriptors once it exists).
+    bool createAutoExposureResources();
+    // Per-path display exposure: harvested auto value, or the manual slider
+    // value when auto exposure is off.
+    float lrExposureNow() const {
+        return autoExposureEnabled_ ? lrExposure_.value : exposure_;
+    }
+    float gtExposureNow() const {
+        return autoExposureEnabled_ ? gtExposure_.value : exposure_;
+    }
     bool createPipelines();
     bool createSyncResources();
     bool createScreenshotStaging();
@@ -465,7 +476,18 @@ private:
     Vec3 sunColor_{1.f, 0.95f, 0.85f};
     bool fillEnabled_ = true;       // defaultLights() blue point fill
     float iblIntensity_ = 1.f;
-    float exposure_ = 1.f;          // display-domain ACES input multiplier
+    float exposure_ = 1.f;          // manual display exposure (ACES input multiplier);
+                                    // also the seed value for auto exposure
+    // Histogram-based auto exposure (UE4 AutoExposure style; per-frame params,
+    // no rebuild — the solver state lives in the ExposureChannels below and is
+    // re-seeded on stack rebuilds from exposure_).  CLI --exposure starts the
+    // app in manual mode.  LR and GT paths solve independently.
+    bool autoExposureEnabled_ = true;
+    float exposureMinEV_ = -8.f;    // EV clamp range (GUI sliders)
+    float exposureMaxEV_ = 8.f;
+    bool autoExposureJustEnabled_ = false; // snap the solver next frame
+    ExposureChannel lrExposure_;    // gbColor_ -> upscaler preExposure + algo columns
+    ExposureChannel gtExposure_;    // gtColor_ / gtSsaaColor_ -> GT column + metric ref
     // CSM sun shadows (Viewer-tab lighting section, per-frame, no rebuild).
     bool shadowsEnabled_ = true;
     bool shadowDebugCascades_ = false; // tint pixels per shadow cascade
