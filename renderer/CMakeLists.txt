@@ -39,6 +39,7 @@ set(RENDERER_SHADERS
     shaders/ssao.comp
     shaders/ssao_blur.comp
     shaders/hiz_downsample.comp
+    shaders/color_downsample.comp
     shaders/bloom_extract.comp
     shaders/bloom_blur.comp
     shaders/bloom_composite.comp

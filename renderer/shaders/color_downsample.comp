@@ -1,0 +1,49 @@
+#version 450
+// HDR color mip chain downsample (one dispatch per mip level).
+//
+// mip 0 is a straight copy of the lit opaque HDR color (RGBA16F, bound as a
+// sampler while in SHADER_READ_ONLY); each further mip is the 2x2 box average
+// of the previous one.  SSR (Phase 1b-2) samples the chain at a
+// roughness-driven LOD so a single sharp ray approximates the widened GGX
+// lobe; Phase 6's bloom pyramid is expected to reuse the same chain.
+//
+// Why a plain box filter: it is deterministic and has no directional bias,
+// and the roughness LOD reads rely on trilinear interpolation between levels
+// (no banding).  Bloom's Karis-average firefly suppression is a property of
+// the threshold extract, not of this shared chain.
+//
+// The chain is a general DeferredCore resource living in VK_IMAGE_LAYOUT_GENERAL
+// for its whole lifetime, mirroring the DepthPyramid model.  Binding shape and
+// push constants match hiz_downsample.comp (HiZPush), so the pass reuses the
+// Hi-Z descriptor set layout and pipeline layout.
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D srcTex;
+layout(set = 0, binding = 1, rgba16f) writeonly uniform image2D dstMip;
+
+layout(push_constant) uniform Push {
+    ivec2 srcSize; // texel size of srcTex (clamps the 2x2 tap on odd sizes)
+} push;
+
+void main() {
+    ivec2 dst = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 dstSize = imageSize(dstMip);
+    if (dst.x >= dstSize.x || dst.y >= dstSize.y) return;
+
+    if (dstSize == push.srcSize) {
+        // Level 0: full-resolution copy of the lit HDR color (the sharp mip
+        // the SSR marcher reads at roughness 0).
+        imageStore(dstMip, dst, texelFetch(srcTex, dst, 0));
+        return;
+    }
+
+    // Edge replication on odd dimensions: a cell at the right/bottom border
+    // re-samples the edge texel instead of clamping AFTER the fetch.
+    ivec2 lo = min(dst * 2, push.srcSize - 1);
+    ivec2 hi = min(dst * 2 + 1, push.srcSize - 1);
+    vec4 c00 = texelFetch(srcTex, ivec2(lo.x, lo.y), 0);
+    vec4 c10 = texelFetch(srcTex, ivec2(hi.x, lo.y), 0);
+    vec4 c01 = texelFetch(srcTex, ivec2(lo.x, hi.y), 0);
+    vec4 c11 = texelFetch(srcTex, ivec2(hi.x, hi.y), 0);
+    imageStore(dstMip, dst, (c00 + c10 + c01 + c11) * 0.25);
+}

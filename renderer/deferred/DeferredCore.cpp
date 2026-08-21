@@ -109,7 +109,12 @@ bool DeferredCore::init(const VulkanContext& ctx, const char* envMapPath) {
     // keeps the untouched sampler state out of the way (and D32 mip-0 sources
     // are not guaranteed to support linear filtering).
     hizSampler_ = createSampler(ctx, VK_FILTER_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
-    if (!textureSampler_ || !gbufferSampler_ || !hizSampler_) return false;
+    // SSR hit-colour reads pick a mip by roughness (textureLod), so the
+    // colour pyramid chain view needs trilinear filtering with the full LOD
+    // range; clamp keeps edge texels from wrapping into the opposite border.
+    colorPyramidSampler_ = createSampler(ctx, VK_FILTER_LINEAR,
+                                         VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, 0.f, 32.f);
+    if (!textureSampler_ || !gbufferSampler_ || !hizSampler_ || !colorPyramidSampler_) return false;
 
     // Depth comparison sampler for the CSM shadow map.  CLAMP_TO_BORDER with
     // an opaque-white border makes off-map reads compare as "lit" (beyond the
@@ -139,6 +144,7 @@ bool DeferredCore::init(const VulkanContext& ctx, const char* envMapPath) {
         !loadShader(ctx, "ssao.comp.spv", ssaoComp_) ||
         !loadShader(ctx, "ssao_blur.comp.spv", ssaoBlurComp_) ||
         !loadShader(ctx, "hiz_downsample.comp.spv", hizDownsampleComp_) ||
+        !loadShader(ctx, "color_downsample.comp.spv", colorDownsampleComp_) ||
         !loadShader(ctx, "bloom_extract.comp.spv", bloomExtractComp_) ||
         !loadShader(ctx, "bloom_blur.comp.spv", bloomBlurComp_) ||
         !loadShader(ctx, "bloom_composite.comp.spv", bloomCompositeComp_) ||
@@ -658,6 +664,13 @@ bool DeferredCore::createPipelines(const VulkanContext& ctx) {
     if (createComputePipeline(ctx, hizCi, hizPipeline_) != VK_SUCCESS)
         return false;
 
+    // HDR color mip chain: same set layout / pipeline layout / push constants
+    // as Hi-Z (one combined sampler + one storage image, HiZPush), only the
+    // reduce op differs (box average instead of max).
+    hizCi.stage.module = colorDownsampleComp_;
+    if (createComputePipeline(ctx, hizCi, colorDownsamplePipeline_) != VK_SUCCESS)
+        return false;
+
     // --- Bloom (reuses ssaoBlur set layout: sampler + storage) ----------------
     VkPushConstantRange bloomPushRange = {};
     bloomPushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -752,6 +765,7 @@ void DeferredCore::destroy(const VulkanContext& ctx) {
     if (ssaoPipeline_) { vkDestroyPipeline(ctx.device, ssaoPipeline_, nullptr); ssaoPipeline_ = VK_NULL_HANDLE; }
     if (ssaoBlurPipeline_) { vkDestroyPipeline(ctx.device, ssaoBlurPipeline_, nullptr); ssaoBlurPipeline_ = VK_NULL_HANDLE; }
     if (hizPipeline_) { vkDestroyPipeline(ctx.device, hizPipeline_, nullptr); hizPipeline_ = VK_NULL_HANDLE; }
+    if (colorDownsamplePipeline_) { vkDestroyPipeline(ctx.device, colorDownsamplePipeline_, nullptr); colorDownsamplePipeline_ = VK_NULL_HANDLE; }
     if (bloomExtractPipeline_) { vkDestroyPipeline(ctx.device, bloomExtractPipeline_, nullptr); bloomExtractPipeline_ = VK_NULL_HANDLE; }
     if (bloomBlurPipeline_) { vkDestroyPipeline(ctx.device, bloomBlurPipeline_, nullptr); bloomBlurPipeline_ = VK_NULL_HANDLE; }
     if (bloomCompositePipeline_) { vkDestroyPipeline(ctx.device, bloomCompositePipeline_, nullptr); bloomCompositePipeline_ = VK_NULL_HANDLE; }
@@ -774,6 +788,7 @@ void DeferredCore::destroy(const VulkanContext& ctx) {
     if (ssaoComp_) { vkDestroyShaderModule(ctx.device, ssaoComp_, nullptr); ssaoComp_ = VK_NULL_HANDLE; }
     if (ssaoBlurComp_) { vkDestroyShaderModule(ctx.device, ssaoBlurComp_, nullptr); ssaoBlurComp_ = VK_NULL_HANDLE; }
     if (hizDownsampleComp_) { vkDestroyShaderModule(ctx.device, hizDownsampleComp_, nullptr); hizDownsampleComp_ = VK_NULL_HANDLE; }
+    if (colorDownsampleComp_) { vkDestroyShaderModule(ctx.device, colorDownsampleComp_, nullptr); colorDownsampleComp_ = VK_NULL_HANDLE; }
     if (bloomExtractComp_) { vkDestroyShaderModule(ctx.device, bloomExtractComp_, nullptr); bloomExtractComp_ = VK_NULL_HANDLE; }
     if (bloomBlurComp_) { vkDestroyShaderModule(ctx.device, bloomBlurComp_, nullptr); bloomBlurComp_ = VK_NULL_HANDLE; }
     if (bloomCompositeComp_) { vkDestroyShaderModule(ctx.device, bloomCompositeComp_, nullptr); bloomCompositeComp_ = VK_NULL_HANDLE; }
@@ -790,6 +805,7 @@ void DeferredCore::destroy(const VulkanContext& ctx) {
     if (gbufferSampler_) { vkDestroySampler(ctx.device, gbufferSampler_, nullptr); gbufferSampler_ = VK_NULL_HANDLE; }
     if (shadowSampler_) { vkDestroySampler(ctx.device, shadowSampler_, nullptr); shadowSampler_ = VK_NULL_HANDLE; }
     if (hizSampler_) { vkDestroySampler(ctx.device, hizSampler_, nullptr); hizSampler_ = VK_NULL_HANDLE; }
+    if (colorPyramidSampler_) { vkDestroySampler(ctx.device, colorPyramidSampler_, nullptr); colorPyramidSampler_ = VK_NULL_HANDLE; }
     ibl_.destroy(ctx);
 }
 
@@ -1410,6 +1426,138 @@ void DeferredCore::destroyDepthPyramid(const VulkanContext& ctx, DepthPyramid& p
 void DeferredCore::recordDepthPyramidPass(VkCommandBuffer cmd, const DepthPyramid& pyramid) const {
     if (!pyramid.image || pyramid.sets.empty()) return;
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, hizPipeline_);
+
+    // WAR: last frame's marcher (fragment) and downsample reads finish before
+    // this frame rewrites mip 0.  Same-layout barrier; the image is GENERAL.
+    imageBarrier(cmd, pyramid.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+                 sync::kSampleStages, sync::kSampled, sync::kCompute, sync::kStorageWrite,
+                 VK_IMAGE_ASPECT_COLOR_BIT, 0, pyramid.mipCount);
+
+    uint32_t srcW = pyramid.width;
+    uint32_t srcH = pyramid.height;
+    for (uint32_t level = 0; level < pyramid.mipCount; ++level) {
+        if (level > 0) {
+            // Level-1 write must be visible before it is sampled as source.
+            imageBarrier(cmd, pyramid.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+                         sync::kCompute, sync::kStorageWrite, sync::kCompute, sync::kSampled,
+                         VK_IMAGE_ASPECT_COLOR_BIT, level - 1, 1);
+        }
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, hizPipelineLayout_, 0, 1,
+                                &pyramid.sets[level], 0, nullptr);
+        HiZPush push;
+        push.srcSize[0] = static_cast<int32_t>(srcW);
+        push.srcSize[1] = static_cast<int32_t>(srcH);
+        vkCmdPushConstants(cmd, hizPipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push),
+                           &push);
+        const uint32_t dstW = std::max(1u, pyramid.width >> level);
+        const uint32_t dstH = std::max(1u, pyramid.height >> level);
+        vkCmdDispatch(cmd, (dstW + 7) / 8, (dstH + 7) / 8, 1);
+        srcW = dstW;
+        srcH = dstH;
+    }
+
+    // The transparent-pass marcher samples the chain later this frame.
+    imageBarrier(cmd, pyramid.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+                 sync::kCompute, sync::kStorageWrite, sync::kFragment, sync::kSampled,
+                 VK_IMAGE_ASPECT_COLOR_BIT, 0, pyramid.mipCount);
+}
+
+// --- HDR color mip chain ------------------------------------------------------
+// Same resource model as the depth pyramid above; only the format, the
+// mip-0 semantics (copy instead of max-reduce of an external D32 source) and
+// the pipeline differ.
+
+bool DeferredCore::createColorPyramid(const VulkanContext& ctx, uint32_t w, uint32_t h,
+                                      ColorPyramid& out) const {
+    out.width = w;
+    out.height = h;
+    out.mipCount = depthPyramidMipCount(w, h); // same full-chain rule (down to 1x1)
+    if (createImage(ctx, w, h, kColorPyramidFormat,
+                    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, out.image,
+                    out.memory, out.mipCount) != VK_SUCCESS)
+        return false;
+    out.chainView =
+        createImageView(ctx, out.image, kColorPyramidFormat, VK_IMAGE_ASPECT_COLOR_BIT, 0,
+                        out.mipCount);
+    if (!out.chainView) return false;
+    out.mipViews.resize(out.mipCount, VK_NULL_HANDLE);
+    for (uint32_t i = 0; i < out.mipCount; ++i) {
+        out.mipViews[i] = createImageView(ctx, out.image, kColorPyramidFormat,
+                                          VK_IMAGE_ASPECT_COLOR_BIT, i, 1);
+        if (!out.mipViews[i]) return false;
+    }
+    // GENERAL for life: every mip is both a compute storage target and a
+    // sampled source, so a fixed layout beats per-frame transitions.
+    submitOneShot(ctx, [&](VkCommandBuffer cmd) {
+        imageBarrier(cmd, out.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                     VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+                     VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                     VK_IMAGE_ASPECT_COLOR_BIT, 0, out.mipCount);
+    });
+    return true;
+}
+
+bool DeferredCore::writeColorPyramidSets(const VulkanContext& ctx, VkDescriptorPool pool,
+                                         VkImageView srcColor, ColorPyramid& out) const {
+    out.sets.resize(out.mipCount, VK_NULL_HANDLE);
+    for (uint32_t level = 0; level < out.mipCount; ++level) {
+        VkDescriptorSetAllocateInfo alloc = {};
+        alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        alloc.descriptorPool = pool;
+        alloc.descriptorSetCount = 1;
+        alloc.pSetLayouts = &hizSetLayout_; // same binding shape as the Hi-Z downsample
+        if (vkAllocateDescriptorSets(ctx.device, &alloc, &out.sets[level]) != VK_SUCCESS)
+            return false;
+
+        VkDescriptorImageInfo src = {};
+        src.sampler = hizSampler_; // texelFetch only; filter state is irrelevant
+        src.imageView = level == 0 ? srcColor : out.mipViews[level - 1];
+        // The lit HDR source color is sampled in SHADER_READ_ONLY; pyramid
+        // mips are GENERAL.
+        src.imageLayout = level == 0 ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+                                     : VK_IMAGE_LAYOUT_GENERAL;
+        VkDescriptorImageInfo dst = {};
+        dst.imageView = out.mipViews[level];
+        dst.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+        VkWriteDescriptorSet w[2] = {};
+        w[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w[0].dstSet = out.sets[level];
+        w[0].dstBinding = 0;
+        w[0].descriptorCount = 1;
+        w[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        w[0].pImageInfo = &src;
+        w[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w[1].dstSet = out.sets[level];
+        w[1].dstBinding = 1;
+        w[1].descriptorCount = 1;
+        w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        w[1].pImageInfo = &dst;
+        vkUpdateDescriptorSets(ctx.device, 2, w, 0, nullptr);
+    }
+    return true;
+}
+
+void DeferredCore::destroyColorPyramid(const VulkanContext& ctx, ColorPyramid& pyramid) const {
+    for (VkImageView v : pyramid.mipViews)
+        if (v) vkDestroyImageView(ctx.device, v, nullptr);
+    pyramid.mipViews.clear();
+    pyramid.sets.clear(); // pool-owned; freed with the host's descriptor pool
+    if (pyramid.chainView) {
+        vkDestroyImageView(ctx.device, pyramid.chainView, nullptr);
+        pyramid.chainView = VK_NULL_HANDLE;
+    }
+    if (pyramid.image) {
+        vmaDestroyImage(ctx.allocator, pyramid.image, pyramid.memory);
+        pyramid.image = VK_NULL_HANDLE;
+        pyramid.memory = VK_NULL_HANDLE;
+    }
+    pyramid.width = pyramid.height = pyramid.mipCount = 0;
+}
+
+void DeferredCore::recordColorPyramidPass(VkCommandBuffer cmd, const ColorPyramid& pyramid) const {
+    if (!pyramid.image || pyramid.sets.empty()) return;
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, colorDownsamplePipeline_);
 
     // WAR: last frame's marcher (fragment) and downsample reads finish before
     // this frame rewrites mip 0.  Same-layout barrier; the image is GENERAL.

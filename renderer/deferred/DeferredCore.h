@@ -209,6 +209,29 @@ struct DepthPyramid {
     uint32_t mipCount = 0;
 };
 
+// --- HDR color mip chain (box-filtered lit-color pyramid) --------------------
+// Roughness-aware SSR (Phase 1b-2) samples this chain at lod = roughness *
+// (mipCount - 1) instead of a single sharp mip-0 read, so one ray
+// approximates the widened GGX lobe; Phase 6's bloom pyramid is expected to
+// reuse the same resource.  RGBA16F like the lighting target, mip 0 =
+// straight copy of the lit opaque HDR color, mips 1..N = 2x2 box average.
+// The chain length rule matches the depth pyramid (full chain down to 1x1).
+constexpr VkFormat kColorPyramidFormat = deferred::kHdrColorFormat;
+
+// Host-owned color pyramid.  Same ownership/layout model as DepthPyramid:
+// the host holds the struct and the descriptor pool, the image stays in
+// VK_IMAGE_LAYOUT_GENERAL for its whole lifetime (zero layout tracking).
+struct ColorPyramid {
+    VkImage image = VK_NULL_HANDLE;
+    VmaAllocation memory = VK_NULL_HANDLE;
+    VkImageView chainView = VK_NULL_HANDLE;   // all mips; bound to the SSR marcher
+    std::vector<VkImageView> mipViews;        // per-mip views (downsample src/dst)
+    std::vector<VkDescriptorSet> sets;        // per-mip downsample sets (pool-owned)
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t mipCount = 0;
+};
+
 // Bloom (half-res extract + separable Gaussian, added back before upscale).
 struct BloomPush {
     float params[4]; // extract: threshold, knee; blur: dir.xy; composite: strength
@@ -277,8 +300,10 @@ public:
     // Binds the LightingUBO (lights + iblParams are read) + IBL maps + the
     // SSAO texture of this path into a transparentSetLayout() descriptor set.
     // shadow follows the same VK_NULL_HANDLE convention as writeLightingSet
-    // (binding 5 left unwritten).  depthPyramid is the chain view (all mips)
-    // of this path's DepthPyramid; ssr.glsl marches it hierarchically.
+    // (binding 5 left unwritten).  ssrColor is the chain view (all mips) of
+    // this path's ColorPyramid and depthPyramid the chain view of its
+    // DepthPyramid; ssr.glsl marches the latter and samples the former at a
+    // roughness-driven LOD.
     void writeTransparentSet(const VulkanContext& ctx, VkDescriptorSet set,
                              VkBuffer lightingUbo, VkImageView ssao, VkImageView shadow,
                              VkImageView ssrColor, VkImageView depthPyramid) const;
@@ -346,6 +371,29 @@ public:
     // compute in the dst scope); the pyramid stays GENERAL throughout and the
     // pass ends with a barrier making the writes visible to fragment reads.
     void recordDepthPyramidPass(VkCommandBuffer cmd, const DepthPyramid& pyramid) const;
+
+    // --- HDR color mip chain (after the lighting pass, before transparency) ---
+    // Replaces the old full-res transfer copy of the lit HDR target: mip 0 of
+    // the chain IS the opaque color copy, so glass gets the sharp reflection
+    // and every blurred level from one pass.  The downsample reuses the Hi-Z
+    // descriptor set layout / pipeline layout (identical binding shape and
+    // HiZPush), only the shader differs.
+    bool createColorPyramid(const VulkanContext& ctx, uint32_t w, uint32_t h,
+                            ColorPyramid& out) const;
+    // Allocates mipCount downsample sets from the caller's pool: set 0 samples
+    // srcColor (the lit HDR target, read while in SHADER_READ_ONLY), set i>0
+    // samples mip i-1.  The sets are pool-owned; destroyColorPyramid only
+    // releases the image and views.
+    bool writeColorPyramidSets(const VulkanContext& ctx, VkDescriptorPool pool,
+                               VkImageView srcColor, ColorPyramid& out) const;
+    void destroyColorPyramid(const VulkanContext& ctx, ColorPyramid& pyramid) const;
+    // Copies the bound source color into mip 0, then box-averages each mip
+    // from the previous (one 8x8 dispatch per level, barriers between).  Same
+    // host contract as recordDepthPyramidPass: the source must already be
+    // shader-readable by compute (SHADER_READ_ONLY with compute in the dst
+    // scope); the chain stays GENERAL throughout and the pass ends with a
+    // barrier making the writes visible to fragment reads.
+    void recordColorPyramidPass(VkCommandBuffer cmd, const ColorPyramid& pyramid) const;
 
     // --- CSM sun shadow pass (between the GBuffer and the lighting pass) ------
     // Creates the 2048^2 x kShadowCascadeCount D32 array + views.  The
@@ -420,6 +468,7 @@ private:
     VkPipeline ssaoBlurPipeline_ = VK_NULL_HANDLE;
     VkPipelineLayout hizPipelineLayout_ = VK_NULL_HANDLE;
     VkPipeline hizPipeline_ = VK_NULL_HANDLE;
+    VkPipeline colorDownsamplePipeline_ = VK_NULL_HANDLE; // reuses hizPipelineLayout_
     VkPipelineLayout bloomPipelineLayout_ = VK_NULL_HANDLE;
     VkPipeline bloomExtractPipeline_ = VK_NULL_HANDLE;
     VkPipeline bloomBlurPipeline_ = VK_NULL_HANDLE;
@@ -436,6 +485,7 @@ private:
     VkShaderModule ssaoComp_ = VK_NULL_HANDLE;
     VkShaderModule ssaoBlurComp_ = VK_NULL_HANDLE;
     VkShaderModule hizDownsampleComp_ = VK_NULL_HANDLE;
+    VkShaderModule colorDownsampleComp_ = VK_NULL_HANDLE;
     VkShaderModule bloomExtractComp_ = VK_NULL_HANDLE;
     VkShaderModule bloomBlurComp_ = VK_NULL_HANDLE;
     VkShaderModule bloomCompositeComp_ = VK_NULL_HANDLE;
@@ -445,6 +495,7 @@ private:
     VkSampler gbufferSampler_ = VK_NULL_HANDLE;
     VkSampler shadowSampler_ = VK_NULL_HANDLE;
     VkSampler hizSampler_ = VK_NULL_HANDLE; // nearest + clamp (texelFetch pyramid reads)
+    VkSampler colorPyramidSampler_ = VK_NULL_HANDLE; // trilinear + clamp (SSR roughness LOD reads)
 };
 
 } // namespace sr
