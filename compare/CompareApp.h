@@ -212,6 +212,25 @@ private:
     DepthPyramid gbPyramid_;
     DepthPyramid gtPyramid_;
     DepthPyramid gtSsaaPyramid_; // gtSsaa only
+    // GTAO view-Z depth chains (XeGTAO DepthMIPFilter) + temporal accumulation
+    // ping-pong state, one per path.  Per-path previous-frame view-projection
+    // (jittered for LR) and frame counters drive the temporal pass; a zero
+    // counter resets (bypasses) the history.  In mixed temporal+spatial
+    // column mode the LR lighting runs twice per frame and the LR counter
+    // advances twice — history stays consistent (each record reprojects from
+    // the previous record's exact view-projection).
+    DepthPyramid gbPyramidAo_;
+    DepthPyramid gtPyramidAo_;
+    DepthPyramid gtSsaaPyramidAo_; // gtSsaa only
+    AoHistory gbAoHist_;
+    AoHistory gtAoHist_;
+    AoHistory gtSsaaAoHist_; // gtSsaa only
+    Mat4 prevAoViewProjGb_ = Mat4::identity();
+    Mat4 prevAoViewProjGt_ = Mat4::identity();
+    Mat4 prevAoViewProjSsaa_ = Mat4::identity();
+    uint32_t aoFramesGb_ = 0;
+    uint32_t aoFramesGt_ = 0;
+    uint32_t aoFramesSsaa_ = 0;
     ImageResource composeImage_; // RGBA8, tonemapped columns + overlay
     ImageResource fontAtlas_;
 
@@ -249,12 +268,10 @@ private:
     VkDescriptorSet gtComposeSet_ = VK_NULL_HANDLE;
     VkDescriptorSet gtDownsampleSet_ = VK_NULL_HANDLE; // 2x GT source (SSAA)
     // SSAO descriptor sets (static: the referenced textures never change).
+    // The blur sets live inside AoHistory (one per ping-pong buffer).
     VkDescriptorSet ssaoSetGb_ = VK_NULL_HANDLE;
-    VkDescriptorSet ssaoBlurSetGb_ = VK_NULL_HANDLE;
     VkDescriptorSet ssaoSetGt_ = VK_NULL_HANDLE;
-    VkDescriptorSet ssaoBlurSetGt_ = VK_NULL_HANDLE;
     VkDescriptorSet ssaoSetSsaa_ = VK_NULL_HANDLE;     // gtSsaa only
-    VkDescriptorSet ssaoBlurSetSsaa_ = VK_NULL_HANDLE; // gtSsaa only
     VkDescriptorSet bloomExtractGb_ = VK_NULL_HANDLE;
     VkDescriptorSet bloomBlurHGb_ = VK_NULL_HANDLE;
     VkDescriptorSet bloomBlurVGb_ = VK_NULL_HANDLE;

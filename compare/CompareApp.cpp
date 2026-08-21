@@ -331,6 +331,17 @@ bool CompareApp::createRenderTargets() {
         return false;
     if (!deferred_.createDepthPyramid(ctx_, dw, dh, gtPyramid_))
         return false;
+    // GTAO view-Z depth chains (XeGTAO DepthMIPFilter) + temporal history.
+    if (!deferred_.createDepthPyramid(ctx_, renderWidth_, renderHeight_, gbPyramidAo_,
+                                      /*aoFilter=*/true, camera_.nearPlane, camera_.farPlane))
+        return false;
+    if (!deferred_.createDepthPyramid(ctx_, dw, dh, gtPyramidAo_, /*aoFilter=*/true,
+                                      camera_.nearPlane, camera_.farPlane))
+        return false;
+    if (!deferred_.createAoHistory(ctx_, renderWidth_, renderHeight_, gbAoHist_))
+        return false;
+    if (!deferred_.createAoHistory(ctx_, dw, dh, gtAoHist_))
+        return false;
     // Color mip chains for roughness-aware SSR (mip 0 = the lit-color copy).
     if (!deferred_.createColorPyramid(ctx_, renderWidth_, renderHeight_, gbColorPyramid_))
         return false;
@@ -393,6 +404,11 @@ bool CompareApp::createRenderTargets() {
                       VK_IMAGE_ASPECT_COLOR_BIT))
             return false;
         if (!deferred_.createDepthPyramid(ctx_, dw * 2, dh * 2, gtSsaaPyramid_))
+            return false;
+        if (!deferred_.createDepthPyramid(ctx_, dw * 2, dh * 2, gtSsaaPyramidAo_,
+                                          /*aoFilter=*/true, camera_.nearPlane, camera_.farPlane))
+            return false;
+        if (!deferred_.createAoHistory(ctx_, dw * 2, dh * 2, gtSsaaAoHist_))
             return false;
         if (!deferred_.createColorPyramid(ctx_, dw * 2, dh * 2, gtSsaaColorPyramid_))
             return false;
@@ -566,8 +582,9 @@ bool CompareApp::createDescriptors() {
     const uint32_t numAlgos = static_cast<uint32_t>(algos_.size());
     const uint32_t numColumns = 1 + numAlgos;
     // Hi-Z / color downsample sets: one per mip per pyramid (sampler + storage image).
-    const uint32_t hizSets =
-        gbPyramid_.mipCount + gtPyramid_.mipCount + gtSsaaPyramid_.mipCount;
+    const uint32_t hizSets = gbPyramid_.mipCount + gtPyramid_.mipCount + gtSsaaPyramid_.mipCount +
+                             gbPyramidAo_.mipCount + gtPyramidAo_.mipCount +
+                             gtSsaaPyramidAo_.mipCount;
     const uint32_t colorSets =
         gbColorPyramid_.mipCount + gtColorPyramid_.mipCount + gtSsaaColorPyramid_.mipCount;
     VkDescriptorPoolSize sizes[5] = {};
@@ -576,7 +593,7 @@ bool CompareApp::createDescriptors() {
                                11 * kFramesInFlight * 4 + // lighting sets (GB/GT/SSAA/spatial), +1 shadow
                                7 * kFramesInFlight * 4 +  // transparent sets + SSR
                                9 * kFramesInFlight * 4 +  // opaque-SSR sets (GB/GT/SSAA/spatial)
-                               3 * 3 +                    // ssao + blur samplers (per path)
+                               10 * 3 +                   // ssao + temporal + blur samplers (per path)
                                2 +                        // auto-exposure HDR sources (LR + GT)
                                hizSets + colorSets;
     sizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
@@ -590,14 +607,14 @@ bool CompareApp::createDescriptors() {
     sizes[3].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     sizes[3].descriptorCount = numAlgos * 2 + 4; // metric blocks/result + auto-exposure (LR + GT)
     sizes[4].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    // ssao raw + blurred outputs (GB/GT/SSAA) + pyramid mips + SSR in-place color targets
-    sizes[4].descriptorCount = 6 + hizSets + colorSets + kFramesInFlight * 4;
+    // ssao raw + temporal history + blur outputs (GB/GT/SSAA) + pyramid mips + SSR in-place color targets
+    sizes[4].descriptorCount = 15 + hizSets + colorSets + kFramesInFlight * 4;
     VkDescriptorPoolCreateInfo poolCi = {};
     poolCi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     poolCi.maxSets = kFramesInFlight * 2 + 2 + numColumns + 1 + numAlgos + kFramesInFlight * 3 +
                      kFramesInFlight * 3 + // transparent sets (GB/GT/SSAA)
                      kFramesInFlight * 4 + // opaque-SSR sets (GB/GT/SSAA/spatial)
-                     6 +                    // ssao sets (GB/GT/SSAA, static)
+                     15 +                   // ssao + temporal + blur sets (GB/GT/SSAA, static)
                      2 +                    // auto-exposure sets (LR + GT)
                      3 * kFramesInFlight + // spatial scene + lighting + transparent
                      hizSets + colorSets;
@@ -613,6 +630,14 @@ bool CompareApp::createDescriptors() {
     if (opts_.gtSsaa &&
         !deferred_.writeDepthPyramidSets(ctx_, descriptorPool_, gtSsaaDepth_.view,
                                          gtSsaaPyramid_))
+        return false;
+    if (!deferred_.writeDepthPyramidSets(ctx_, descriptorPool_, gbDepth_.view, gbPyramidAo_))
+        return false;
+    if (!deferred_.writeDepthPyramidSets(ctx_, descriptorPool_, gtDepth_.view, gtPyramidAo_))
+        return false;
+    if (opts_.gtSsaa &&
+        !deferred_.writeDepthPyramidSets(ctx_, descriptorPool_, gtSsaaDepth_.view,
+                                         gtSsaaPyramidAo_))
         return false;
     // Color chain set 0 samples the lit HDR target of each path.
     if (!deferred_.writeColorPyramidSets(ctx_, descriptorPool_, gbColor_.view, gbColorPyramid_))
@@ -675,12 +700,9 @@ bool CompareApp::createDescriptors() {
     }
     if (!allocSet(deferred_.textureSetLayout(), textureSet_)) return false;
     if (!allocSet(deferred_.ssaoSetLayout(), ssaoSetGb_)) return false;
-    if (!allocSet(deferred_.ssaoBlurSetLayout(), ssaoBlurSetGb_)) return false;
     if (!allocSet(deferred_.ssaoSetLayout(), ssaoSetGt_)) return false;
-    if (!allocSet(deferred_.ssaoBlurSetLayout(), ssaoBlurSetGt_)) return false;
     if (opts_.gtSsaa) {
         if (!allocSet(deferred_.ssaoSetLayout(), ssaoSetSsaa_)) return false;
-        if (!allocSet(deferred_.ssaoBlurSetLayout(), ssaoBlurSetSsaa_)) return false;
     }
     if (!allocSet(composeSetLayout_, gtComposeSet_)) return false;
     if (!allocSet(copySetLayout_, copySet_)) return false;
@@ -692,14 +714,22 @@ bool CompareApp::createDescriptors() {
 
     // --- writes ---------------------------------------------------------------
     deferred_.writeTextureSet(ctx_, textureSet_, scene_);
-    deferred_.writeSsaoSet(ctx_, ssaoSetGb_, gbDepth_.view, gbNormal_.view, gbAoRaw_.view);
-    deferred_.writeSsaoBlurSet(ctx_, ssaoBlurSetGb_, gbAoRaw_.view, gbAo_.view);
-    deferred_.writeSsaoSet(ctx_, ssaoSetGt_, gtDepth_.view, gtNormal_.view, gtAoRaw_.view);
-    deferred_.writeSsaoBlurSet(ctx_, ssaoBlurSetGt_, gtAoRaw_.view, gtAo_.view);
+    deferred_.writeSsaoSet(ctx_, ssaoSetGb_, gbPyramidAo_.chainView, gbNormal_.view,
+                           gbAoRaw_.view);
+    deferred_.writeSsaoSet(ctx_, ssaoSetGt_, gtPyramidAo_.chainView, gtNormal_.view,
+                           gtAoRaw_.view);
+    if (!deferred_.writeAoHistorySets(ctx_, descriptorPool_, gbAoRaw_.view, gbDepth_.view,
+                                      gbAo_.view, gbAoHist_))
+        return false;
+    if (!deferred_.writeAoHistorySets(ctx_, descriptorPool_, gtAoRaw_.view, gtDepth_.view,
+                                      gtAo_.view, gtAoHist_))
+        return false;
     if (opts_.gtSsaa) {
-        deferred_.writeSsaoSet(ctx_, ssaoSetSsaa_, gtSsaaDepth_.view, gtSsaaNormal_.view,
-                               gtSsaaAoRaw_.view);
-        deferred_.writeSsaoBlurSet(ctx_, ssaoBlurSetSsaa_, gtSsaaAoRaw_.view, gtSsaaAo_.view);
+        deferred_.writeSsaoSet(ctx_, ssaoSetSsaa_, gtSsaaPyramidAo_.chainView,
+                               gtSsaaNormal_.view, gtSsaaAoRaw_.view);
+        if (!deferred_.writeAoHistorySets(ctx_, descriptorPool_, gtSsaaAoRaw_.view,
+                                          gtSsaaDepth_.view, gtSsaaAo_.view, gtSsaaAoHist_))
+            return false;
     }
 
     auto writeComposeSet = [&](VkDescriptorSet set, VkImageView source) {
@@ -1430,16 +1460,27 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         if (hasTransparency_ || opts_.ssr)
             deferred_.recordDepthPyramidPass(cmd, gbPyramid_);
 
+        // GTAO: view-Z depth chain (sampled at per-step LODs) -> main pass ->
+        // temporal EMA -> denoise.  The chain is rebuilt every record.
+        deferred_.recordDepthPyramidPass(cmd, gbPyramidAo_);
+        const Mat4 invAoVp = Mat4::inverse(ssaoViewProj);
+        const float aoMaxLodGb = static_cast<float>(std::min(gbPyramidAo_.mipCount - 1, 4u));
         transition(gbAoRaw_.image, gbAoRawLayout_, VK_IMAGE_LAYOUT_GENERAL, sync::kCompute,
                    sync::kSampled, sync::kCompute, sync::kStorageWrite, VK_IMAGE_ASPECT_COLOR_BIT);
-        deferred_.recordSsaoPass(cmd, ssaoSetGb_, ssaoViewProj, frameIndex, renderWidth_,
-                                 renderHeight_);
+        deferred_.recordSsaoPass(cmd, ssaoSetGb_, invAoVp, frameIndex, camera_.nearPlane,
+                                 camera_.farPlane, aoMaxLodGb, renderWidth_, renderHeight_);
         transition(gbAoRaw_.image, gbAoRawLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                    sync::kCompute, sync::kStorageWrite, sync::kCompute, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
+        const uint32_t aoWriteGb = aoFramesGb_ & 1u;
+        deferred_.recordSsaoTemporalPass(cmd, gbAoHist_, aoWriteGb, invAoVp, prevAoViewProjGb_,
+                                         renderWidth_, renderHeight_, /*reset=*/aoFramesGb_ == 0);
+        prevAoViewProjGb_ = ssaoViewProj;
+        ++aoFramesGb_;
         transition(gbAo_.image, gbAoLayout_, VK_IMAGE_LAYOUT_GENERAL, sync::kSampleStages,
                    sync::kSampled, sync::kCompute, sync::kStorageWrite, VK_IMAGE_ASPECT_COLOR_BIT);
-        deferred_.recordSsaoBlurPass(cmd, ssaoBlurSetGb_, renderWidth_, renderHeight_);
+        deferred_.recordSsaoBlurPass(cmd, gbAoHist_.blurSet[aoWriteGb], renderWidth_,
+                                     renderHeight_);
         transition(gbAo_.image, gbAoLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                    sync::kCompute, sync::kStorageWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
@@ -1711,18 +1752,30 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         if (hasTransparency_ || opts_.ssr)
             deferred_.recordDepthPyramidPass(cmd, gtSsaaPyramid_);
 
-        // SSAO for the 2x GT path (un-jittered view-projection).  The AO
-        // output is also sampled by the opaque-SSR compute pass.
+        // GTAO for the 2x GT path (un-jittered view-projection): view-Z depth
+        // chain -> main pass -> temporal EMA -> denoise.  The AO output is
+        // also sampled by the opaque-SSR compute pass.
+        deferred_.recordDepthPyramidPass(cmd, gtSsaaPyramidAo_);
+        const Mat4 invAoVpSsaa = Mat4::inverse(cullViewProj);
+        const float aoMaxLodSsaa =
+            static_cast<float>(std::min(gtSsaaPyramidAo_.mipCount - 1, 4u));
         transition(gtSsaaAoRaw_.image, gtSsaaAoRawLayout_, VK_IMAGE_LAYOUT_GENERAL,
                    sync::kCompute, sync::kSampled, sync::kCompute, sync::kStorageWrite,
                    VK_IMAGE_ASPECT_COLOR_BIT);
-        deferred_.recordSsaoPass(cmd, ssaoSetSsaa_, cullViewProj, frameIndex, sw, sh);
+        deferred_.recordSsaoPass(cmd, ssaoSetSsaa_, invAoVpSsaa, frameIndex, camera_.nearPlane,
+                                 camera_.farPlane, aoMaxLodSsaa, sw, sh);
         transition(gtSsaaAoRaw_.image, gtSsaaAoRawLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                    sync::kCompute, sync::kStorageWrite, sync::kCompute, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
+        const uint32_t aoWriteSsaa = aoFramesSsaa_ & 1u;
+        deferred_.recordSsaoTemporalPass(cmd, gtSsaaAoHist_, aoWriteSsaa, invAoVpSsaa,
+                                         prevAoViewProjSsaa_, sw, sh,
+                                         /*reset=*/aoFramesSsaa_ == 0);
+        prevAoViewProjSsaa_ = cullViewProj;
+        ++aoFramesSsaa_;
         transition(gtSsaaAo_.image, gtSsaaAoLayout_, VK_IMAGE_LAYOUT_GENERAL, sync::kSampleStages,
                    sync::kSampled, sync::kCompute, sync::kStorageWrite, VK_IMAGE_ASPECT_COLOR_BIT);
-        deferred_.recordSsaoBlurPass(cmd, ssaoBlurSetSsaa_, sw, sh);
+        deferred_.recordSsaoBlurPass(cmd, gtSsaaAoHist_.blurSet[aoWriteSsaa], sw, sh);
         transition(gtSsaaAo_.image, gtSsaaAoLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                    sync::kCompute, sync::kStorageWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
@@ -1863,17 +1916,27 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         if (hasTransparency_ || opts_.ssr)
             deferred_.recordDepthPyramidPass(cmd, gtPyramid_);
 
-        // SSAO for the 1x GT path (un-jittered view-projection).  The AO
-        // output is also sampled by the opaque-SSR compute pass.
+        // GTAO for the 1x GT path (un-jittered view-projection): view-Z depth
+        // chain -> main pass -> temporal EMA -> denoise.  The AO output is
+        // also sampled by the opaque-SSR compute pass.
+        deferred_.recordDepthPyramidPass(cmd, gtPyramidAo_);
+        const Mat4 invAoVpGt = Mat4::inverse(cullViewProj);
+        const float aoMaxLodGt = static_cast<float>(std::min(gtPyramidAo_.mipCount - 1, 4u));
         transition(gtAoRaw_.image, gtAoRawLayout_, VK_IMAGE_LAYOUT_GENERAL, sync::kCompute,
                    sync::kSampled, sync::kCompute, sync::kStorageWrite, VK_IMAGE_ASPECT_COLOR_BIT);
-        deferred_.recordSsaoPass(cmd, ssaoSetGt_, cullViewProj, frameIndex, dw, dh);
+        deferred_.recordSsaoPass(cmd, ssaoSetGt_, invAoVpGt, frameIndex, camera_.nearPlane,
+                                 camera_.farPlane, aoMaxLodGt, dw, dh);
         transition(gtAoRaw_.image, gtAoRawLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                    sync::kCompute, sync::kStorageWrite, sync::kCompute, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
+        const uint32_t aoWriteGt = aoFramesGt_ & 1u;
+        deferred_.recordSsaoTemporalPass(cmd, gtAoHist_, aoWriteGt, invAoVpGt, prevAoViewProjGt_,
+                                         dw, dh, /*reset=*/aoFramesGt_ == 0);
+        prevAoViewProjGt_ = cullViewProj;
+        ++aoFramesGt_;
         transition(gtAo_.image, gtAoLayout_, VK_IMAGE_LAYOUT_GENERAL, sync::kSampleStages,
                    sync::kSampled, sync::kCompute, sync::kStorageWrite, VK_IMAGE_ASPECT_COLOR_BIT);
-        deferred_.recordSsaoBlurPass(cmd, ssaoBlurSetGt_, dw, dh);
+        deferred_.recordSsaoBlurPass(cmd, gtAoHist_.blurSet[aoWriteGt], dw, dh);
         transition(gtAo_.image, gtAoLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                    sync::kCompute, sync::kStorageWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
@@ -2329,6 +2392,12 @@ void CompareApp::shutdown() {
     deferred_.destroyDepthPyramid(ctx_, gbPyramid_);
     deferred_.destroyDepthPyramid(ctx_, gtPyramid_);
     deferred_.destroyDepthPyramid(ctx_, gtSsaaPyramid_);
+    deferred_.destroyDepthPyramid(ctx_, gbPyramidAo_);
+    deferred_.destroyDepthPyramid(ctx_, gtPyramidAo_);
+    deferred_.destroyDepthPyramid(ctx_, gtSsaaPyramidAo_);
+    deferred_.destroyAoHistory(ctx_, gbAoHist_);
+    deferred_.destroyAoHistory(ctx_, gtAoHist_);
+    deferred_.destroyAoHistory(ctx_, gtSsaaAoHist_);
     gbAlbedo_.destroy(ctx_);
     gbNormal_.destroy(ctx_);
     gbMaterial_.destroy(ctx_);

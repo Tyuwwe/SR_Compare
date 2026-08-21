@@ -147,6 +147,18 @@ private:
     // resource, later reused by GTAO/contact shadows/occlusion culling.
     DepthPyramid gbPyramid_;
     DepthPyramid gtPyramid_;
+    // GTAO view-Z depth chains (XeGTAO DepthMIPFilter) + temporal accumulation
+    // ping-pong state, one per path.  Per-path previous-frame view-projection
+    // (jittered for LR) and frame counters drive the temporal pass; a zero
+    // counter resets (bypasses) the history.
+    DepthPyramid gbPyramidAo_;
+    DepthPyramid gtPyramidAo_;
+    AoHistory gbAoHist_;
+    AoHistory gtAoHist_;
+    Mat4 prevAoViewProjGb_ = Mat4::identity();
+    Mat4 prevAoViewProjGt_ = Mat4::identity();
+    uint32_t aoFramesGb_ = 0;
+    uint32_t aoFramesGt_ = 0;
 
     // Shared deferred pipeline (shaders/layouts/pipelines/samplers + IBL maps).
     DeferredCore deferred_;
@@ -173,10 +185,9 @@ private:
     VkDescriptorSet textureSet_ = VK_NULL_HANDLE;
     VkDescriptorSet presentSet_ = VK_NULL_HANDLE;
     // SSAO descriptor sets (static: the referenced textures never change).
+    // The blur sets live inside AoHistory (one per ping-pong buffer).
     VkDescriptorSet ssaoSetGb_ = VK_NULL_HANDLE;
-    VkDescriptorSet ssaoBlurSetGb_ = VK_NULL_HANDLE;
     VkDescriptorSet ssaoSetGt_ = VK_NULL_HANDLE;
-    VkDescriptorSet ssaoBlurSetGt_ = VK_NULL_HANDLE;
     VkDescriptorSet bloomExtractGb_ = VK_NULL_HANDLE;
     VkDescriptorSet bloomBlurHGb_ = VK_NULL_HANDLE;
     VkDescriptorSet bloomBlurVGb_ = VK_NULL_HANDLE;

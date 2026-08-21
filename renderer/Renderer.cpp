@@ -259,6 +259,17 @@ bool Renderer::createRenderTargets() {
         return false;
     if (!deferred_.createDepthPyramid(ctx_, dw, dh, gtPyramid_))
         return false;
+    // GTAO view-Z depth chains (XeGTAO DepthMIPFilter) + temporal history.
+    if (!deferred_.createDepthPyramid(ctx_, renderWidth_, renderHeight_, gbPyramidAo_,
+                                      /*aoFilter=*/true, camera_.nearPlane, camera_.farPlane))
+        return false;
+    if (!deferred_.createDepthPyramid(ctx_, dw, dh, gtPyramidAo_, /*aoFilter=*/true,
+                                      camera_.nearPlane, camera_.farPlane))
+        return false;
+    if (!deferred_.createAoHistory(ctx_, renderWidth_, renderHeight_, gbAoHist_))
+        return false;
+    if (!deferred_.createAoHistory(ctx_, dw, dh, gtAoHist_))
+        return false;
     // Color mip chains for roughness-aware SSR (mip 0 = the lit-color copy).
     if (!deferred_.createColorPyramid(ctx_, renderWidth_, renderHeight_, gbColorPyramid_))
         return false;
@@ -312,14 +323,15 @@ bool Renderer::createSceneDescriptors() {
 
     VkDescriptorPoolSize sizes[5] = {};
     // Hi-Z / color downsample sets: one per mip per pyramid (sampler + storage image).
-    const uint32_t hizSets = gbPyramid_.mipCount + gtPyramid_.mipCount;
+    const uint32_t hizSets = gbPyramid_.mipCount + gtPyramid_.mipCount + gbPyramidAo_.mipCount +
+                             gtPyramidAo_.mipCount;
     const uint32_t colorSets = gbColorPyramid_.mipCount + gtColorPyramid_.mipCount;
     sizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     sizes[0].descriptorCount = deferred::kMaxTextures + 1 + // texture array + present
                                11 * kFramesInFlight * 2 + // lighting sets (GB/GT), +1 shadow map
                                7 * kFramesInFlight * 2 +  // transparent sets (GB/GT), +SSR+shadow
                                9 * kFramesInFlight * 2 +  // opaque-SSR sets (GB/GT)
-                               2 * 2 + 1 * 2 +            // ssao + blur samplers
+                               2 * 2 + 3 * 4 + 1 * 4 +     // ssao + temporal + blur samplers
                                8 +                        // bloom extract/blur/comp (GB/GT)
                                1 +                        // auto-exposure HDR source
                                hizSets + colorSets;
@@ -328,13 +340,13 @@ bool Renderer::createSceneDescriptors() {
     sizes[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
     sizes[2].descriptorCount = kFramesInFlight;
     sizes[3].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    // ssao + bloom (GB/GT) + pyramid mips + SSR in-place color targets
-    sizes[3].descriptorCount = 4 + 8 + hizSets + colorSets + kFramesInFlight * 2;
+    // ssao raw + temporal history + blur (GB/GT) + pyramid mips + SSR in-place color targets
+    sizes[3].descriptorCount = 10 + 8 + hizSets + colorSets + kFramesInFlight * 2;
     sizes[4].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     sizes[4].descriptorCount = 2; // auto-exposure histogram + state
     VkDescriptorPoolCreateInfo poolCi = {};
     poolCi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    poolCi.maxSets = kFramesInFlight * 7 + 6 + 8 + hizSets + colorSets + 1; // + 8 bloom, + 1 auto-exposure
+    poolCi.maxSets = kFramesInFlight * 7 + 12 + 8 + hizSets + colorSets + 1; // +12 ssao/temporal/blur, +8 bloom, +1 auto-exposure
     poolCi.poolSizeCount = 5;
     poolCi.pPoolSizes = sizes;
     if (vkCreateDescriptorPool(ctx_.device, &poolCi, nullptr, &descriptorPool_) != VK_SUCCESS)
@@ -343,6 +355,10 @@ bool Renderer::createSceneDescriptors() {
     if (!deferred_.writeDepthPyramidSets(ctx_, descriptorPool_, gbDepth_.view, gbPyramid_))
         return false;
     if (!deferred_.writeDepthPyramidSets(ctx_, descriptorPool_, gtDepth_.view, gtPyramid_))
+        return false;
+    if (!deferred_.writeDepthPyramidSets(ctx_, descriptorPool_, gbDepth_.view, gbPyramidAo_))
+        return false;
+    if (!deferred_.writeDepthPyramidSets(ctx_, descriptorPool_, gtDepth_.view, gtPyramidAo_))
         return false;
     // Color chain set 0 samples the lit HDR target (gbColor_ / finalImage_).
     if (!deferred_.writeColorPyramidSets(ctx_, descriptorPool_, gbColor_.view, gbColorPyramid_))
@@ -626,17 +642,19 @@ bool Renderer::createSyncResources() {
         ssaoAlloc.descriptorPool = descriptorPool_;
         ssaoAlloc.descriptorSetCount = 1;
         const VkDescriptorSetLayout ssaoLayout = deferred_.ssaoSetLayout();
-        const VkDescriptorSetLayout blurLayout = deferred_.ssaoBlurSetLayout();
         ssaoAlloc.pSetLayouts = &ssaoLayout;
         if (vkAllocateDescriptorSets(ctx_.device, &ssaoAlloc, &ssaoSetGb_) != VK_SUCCESS) return false;
         if (vkAllocateDescriptorSets(ctx_.device, &ssaoAlloc, &ssaoSetGt_) != VK_SUCCESS) return false;
-        ssaoAlloc.pSetLayouts = &blurLayout;
-        if (vkAllocateDescriptorSets(ctx_.device, &ssaoAlloc, &ssaoBlurSetGb_) != VK_SUCCESS) return false;
-        if (vkAllocateDescriptorSets(ctx_.device, &ssaoAlloc, &ssaoBlurSetGt_) != VK_SUCCESS) return false;
-        deferred_.writeSsaoSet(ctx_, ssaoSetGb_, gbDepth_.view, gbNormal_.view, gbAoRaw_.view);
-        deferred_.writeSsaoSet(ctx_, ssaoSetGt_, gtDepth_.view, gtNormal_.view, gtAoRaw_.view);
-        deferred_.writeSsaoBlurSet(ctx_, ssaoBlurSetGb_, gbAoRaw_.view, gbAo_.view);
-        deferred_.writeSsaoBlurSet(ctx_, ssaoBlurSetGt_, gtAoRaw_.view, gtAo_.view);
+        deferred_.writeSsaoSet(ctx_, ssaoSetGb_, gbPyramidAo_.chainView, gbNormal_.view,
+                               gbAoRaw_.view);
+        deferred_.writeSsaoSet(ctx_, ssaoSetGt_, gtPyramidAo_.chainView, gtNormal_.view,
+                               gtAoRaw_.view);
+        if (!deferred_.writeAoHistorySets(ctx_, descriptorPool_, gbAoRaw_.view, gbDepth_.view,
+                                          gbAo_.view, gbAoHist_))
+            return false;
+        if (!deferred_.writeAoHistorySets(ctx_, descriptorPool_, gtAoRaw_.view, gtDepth_.view,
+                                          gtAo_.view, gtAoHist_))
+            return false;
     }
 
     {
@@ -842,7 +860,8 @@ void Renderer::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
             }
         }
     }
-    updateLightingUBO(frameIndex, Mat4::inverse(viewProjUsed), shadow);
+    const Mat4 invViewProjUsed = Mat4::inverse(viewProjUsed);
+    updateLightingUBO(frameIndex, invViewProjUsed, shadow);
 
     ImageResource& tgtAlbedo = gbuffer ? gbAlbedo_ : gtAlbedo_;
     ImageResource& tgtNormal = gbuffer ? gbNormal_ : gtNormal_;
@@ -854,6 +873,12 @@ void Renderer::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     ImageResource& litTarget = gbuffer ? gbColor_ : finalImage_;
     const uint32_t sceneW = gbuffer ? renderWidth_ : opts_.displayWidth;
     const uint32_t sceneH = gbuffer ? renderHeight_ : opts_.displayHeight;
+    // Per-path GTAO temporal state (ping-pong index, reprojection matrix,
+    // first-frame reset).
+    DepthPyramid& aoChain = gbuffer ? gbPyramidAo_ : gtPyramidAo_;
+    AoHistory& aoHist = gbuffer ? gbAoHist_ : gtAoHist_;
+    Mat4& prevAoVp = gbuffer ? prevAoViewProjGb_ : prevAoViewProjGt_;
+    uint32_t& aoFrames = gbuffer ? aoFramesGb_ : aoFramesGt_;
 
     auto transition = [&](ImageResource& rt, VkImageLayout target,
                           VkPipelineStageFlags2 srcStage, VkAccessFlags2 srcAccess,
@@ -952,19 +977,29 @@ void Renderer::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                    sync::kColorAttach, sync::kColorWrite, sync::kFragment, sync::kSampled);
     }
 
-    // --- GTAO (depth + normal -> working AO/Z -> 5x5 bilateral denoise) ---------
-    // AoRaw ping-pongs between ssao main (storage write) and blur (sampled).
+    // --- GTAO (view-Z depth chain -> main pass -> temporal EMA -> denoise) ------
+    // The AO depth chain is rebuilt every frame (the main pass samples it at
+    // per-step LODs).  AoRaw ping-pongs between ssao main (storage write) and
+    // the temporal pass (sampled); the accumulated history feeds the blur.
+    deferred_.recordDepthPyramidPass(cmd, aoChain);
     transition(tgtAoRaw, VK_IMAGE_LAYOUT_GENERAL,
                sync::kCompute, sync::kSampled, sync::kCompute, sync::kStorageWrite);
-    deferred_.recordSsaoPass(cmd, gbuffer ? ssaoSetGb_ : ssaoSetGt_, viewProjUsed, frameIndex,
-                             sceneW, sceneH);
+    // XeGTAO's working depth has 5 levels: cap the step LOD at 4.
+    const float aoMaxLod = static_cast<float>(std::min(aoChain.mipCount - 1, 4u));
+    deferred_.recordSsaoPass(cmd, gbuffer ? ssaoSetGb_ : ssaoSetGt_, invViewProjUsed, frameIndex,
+                             camera_.nearPlane, camera_.farPlane, aoMaxLod, sceneW, sceneH);
     transition(tgtAoRaw, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                sync::kCompute, sync::kStorageWrite, sync::kCompute, sync::kSampled);
+    const uint32_t aoWrite = aoFrames & 1u;
+    deferred_.recordSsaoTemporalPass(cmd, aoHist, aoWrite, invViewProjUsed, prevAoVp, sceneW,
+                                     sceneH, /*reset=*/aoFrames == 0);
+    prevAoVp = viewProjUsed;
+    ++aoFrames;
     // Ao: sampled by the lighting fragment + opaque-SSR compute shaders,
     // rewritten by the blur pass.
     transition(tgtAo, VK_IMAGE_LAYOUT_GENERAL,
                sync::kSampleStages, sync::kSampled, sync::kCompute, sync::kStorageWrite);
-    deferred_.recordSsaoBlurPass(cmd, gbuffer ? ssaoBlurSetGb_ : ssaoBlurSetGt_, sceneW, sceneH);
+    deferred_.recordSsaoBlurPass(cmd, aoHist.blurSet[aoWrite], sceneW, sceneH);
     transition(tgtAo, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                sync::kCompute, sync::kStorageWrite, sync::kSampleStages, sync::kSampled);
 
@@ -1352,6 +1387,10 @@ void Renderer::shutdown() {
     deferred_.destroyColorPyramid(ctx_, gtColorPyramid_);
     deferred_.destroyDepthPyramid(ctx_, gbPyramid_);
     deferred_.destroyDepthPyramid(ctx_, gtPyramid_);
+    deferred_.destroyDepthPyramid(ctx_, gbPyramidAo_);
+    deferred_.destroyDepthPyramid(ctx_, gtPyramidAo_);
+    deferred_.destroyAoHistory(ctx_, gbAoHist_);
+    deferred_.destroyAoHistory(ctx_, gtAoHist_);
     finalImage_.destroy(ctx_);
 
     if (shadowsActive_) { deferred_.destroyShadowTargets(ctx_, shadow_); shadowsActive_ = false; }
