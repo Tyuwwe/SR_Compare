@@ -81,6 +81,39 @@ bool Scene::uploadMesh(const VulkanContext& ctx, const std::vector<Vertex>& vert
     return true;
 }
 
+bool Scene::uploadSkinnedMesh(const VulkanContext& ctx, const std::vector<SkinnedVertex>& vertices,
+                              const std::vector<uint32_t>& indices, Mesh& out, VkCommandPool pool) {
+    if (vertices.empty() || indices.empty()) return false;
+
+    const VkDeviceSize vbSize = vertices.size() * sizeof(SkinnedVertex);
+    const VkDeviceSize ibSize = indices.size() * sizeof(uint32_t);
+
+    // Own buffers, deliberately NOT accumulated into the merged scene buffers:
+    // the vertex format differs and skinned meshes are rare, so the merged
+    // draw path (which binds one vertex buffer per pass) cannot serve them.
+    if (!createStagedBuffer(ctx, vertices.data(), vbSize, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                            out.vertexBuffer, out.vertexMemory, pool))
+        return false;
+    if (!createStagedBuffer(ctx, indices.data(), ibSize, VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                            out.indexBuffer, out.indexMemory, pool))
+        return false;
+
+    Vec3 lo = vertices[0].position, hi = vertices[0].position;
+    for (const auto& v : vertices) {
+        lo.x = std::min(lo.x, v.position.x); lo.y = std::min(lo.y, v.position.y);
+        lo.z = std::min(lo.z, v.position.z);
+        hi.x = std::max(hi.x, v.position.x); hi.y = std::max(hi.y, v.position.y);
+        hi.z = std::max(hi.z, v.position.z);
+    }
+    out.aabbMin = lo;
+    out.aabbMax = hi;
+    out.firstIndex = 0;
+    out.vertexOffset = 0;
+    out.indexCount = static_cast<uint32_t>(indices.size());
+    out.indexType = VK_INDEX_TYPE_UINT32;
+    return true;
+}
+
 bool Scene::buildMergedBuffers(const VulkanContext& ctx, VkCommandPool pool) {
     if (mergedVerts_.empty() || mergedIndices_.empty()) return false;
     const VkDeviceSize vbSize = mergedVerts_.size() * sizeof(Vertex);
@@ -99,8 +132,11 @@ void Scene::finalizeInstances() {
     for (auto& inst : instances) {
         inst.normalModel = Mat4::transpose(Mat4::inverse(inst.model));
         // Transform the 8 local-AABB corners; the result is conservative for
-        // any affine model matrix.
-        const Mesh& mesh = meshes[inst.meshIndex];
+        // any affine model matrix.  Skinned instances index skinnedMeshes and
+        // their bounds are overwritten by computeAnimatedBounds() anyway (the
+        // bind-pose result here is only a placeholder).
+        const Mesh& mesh = inst.skinIndex >= 0 ? skinnedMeshes[inst.meshIndex]
+                                               : meshes[inst.meshIndex];
         Vec3 lo, hi;
         for (int c = 0; c < 8; ++c) {
             const Vec3 corner{(c & 1) ? mesh.aabbMax.x : mesh.aabbMin.x,
@@ -229,6 +265,32 @@ void Scene::destroy(const VulkanContext& ctx) {
         if (m.indexBuffer) vmaDestroyBuffer(ctx.allocator, m.indexBuffer, m.indexMemory);
     }
     meshes.clear();
+
+    for (auto& m : skinnedMeshes) {
+        if (m.vertexBuffer) vmaDestroyBuffer(ctx.allocator, m.vertexBuffer, m.vertexMemory);
+        if (m.indexBuffer) vmaDestroyBuffer(ctx.allocator, m.indexBuffer, m.indexMemory);
+    }
+    skinnedMeshes.clear();
+
+    for (uint32_t slot = 0; slot < kSkinPaletteSlots; ++slot) {
+        if (skinPaletteBuffer[slot]) {
+            if (skinPaletteMapped[slot]) {
+                vmaUnmapMemory(ctx.allocator, skinPaletteMemory[slot]);
+                skinPaletteMapped[slot] = nullptr;
+            }
+            vmaDestroyBuffer(ctx.allocator, skinPaletteBuffer[slot], skinPaletteMemory[slot]);
+            skinPaletteBuffer[slot] = VK_NULL_HANDLE;
+            skinPaletteMemory[slot] = VK_NULL_HANDLE;
+        }
+    }
+    skinPaletteJointCount = 0;
+    skins.clear();
+    nodes.clear();
+    nodeTopoOrder.clear();
+    animSamplers.clear();
+    animChannels.clear();
+    animDuration = 0.f;
+    dynamicDrivers.clear();
 
     for (auto& t : textures) {
         if (t.view) vkDestroyImageView(ctx.device, t.view, nullptr);

@@ -8,6 +8,7 @@ add_library(renderer STATIC
     core/TimestampQuery.cpp
     core/MemoryBudget.cpp
     scene/Scene.cpp
+    scene/Animation.cpp
     scene/ProceduralScene.cpp
     scene/GltfLoader.cpp
     scene/Camera.cpp
@@ -28,6 +29,7 @@ set(RENDERER_SHADERS
     shaders/fullscreen.vert
     shaders/present.frag
     shaders/gbuffer.vert
+    shaders/gbuffer_skinned.vert
     shaders/gbuffer.frag
     shaders/gbuffer_gt.frag
     shaders/lighting.frag
@@ -35,6 +37,7 @@ set(RENDERER_SHADERS
     shaders/transparent.frag
     shaders/transparent_gt.frag
     shaders/shadow_depth.vert
+    shaders/shadow_depth_skinned.vert
     shaders/shadow_depth.frag
     shaders/ssao.comp
     shaders/ssao_blur.comp

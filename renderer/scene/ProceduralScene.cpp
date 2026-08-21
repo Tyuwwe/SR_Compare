@@ -141,6 +141,51 @@ bool Scene::loadProcedural(const VulkanContext& ctx, VkCommandPool pool) {
 
     updatePrevTransforms();
     finalizeInstances();
+
+    // Dynamic test load: two boxes driven by the frame index (see
+    // Scene::advanceToFrame), giving temporal upscalers non-trivial per-object
+    // motion vectors.  Added AFTER finalizeInstances so the driver indices
+    // survive the (material, mesh) sort; the static sort order is untouched.
+    // Their culling AABBs are analytic motion envelopes (yaw rotation -> the
+    // circumscribed sphere box, plus the slide amplitude).
+    auto addDynamicBox = [&](const DynamicBoxDriver& drv, uint32_t mat) {
+        DynamicBoxDriver d = drv;
+        d.instanceIndex = static_cast<uint32_t>(instances.size());
+
+        MeshInstance inst;
+        inst.meshIndex = cubeMesh;
+        inst.materialIndex = mat;
+        inst.model = composeTransform(d.basePos, d.baseYaw, d.scale);
+        inst.prevModel = inst.model;
+        inst.normalModel = Mat4::transpose(Mat4::inverse(inst.model));
+
+        const float halfDiag = 0.5f * std::sqrt(d.scale.x * d.scale.x + d.scale.y * d.scale.y +
+                                                d.scale.z * d.scale.z);
+        const Vec3 ext{halfDiag + std::fabs(d.slideAmp.x), halfDiag + std::fabs(d.slideAmp.y),
+                       halfDiag + std::fabs(d.slideAmp.z)};
+        inst.aabbMin = d.basePos - ext;
+        inst.aabbMax = d.basePos + ext;
+
+        instances.push_back(inst);
+        dynamicDrivers.push_back(d);
+    };
+
+    // Spinner: yaws in place near the path's mid-field view.
+    DynamicBoxDriver spinner;
+    spinner.basePos = {2.f, 1.75f, 1.5f};
+    spinner.scale = {1.4f, 1.4f, 1.4f};
+    spinner.yawRate = 1.1f; // rad/s
+    addDynamicBox(spinner, boxMatStart + 0);
+
+    // Slider: translates along X and counter-rotates, hovering above the floor.
+    DynamicBoxDriver slider;
+    slider.basePos = {-2.5f, 2.5f, -2.f};
+    slider.scale = {1.f, 1.f, 1.f};
+    slider.yawRate = -0.7f;
+    slider.slideAmp = {2.2f, 0.6f, 0.f};
+    slider.slidePeriod = 4.f; // seconds
+    addDynamicBox(slider, boxMatStart + 2);
+
     buildMergedBuffers(ctx, pool);
     return true;
 }

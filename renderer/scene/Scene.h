@@ -59,14 +59,85 @@ struct Material {
 };
 
 struct MeshInstance {
-    uint32_t meshIndex = 0;
+    uint32_t meshIndex = 0;      // meshes[], or skinnedMeshes[] when skinIndex >= 0
     uint32_t materialIndex = 0;
     Mat4 model;
-    Mat4 prevModel; // reserved per-object previous transform (static == model for now)
+    Mat4 prevModel; // previous-frame transform; rewritten per frame for dynamic instances
     Mat4 normalModel;    // cached transpose(inverse(model)); only the upper 3x3 matters
     Vec3 aabbMin{0.f, 0.f, 0.f}; // world-space bounds (for frustum culling)
     Vec3 aabbMax{0.f, 0.f, 0.f};
+    int32_t nodeIndex = -1; // scene node driving this instance (-1 = static)
+    int32_t skinIndex = -1; // skins[] entry (-1 = rigid); skinned draws use skinnedMeshes
 };
+
+// Skinned vertex: same layout as Vertex plus JOINTS0/WEIGHTS0.  Joints index
+// into the owning skin's joint list (never the palette directly).
+struct SkinnedVertex {
+    Vec3 position;
+    Vec3 normal;
+    Vec2 uv;
+    Vec4 tangent{1.f, 0.f, 0.f, 1.f};
+    uint16_t joints[4] = {0, 0, 0, 0};
+    Vec4 weights{1.f, 0.f, 0.f, 0.f}; // normalized on load
+};
+
+// --- glTF animation / skinning state ------------------------------------------
+// Populated only when the loaded file has animations or skins; scenes without
+// them (Sponza, Bistro, procedural) keep zero overhead and the exact old
+// static behaviour.
+
+struct SceneNode {
+    int32_t parent = -1;
+    Vec3 translation{0.f, 0.f, 0.f};
+    Vec4 rotation{0.f, 0.f, 0.f, 1.f}; // quaternion xyzw
+    Vec3 scale{1.f, 1.f, 1.f};
+};
+
+enum class AnimPath : uint32_t { Translation = 0, Rotation = 1, Scale = 2 };
+
+struct AnimSampler {
+    std::vector<float> times;
+    std::vector<Vec4> values; // translation/scale in xyz, rotation quaternion in xyzw
+    bool step = false;        // STEP interpolation (default: LINEAR; CUBICSPLINE unsupported)
+};
+
+struct AnimChannel {
+    uint32_t node = 0;
+    AnimPath path = AnimPath::Translation;
+    uint32_t sampler = 0;
+};
+
+struct Skin {
+    std::vector<uint32_t> joints;   // scene node indices
+    std::vector<Mat4> inverseBind;  // one per joint
+    // Mat4 offsets into the joint palette buffer (see Scene::skinPaletteBuffer).
+    uint32_t paletteCur = 0;
+    uint32_t palettePrev = 0;
+};
+
+// Procedural test-scene motion driver: a box yawing around its own centre and
+// sliding on a sinusoidal path.  Analytic (not keyframed) so the pose is a
+// pure function of the frame index — bench determinism depends on that.
+struct DynamicBoxDriver {
+    uint32_t instanceIndex = 0;
+    Vec3 basePos{0.f, 0.f, 0.f};
+    float baseYaw = 0.f;
+    Vec3 scale{1.f, 1.f, 1.f};
+    float yawRate = 0.f;            // rad/s around Y
+    Vec3 slideAmp{0.f, 0.f, 0.f};   // sinusoidal translation amplitude (m)
+    float slidePeriod = 1.f;        // seconds
+    float slidePhase = 0.f;
+};
+
+// Fixed animation timestep: poses are sampled at frame * kAnimDt (never wall
+// clock) so a fixed camera path is bit-reproducible across runs.
+constexpr float kAnimDt = 1.f / 60.f;
+
+// Joint palettes are double-buffered to match the hosts' kFramesInFlight: the
+// palette written for frame N lives in slot N % kSkinPaletteSlots and is only
+// overwritten once that slot's fence has passed (same rule as the per-slot
+// UBOs), so in-flight frames never read a half-updated palette.
+constexpr uint32_t kSkinPaletteSlots = 2;
 
 // Punctual light, modelled after KHR_lights_punctual.  Plain POD: the GPU
 // packing (std140 LightGPU) happens in DeferredCore::fillLightingUBO.
@@ -142,6 +213,37 @@ public:
     VkBuffer mergedIndexBuffer = VK_NULL_HANDLE;
     VmaAllocation mergedIndexMemory = VK_NULL_HANDLE;
 
+    // --- animation / skinning (see the struct comments above) -----------------
+    std::vector<SceneNode> nodes;         // node tree (local TRS), kept only for animated scenes
+    std::vector<uint32_t> nodeTopoOrder;  // parents before children
+    std::vector<AnimSampler> animSamplers;
+    std::vector<AnimChannel> animChannels; // the first glTF animation, flattened
+    float animDuration = 0.f;              // seconds; looping wraps via fmod
+    std::vector<Skin> skins;
+    // Skinned meshes keep their own (non-merged) buffers: their vertex format
+    // differs and they are few, so the merged-buffer optimization is skipped.
+    std::vector<Mesh> skinnedMeshes;
+    std::vector<DynamicBoxDriver> dynamicDrivers;
+
+    // Joint palette SSBOs (one per in-flight slot, see kSkinPaletteSlots).
+    // Layout per buffer: [current-frame joints][previous-frame joints], the
+    // previous block starting at skinPaletteJointCount mat4s.  Persistently
+    // mapped; advanceToFrame() rewrites the current frame's slot.
+    VkBuffer skinPaletteBuffer[kSkinPaletteSlots] = {};
+    VmaAllocation skinPaletteMemory[kSkinPaletteSlots] = {};
+    void* skinPaletteMapped[kSkinPaletteSlots] = {};
+    uint32_t skinPaletteJointCount = 0;
+
+    bool hasDynamicContent() const { return !animChannels.empty() || !dynamicDrivers.empty(); }
+    bool hasSkinnedMeshes() const { return !skinnedMeshes.empty(); }
+    VkBuffer skinPalette(uint32_t slot) const { return skinPaletteBuffer[slot % kSkinPaletteSlots]; }
+
+    // Advances animations / dynamic drivers to the given frame (time =
+    // frameIndex * kAnimDt).  Rewrites model/prevModel/normalModel of driven
+    // instances and the current slot's joint palettes.  No-op for fully
+    // static scenes.  Must be called once per frame before recording.
+    void advanceToFrame(uint32_t frameIndex);
+
     // Optional load progress (glTF).  total == 0 means the stage is
     // indeterminate (parse / finalize).  The callback fires from whichever
     // thread runs the load (the GUI worker thread during async rebuilds), so
@@ -171,6 +273,18 @@ public:
     bool uploadMesh(const VulkanContext& ctx, const std::vector<Vertex>& vertices,
                     const std::vector<uint32_t>& indices, Mesh& out,
                     VkCommandPool pool = VK_NULL_HANDLE);
+    // Skinned meshes stay out of the merged scene buffers (different vertex
+    // format); the returned Mesh addresses its own buffers from offset 0.
+    bool uploadSkinnedMesh(const VulkanContext& ctx, const std::vector<SkinnedVertex>& vertices,
+                           const std::vector<uint32_t>& indices, Mesh& out,
+                           VkCommandPool pool = VK_NULL_HANDLE);
+    // Allocates + persistently maps the per-slot joint palette SSBOs and fills
+    // them with the bind pose.  Call once after skins/nodes are loaded.
+    bool createSkinPalettes(const VulkanContext& ctx);
+    // Recomputes conservative world AABBs for animation-driven and skinned
+    // instances by sampling the whole animation (static instances already got
+    // tight bounds from finalizeInstances).  Called by the loaders.
+    void computeAnimatedBounds();
     // Uploads RGBA8 texels and generates the full mip chain (per-level blits).
     // srgb=true (default): base color / emissive; false: normal/MR/AO data.
     bool uploadTexture(const VulkanContext& ctx, uint32_t width, uint32_t height,
