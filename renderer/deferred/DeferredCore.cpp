@@ -1431,6 +1431,7 @@ void DeferredCore::recordGBufferDraws(VkCommandBuffer cmd, const Scene& scene, b
     for (const auto& inst : scene.instances) {
         if (scene.materials[inst.materialIndex].blend) continue; // transparency pass draws these
         if (!aabbIntersectsFrustum(frustum, inst.aabbMin, inst.aabbMax)) continue;
+        if (inst.lodCulled) continue; // LOD screen-size cull (updateLodSelection)
 
         if (inst.skinIndex >= 0) {
             // Skinned draw: own vertex buffers + palette offsets; the push
@@ -1489,8 +1490,9 @@ void DeferredCore::recordGBufferDraws(VkCommandBuffer cmd, const Scene& scene, b
                                     &sceneSet, 1, &dynOffset);
         }
 
-        const Mesh& mesh = scene.meshes[inst.meshIndex];
-        vkCmdDrawIndexed(cmd, mesh.indexCount, 1, mesh.firstIndex, mesh.vertexOffset, 0);
+        // LOD level chosen by Scene::updateLodSelection (lodDraws[0] = full mesh).
+        const LodDraw& draw = inst.lodDraws[inst.lodLevel];
+        vkCmdDrawIndexed(cmd, draw.indexCount, 1, draw.firstIndex, draw.vertexOffset, 0);
     }
 }
 
@@ -2590,6 +2592,7 @@ void DeferredCore::recordTransparentDraws(VkCommandBuffer cmd, const Scene& scen
         const MeshInstance& inst = scene.instances[i];
         if (!scene.materials[inst.materialIndex].blend) continue;
         if (!aabbIntersectsFrustum(frustum, inst.aabbMin, inst.aabbMax)) continue;
+        if (inst.lodCulled) continue; // LOD screen-size cull
         order.push_back(i);
     }
     if (order.empty()) return;
@@ -2637,8 +2640,8 @@ void DeferredCore::recordTransparentDraws(VkCommandBuffer cmd, const Scene& scen
                                     0, 1, &sceneSet, 1, &dynOffset);
         }
 
-        const Mesh& mesh = scene.meshes[inst.meshIndex];
-        vkCmdDrawIndexed(cmd, mesh.indexCount, 1, mesh.firstIndex, mesh.vertexOffset, 0);
+        const LodDraw& draw = inst.lodDraws[inst.lodLevel];
+        vkCmdDrawIndexed(cmd, draw.indexCount, 1, draw.firstIndex, draw.vertexOffset, 0);
     }
 }
 
@@ -2838,6 +2841,9 @@ void DeferredCore::recordShadowPass(VkCommandBuffer cmd, const ShadowTargets& ta
         for (const auto& inst : scene.instances) {
             if (scene.materials[inst.materialIndex].blend) continue; // glass does not occlude
             if (!aabbIntersectsFrustum(frustum, inst.aabbMin, inst.aabbMax)) continue;
+            // Same LOD choice as the camera passes: a caster too small to draw
+            // casts a shadow too small to miss, and the ranges are free here.
+            if (inst.lodCulled) continue;
 
             if (inst.skinIndex >= 0) {
                 // Skinned caster: current-frame palette only (no motion here).
@@ -2893,8 +2899,8 @@ void DeferredCore::recordShadowPass(VkCommandBuffer cmd, const ShadowTargets& ta
                                         0, 1, &sceneSet, 1, &dynOffset);
             }
 
-            const Mesh& mesh = scene.meshes[inst.meshIndex];
-            vkCmdDrawIndexed(cmd, mesh.indexCount, 1, mesh.firstIndex, mesh.vertexOffset, 0);
+            const LodDraw& draw = inst.lodDraws[inst.lodLevel];
+            vkCmdDrawIndexed(cmd, draw.indexCount, 1, draw.firstIndex, draw.vertexOffset, 0);
         }
         vkCmdEndRendering(cmd);
     }

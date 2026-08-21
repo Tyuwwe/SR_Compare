@@ -8,6 +8,7 @@
 #include "renderer/math/Math.h"
 
 #include <cstdint>
+#include <cstdlib>
 #include <functional>
 #include <vector>
 
@@ -18,6 +19,38 @@ struct Vertex {
     Vec3 normal;
     Vec2 uv;
     Vec4 tangent{1.f, 0.f, 0.f, 1.f}; // xyz = tangent, w = bitangent sign
+};
+
+// --- LOD -------------------------------------------------------------------
+// Per-mesh LOD chains (2020-standard: discrete levels switched by projected
+// screen size).  Two sources, unified into the same per-instance draw-range
+// table at load time:
+//  - authored: glTF MSFT_lod node extension (chain of sibling nodes/meshes);
+//  - generated: meshopt_simplify index-only decimation (LodBuilder.cpp).
+// Skinned meshes deliberately keep a single level: simplification would have
+// to preserve skin weights/bounds and skinned meshes are rare, so the win
+// does not pay for the complexity.
+constexpr uint32_t kMaxMeshLods = 4; // LOD0 + up to 3 coarser levels
+
+// Hosts default LOD selection to on; SR_LOD=0 disables it (bench A/B
+// comparisons against pre-LOD behavior in the same binary).
+inline bool lodEnabledByDefault() {
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4996) // std::getenv is portable; _dupenv_s is MSVC-only
+#endif
+    const char* v = std::getenv("SR_LOD");
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
+    return !v || v[0] != '0';
+}
+
+// One draw range into the merged scene buffers (index span + vertex offset).
+struct LodDraw {
+    uint32_t firstIndex = 0;
+    uint32_t indexCount = 0;
+    int32_t vertexOffset = 0;
 };
 
 struct Mesh {
@@ -32,6 +65,11 @@ struct Mesh {
     // Location inside the merged scene-wide buffers (viewer draw path).
     uint32_t firstIndex = 0;
     int32_t vertexOffset = 0;
+    // LOD chain as ranges into the merged index buffer; generated levels
+    // share the original vertices (meshopt_simplify only re-indexes), so
+    // vertexOffset stays the mesh's own.  lods[0] mirrors the fields above.
+    LodDraw lods[kMaxMeshLods] = {};
+    uint32_t lodCount = 1;
 };
 
 struct Texture {
@@ -68,6 +106,20 @@ struct MeshInstance {
     Vec3 aabbMax{0.f, 0.f, 0.f};
     int32_t nodeIndex = -1; // scene node driving this instance (-1 = static)
     int32_t skinIndex = -1; // skins[] entry (-1 = rigid); skinned draws use skinnedMeshes
+
+    // Per-frame LOD state (updateLodSelection; deterministic: pure function of
+    // camera + instance bounds with hysteresis, no wall-clock input).
+    uint32_t lodLevel = 0; // index into lodDraws
+    bool lodCulled = false; // projected size below the cull radius: skip draw
+    // Draw range per LOD level.  Mirrors meshes[meshIndex].lods unless the
+    // glTF authored an MSFT_lod chain, in which case each level points at the
+    // LOD node's own mesh.  Unused by the skinned draw path.
+    LodDraw lodDraws[kMaxMeshLods] = {};
+    uint32_t lodDrawCount = 1;
+    // Authored MSFT_lod chain (scene mesh indices per level, [0] = this
+    // instance's mesh); consumed once by buildLodDraws(), then stale.
+    uint32_t authoredLodMeshes[kMaxMeshLods] = {};
+    uint32_t authoredLodCount = 0;
 };
 
 // Skinned vertex: same layout as Vertex plus JOINTS0/WEIGHTS0.  Joints index
@@ -243,6 +295,23 @@ public:
     // instances and the current slot's joint palettes.  No-op for fully
     // static scenes.  Must be called once per frame before recording.
     void advanceToFrame(uint32_t frameIndex);
+
+    // Per-frame LOD selection: picks lodLevel/lodCulled per instance from the
+    // world-AABB bounding sphere projected at a FIXED 1080p reference height
+    // (so GT and upscaled paths of the same frame always agree).  Called once
+    // per frame by the hosts right after advanceToFrame(); with enabled=false
+    // everything stays at LOD0 / never culled.
+    void updateLodSelection(const Vec3& cameraPos, float fovY, bool enabled);
+
+    // Fills per-instance lodDraws from mesh LOD chains (or the authored
+    // MSFT_lod chain when present).  Call once after all meshes and generated
+    // LOD levels exist, before buildMergedBuffers().
+    void buildLodDraws();
+
+    // Appends one generated LOD level (index buffer over the mesh's existing
+    // vertices) to the mesh's chain and the merged index accumulation.
+    // Used by LodBuilder before buildMergedBuffers().
+    void appendMeshLod(uint32_t meshIndex, const std::vector<uint32_t>& indices);
 
     // Optional load progress (glTF).  total == 0 means the stage is
     // indeterminate (parse / finalize).  The callback fires from whichever

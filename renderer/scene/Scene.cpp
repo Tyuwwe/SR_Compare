@@ -78,6 +78,8 @@ bool Scene::uploadMesh(const VulkanContext& ctx, const std::vector<Vertex>& vert
 
     out.indexCount = static_cast<uint32_t>(indices.size());
     out.indexType = VK_INDEX_TYPE_UINT32;
+    out.lods[0] = {out.firstIndex, out.indexCount, out.vertexOffset};
+    out.lodCount = 1;
     return true;
 }
 
@@ -111,6 +113,8 @@ bool Scene::uploadSkinnedMesh(const VulkanContext& ctx, const std::vector<Skinne
     out.vertexOffset = 0;
     out.indexCount = static_cast<uint32_t>(indices.size());
     out.indexType = VK_INDEX_TYPE_UINT32;
+    out.lods[0] = {0, out.indexCount, 0};
+    out.lodCount = 1;
     return true;
 }
 

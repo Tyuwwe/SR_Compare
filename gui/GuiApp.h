@@ -493,6 +493,8 @@ private:
     bool shadowDebugCascades_ = false; // tint pixels per shadow cascade
     // Opaque screen-space reflections (per-frame pass skip, no rebuild).
     bool ssrEnabled_ = true;
+    // Screen-size LOD switching + distance cull (per-frame CPU selection).
+    bool lodEnabled_ = lodEnabledByDefault();
 
     ImageResource gbColor_;
     ImageResource gbColorSpatial_; // unjittered LR HDR copy for spatial upscalers

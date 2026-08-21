@@ -2740,6 +2740,8 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     // Frame-index driven scene animation (dynamic boxes / glTF clips), before
     // any recording; no-op for static scenes.
     scene_.advanceToFrame(frameIndex);
+    // CPU LOD selection for this frame's camera (GUI checkbox toggles it).
+    scene_.updateLodSelection(camera_.position, camera_.fovY, lodEnabled_);
 
     vkResetCommandBuffer(cmd, 0);
     VkCommandBufferBeginInfo begin = {};
@@ -4489,6 +4491,8 @@ void GuiApp::drawViewerTab() {
     if (!shadowsActive_) ImGui::EndDisabled();
     // Opaque SSR: per-frame pass skip (no rebuild), all deferred paths.
     ImGui::Checkbox("ssr (opaque)", &ssrEnabled_);
+    // Screen-size LOD + small-object cull: per-frame CPU selection, no rebuild.
+    ImGui::Checkbox("lod", &lodEnabled_);
     ImGui::Separator();
 
     // Live performance readout.

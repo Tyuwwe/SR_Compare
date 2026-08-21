@@ -1,10 +1,14 @@
 #include "renderer/scene/Scene.h"
 
 #include "renderer/core/VkUtil.h"
+#include "renderer/scene/LodBuilder.h"
 #include "renderer/scene/SceneRegistry.h"
 
+#include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <set>
 #include <string>
 #include <utility>
@@ -99,6 +103,33 @@ std::string dirOfPath(const char* path) {
     std::string p(path);
     const size_t slash = p.find_last_of("/\\");
     return slash == std::string::npos ? std::string() : p.substr(0, slash + 1);
+}
+
+// cgltf keeps unparsed extensions as raw JSON (name + data); MSFT_lod carries
+// {"ids":[n0,n1,...]} — nodes that are the next-coarser LODs of this node.
+std::vector<int32_t> parseMsftLodIds(const cgltf_node* node, cgltf_size nodeCount) {
+    std::vector<int32_t> ids;
+    for (size_t e = 0; e < node->extensions_count; ++e) {
+        const cgltf_extension& ext = node->extensions[e];
+        if (!ext.name || std::strcmp(ext.name, "MSFT_lod") != 0 || !ext.data) continue;
+        const char* p = std::strstr(ext.data, "\"ids\"");
+        if (!p) continue;
+        p = std::strchr(p, '[');
+        if (!p) continue;
+        ++p;
+        while (*p && *p != ']') {
+            while (*p && *p != ']' && (std::isspace(static_cast<unsigned char>(*p)) || *p == ','))
+                ++p;
+            if (!*p || *p == ']') break;
+            char* end = nullptr;
+            const long v = std::strtol(p, &end, 10);
+            if (end == p) break; // malformed: stop instead of looping forever
+            p = end;
+            if (v >= 0 && static_cast<cgltf_size>(v) < nodeCount)
+                ids.push_back(static_cast<int32_t>(v));
+        }
+    }
+    return ids;
 }
 
 // Splits a node's baked matrix into TRS so animation channels can override
@@ -377,6 +408,37 @@ bool Scene::loadGltf(const VulkanContext& ctx, const char* path, VkCommandPool p
         for (size_t m = 0; m < data->meshes_count; ++m)
             skinnedMeshIdx[m].assign(data->meshes[m].primitives_count, -1);
     }
+
+    // (mesh, primitive) -> scene mesh index for static uploads, needed to
+    // resolve MSFT_lod chains whose LOD nodes may be processed later.
+    std::vector<std::vector<int32_t>> staticMeshIdx(data->meshes_count);
+    for (size_t m = 0; m < data->meshes_count; ++m)
+        staticMeshIdx[m].assign(data->meshes[m].primitives_count, -1);
+
+    // MSFT_lod: nodes referenced by another node's "ids" are LOD variants of
+    // it; they get no own instance, the master instance switches to their
+    // meshes instead.  Skinned masters keep a single level (see Scene.h).
+    std::vector<char> lodAuxNode(data->nodes_count, 0);
+    std::vector<std::vector<int32_t>> lodIdsPerNode(data->nodes_count);
+    for (size_t n = 0; n < data->nodes_count; ++n) {
+        const cgltf_node* node = &data->nodes[n];
+        if (!node->mesh || node->skin) continue;
+        lodIdsPerNode[n] = parseMsftLodIds(node, data->nodes_count);
+        for (const int32_t id : lodIdsPerNode[n]) {
+            if (data->nodes[id].mesh) lodAuxNode[static_cast<size_t>(id)] = 1;
+        }
+    }
+    // Instances whose authored chain must be resolved after ALL meshes are
+    // uploaded (LOD nodes can reference meshes later in the file).
+    struct PendingLodChain {
+        uint32_t instanceIndex;
+        uint32_t node;
+        uint32_t prim;
+    };
+    std::vector<PendingLodChain> pendingLodChains;
+    // CPU geometry stash for runtime LOD generation (moved, not copied).
+    std::vector<LodSourceMesh> lodSources;
+
     size_t totalPrims = 0;
     for (int m = 0; m < static_cast<int>(data->meshes_count); ++m)
         totalPrims += data->meshes[m].primitives_count;
@@ -455,12 +517,18 @@ bool Scene::loadGltf(const VulkanContext& ctx, const char* path, VkCommandPool p
                 if (!uploadMesh(ctx, verts, idx, out, pool)) continue;
                 meshes.push_back(out);
                 meshIndex = static_cast<uint32_t>(meshes.size() - 1);
+                staticMeshIdx[static_cast<size_t>(m)][static_cast<size_t>(p)] =
+                    static_cast<int32_t>(meshIndex);
+                // Stash the CPU copy for LOD generation (move: uploadMesh
+                // already fed the merged buffers, so this costs nothing).
+                lodSources.push_back({meshIndex, std::move(verts), std::move(idx)});
             }
 
             // Instances come from nodes that reference this mesh.
             for (int n = 0; n < static_cast<int>(data->nodes_count); ++n) {
                 const cgltf_node* node = &data->nodes[n];
                 if (node->mesh != mesh) continue;
+                if (lodAuxNode[static_cast<size_t>(n)]) continue; // drawn via the LOD master
 
                 MeshInstance inst;
                 inst.materialIndex = matIdx >= 0 ? static_cast<uint32_t>(matIdx) : 0;
@@ -524,7 +592,39 @@ bool Scene::loadGltf(const VulkanContext& ctx, const char* path, VkCommandPool p
                 inst.prevModel = inst.model;
                 if (keepNodes) inst.nodeIndex = n; // per-frame advance rewrites model/prevModel
                 instances.push_back(inst);
+                if (!lodIdsPerNode[static_cast<size_t>(n)].empty()) {
+                    pendingLodChains.push_back({static_cast<uint32_t>(instances.size() - 1),
+                                                static_cast<uint32_t>(n), static_cast<uint32_t>(p)});
+                }
             }
+        }
+    }
+
+    // Resolve authored MSFT_lod chains now that every mesh exists.  Chain
+    // members are excluded from runtime simplification (authored wins).
+    std::vector<char> lodSkipMeshes;
+    if (!pendingLodChains.empty()) lodSkipMeshes.assign(meshes.size(), 0);
+    for (const PendingLodChain& pc : pendingLodChains) {
+        MeshInstance& inst = instances[pc.instanceIndex];
+        uint32_t cnt = 0;
+        inst.authoredLodMeshes[cnt++] = inst.meshIndex;
+        for (const int32_t id : lodIdsPerNode[pc.node]) {
+            if (cnt >= kMaxMeshLods) break;
+            const cgltf_node* aux = &data->nodes[static_cast<size_t>(id)];
+            if (!aux->mesh) continue;
+            const size_t am = static_cast<size_t>(aux->mesh - data->meshes);
+            // LOD meshes are expected to mirror the master's primitive count;
+            // clamp so a shorter aux mesh still yields a usable level.
+            const size_t ap = std::min<size_t>(pc.prim, aux->mesh->primitives_count - 1);
+            const int32_t mi = staticMeshIdx[am][ap];
+            if (mi < 0) continue;
+            inst.authoredLodMeshes[cnt++] = static_cast<uint32_t>(mi);
+        }
+        inst.authoredLodCount = cnt;
+        if (cnt > 1) {
+            for (uint32_t k = 0; k < cnt; ++k) lodSkipMeshes[inst.authoredLodMeshes[k]] = 1;
+        } else {
+            inst.authoredLodCount = 0; // no usable aux mesh: fall back to generated LODs
         }
     }
 
@@ -599,6 +699,11 @@ bool Scene::loadGltf(const VulkanContext& ctx, const char* path, VkCommandPool p
     updatePrevTransforms();
     finalizeInstances();
     if (keepNodes) computeAnimatedBounds();
+    // Runtime LOD generation (cached next to the glTF) + per-instance draw
+    // tables; must run after the merged index accumulation is complete and
+    // before it is uploaded.
+    generateMeshLods(*this, lodSources, path, lodSkipMeshes);
+    buildLodDraws();
     buildMergedBuffers(ctx, pool);
     if (keepNodes && !skins.empty() && !createSkinPalettes(ctx)) return false;
     return !meshes.empty() || !skinnedMeshes.empty();

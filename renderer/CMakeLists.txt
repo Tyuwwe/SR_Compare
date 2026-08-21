@@ -11,6 +11,7 @@ add_library(renderer STATIC
     scene/Animation.cpp
     scene/ProceduralScene.cpp
     scene/GltfLoader.cpp
+    scene/LodBuilder.cpp
     scene/Camera.cpp
     scene/CameraPath.cpp
     scene/SceneRegistry.cpp
@@ -20,7 +21,17 @@ add_library(renderer STATIC
     Screenshot.cpp
 )
 
+# meshoptimizer (zeux): meshopt_simplify for runtime LOD chain generation.
+# Separate target so the project's /W4 zero-warning setup does not apply to
+# third-party sources; its headers propagate as SYSTEM (external) includes.
+add_library(meshoptimizer STATIC
+    ${SR_THIRD_PARTY_DIR}/meshoptimizer/allocator.cpp
+    ${SR_THIRD_PARTY_DIR}/meshoptimizer/simplifier.cpp
+)
+target_include_directories(meshoptimizer SYSTEM PUBLIC ${SR_THIRD_PARTY_DIR}/meshoptimizer)
+
 sr_common_setup(renderer)
+target_link_libraries(renderer PUBLIC meshoptimizer)
 target_compile_definitions(renderer PRIVATE SR_SHADER_DIR="${SR_SHADER_OUT_DIR}/")
 
 # Compile the renderer's GLSL to SPIR-V at build time.  The deferred

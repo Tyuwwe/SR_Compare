@@ -2266,8 +2266,10 @@ void CompareApp::run() {
         // After the slot fence: the palette/instance state of this slot is no
         // longer read by the GPU.  No-op for static scenes.
         scene_.advanceToFrame(frameIndex);
-
-        // The metric readback recorded for this slot (if any) is complete now.
+        // CPU LOD selection for this frame's camera.  One decision per frame,
+        // shared by the GT and upscaled paths, so both sides of the
+        // comparison always draw the same levels (fair + deterministic).
+        scene_.updateLodSelection(camera_.position, camera_.fovY, lodEnabledByDefault());
         if (metricPending_[slot]) {
             harvestMetrics(slot);
             metricPending_[slot] = false;

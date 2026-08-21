@@ -1292,8 +1292,9 @@ void Renderer::run() {
         // After the slot fence: the palette/instance state of this slot is no
         // longer read by the GPU.  No-op for static scenes.
         scene_.advanceToFrame(frameIndex);
-
-        // The frame that used this slot (frameIndex - kFramesInFlight) is now
+        // CPU LOD selection for this frame's camera (viewer: always enabled).
+        // Before recording; both GT and upscaled paths share the result.
+        scene_.updateLodSelection(camera_.position, camera_.fovY, lodEnabledByDefault());
         // complete; harvest its GPU timings before the slot is reused.
         if (!opts_.frameTimesPath.empty() && frameIndex >= kFramesInFlight) {
             frameTimes_.push_back(timestamps_.read(ctx_, slot));

@@ -186,6 +186,9 @@ bool Scene::loadProcedural(const VulkanContext& ctx, VkCommandPool pool) {
     slider.slidePeriod = 4.f; // seconds
     addDynamicBox(slider, boxMatStart + 2);
 
+    // No generated LODs for the tiny procedural meshes; this only mirrors each
+    // mesh's LOD0 range into the per-instance draw tables the passes use.
+    buildLodDraws();
     buildMergedBuffers(ctx, pool);
     return true;
 }
