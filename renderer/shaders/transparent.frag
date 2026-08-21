@@ -62,9 +62,10 @@ layout(set = 2, binding = 3) uniform sampler2D iblBrdfLut;
 // Screen-space AO (R16F, same resolution as this path's GBuffer).
 layout(set = 2, binding = 4) uniform sampler2D ssaoTex;
 layout(set = 2, binding = 5) uniform sampler2DArrayShadow shadowMap; // CSM, comparison sampler
-// Opaque HDR + depth copied before this pass writes color (SSR).
+// Opaque HDR + depth pyramid (Hi-Z, R32F) captured before this pass writes
+// color (SSR).
 layout(set = 2, binding = 6) uniform sampler2D ssrColor;
-layout(set = 2, binding = 7) uniform sampler2D ssrDepth;
+layout(set = 2, binding = 7) uniform sampler2D ssrHiZ;
 
 layout(location = 0) in vec3 vWorldPos;
 layout(location = 1) in vec3 vNormal;
@@ -242,8 +243,9 @@ void main() {
     vec3 specSsr = specularIbl * ambientScale;
     float ssrHit = 0.0;
     if (roughness < 0.45) {
-        vec4 ssr = traceSsr(ssrColor, ssrDepth, ubo.viewProj, lighting.invViewProj,
-                            ubo.cameraPos.xyz, vWorldPos, N, R, ubo.renderSizeJitter.xy);
+        vec4 ssr = traceSsr(ssrColor, ssrHiZ, textureQueryLevels(ssrHiZ), ubo.viewProj,
+                            lighting.invViewProj, ubo.cameraPos.xyz, vWorldPos, N, R,
+                            ubo.renderSizeJitter.xy);
         ssrHit = clamp(ssr.a, 0.0, 1.0);
         // UE applies EnvBRDF on the hit (not D*G*F).  Shop glass is a
         // coated mirror: lerp EnvBRDF toward 1 with hit confidence so a

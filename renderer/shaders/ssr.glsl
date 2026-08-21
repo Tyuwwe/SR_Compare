@@ -1,16 +1,24 @@
-// Screen-space reflection: McGuire clip-space DDA against the opaque depth,
-// matching the tracing model used by UE's ScreenSpaceReflections pass
-// (SSRTReflections.usf) rather than a world-space quadratic march.
+// Screen-space reflection: hierarchical-Z (Hi-Z) march in clip space against
+// the opaque depth pyramid, matching the tracing model used by UE's
+// ScreenSpaceReflections pass (SSRTReflections.usf) rather than a world-space
+// quadratic march.
 //
 // Why clip-space: 1/w is linear in screen along a 3D ray, so view-Z and UV
 // stay perspective-correct.  The previous world-space t² march compared
 // Euclidean camera distances against a nonlinear depth buffer and produced
 // stretched / false hits on the Bistro shop windows.
 //
+// Why Hi-Z: the march advances one pyramid cell at the current mip while the
+// ray stays in front of the cell's farthest surface (ascending to coarser
+// mips as it accelerates), and descends one mip without advancing when the
+// hull is crossed — a finer cell's max can only be smaller, so the descent
+// always reaches mip 0, where binary refinement pins the exact front-to-back
+// transition.  Long rays across empty screen regions cost a handful of
+// coarse steps instead of 96 full-resolution samples.
+//
 // UE composite (DiffuseIndirectComposite) applies EnvBRDF on the hit colour
 // and a screen-edge vignette; the caller does the EnvBRDF multiply.  We return
-// rgb + confidence (0 = miss).  Hierarchical Z is approximated by a coarse
-// pixel stride plus binary refinement (no extra mip chain).
+// rgb + confidence (0 = miss).
 //
 // Ref: McGuire & Mara, "Efficient GPU Screen-Space Ray Tracing", JCGT 2014
 //      Stachowiak, Stochastic SSR, SIGGRAPH 2015
@@ -47,9 +55,12 @@ float ssrClipToScreen(vec2 startUv, vec2 endUv) {
     return (t0 < t1) ? clamp(t1, 0.0, 1.0) : 0.0;
 }
 
-vec4 traceSsr(sampler2D colorTex, sampler2D depthTex, mat4 viewProj, mat4 invViewProj,
-              vec3 cameraPos, vec3 worldPos, vec3 N, vec3 R, vec2 renderSize) {
-    const int kMaxSteps = 96;
+// hizTex: max-reduced depth pyramid (mip 0 = opaque depth copy, R32F);
+// hizMipCount = textureQueryLevels(hizTex) at the call site.
+vec4 traceSsr(sampler2D colorTex, sampler2D hizTex, int hizMipCount,
+              mat4 viewProj, mat4 invViewProj, vec3 cameraPos, vec3 worldPos,
+              vec3 N, vec3 R, vec2 renderSize) {
+    const int kMaxIters = 128; // hierarchy steps (each descends or advances)
     const int kRefine = 8;
     const float kMaxDist = 100.0;
     const float kBias = 0.08;
@@ -93,65 +104,84 @@ vec4 traceSsr(sampler2D colorTex, sampler2D depthTex, mat4 viewProj, mat4 invVie
     // still take a few samples so a slight offset can hit on-screen geometry.
     if (pixelDist < 0.25) return vec4(0.0);
 
-    int steps = int(clamp(max(pixelDist, 8.0), 8.0, float(kMaxSteps)));
-    vec2 stepPx = dPx / float(steps);
-
-    float lastDiff = -1.0;
-    bool hit = false;
-    vec2 hitUv = endUv;
-    float hitDist = kMaxDist;
+    const int maxMip = hizMipCount - 1;
+    const ivec2 size0 = ivec2(renderSize);
     // |R·N|: 1 head-on, ~0 at grazing.  Scales the self-hit radius and the
     // thickness window below; grazing incidence is where both fixed
     // thresholds used to kill valid reflections (Bistro shop windows).
-    float grazing = abs(dot(R, N));
+    const float grazing = abs(dot(R, N));
 
-    for (int i = 1; i <= steps; ++i) {
-        float t = float(i) / float(steps);
-        vec2 px = startPx + stepPx * float(i);
+    // t parameterises the clipped segment: uv = mix(startUv, endUv, t) and
+    // 1/w = mix(invW0, invW1, t), so every sample stays perspective-correct.
+    float t = 0.0;
+    float tFront = 0.0; // last sampled position still in front of the hull
+    int level = 0;
+    bool hit = false;
+    vec2 hitUv = endUv;
+    float hitDist = kMaxDist;
+
+    for (int it = 0; it < kMaxIters && t <= 1.0; ++it) {
+        vec2 px = startPx + dPx * t;
         vec2 uv = px / renderSize;
         if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) break;
 
+        ivec2 mipSize = max(size0 >> level, ivec2(1));
+        ivec2 ip = clamp(ivec2(px) >> level, ivec2(0), mipSize - 1);
+        float cellDepth = texelFetch(hizTex, ip, level).r;
+
         float invW = mix(invW0, invW1, t);
         float rayZ = abs(1.0 / invW);
+        // Sky (cleared depth 1.0) max-reduces to the far plane and dominates
+        // any mixed cell; report +inf so sky cells are skipped at full speed.
+        // The accepted Hi-Z tradeoff: thin silhouettes against the sky are
+        // only resolved once the cell no longer contains a sky pixel.
+        float cellZ = cellDepth < 0.9999 ? ssrViewZ(viewProj, invViewProj, uv, cellDepth)
+                                         : 3.0e38;
 
-        ivec2 ip = ivec2(clamp(px, vec2(0.0), renderSize - 1.0));
-        float sceneDepth = texelFetch(depthTex, ip, 0).r;
-        if (sceneDepth >= 0.9999) {
-            lastDiff = -1.0;
+        if (rayZ <= cellZ) {
+            // In front of the farthest surface of this cell: safe to skip it,
+            // then coarsen so long empty runs cost one iteration per cell.
+            tFront = t;
+            t += float(1 << level) / pixelDist;
+            level = min(level + 1, maxMip);
             continue;
         }
-        float sceneZ = ssrViewZ(viewProj, invViewProj, uv, sceneDepth);
-        float diff = rayZ - sceneZ;
-        // Any front-to-back crossing is a candidate.  Thickness is tested
-        // AFTER binary refine: a coarse 4 px step can overshoot by metres.
-        if (lastDiff <= 0.0 && diff > 0.0) {
-            float lo = t - 1.0 / float(steps);
-            float hi = t;
-            vec2 hiUv = uv;
-            for (int r = 0; r < kRefine; ++r) {
-                float mid = 0.5 * (lo + hi);
-                vec2 mUv = mix(startUv, endUv, mid);
-                float mRayZ = abs(1.0 / mix(invW0, invW1, mid));
-                float mDepth = texelFetch(depthTex, ivec2(clamp(mUv * renderSize, vec2(0.0),
-                                                                renderSize - 1.0)), 0).r;
-                if (mDepth >= 0.9999) {
-                    lo = mid;
-                    continue;
-                }
-                float mSceneZ = ssrViewZ(viewProj, invViewProj, mUv, mDepth);
-                if (mRayZ > mSceneZ) {
-                    hi = mid;
-                    hiUv = mUv;
-                } else {
-                    lo = mid;
-                }
-            }
-            float hiDepth = texelFetch(depthTex, ivec2(clamp(hiUv * renderSize, vec2(0.0),
-                                                            renderSize - 1.0)), 0).r;
-            if (hiDepth >= 0.9999) {
-                lastDiff = diff;
+        if (level > 0) {
+            // Crossed the coarse hull: re-test the same position one mip
+            // finer (a finer cell's max can only be smaller, so the descent
+            // always terminates at mip 0).
+            --level;
+            continue;
+        }
+
+        // Mip-0 crossing between tFront and t: binary-refine the exact
+        // front-to-back transition, then apply the acceptance tests.
+        float lo = tFront;
+        float hi = t;
+        vec2 hiUv = uv;
+        for (int r = 0; r < kRefine; ++r) {
+            float mid = 0.5 * (lo + hi);
+            vec2 mUv = mix(startUv, endUv, mid);
+            float mRayZ = abs(1.0 / mix(invW0, invW1, mid));
+            float mDepth = texelFetch(hizTex, ivec2(clamp(mUv * renderSize, vec2(0.0),
+                                                          renderSize - 1.0)), 0).r;
+            if (mDepth >= 0.9999) {
+                lo = mid;
                 continue;
             }
+            float mSceneZ = ssrViewZ(viewProj, invViewProj, mUv, mDepth);
+            if (mRayZ > mSceneZ) {
+                hi = mid;
+                hiUv = mUv;
+            } else {
+                lo = mid;
+            }
+        }
+        float hiDepth = texelFetch(hizTex, ivec2(clamp(hiUv * renderSize, vec2(0.0),
+                                                        renderSize - 1.0)), 0).r;
+        bool reject = hiDepth >= 0.9999;
+        float dist = kMaxDist;
+        if (!reject) {
             float hiRayZ = abs(1.0 / mix(invW0, invW1, hi));
             float hiSceneZ = ssrViewZ(viewProj, invViewProj, hiUv, hiDepth);
             float hiOver = hiRayZ - hiSceneZ;
@@ -160,18 +190,12 @@ vec4 traceSsr(sampler2D colorTex, sampler2D depthTex, mat4 viewProj, mat4 invVie
             // can sit a coarse step past a thin reflector (window frame,
             // mullion) and the angle-independent window rejected it.
             float thickness = (0.35 + 0.03 * hiRayZ) / max(grazing, 0.25);
-            if (hiOver < 0.0 || hiOver > thickness) {
-                // Reset, not lastDiff = diff: a positive lastDiff blocks the
-                // crossing test for the rest of the march, so one rejected
-                // crossing used to void the whole ray.  A rejected crossing
-                // at grazing is often the ray hugging a surface with internal
-                // depth jumps; later real crossings must stay detectable.
-                lastDiff = -1.0;
-                continue;
-            }
+            if (hiOver < 0.0 || hiOver > thickness) reject = true;
+        }
+        if (!reject) {
             vec4 hw = invViewProj * vec4(hiUv * 2.0 - 1.0, hiDepth, 1.0);
             hw /= hw.w;
-            float dist = length(hw.xyz - worldPos);
+            dist = length(hw.xyz - worldPos);
             // Reject hits on the reflecting surface itself, not hits that are
             // simply closer to the camera (street furniture in front of a
             // shop window is a valid mirror image).  The fixed 0.22 m radius
@@ -180,16 +204,22 @@ vec4 traceSsr(sampler2D colorTex, sampler2D depthTex, mat4 viewProj, mat4 invVie
             // within a few tens of centimetres.  Scale the radius by the
             // clearance rate |R·N| — 0.22 m head-on (old behaviour), down to
             // the origin bias at exact grazing — and keep probing on reject.
-            if (dist < kBias + 0.14 * grazing) {
-                lastDiff = -1.0;
-                continue;
-            }
-            hit = true;
-            hitUv = hiUv;
-            hitDist = dist;
-            break;
+            if (dist < kBias + 0.14 * grazing) reject = true;
         }
-        lastDiff = diff;
+        if (reject) {
+            // Same contract as Phase 1a's lastDiff reset: a rejected crossing
+            // (sky, thickness overshoot, self-hit) must not void the rest of
+            // the ray — at grazing the ray hugs surfaces with internal depth
+            // jumps, and later real crossings must stay detectable.  Resume
+            // one mip-0 pixel past the rejected crossing.
+            tFront = t;
+            t += 1.0 / pixelDist;
+            continue;
+        }
+        hit = true;
+        hitUv = hiUv;
+        hitDist = dist;
+        break;
     }
 
     if (!hit) return vec4(0.0);

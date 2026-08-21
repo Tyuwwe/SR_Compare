@@ -260,6 +260,10 @@ bool Renderer::createRenderTargets() {
         return false;
     if (!createRT(gtSsrSrc_, dw, dh, deferred::kHdrColorFormat, ssrUsage, VK_IMAGE_ASPECT_COLOR_BIT))
         return false;
+    if (!deferred_.createDepthPyramid(ctx_, renderWidth_, renderHeight_, gbPyramid_))
+        return false;
+    if (!deferred_.createDepthPyramid(ctx_, dw, dh, gtPyramid_))
+        return false;
     if (!createRT(finalImage_, dw, dh, deferred::kHdrColorFormat,
                   VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
                       VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
@@ -307,24 +311,32 @@ bool Renderer::createSceneDescriptors() {
         return false;
 
     VkDescriptorPoolSize sizes[4] = {};
+    // Hi-Z downsample sets: one per mip per pyramid (sampler + storage image).
+    const uint32_t hizSets = gbPyramid_.mipCount + gtPyramid_.mipCount;
     sizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     sizes[0].descriptorCount = deferred::kMaxTextures + 1 + // texture array + present
                                11 * kFramesInFlight * 2 + // lighting sets (GB/GT), +1 shadow map
                                7 * kFramesInFlight * 2 +  // transparent sets (GB/GT), +SSR+shadow
                                2 * 2 + 1 * 2 +            // ssao + blur samplers
-                               8;                         // bloom extract/blur/comp (GB/GT)
+                               8 +                        // bloom extract/blur/comp (GB/GT)
+                               hizSets;
     sizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     sizes[1].descriptorCount = kFramesInFlight * 4; // scene + lighting + 2 transparent UBOs
     sizes[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
     sizes[2].descriptorCount = kFramesInFlight;
     sizes[3].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    sizes[3].descriptorCount = 4 + 8; // ssao + bloom (GB/GT)
+    sizes[3].descriptorCount = 4 + 8 + hizSets; // ssao + bloom (GB/GT) + Hi-Z mips
     VkDescriptorPoolCreateInfo poolCi = {};
     poolCi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    poolCi.maxSets = kFramesInFlight * 5 + 6 + 8; // + 8 bloom sets
+    poolCi.maxSets = kFramesInFlight * 5 + 6 + 8 + hizSets; // + 8 bloom sets
     poolCi.poolSizeCount = 4;
     poolCi.pPoolSizes = sizes;
     if (vkCreateDescriptorPool(ctx_.device, &poolCi, nullptr, &descriptorPool_) != VK_SUCCESS)
+        return false;
+
+    if (!deferred_.writeDepthPyramidSets(ctx_, descriptorPool_, gbDepth_.view, gbPyramid_))
+        return false;
+    if (!deferred_.writeDepthPyramidSets(ctx_, descriptorPool_, gtDepth_.view, gtPyramid_))
         return false;
 
     if (!deferred_.createMaterialUbo(ctx_, scene_, materialUbo_, materialUboMemory_,
@@ -560,9 +572,9 @@ bool Renderer::createSyncResources() {
                                      &frames_[i].transparentSetGt) != VK_SUCCESS)
             return false;
         deferred_.writeTransparentSet(ctx_, frames_[i].transparentSetGb, frames_[i].lightingUbo,
-                                      gbAo_.view, shadowView, gbSsrSrc_.view, gbDepth_.view);
+                                      gbAo_.view, shadowView, gbSsrSrc_.view, gbPyramid_.chainView);
         deferred_.writeTransparentSet(ctx_, frames_[i].transparentSetGt, frames_[i].lightingUbo,
-                                      gtAo_.view, shadowView, gtSsrSrc_.view, gtDepth_.view);
+                                      gtAo_.view, shadowView, gtSsrSrc_.view, gtPyramid_.chainView);
     }
 
     // SSAO sets (static bindings; per-frame data goes through push constants).
@@ -882,8 +894,12 @@ void Renderer::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     transition(tgtEmissive, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                sync::kColorAttach, sync::kColorWrite, sync::kFragment, sync::kSampled);
     transition(tgtDepth, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-               sync::kDepthTests, sync::kDepthWrite, sync::kFragment, sync::kSampled,
+               sync::kDepthTests, sync::kDepthWrite, sync::kSampleStages, sync::kSampled,
                VK_IMAGE_ASPECT_DEPTH_BIT);
+    // Hi-Z pyramid for the glass SSR marcher (skippable when no BLEND
+    // material exists; the pyramid then just keeps its last contents).
+    if (hasTransparency_)
+        deferred_.recordDepthPyramidPass(cmd, gbuffer ? gbPyramid_ : gtPyramid_);
     if (gbuffer) {
         transition(gbMotion_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                    sync::kColorAttach, sync::kColorWrite, sync::kFragment, sync::kSampled);
@@ -1251,6 +1267,8 @@ void Renderer::shutdown() {
     gtBloomB_.destroy(ctx_);
     gbSsrSrc_.destroy(ctx_);
     gtSsrSrc_.destroy(ctx_);
+    deferred_.destroyDepthPyramid(ctx_, gbPyramid_);
+    deferred_.destroyDepthPyramid(ctx_, gtPyramid_);
     finalImage_.destroy(ctx_);
 
     if (shadowsActive_) { deferred_.destroyShadowTargets(ctx_, shadow_); shadowsActive_ = false; }

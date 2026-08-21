@@ -496,6 +496,11 @@ private:
     ImageResource gbSsrSrc_;
     ImageResource gtSsrSrc_;
     ImageResource gtSsaaSsrSrc_;
+    // Hi-Z depth pyramids for the SSR march (LR / GT / GT-SSAA paths); general
+    // DeferredCore resource, later reused by GTAO/contact shadows/culling.
+    DepthPyramid gbPyramid_;
+    DepthPyramid gtPyramid_;
+    DepthPyramid gtSsaaPyramid_; // compare GT SSAA only
     ImageResource composeImage_; // RGBA8 composite; presentation + screenshot source
     ImageResource uiShotImage_;  // BGRA8 debug screenshot target incl. ImGui
     VkImageLayout uiShotLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;

@@ -52,7 +52,7 @@ layout(set = 2, binding = 3) uniform sampler2D iblBrdfLut;
 layout(set = 2, binding = 4) uniform sampler2D ssaoTex;
 layout(set = 2, binding = 5) uniform sampler2DArrayShadow shadowMap; // CSM, comparison sampler
 layout(set = 2, binding = 6) uniform sampler2D ssrColor;
-layout(set = 2, binding = 7) uniform sampler2D ssrDepth;
+layout(set = 2, binding = 7) uniform sampler2D ssrHiZ; // opaque depth pyramid (Hi-Z, R32F)
 
 layout(location = 0) in vec3 vWorldPos;
 layout(location = 1) in vec3 vNormal;
@@ -216,8 +216,9 @@ void main() {
     vec3 specSsr = specularIbl * ambientScale;
     float ssrHit = 0.0;
     if (roughness < 0.45) {
-        vec4 ssr = traceSsr(ssrColor, ssrDepth, ubo.viewProj, lighting.invViewProj,
-                            ubo.cameraPos.xyz, vWorldPos, N, R, ubo.renderSizeJitter.xy);
+        vec4 ssr = traceSsr(ssrColor, ssrHiZ, textureQueryLevels(ssrHiZ), ubo.viewProj,
+                            lighting.invViewProj, ubo.cameraPos.xyz, vWorldPos, N, R,
+                            ubo.renderSizeJitter.xy);
         ssrHit = clamp(ssr.a, 0.0, 1.0);
         specSsr = mix(specSsr, ssr.rgb * mix(envBrdf, vec3(1.0), ssrHit * 0.8), ssrHit);
     }

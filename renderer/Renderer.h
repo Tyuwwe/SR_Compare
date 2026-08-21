@@ -131,6 +131,10 @@ private:
     ImageResource gtBloomB_;
     ImageResource gbSsrSrc_; // opaque HDR copy for glass SSR
     ImageResource gtSsrSrc_;
+    // Hi-Z depth pyramids for the SSR march (LR / GT); general DeferredCore
+    // resource, later reused by GTAO/contact shadows/occlusion culling.
+    DepthPyramid gbPyramid_;
+    DepthPyramid gtPyramid_;
 
     // Shared deferred pipeline (shaders/layouts/pipelines/samplers + IBL maps).
     DeferredCore deferred_;

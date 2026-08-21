@@ -190,6 +190,11 @@ private:
     ImageResource gbSsrSrc_;
     ImageResource gtSsrSrc_;
     ImageResource gtSsaaSsrSrc_;
+    // Hi-Z depth pyramids for the SSR march (LR / GT / GT-SSAA paths); general
+    // DeferredCore resource, later reused by GTAO/contact shadows/culling.
+    DepthPyramid gbPyramid_;
+    DepthPyramid gtPyramid_;
+    DepthPyramid gtSsaaPyramid_; // gtSsaa only
     ImageResource composeImage_; // RGBA8, tonemapped columns + overlay
     ImageResource fontAtlas_;
 

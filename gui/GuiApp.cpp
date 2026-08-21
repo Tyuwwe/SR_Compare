@@ -1178,7 +1178,15 @@ bool GuiApp::createRenderTargets() {
         if (!createRT(gtSsaaSsrSrc_, dw * 2, dh * 2, deferred::kHdrColorFormat, ssrUsage,
                       VK_IMAGE_ASPECT_COLOR_BIT))
             return false;
+        if (!deferred_.createDepthPyramid(ctx_, dw * 2, dh * 2, gtSsaaPyramid_))
+            return false;
     }
+
+    // Hi-Z depth pyramids for the SSR march (LR / GT paths).
+    if (!deferred_.createDepthPyramid(ctx_, renderWidth_, renderHeight_, gbPyramid_))
+        return false;
+    if (!deferred_.createDepthPyramid(ctx_, gtW, gtH, gtPyramid_))
+        return false;
 
     // (Per-algorithm output images are created by createAlgoResources, after
     // the descriptor pool exists, so algo-only rebuilds can redo just those.)
@@ -1352,11 +1360,14 @@ bool GuiApp::createDescriptors() {
     // each; transparent sets: 3 per frame (GB/GT/SSAA), 5 samplers + 1 UBO each;
     // SSAO sets: static, 3 samplers + 2 storage images per path.
     // (+1 sampler per lighting/transparent set is the CSM shadow map binding.)
+    // Hi-Z downsample sets: one per mip per pyramid (sampler + storage image).
+    const uint32_t hizSets =
+        gbPyramid_.mipCount + gtPyramid_.mipCount + gtSsaaPyramid_.mipCount;
     VkDescriptorPoolSize sizes[5] = {};
     sizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     sizes[0].descriptorCount =
         deferred::kMaxTextures + numColumns * 2 + 2 + numAlgos * 6 + 11 * kFramesInFlight * 4 +
-        7 * kFramesInFlight * 4 + 3 * 3;
+        7 * kFramesInFlight * 4 + 3 * 3 + hizSets;
     sizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     sizes[1].descriptorCount = kFramesInFlight * 3 + numColumns + numAlgos + kFramesInFlight * 4 +
                                kFramesInFlight * 4;
@@ -1365,16 +1376,26 @@ bool GuiApp::createDescriptors() {
     sizes[3].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     sizes[3].descriptorCount = numAlgos * 2;
     sizes[4].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    sizes[4].descriptorCount = 6; // ssao raw + blurred outputs (GB/GT/SSAA)
+    sizes[4].descriptorCount = 6 + hizSets; // ssao raw + blurred outputs (GB/GT/SSAA) + Hi-Z
     VkDescriptorPoolCreateInfo poolCi = {};
     poolCi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     poolCi.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
     poolCi.maxSets = kFramesInFlight * 3 + 2 + numColumns + 1 + numAlgos * 3 + kFramesInFlight * 4 +
                      kFramesInFlight * 4 + // transparent sets (GB/GT/SSAA/spatial)
-                     6;                     // ssao sets (GB/GT/SSAA, static)
+                     6 +                   // ssao sets (GB/GT/SSAA, static)
+                     hizSets;
     poolCi.poolSizeCount = 5;
     poolCi.pPoolSizes = sizes;
     if (vkCreateDescriptorPool(ctx_.device, &poolCi, nullptr, &descriptorPool_) != VK_SUCCESS)
+        return false;
+
+    if (!deferred_.writeDepthPyramidSets(ctx_, descriptorPool_, gbDepth_.view, gbPyramid_))
+        return false;
+    if (!deferred_.writeDepthPyramidSets(ctx_, descriptorPool_, gtDepth_.view, gtPyramid_))
+        return false;
+    if (active_.gtSsaa &&
+        !deferred_.writeDepthPyramidSets(ctx_, descriptorPool_, gtSsaaDepth_.view,
+                                         gtSsaaPyramid_))
         return false;
 
     linearSampler_ = createSampler(ctx_, VK_FILTER_LINEAR, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
@@ -1860,15 +1881,16 @@ bool GuiApp::createSyncResources() {
         // The transparency shader reads iblParams (identical in both lighting
         // UBOs) plus the path's own SSAO texture: one set per path.
         deferred_.writeTransparentSet(ctx_, fr.transparentSetGb, fr.lightingUboGb, gbAo_.view,
-                                      shadowView, gbSsrSrc_.view, gbDepth_.view);
+                                      shadowView, gbSsrSrc_.view, gbPyramid_.chainView);
         deferred_.writeTransparentSet(ctx_, fr.transparentSetGbSpatial, fr.lightingUboGbSpatial,
-                                      gbAo_.view, shadowView, gbSsrSrc_.view, gbDepth_.view);
+                                      gbAo_.view, shadowView, gbSsrSrc_.view,
+                                      gbPyramid_.chainView);
         deferred_.writeTransparentSet(ctx_, fr.transparentSetGt, fr.lightingUboGt, gtAo_.view,
-                                      shadowView, gtSsrSrc_.view, gtDepth_.view);
+                                      shadowView, gtSsrSrc_.view, gtPyramid_.chainView);
         if (active_.gtSsaa) {
             deferred_.writeTransparentSet(ctx_, fr.transparentSetSsaa, fr.lightingUboGt,
                                           gtSsaaAo_.view, shadowView, gtSsaaSsrSrc_.view,
-                                          gtSsaaDepth_.view);
+                                          gtSsaaPyramid_.chainView);
         }
     }
 
@@ -2105,6 +2127,9 @@ void GuiApp::destroyStackResources() {
     gbSsrSrc_.destroy(ctx_);
     gtSsrSrc_.destroy(ctx_);
     gtSsaaSsrSrc_.destroy(ctx_);
+    deferred_.destroyDepthPyramid(ctx_, gbPyramid_);
+    deferred_.destroyDepthPyramid(ctx_, gtPyramid_);
+    deferred_.destroyDepthPyramid(ctx_, gtSsaaPyramid_);
     composeImage_.destroy(ctx_);
     uiShotImage_.destroy(ctx_);
     uiShotLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -2755,8 +2780,12 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                    sync::kColorAttach, sync::kColorWrite, sync::kFragment, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
         transition(gbDepth_.image, gbDepthLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                   sync::kDepthTests, sync::kDepthWrite, sync::kFragment, sync::kSampled,
+                   sync::kDepthTests, sync::kDepthWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_DEPTH_BIT);
+        // Hi-Z pyramid for the glass SSR marcher (both LR lighting variants
+        // share the same GBuffer depth).
+        if (hasTransparency_)
+            deferred_.recordDepthPyramidPass(cmd, gbPyramid_);
 
         transition(gbAoRaw_.image, gbAoRawLayout_, VK_IMAGE_LAYOUT_GENERAL, sync::kCompute,
                    sync::kSampled, sync::kCompute, sync::kStorageWrite, VK_IMAGE_ASPECT_COLOR_BIT);
@@ -3011,8 +3040,10 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kColorAttach, sync::kColorWrite,
                    sync::kFragment, sync::kSampled, VK_IMAGE_ASPECT_COLOR_BIT);
         transition(gtSsaaDepth_.image, gtSsaaDepthLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                   sync::kDepthTests, sync::kDepthWrite, sync::kFragment, sync::kSampled,
+                   sync::kDepthTests, sync::kDepthWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_DEPTH_BIT);
+        if (hasTransparency_)
+            deferred_.recordDepthPyramidPass(cmd, gtSsaaPyramid_);
 
         // SSAO for the 2x GT path (un-jittered view-projection).
         transition(gtSsaaAoRaw_.image, gtSsaaAoRawLayout_, VK_IMAGE_LAYOUT_GENERAL, sync::kCompute,
@@ -3149,8 +3180,10 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                    sync::kColorAttach, sync::kColorWrite, sync::kFragment, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
         transition(gtDepth_.image, gtDepthLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                   sync::kDepthTests, sync::kDepthWrite, sync::kFragment, sync::kSampled,
+                   sync::kDepthTests, sync::kDepthWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_DEPTH_BIT);
+        if (hasTransparency_)
+            deferred_.recordDepthPyramidPass(cmd, gtPyramid_);
 
         // SSAO for the 1x GT path (un-jittered view-projection).  In
         // "GT (Apply scale)" mode gtW/gtH are the low input resolution.
