@@ -140,6 +140,11 @@ private:
         VkDescriptorSet transparentSetGbSpatial = VK_NULL_HANDLE;
         VkDescriptorSet transparentSetGt = VK_NULL_HANDLE;
         VkDescriptorSet transparentSetSsaa = VK_NULL_HANDLE; // gtSsaa only
+        // Opaque-SSR compute sets (bind the same per-path lighting UBOs).
+        VkDescriptorSet ssrSetGb = VK_NULL_HANDLE;
+        VkDescriptorSet ssrSetGbSpatial = VK_NULL_HANDLE;
+        VkDescriptorSet ssrSetGt = VK_NULL_HANDLE;
+        VkDescriptorSet ssrSetSsaa = VK_NULL_HANDLE; // gtSsaa only
     };
 
     struct AlgoColumn {
@@ -464,6 +469,8 @@ private:
     // CSM sun shadows (Viewer-tab lighting section, per-frame, no rebuild).
     bool shadowsEnabled_ = true;
     bool shadowDebugCascades_ = false; // tint pixels per shadow cascade
+    // Opaque screen-space reflections (per-frame pass skip, no rebuild).
+    bool ssrEnabled_ = true;
 
     ImageResource gbColor_;
     ImageResource gbColorSpatial_; // unjittered LR HDR copy for spatial upscalers

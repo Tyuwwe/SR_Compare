@@ -1357,6 +1357,8 @@ bool GuiApp::createDescriptors() {
     // each; transparent sets: 3 per frame (GB/GT/SSAA), 5 samplers + 1 UBO each;
     // SSAO sets: static, 3 samplers + 2 storage images per path.
     // (+1 sampler per lighting/transparent set is the CSM shadow map binding.)
+    // Opaque-SSR sets: 4 per frame (GB/GT/SSAA/spatial), 9 samplers + 1 UBO +
+    // 1 storage image each.
     // Hi-Z / color downsample sets: one per mip per pyramid (sampler + storage image).
     const uint32_t hizSets =
         gbPyramid_.mipCount + gtPyramid_.mipCount + gtSsaaPyramid_.mipCount;
@@ -1366,21 +1368,23 @@ bool GuiApp::createDescriptors() {
     sizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     sizes[0].descriptorCount =
         deferred::kMaxTextures + numColumns * 2 + 2 + numAlgos * 6 + 11 * kFramesInFlight * 4 +
-        7 * kFramesInFlight * 4 + 3 * 3 + hizSets + colorSets;
+        7 * kFramesInFlight * 4 + 9 * kFramesInFlight * 4 + 3 * 3 + hizSets + colorSets;
     sizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     sizes[1].descriptorCount = kFramesInFlight * 3 + numColumns + numAlgos + kFramesInFlight * 4 +
-                               kFramesInFlight * 4;
+                               kFramesInFlight * 4 + kFramesInFlight * 4; // + opaque-SSR UBOs
     sizes[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
     sizes[2].descriptorCount = kFramesInFlight * 3;
     sizes[3].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     sizes[3].descriptorCount = numAlgos * 2;
     sizes[4].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    sizes[4].descriptorCount = 6 + hizSets + colorSets; // ssao raw + blurred outputs (GB/GT/SSAA) + pyramid mips
+    // ssao raw + blurred outputs (GB/GT/SSAA) + pyramid mips + SSR in-place color targets
+    sizes[4].descriptorCount = 6 + hizSets + colorSets + kFramesInFlight * 4;
     VkDescriptorPoolCreateInfo poolCi = {};
     poolCi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     poolCi.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
     poolCi.maxSets = kFramesInFlight * 3 + 2 + numColumns + 1 + numAlgos * 3 + kFramesInFlight * 4 +
                      kFramesInFlight * 4 + // transparent sets (GB/GT/SSAA/spatial)
+                     kFramesInFlight * 4 + // opaque-SSR sets (GB/GT/SSAA/spatial)
                      6 +                   // ssao sets (GB/GT/SSAA, static)
                      hizSets + colorSets;
     poolCi.poolSizeCount = 5;
@@ -1447,6 +1451,10 @@ bool GuiApp::createDescriptors() {
         if (!allocSet(deferred_.transparentSetLayout(), frames_[i].transparentSetGt)) return false;
         if (!allocSet(deferred_.transparentSetLayout(), frames_[i].transparentSetSsaa))
             return false;
+        if (!allocSet(deferred_.ssrSetLayout(), frames_[i].ssrSetGb)) return false;
+        if (!allocSet(deferred_.ssrSetLayout(), frames_[i].ssrSetGbSpatial)) return false;
+        if (!allocSet(deferred_.ssrSetLayout(), frames_[i].ssrSetGt)) return false;
+        if (!allocSet(deferred_.ssrSetLayout(), frames_[i].ssrSetSsaa)) return false;
     }
     if (!allocSet(deferred_.textureSetLayout(), textureSet_)) return false;
     if (!allocSet(deferred_.ssaoSetLayout(), ssaoSetGb_)) return false;
@@ -1902,6 +1910,24 @@ bool GuiApp::createSyncResources() {
                                           gtSsaaAo_.view, shadowView,
                                           gtSsaaColorPyramid_.chainView,
                                           gtSsaaPyramid_.chainView);
+        }
+
+        // Opaque-SSR sets: binding 0 reuses the path's lighting UBO; the rest
+        // is the GBuffer + SSAO + pyramids + the lit HDR target (storage RMW).
+        deferred_.writeSsrSet(ctx_, fr.ssrSetGb, fr.lightingUboGb, gbAlbedo_.view,
+                              gbNormal_.view, gbMaterial_.view, gbDepth_.view, gbAo_.view,
+                              gbColorPyramid_.chainView, gbPyramid_.chainView, gbColor_.view);
+        deferred_.writeSsrSet(ctx_, fr.ssrSetGbSpatial, fr.lightingUboGbSpatial, gbAlbedo_.view,
+                              gbNormal_.view, gbMaterial_.view, gbDepth_.view, gbAo_.view,
+                              gbColorPyramid_.chainView, gbPyramid_.chainView, gbColor_.view);
+        deferred_.writeSsrSet(ctx_, fr.ssrSetGt, fr.lightingUboGt, gtAlbedo_.view,
+                              gtNormal_.view, gtMaterial_.view, gtDepth_.view, gtAo_.view,
+                              gtColorPyramid_.chainView, gtPyramid_.chainView, gtColor_.view);
+        if (active_.gtSsaa) {
+            deferred_.writeSsrSet(ctx_, fr.ssrSetSsaa, fr.lightingUboGt, gtSsaaAlbedo_.view,
+                                  gtSsaaNormal_.view, gtSsaaMaterial_.view, gtSsaaDepth_.view,
+                                  gtSsaaAo_.view, gtSsaaColorPyramid_.chainView,
+                                  gtSsaaPyramid_.chainView, gtSsaaColor_.view);
         }
     }
 
@@ -2732,7 +2758,8 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     //     pass when mixed with spatial plugins) --------------------------------
     timestamps_.sceneBegin(cmd, slot);
     auto recordLrDeferred = [&](VkDescriptorSet sceneSet, VkDescriptorSet lightingSet,
-                                VkDescriptorSet transparentSet, const Mat4& ssaoViewProj) {
+                                VkDescriptorSet transparentSet, VkDescriptorSet ssrSet,
+                                const Mat4& ssaoViewProj) {
         transition(gbAlbedo_.image, gbAlbedoLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                    sync::kSampleStages, sync::kSampled, sync::kColorAttach, sync::kColorWrite,
                    VK_IMAGE_ASPECT_COLOR_BIT);
@@ -2772,17 +2799,19 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                                          cullViewProj);
             vkCmdEndRendering(cmd);
         }
+        // dst scope includes compute: the opaque-SSR pass (ssr_opaque.comp)
+        // samples the GBuffer after the lighting fragment shader.
         transition(gbAlbedo_.image, gbAlbedoLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                   sync::kColorAttach, sync::kColorWrite, sync::kFragment, sync::kSampled,
+                   sync::kColorAttach, sync::kColorWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
         transition(gbNormal_.image, gbNormalLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                   sync::kColorAttach, sync::kColorWrite, sync::kFragment, sync::kSampled,
+                   sync::kColorAttach, sync::kColorWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
         transition(gbMaterial_.image, gbMaterialLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                   sync::kColorAttach, sync::kColorWrite, sync::kFragment, sync::kSampled,
+                   sync::kColorAttach, sync::kColorWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
         transition(gbEmissive_.image, gbEmissiveLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                   sync::kColorAttach, sync::kColorWrite, sync::kFragment, sync::kSampled,
+                   sync::kColorAttach, sync::kColorWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
         transition(gbMotion_.image, gbMotionLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                    sync::kColorAttach, sync::kColorWrite, sync::kFragment, sync::kSampled,
@@ -2790,9 +2819,9 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         transition(gbDepth_.image, gbDepthLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                    sync::kDepthTests, sync::kDepthWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_DEPTH_BIT);
-        // Hi-Z pyramid for the glass SSR marcher (both LR lighting variants
-        // share the same GBuffer depth).
-        if (hasTransparency_)
+        // Hi-Z pyramid for the SSR marchers (glass transparency + opaque-SSR
+        // compute; both LR lighting variants share the same GBuffer depth).
+        if (hasTransparency_ || ssrEnabled_)
             deferred_.recordDepthPyramidPass(cmd, gbPyramid_);
 
         transition(gbAoRaw_.image, gbAoRawLayout_, VK_IMAGE_LAYOUT_GENERAL, sync::kCompute,
@@ -2802,11 +2831,11 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         transition(gbAoRaw_.image, gbAoRawLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                    sync::kCompute, sync::kStorageWrite, sync::kCompute, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
-        transition(gbAo_.image, gbAoLayout_, VK_IMAGE_LAYOUT_GENERAL, sync::kFragment,
+        transition(gbAo_.image, gbAoLayout_, VK_IMAGE_LAYOUT_GENERAL, sync::kSampleStages,
                    sync::kSampled, sync::kCompute, sync::kStorageWrite, VK_IMAGE_ASPECT_COLOR_BIT);
         deferred_.recordSsaoBlurPass(cmd, ssaoBlurSetGb_, renderWidth_, renderHeight_);
         transition(gbAo_.image, gbAoLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                   sync::kCompute, sync::kStorageWrite, sync::kFragment, sync::kSampled,
+                   sync::kCompute, sync::kStorageWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
 
         transition(gbColor_.image, gbColorLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
@@ -2814,16 +2843,32 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                    VK_IMAGE_ASPECT_COLOR_BIT);
         deferred_.recordLightingPass(cmd, lightingSet, gbColor_.view, renderWidth_, renderHeight_);
 
-        if (hasTransparency_) {
+        if (hasTransparency_ || ssrEnabled_) {
             // Color mip chain: mip 0 is the opaque HDR copy glass SSR used to
-            // make with a transfer; the chain stays GENERAL for life.
+            // make with a transfer; the chain stays GENERAL for life.  The
+            // opaque-SSR pass consumes the same chain, so it is built whenever
+            // either consumer runs.
             transition(gbColor_.image, gbColorLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                        sync::kColorAttach, sync::kColorWrite, sync::kCompute, sync::kSampled,
                        VK_IMAGE_ASPECT_COLOR_BIT);
             deferred_.recordColorPyramidPass(cmd, gbColorPyramid_);
-            transition(gbColor_.image, gbColorLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                       sync::kCompute, sync::kSampled, sync::kColorAttach, sync::kColorReadWrite,
-                       VK_IMAGE_ASPECT_COLOR_BIT);
+            if (ssrEnabled_) {
+                // Opaque SSR: in-place RMW on the lit target (GENERAL);
+                // replaces the IBL specular term instead of stacking on it.
+                transition(gbColor_.image, gbColorLayout_, VK_IMAGE_LAYOUT_GENERAL,
+                           sync::kCompute, sync::kSampled, sync::kCompute,
+                           sync::kStorageReadWrite, VK_IMAGE_ASPECT_COLOR_BIT);
+                deferred_.recordSsrPass(cmd, ssrSet, ssaoViewProj, renderWidth_, renderHeight_);
+                transition(gbColor_.image, gbColorLayout_,
+                           VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, sync::kCompute,
+                           sync::kStorageWrite, sync::kColorAttach, sync::kColorReadWrite,
+                           VK_IMAGE_ASPECT_COLOR_BIT);
+            } else {
+                transition(gbColor_.image, gbColorLayout_,
+                           VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, sync::kCompute,
+                           sync::kSampled, sync::kColorAttach, sync::kColorReadWrite,
+                           VK_IMAGE_ASPECT_COLOR_BIT);
+            }
         }
 
         if (hasTransparency_) {
@@ -2876,7 +2921,8 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     if (gbuffer) {
         if (mixedSpatial) {
             recordLrDeferred(fr.sceneSetGbSpatial, fr.lightingSetGbSpatial,
-                             fr.transparentSetGbSpatial, Mat4::multiply(proj, view));
+                             fr.transparentSetGbSpatial, fr.ssrSetGbSpatial,
+                             Mat4::multiply(proj, view));
             transition(gbColor_.image, gbColorLayout_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                        sync::kSampleStages, sync::kSampled, sync::kCopy, sync::kTransferRead,
                        VK_IMAGE_ASPECT_COLOR_BIT);
@@ -2894,7 +2940,7 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kCopy, sync::kTransferWrite,
                        sync::kSampleStages, sync::kSampled, VK_IMAGE_ASPECT_COLOR_BIT);
         }
-        recordLrDeferred(fr.sceneSetGb, fr.lightingSetGb, fr.transparentSetGb,
+        recordLrDeferred(fr.sceneSetGb, fr.lightingSetGb, fr.transparentSetGb, fr.ssrSetGb,
                          Mat4::multiply(projJittered, view));
     }
 
@@ -3029,36 +3075,38 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                                          materialStride_, sw, sh, cullViewProjGt);
             vkCmdEndRendering(cmd);
         }
+        // dst scope includes compute: the opaque-SSR pass samples the GBuffer.
         transition(gtSsaaAlbedo_.image, gtSsaaAlbedoLayout_,
                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kColorAttach, sync::kColorWrite,
-                   sync::kFragment, sync::kSampled, VK_IMAGE_ASPECT_COLOR_BIT);
+                   sync::kSampleStages, sync::kSampled, VK_IMAGE_ASPECT_COLOR_BIT);
         transition(gtSsaaNormal_.image, gtSsaaNormalLayout_,
                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kColorAttach, sync::kColorWrite,
-                   sync::kFragment, sync::kSampled, VK_IMAGE_ASPECT_COLOR_BIT);
+                   sync::kSampleStages, sync::kSampled, VK_IMAGE_ASPECT_COLOR_BIT);
         transition(gtSsaaMaterial_.image, gtSsaaMaterialLayout_,
                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kColorAttach, sync::kColorWrite,
-                   sync::kFragment, sync::kSampled, VK_IMAGE_ASPECT_COLOR_BIT);
+                   sync::kSampleStages, sync::kSampled, VK_IMAGE_ASPECT_COLOR_BIT);
         transition(gtSsaaEmissive_.image, gtSsaaEmissiveLayout_,
                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kColorAttach, sync::kColorWrite,
-                   sync::kFragment, sync::kSampled, VK_IMAGE_ASPECT_COLOR_BIT);
+                   sync::kSampleStages, sync::kSampled, VK_IMAGE_ASPECT_COLOR_BIT);
         transition(gtSsaaDepth_.image, gtSsaaDepthLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                    sync::kDepthTests, sync::kDepthWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_DEPTH_BIT);
-        if (hasTransparency_)
+        if (hasTransparency_ || ssrEnabled_)
             deferred_.recordDepthPyramidPass(cmd, gtSsaaPyramid_);
 
-        // SSAO for the 2x GT path (un-jittered view-projection).
+        // SSAO for the 2x GT path (un-jittered view-projection).  The AO
+        // output is also sampled by the opaque-SSR compute pass.
         transition(gtSsaaAoRaw_.image, gtSsaaAoRawLayout_, VK_IMAGE_LAYOUT_GENERAL, sync::kCompute,
                    sync::kSampled, sync::kCompute, sync::kStorageWrite, VK_IMAGE_ASPECT_COLOR_BIT);
         deferred_.recordSsaoPass(cmd, ssaoSetSsaa_, cullViewProjGt, frameIndex, sw, sh);
         transition(gtSsaaAoRaw_.image, gtSsaaAoRawLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                    sync::kCompute, sync::kStorageWrite, sync::kCompute, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
-        transition(gtSsaaAo_.image, gtSsaaAoLayout_, VK_IMAGE_LAYOUT_GENERAL, sync::kFragment,
+        transition(gtSsaaAo_.image, gtSsaaAoLayout_, VK_IMAGE_LAYOUT_GENERAL, sync::kSampleStages,
                    sync::kSampled, sync::kCompute, sync::kStorageWrite, VK_IMAGE_ASPECT_COLOR_BIT);
         deferred_.recordSsaoBlurPass(cmd, ssaoBlurSetSsaa_, sw, sh);
         transition(gtSsaaAo_.image, gtSsaaAoLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                   sync::kCompute, sync::kStorageWrite, sync::kFragment, sync::kSampled,
+                   sync::kCompute, sync::kStorageWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
 
         transition(gtSsaaColor_.image, gtSsaaColorLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
@@ -3066,15 +3114,30 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                    VK_IMAGE_ASPECT_COLOR_BIT);
         deferred_.recordLightingPass(cmd, fr.lightingSetSsaa, gtSsaaColor_.view, sw, sh);
 
-        if (hasTransparency_) {
-            // Same color mip chain build as the GB path (GENERAL for life).
+        if (hasTransparency_ || ssrEnabled_) {
+            // Same color mip chain build as the GB path (GENERAL for life);
+            // the opaque-SSR pass consumes the same chain.
             transition(gtSsaaColor_.image, gtSsaaColorLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                        sync::kColorAttach, sync::kColorWrite, sync::kCompute, sync::kSampled,
                        VK_IMAGE_ASPECT_COLOR_BIT);
             deferred_.recordColorPyramidPass(cmd, gtSsaaColorPyramid_);
-            transition(gtSsaaColor_.image, gtSsaaColorLayout_,
-                       VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, sync::kCompute, sync::kSampled,
-                       sync::kColorAttach, sync::kColorReadWrite, VK_IMAGE_ASPECT_COLOR_BIT);
+            if (ssrEnabled_) {
+                // Opaque SSR at 2x before the box downsample: in-place RMW on
+                // the lit target (GENERAL).
+                transition(gtSsaaColor_.image, gtSsaaColorLayout_, VK_IMAGE_LAYOUT_GENERAL,
+                           sync::kCompute, sync::kSampled, sync::kCompute,
+                           sync::kStorageReadWrite, VK_IMAGE_ASPECT_COLOR_BIT);
+                deferred_.recordSsrPass(cmd, fr.ssrSetSsaa, cullViewProjGt, sw, sh);
+                transition(gtSsaaColor_.image, gtSsaaColorLayout_,
+                           VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, sync::kCompute,
+                           sync::kStorageWrite, sync::kColorAttach, sync::kColorReadWrite,
+                           VK_IMAGE_ASPECT_COLOR_BIT);
+            } else {
+                transition(gtSsaaColor_.image, gtSsaaColorLayout_,
+                           VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, sync::kCompute,
+                           sync::kSampled, sync::kColorAttach, sync::kColorReadWrite,
+                           VK_IMAGE_ASPECT_COLOR_BIT);
+            }
         }
 
         // Transparency pass: alpha-blended surfaces over the lit scene (GT
@@ -3163,37 +3226,39 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                                          materialStride_, gtW, gtH, cullViewProjGt);
             vkCmdEndRendering(cmd);
         }
+        // dst scope includes compute: the opaque-SSR pass samples the GBuffer.
         transition(gtAlbedo_.image, gtAlbedoLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                   sync::kColorAttach, sync::kColorWrite, sync::kFragment, sync::kSampled,
+                   sync::kColorAttach, sync::kColorWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
         transition(gtNormal_.image, gtNormalLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                   sync::kColorAttach, sync::kColorWrite, sync::kFragment, sync::kSampled,
+                   sync::kColorAttach, sync::kColorWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
         transition(gtMaterial_.image, gtMaterialLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                   sync::kColorAttach, sync::kColorWrite, sync::kFragment, sync::kSampled,
+                   sync::kColorAttach, sync::kColorWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
         transition(gtEmissive_.image, gtEmissiveLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                   sync::kColorAttach, sync::kColorWrite, sync::kFragment, sync::kSampled,
+                   sync::kColorAttach, sync::kColorWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
         transition(gtDepth_.image, gtDepthLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                    sync::kDepthTests, sync::kDepthWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_DEPTH_BIT);
-        if (hasTransparency_)
+        if (hasTransparency_ || ssrEnabled_)
             deferred_.recordDepthPyramidPass(cmd, gtPyramid_);
 
         // SSAO for the 1x GT path (un-jittered view-projection).  In
-        // "GT (Apply scale)" mode gtW/gtH are the low input resolution.
+        // "GT (Apply scale)" mode gtW/gtH are the low input resolution.  The
+        // AO output is also sampled by the opaque-SSR compute pass.
         transition(gtAoRaw_.image, gtAoRawLayout_, VK_IMAGE_LAYOUT_GENERAL, sync::kCompute,
                    sync::kSampled, sync::kCompute, sync::kStorageWrite, VK_IMAGE_ASPECT_COLOR_BIT);
         deferred_.recordSsaoPass(cmd, ssaoSetGt_, cullViewProjGt, frameIndex, gtW, gtH);
         transition(gtAoRaw_.image, gtAoRawLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                    sync::kCompute, sync::kStorageWrite, sync::kCompute, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
-        transition(gtAo_.image, gtAoLayout_, VK_IMAGE_LAYOUT_GENERAL, sync::kFragment,
+        transition(gtAo_.image, gtAoLayout_, VK_IMAGE_LAYOUT_GENERAL, sync::kSampleStages,
                    sync::kSampled, sync::kCompute, sync::kStorageWrite, VK_IMAGE_ASPECT_COLOR_BIT);
         deferred_.recordSsaoBlurPass(cmd, ssaoBlurSetGt_, gtW, gtH);
         transition(gtAo_.image, gtAoLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                   sync::kCompute, sync::kStorageWrite, sync::kFragment, sync::kSampled,
+                   sync::kCompute, sync::kStorageWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
 
         transition(gtColor_.image, gtColorLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
@@ -3201,15 +3266,30 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                    VK_IMAGE_ASPECT_COLOR_BIT);
         deferred_.recordLightingPass(cmd, fr.lightingSetGt, gtColor_.view, gtW, gtH);
 
-        if (hasTransparency_) {
-            // Same color mip chain build as the GB path (GENERAL for life).
+        if (hasTransparency_ || ssrEnabled_) {
+            // Same color mip chain build as the GB path (GENERAL for life);
+            // the opaque-SSR pass consumes the same chain.
             transition(gtColor_.image, gtColorLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                        sync::kColorAttach, sync::kColorWrite, sync::kCompute, sync::kSampled,
                        VK_IMAGE_ASPECT_COLOR_BIT);
             deferred_.recordColorPyramidPass(cmd, gtColorPyramid_);
-            transition(gtColor_.image, gtColorLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                       sync::kCompute, sync::kSampled, sync::kColorAttach, sync::kColorReadWrite,
-                       VK_IMAGE_ASPECT_COLOR_BIT);
+            if (ssrEnabled_) {
+                // Opaque SSR: in-place RMW on the lit target (GENERAL);
+                // replaces the IBL specular term instead of stacking on it.
+                transition(gtColor_.image, gtColorLayout_, VK_IMAGE_LAYOUT_GENERAL,
+                           sync::kCompute, sync::kSampled, sync::kCompute,
+                           sync::kStorageReadWrite, VK_IMAGE_ASPECT_COLOR_BIT);
+                deferred_.recordSsrPass(cmd, fr.ssrSetGt, cullViewProjGt, gtW, gtH);
+                transition(gtColor_.image, gtColorLayout_,
+                           VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, sync::kCompute,
+                           sync::kStorageWrite, sync::kColorAttach, sync::kColorReadWrite,
+                           VK_IMAGE_ASPECT_COLOR_BIT);
+            } else {
+                transition(gtColor_.image, gtColorLayout_,
+                           VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, sync::kCompute,
+                           sync::kSampled, sync::kColorAttach, sync::kColorReadWrite,
+                           VK_IMAGE_ASPECT_COLOR_BIT);
+            }
         }
 
         // Transparency pass: alpha-blended surfaces over the lit scene (GT
@@ -4169,6 +4249,8 @@ void GuiApp::drawViewerTab() {
     ImGui::Checkbox("cascade debug", &shadowDebugCascades_);
     if (!shadowsEnabled_) ImGui::EndDisabled();
     if (!shadowsActive_) ImGui::EndDisabled();
+    // Opaque SSR: per-frame pass skip (no rebuild), all deferred paths.
+    ImGui::Checkbox("ssr (opaque)", &ssrEnabled_);
     ImGui::Separator();
 
     // Live performance readout.

@@ -42,6 +42,7 @@ struct CompareOptions {
     bool shadows = true;                // CSM sun shadows (all paths share one map)
     bool shadowDebug = false;           // tint pixels per shadow cascade
     bool bloom = true;                  // HDR bloom before upscale
+    bool ssr = true;                    // opaque screen-space reflections (CLI: --no-ssr)
     float zoom = 1.f;                   // compare-view zoom (1..16)
     float zoomCenterU = 0.5f;           // zoom window center, normalized source UV
     float zoomCenterV = 0.5f;
@@ -106,6 +107,11 @@ private:
         VkDescriptorSet transparentSetGbSpatial = VK_NULL_HANDLE;
         VkDescriptorSet transparentSetGt = VK_NULL_HANDLE;
         VkDescriptorSet transparentSetSsaa = VK_NULL_HANDLE; // gtSsaa only
+        // Opaque-SSR compute sets (bind the same per-path lighting UBOs).
+        VkDescriptorSet ssrSetGb = VK_NULL_HANDLE;
+        VkDescriptorSet ssrSetGbSpatial = VK_NULL_HANDLE;
+        VkDescriptorSet ssrSetGt = VK_NULL_HANDLE;
+        VkDescriptorSet ssrSetSsaa = VK_NULL_HANDLE; // gtSsaa only
     };
 
     struct AlgoColumn {

@@ -41,6 +41,7 @@ struct RendererOptions {
     bool shadowDebug = false; // cascade tint overlay (CLI: --shadow-debug)
     float exposure = 1.f;     // display-domain ACES input multiplier
     bool bloom = true;        // HDR bloom before upscale (CLI: --no-bloom)
+    bool ssr = true;          // opaque screen-space reflections (CLI: --no-ssr)
 };
 
 class Renderer {
@@ -78,6 +79,8 @@ private:
         VkDescriptorSet lightingSetGt = VK_NULL_HANDLE;
         VkDescriptorSet transparentSetGb = VK_NULL_HANDLE; // IBL + LR AO texture
         VkDescriptorSet transparentSetGt = VK_NULL_HANDLE; // IBL + GT AO texture
+        VkDescriptorSet ssrSetGb = VK_NULL_HANDLE; // opaque SSR, LR path
+        VkDescriptorSet ssrSetGt = VK_NULL_HANDLE; // opaque SSR, GT path
     };
 
     RendererOptions opts_;

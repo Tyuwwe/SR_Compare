@@ -46,7 +46,8 @@ void printUsage() {
                  "  --no-shadows                     disable CSM sun shadows\n"
                  "  --shadow-debug                   tint pixels per shadow cascade\n"
                  "  --exposure <f>                   display exposure (default 1; ACES input)\n"
-                 "  --no-bloom                       disable HDR bloom\n");
+                 "  --no-bloom                       disable HDR bloom\n"
+                 "  --no-ssr                         disable opaque screen-space reflections\n");
 }
 
 int runViewer(int argc, char** argv) {
@@ -103,6 +104,8 @@ int runViewer(int argc, char** argv) {
             }
         } else if (a == "--no-bloom") {
             opts.bloom = false;
+        } else if (a == "--no-ssr") {
+            opts.ssr = false;
         } else {
             std::fprintf(stderr, "unknown viewer option: %s\n", a.c_str());
             return 1;

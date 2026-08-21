@@ -573,23 +573,27 @@ bool CompareApp::createDescriptors() {
     sizes[0].descriptorCount = deferred::kMaxTextures + numColumns * 2 + 2 + numAlgos * 2 +
                                11 * kFramesInFlight * 4 + // lighting sets (GB/GT/SSAA/spatial), +1 shadow
                                7 * kFramesInFlight * 4 +  // transparent sets + SSR
+                               9 * kFramesInFlight * 4 +  // opaque-SSR sets (GB/GT/SSAA/spatial)
                                3 * 3 +                    // ssao + blur samplers (per path)
                                hizSets + colorSets;
     sizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     sizes[1].descriptorCount = kFramesInFlight * 2 + numColumns +
                                kFramesInFlight * 2 + // lighting UBOs
                                kFramesInFlight * 3 +  // transparent UBOs (GB/GT/SSAA)
+                               kFramesInFlight * 4 +  // opaque-SSR UBOs (GB/GT/SSAA/spatial)
                                3 * kFramesInFlight;   // spatial scene + lighting + transparent
     sizes[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
     sizes[2].descriptorCount = kFramesInFlight * 3; // Gb + Gt + spatial scene sets
     sizes[3].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     sizes[3].descriptorCount = numAlgos * 2;
     sizes[4].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    sizes[4].descriptorCount = 6 + hizSets + colorSets; // ssao raw + blurred outputs (GB/GT/SSAA) + pyramid mips
+    // ssao raw + blurred outputs (GB/GT/SSAA) + pyramid mips + SSR in-place color targets
+    sizes[4].descriptorCount = 6 + hizSets + colorSets + kFramesInFlight * 4;
     VkDescriptorPoolCreateInfo poolCi = {};
     poolCi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     poolCi.maxSets = kFramesInFlight * 2 + 2 + numColumns + 1 + numAlgos + kFramesInFlight * 3 +
                      kFramesInFlight * 3 + // transparent sets (GB/GT/SSAA)
+                     kFramesInFlight * 4 + // opaque-SSR sets (GB/GT/SSAA/spatial)
                      6 +                    // ssao sets (GB/GT/SSAA, static)
                      3 * kFramesInFlight + // spatial scene + lighting + transparent
                      hizSets + colorSets;
@@ -658,6 +662,11 @@ bool CompareApp::createDescriptors() {
         if (!allocSet(deferred_.transparentSetLayout(), frames_[i].transparentSetGt)) return false;
         if (opts_.gtSsaa &&
             !allocSet(deferred_.transparentSetLayout(), frames_[i].transparentSetSsaa))
+            return false;
+        if (!allocSet(deferred_.ssrSetLayout(), frames_[i].ssrSetGb)) return false;
+        if (!allocSet(deferred_.ssrSetLayout(), frames_[i].ssrSetGbSpatial)) return false;
+        if (!allocSet(deferred_.ssrSetLayout(), frames_[i].ssrSetGt)) return false;
+        if (opts_.gtSsaa && !allocSet(deferred_.ssrSetLayout(), frames_[i].ssrSetSsaa))
             return false;
     }
     if (!allocSet(deferred_.textureSetLayout(), textureSet_)) return false;
@@ -1074,6 +1083,24 @@ bool CompareApp::createSyncResources() {
                                           gtSsaaColorPyramid_.chainView,
                                           gtSsaaPyramid_.chainView);
         }
+
+        // Opaque-SSR sets: binding 0 reuses the path's lighting UBO; the rest
+        // is the GBuffer + SSAO + pyramids + the lit HDR target (storage RMW).
+        deferred_.writeSsrSet(ctx_, fr.ssrSetGb, fr.lightingUboGb, gbAlbedo_.view,
+                              gbNormal_.view, gbMaterial_.view, gbDepth_.view, gbAo_.view,
+                              gbColorPyramid_.chainView, gbPyramid_.chainView, gbColor_.view);
+        deferred_.writeSsrSet(ctx_, fr.ssrSetGbSpatial, fr.lightingUboGbSpatial, gbAlbedo_.view,
+                              gbNormal_.view, gbMaterial_.view, gbDepth_.view, gbAo_.view,
+                              gbColorPyramid_.chainView, gbPyramid_.chainView, gbColor_.view);
+        deferred_.writeSsrSet(ctx_, fr.ssrSetGt, fr.lightingUboGt, gtAlbedo_.view,
+                              gtNormal_.view, gtMaterial_.view, gtDepth_.view, gtAo_.view,
+                              gtColorPyramid_.chainView, gtPyramid_.chainView, gtColor_.view);
+        if (opts_.gtSsaa) {
+            deferred_.writeSsrSet(ctx_, fr.ssrSetSsaa, fr.lightingUboGt, gtSsaaAlbedo_.view,
+                                  gtSsaaNormal_.view, gtSsaaMaterial_.view, gtSsaaDepth_.view,
+                                  gtSsaaAo_.view, gtSsaaColorPyramid_.chainView,
+                                  gtSsaaPyramid_.chainView, gtSsaaColor_.view);
+        }
     }
 
     // One renderFinished semaphore per swapchain image (present sync).
@@ -1359,18 +1386,21 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     };
 
     auto recordLrLighting = [&](VkDescriptorSet sceneSet, VkDescriptorSet lightingSet,
-                                VkDescriptorSet transparentSet, const Mat4& ssaoViewProj) {
+                                VkDescriptorSet transparentSet, VkDescriptorSet ssrSet,
+                                const Mat4& ssaoViewProj) {
+        // dst scope includes compute: the opaque-SSR pass (ssr_opaque.comp)
+        // samples the GBuffer after the lighting fragment shader.
         transition(gbAlbedo_.image, gbAlbedoLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                   sync::kColorAttach, sync::kColorWrite, sync::kFragment, sync::kSampled,
+                   sync::kColorAttach, sync::kColorWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
         transition(gbNormal_.image, gbNormalLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                   sync::kColorAttach, sync::kColorWrite, sync::kFragment, sync::kSampled,
+                   sync::kColorAttach, sync::kColorWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
         transition(gbMaterial_.image, gbMaterialLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                   sync::kColorAttach, sync::kColorWrite, sync::kFragment, sync::kSampled,
+                   sync::kColorAttach, sync::kColorWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
         transition(gbEmissive_.image, gbEmissiveLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                   sync::kColorAttach, sync::kColorWrite, sync::kFragment, sync::kSampled,
+                   sync::kColorAttach, sync::kColorWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
         transition(gbMotion_.image, gbMotionLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                    sync::kColorAttach, sync::kColorWrite, sync::kFragment, sync::kSampled,
@@ -1378,9 +1408,9 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         transition(gbDepth_.image, gbDepthLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                    sync::kDepthTests, sync::kDepthWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_DEPTH_BIT);
-        // Hi-Z pyramid for the glass SSR marcher (both LR lighting variants
-        // share the same GBuffer depth).
-        if (hasTransparency_)
+        // Hi-Z pyramid for the SSR marchers (glass transparency + opaque-SSR
+        // compute; both LR lighting variants share the same GBuffer depth).
+        if (hasTransparency_ || opts_.ssr)
             deferred_.recordDepthPyramidPass(cmd, gbPyramid_);
 
         transition(gbAoRaw_.image, gbAoRawLayout_, VK_IMAGE_LAYOUT_GENERAL, sync::kCompute,
@@ -1390,11 +1420,11 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         transition(gbAoRaw_.image, gbAoRawLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                    sync::kCompute, sync::kStorageWrite, sync::kCompute, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
-        transition(gbAo_.image, gbAoLayout_, VK_IMAGE_LAYOUT_GENERAL, sync::kFragment,
+        transition(gbAo_.image, gbAoLayout_, VK_IMAGE_LAYOUT_GENERAL, sync::kSampleStages,
                    sync::kSampled, sync::kCompute, sync::kStorageWrite, VK_IMAGE_ASPECT_COLOR_BIT);
         deferred_.recordSsaoBlurPass(cmd, ssaoBlurSetGb_, renderWidth_, renderHeight_);
         transition(gbAo_.image, gbAoLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                   sync::kCompute, sync::kStorageWrite, sync::kFragment, sync::kSampled,
+                   sync::kCompute, sync::kStorageWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
 
         transition(gbColor_.image, gbColorLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
@@ -1402,16 +1432,32 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                    VK_IMAGE_ASPECT_COLOR_BIT);
         deferred_.recordLightingPass(cmd, lightingSet, gbColor_.view, renderWidth_, renderHeight_);
 
-        if (hasTransparency_) {
+        if (hasTransparency_ || opts_.ssr) {
             // Color mip chain: mip 0 is the opaque HDR copy glass SSR used to
-            // make with a transfer; the chain stays GENERAL for life.
+            // make with a transfer; the chain stays GENERAL for life.  The
+            // opaque-SSR pass consumes the same chain, so it is built whenever
+            // either consumer runs.
             transition(gbColor_.image, gbColorLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                        sync::kColorAttach, sync::kColorWrite, sync::kCompute, sync::kSampled,
                        VK_IMAGE_ASPECT_COLOR_BIT);
             deferred_.recordColorPyramidPass(cmd, gbColorPyramid_);
-            transition(gbColor_.image, gbColorLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                       sync::kCompute, sync::kSampled, sync::kColorAttach, sync::kColorReadWrite,
-                       VK_IMAGE_ASPECT_COLOR_BIT);
+            if (opts_.ssr) {
+                // Opaque SSR: in-place RMW on the lit target (GENERAL);
+                // replaces the IBL specular term instead of stacking on it.
+                transition(gbColor_.image, gbColorLayout_, VK_IMAGE_LAYOUT_GENERAL,
+                           sync::kCompute, sync::kSampled, sync::kCompute,
+                           sync::kStorageReadWrite, VK_IMAGE_ASPECT_COLOR_BIT);
+                deferred_.recordSsrPass(cmd, ssrSet, ssaoViewProj, renderWidth_, renderHeight_);
+                transition(gbColor_.image, gbColorLayout_,
+                           VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, sync::kCompute,
+                           sync::kStorageWrite, sync::kColorAttach, sync::kColorReadWrite,
+                           VK_IMAGE_ASPECT_COLOR_BIT);
+            } else {
+                transition(gbColor_.image, gbColorLayout_,
+                           VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, sync::kCompute,
+                           sync::kSampled, sync::kColorAttach, sync::kColorReadWrite,
+                           VK_IMAGE_ASPECT_COLOR_BIT);
+            }
         }
 
         // Overwrites motion (static glass = camera motion) and accumulates the
@@ -1488,7 +1534,7 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
 
     if (mixed) {
         recordLrLighting(fr.sceneSetGbSpatial, fr.lightingSetGbSpatial, fr.transparentSetGbSpatial,
-                         cullViewProj);
+                         fr.ssrSetGbSpatial, cullViewProj);
         transition(gbColor_.image, gbColorLayout_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                    sync::kSampleStages, sync::kSampled, sync::kCopy, sync::kTransferRead,
                    VK_IMAGE_ASPECT_COLOR_BIT);
@@ -1509,10 +1555,10 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kCopy, sync::kTransferWrite,
                    sync::kSampleStages, sync::kSampled, VK_IMAGE_ASPECT_COLOR_BIT);
         recordLrGBuffer(fr.sceneSetGb);
-        recordLrLighting(fr.sceneSetGb, fr.lightingSetGb, fr.transparentSetGb,
+        recordLrLighting(fr.sceneSetGb, fr.lightingSetGb, fr.transparentSetGb, fr.ssrSetGb,
                          Mat4::multiply(projJittered, view));
     } else {
-        recordLrLighting(fr.sceneSetGb, fr.lightingSetGb, fr.transparentSetGb,
+        recordLrLighting(fr.sceneSetGb, fr.lightingSetGb, fr.transparentSetGb, fr.ssrSetGb,
                          Mat4::multiply(projJittered, view));
     }
 
@@ -1612,25 +1658,27 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                                          materialStride_, sw, sh, cullViewProj);
             vkCmdEndRendering(cmd);
         }
+        // dst scope includes compute: the opaque-SSR pass samples the GBuffer.
         transition(gtSsaaAlbedo_.image, gtSsaaAlbedoLayout_,
                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kColorAttach, sync::kColorWrite,
-                   sync::kFragment, sync::kSampled, VK_IMAGE_ASPECT_COLOR_BIT);
+                   sync::kSampleStages, sync::kSampled, VK_IMAGE_ASPECT_COLOR_BIT);
         transition(gtSsaaNormal_.image, gtSsaaNormalLayout_,
                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kColorAttach, sync::kColorWrite,
-                   sync::kFragment, sync::kSampled, VK_IMAGE_ASPECT_COLOR_BIT);
+                   sync::kSampleStages, sync::kSampled, VK_IMAGE_ASPECT_COLOR_BIT);
         transition(gtSsaaMaterial_.image, gtSsaaMaterialLayout_,
                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kColorAttach, sync::kColorWrite,
-                   sync::kFragment, sync::kSampled, VK_IMAGE_ASPECT_COLOR_BIT);
+                   sync::kSampleStages, sync::kSampled, VK_IMAGE_ASPECT_COLOR_BIT);
         transition(gtSsaaEmissive_.image, gtSsaaEmissiveLayout_,
                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kColorAttach, sync::kColorWrite,
-                   sync::kFragment, sync::kSampled, VK_IMAGE_ASPECT_COLOR_BIT);
+                   sync::kSampleStages, sync::kSampled, VK_IMAGE_ASPECT_COLOR_BIT);
         transition(gtSsaaDepth_.image, gtSsaaDepthLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                    sync::kDepthTests, sync::kDepthWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_DEPTH_BIT);
-        if (hasTransparency_)
+        if (hasTransparency_ || opts_.ssr)
             deferred_.recordDepthPyramidPass(cmd, gtSsaaPyramid_);
 
-        // SSAO for the 2x GT path (un-jittered view-projection).
+        // SSAO for the 2x GT path (un-jittered view-projection).  The AO
+        // output is also sampled by the opaque-SSR compute pass.
         transition(gtSsaaAoRaw_.image, gtSsaaAoRawLayout_, VK_IMAGE_LAYOUT_GENERAL,
                    sync::kCompute, sync::kSampled, sync::kCompute, sync::kStorageWrite,
                    VK_IMAGE_ASPECT_COLOR_BIT);
@@ -1638,11 +1686,11 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         transition(gtSsaaAoRaw_.image, gtSsaaAoRawLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                    sync::kCompute, sync::kStorageWrite, sync::kCompute, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
-        transition(gtSsaaAo_.image, gtSsaaAoLayout_, VK_IMAGE_LAYOUT_GENERAL, sync::kFragment,
+        transition(gtSsaaAo_.image, gtSsaaAoLayout_, VK_IMAGE_LAYOUT_GENERAL, sync::kSampleStages,
                    sync::kSampled, sync::kCompute, sync::kStorageWrite, VK_IMAGE_ASPECT_COLOR_BIT);
         deferred_.recordSsaoBlurPass(cmd, ssaoBlurSetSsaa_, sw, sh);
         transition(gtSsaaAo_.image, gtSsaaAoLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                   sync::kCompute, sync::kStorageWrite, sync::kFragment, sync::kSampled,
+                   sync::kCompute, sync::kStorageWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
 
         transition(gtSsaaColor_.image, gtSsaaColorLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
@@ -1650,15 +1698,30 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                    VK_IMAGE_ASPECT_COLOR_BIT);
         deferred_.recordLightingPass(cmd, fr.lightingSetSsaa, gtSsaaColor_.view, sw, sh);
 
-        if (hasTransparency_) {
-            // Same color mip chain build as the GB path (GENERAL for life).
+        if (hasTransparency_ || opts_.ssr) {
+            // Same color mip chain build as the GB path (GENERAL for life);
+            // the opaque-SSR pass consumes the same chain.
             transition(gtSsaaColor_.image, gtSsaaColorLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                        sync::kColorAttach, sync::kColorWrite, sync::kCompute, sync::kSampled,
                        VK_IMAGE_ASPECT_COLOR_BIT);
             deferred_.recordColorPyramidPass(cmd, gtSsaaColorPyramid_);
-            transition(gtSsaaColor_.image, gtSsaaColorLayout_,
-                       VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, sync::kCompute, sync::kSampled,
-                       sync::kColorAttach, sync::kColorReadWrite, VK_IMAGE_ASPECT_COLOR_BIT);
+            if (opts_.ssr) {
+                // Opaque SSR at 2x before the box downsample: in-place RMW on
+                // the lit target (GENERAL).
+                transition(gtSsaaColor_.image, gtSsaaColorLayout_, VK_IMAGE_LAYOUT_GENERAL,
+                           sync::kCompute, sync::kSampled, sync::kCompute,
+                           sync::kStorageReadWrite, VK_IMAGE_ASPECT_COLOR_BIT);
+                deferred_.recordSsrPass(cmd, fr.ssrSetSsaa, cullViewProj, sw, sh);
+                transition(gtSsaaColor_.image, gtSsaaColorLayout_,
+                           VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, sync::kCompute,
+                           sync::kStorageWrite, sync::kColorAttach, sync::kColorReadWrite,
+                           VK_IMAGE_ASPECT_COLOR_BIT);
+            } else {
+                transition(gtSsaaColor_.image, gtSsaaColorLayout_,
+                           VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, sync::kCompute,
+                           sync::kSampled, sync::kColorAttach, sync::kColorReadWrite,
+                           VK_IMAGE_ASPECT_COLOR_BIT);
+            }
         }
 
         // Transparency pass: alpha-blended surfaces over the lit scene (GT
@@ -1747,36 +1810,38 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                                          materialStride_, dw, dh, cullViewProj);
             vkCmdEndRendering(cmd);
         }
+        // dst scope includes compute: the opaque-SSR pass samples the GBuffer.
         transition(gtAlbedo_.image, gtAlbedoLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                   sync::kColorAttach, sync::kColorWrite, sync::kFragment, sync::kSampled,
+                   sync::kColorAttach, sync::kColorWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
         transition(gtNormal_.image, gtNormalLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                   sync::kColorAttach, sync::kColorWrite, sync::kFragment, sync::kSampled,
+                   sync::kColorAttach, sync::kColorWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
         transition(gtMaterial_.image, gtMaterialLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                   sync::kColorAttach, sync::kColorWrite, sync::kFragment, sync::kSampled,
+                   sync::kColorAttach, sync::kColorWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
         transition(gtEmissive_.image, gtEmissiveLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                   sync::kColorAttach, sync::kColorWrite, sync::kFragment, sync::kSampled,
+                   sync::kColorAttach, sync::kColorWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
         transition(gtDepth_.image, gtDepthLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                    sync::kDepthTests, sync::kDepthWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_DEPTH_BIT);
-        if (hasTransparency_)
+        if (hasTransparency_ || opts_.ssr)
             deferred_.recordDepthPyramidPass(cmd, gtPyramid_);
 
-        // SSAO for the 1x GT path (un-jittered view-projection).
+        // SSAO for the 1x GT path (un-jittered view-projection).  The AO
+        // output is also sampled by the opaque-SSR compute pass.
         transition(gtAoRaw_.image, gtAoRawLayout_, VK_IMAGE_LAYOUT_GENERAL, sync::kCompute,
                    sync::kSampled, sync::kCompute, sync::kStorageWrite, VK_IMAGE_ASPECT_COLOR_BIT);
         deferred_.recordSsaoPass(cmd, ssaoSetGt_, cullViewProj, frameIndex, dw, dh);
         transition(gtAoRaw_.image, gtAoRawLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                    sync::kCompute, sync::kStorageWrite, sync::kCompute, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
-        transition(gtAo_.image, gtAoLayout_, VK_IMAGE_LAYOUT_GENERAL, sync::kFragment,
+        transition(gtAo_.image, gtAoLayout_, VK_IMAGE_LAYOUT_GENERAL, sync::kSampleStages,
                    sync::kSampled, sync::kCompute, sync::kStorageWrite, VK_IMAGE_ASPECT_COLOR_BIT);
         deferred_.recordSsaoBlurPass(cmd, ssaoBlurSetGt_, dw, dh);
         transition(gtAo_.image, gtAoLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                   sync::kCompute, sync::kStorageWrite, sync::kFragment, sync::kSampled,
+                   sync::kCompute, sync::kStorageWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
 
         transition(gtColor_.image, gtColorLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
@@ -1784,15 +1849,30 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                    VK_IMAGE_ASPECT_COLOR_BIT);
         deferred_.recordLightingPass(cmd, fr.lightingSetGt, gtColor_.view, dw, dh);
 
-        if (hasTransparency_) {
-            // Same color mip chain build as the GB path (GENERAL for life).
+        if (hasTransparency_ || opts_.ssr) {
+            // Same color mip chain build as the GB path (GENERAL for life);
+            // the opaque-SSR pass consumes the same chain.
             transition(gtColor_.image, gtColorLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                        sync::kColorAttach, sync::kColorWrite, sync::kCompute, sync::kSampled,
                        VK_IMAGE_ASPECT_COLOR_BIT);
             deferred_.recordColorPyramidPass(cmd, gtColorPyramid_);
-            transition(gtColor_.image, gtColorLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                       sync::kCompute, sync::kSampled, sync::kColorAttach, sync::kColorReadWrite,
-                       VK_IMAGE_ASPECT_COLOR_BIT);
+            if (opts_.ssr) {
+                // Opaque SSR: in-place RMW on the lit target (GENERAL);
+                // replaces the IBL specular term instead of stacking on it.
+                transition(gtColor_.image, gtColorLayout_, VK_IMAGE_LAYOUT_GENERAL,
+                           sync::kCompute, sync::kSampled, sync::kCompute,
+                           sync::kStorageReadWrite, VK_IMAGE_ASPECT_COLOR_BIT);
+                deferred_.recordSsrPass(cmd, fr.ssrSetGt, cullViewProj, dw, dh);
+                transition(gtColor_.image, gtColorLayout_,
+                           VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, sync::kCompute,
+                           sync::kStorageWrite, sync::kColorAttach, sync::kColorReadWrite,
+                           VK_IMAGE_ASPECT_COLOR_BIT);
+            } else {
+                transition(gtColor_.image, gtColorLayout_,
+                           VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, sync::kCompute,
+                           sync::kSampled, sync::kColorAttach, sync::kColorReadWrite,
+                           VK_IMAGE_ASPECT_COLOR_BIT);
+            }
         }
 
         // Transparency pass: alpha-blended surfaces over the lit scene (GT
