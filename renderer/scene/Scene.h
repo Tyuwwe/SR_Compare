@@ -259,6 +259,28 @@ inline const std::vector<Light>& defaultLights() {
     return lights;
 }
 
+// --- Froxel volumetric fog (Phase 5a; Frostbite 2015 / UE4.16) ----------------
+// Per-scene participating-media parameters, filled from the lighting preset
+// (SceneRegistry) and consumed by the DeferredCore froxel passes.  Plain POD
+// scene data; the CLI/GUI toggles gate on `enabled` without rebuilding.
+// References: Hillaire, "Physically Based Sky, Atmosphere and Cloud Rendering
+// in Frostbite" (SIGGRAPH 2015); Wronski, "Volumetric Fog" (SIGGRAPH 2014);
+// UE4 Volumetric Fog documentation.
+struct VolFogParams {
+    bool enabled = false;     // presets opt in; hosts AND this with the CLI/GUI toggle
+    float density = 0.01f;    // base extinction sigma_t at baseHeight (1/m)
+    float heightFalloff = 0.15f; // exponential density decay per metre above baseHeight
+    float baseHeight = 0.f;   // world Y of the densest fog (m)
+    float anisotropy = 0.6f;  // Schlick/Henyey-Greenstein g (forward scattering)
+    Vec3 albedo{0.9f, 0.9f, 0.9f}; // scattering albedo (fog colour)
+    float noiseStrength = 0.5f; // 0..1 static 3D noise modulation of density
+    float noiseScale = 0.08f;   // noise feature scale (1/m)
+    float maxDistance = 200.f;  // froxel far range (m of view depth); matches
+                                // kShadowMaxDistance so fog god rays stay
+                                // inside the CSM coverage
+    float ambient = 0.4f;     // isotropic ambient light scale (x IBL intensity)
+};
+
 // --- Reflection probes (UE4 reflection-capture style, Phase 4c-2) ------------
 // A baked local specular/diffuse capture: the scene is rendered into a small
 // cubemap from `position` once (offline --bake-probes command), prefiltered

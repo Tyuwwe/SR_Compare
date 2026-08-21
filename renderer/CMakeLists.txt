@@ -68,6 +68,11 @@ set(RENDERER_SHADERS
     shaders/ibl_irradiance.comp
     shaders/ibl_prefilter.comp
     shaders/ibl_brdf_lut.comp
+    shaders/volfog_inject.comp
+    shaders/volfog_light.comp
+    shaders/volfog_temporal.comp
+    shaders/volfog_march.comp
+    shaders/volfog_composite.comp
 )
 set(RENDERER_SPV "")
 foreach(SHADER ${RENDERER_SHADERS})
@@ -81,6 +86,8 @@ foreach(SHADER ${RENDERER_SHADERS})
         sr_compile_shader(SPV ${SHADER} "${SR_SHADER_INCLUDE_DIR}/brdf.glsl" "${SR_SHADER_INCLUDE_DIR}/ssr.glsl" "${SR_SHADER_INCLUDE_DIR}/probes.glsl")
     elseif(SHADER STREQUAL "shaders/ibl_brdf_lut.comp")
         sr_compile_shader(SPV ${SHADER} "${SR_SHADER_INCLUDE_DIR}/brdf.glsl")
+    elseif(SHADER MATCHES "^shaders/volfog_.*\\.comp$")
+        sr_compile_shader(SPV ${SHADER} "${SR_SHADER_INCLUDE_DIR}/volfog.glsl")
     else()
         sr_compile_shader(SPV ${SHADER})
     endif()

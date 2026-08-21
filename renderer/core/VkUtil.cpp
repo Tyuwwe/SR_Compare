@@ -47,6 +47,29 @@ VkResult createImage(const VulkanContext& ctx, uint32_t width, uint32_t height, 
     return vmaCreateImage(ctx.allocator, &info, &alloc, &image, &allocation, nullptr);
 }
 
+VkResult createImage3D(const VulkanContext& ctx, uint32_t width, uint32_t height, uint32_t depth,
+                       VkFormat format, VkImageUsageFlags usage, VkImage& image,
+                       VmaAllocation& allocation) {
+    VkImageCreateInfo info = {};
+    info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    info.imageType = VK_IMAGE_TYPE_3D;
+    info.extent = {width, height, depth};
+    info.mipLevels = 1;
+    info.arrayLayers = 1;
+    info.format = format;
+    info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    info.usage = usage;
+    info.samples = VK_SAMPLE_COUNT_1_BIT;
+    info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+    VmaAllocationCreateInfo alloc = {};
+    alloc.usage = VMA_MEMORY_USAGE_AUTO;
+    alloc.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+
+    return vmaCreateImage(ctx.allocator, &info, &alloc, &image, &allocation, nullptr);
+}
+
 VkImageView createImageView(const VulkanContext& ctx, VkImage image, VkFormat format,
                             VkImageAspectFlags aspect, uint32_t baseMip, uint32_t levelCount,
                             VkImageViewType viewType, uint32_t layerCount) {

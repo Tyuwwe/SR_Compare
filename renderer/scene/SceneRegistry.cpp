@@ -36,7 +36,22 @@ std::string resolveSceneArg(const std::string& arg) {
     return resolveAssetPath(arg);  // treat as a glTF path (may still be CWD-relative)
 }
 
-LightingPreset defaultLightingPreset() { return LightingPreset{}; }
+LightingPreset defaultLightingPreset() {
+    LightingPreset p;
+    // Mild neutral height fog (boxes room / Sponza atrium): visible shafts
+    // through the Sponza arches without washing the scene out.
+    p.fog.enabled = true;
+    p.fog.density = 0.012f;
+    p.fog.heightFalloff = 0.2f;
+    p.fog.baseHeight = 0.f;
+    p.fog.anisotropy = 0.55f;
+    p.fog.albedo = {0.92f, 0.92f, 0.94f};
+    p.fog.noiseStrength = 0.4f;
+    p.fog.noiseScale = 0.08f;
+    p.fog.maxDistance = 200.f;
+    p.fog.ambient = 0.4f;
+    return p;
+}
 
 LightingPreset goldenHourPreset() {
     LightingPreset p;
@@ -51,6 +66,19 @@ LightingPreset goldenHourPreset() {
     p.iblIntensity = 0.45f;
     p.exposure = 1.f;
     p.preferPresetSun = true;
+    // Showcase volumetric fog: warm dense street-level haze with strong
+    // forward scattering so the low sun throws god rays between the
+    // buildings; the height falloff keeps the rooftops clear.
+    p.fog.enabled = true;
+    p.fog.density = 0.03f;
+    p.fog.heightFalloff = 0.09f;
+    p.fog.baseHeight = 0.f;
+    p.fog.anisotropy = 0.7f;
+    p.fog.albedo = {1.0f, 0.85f, 0.66f};
+    p.fog.noiseStrength = 0.55f;
+    p.fog.noiseScale = 0.05f;
+    p.fog.maxDistance = 200.f;
+    p.fog.ambient = 0.5f;
     return p;
 }
 

@@ -188,7 +188,12 @@ bool DeferredCore::init(const VulkanContext& ctx, const char* envMapPath) {
         !loadShader(ctx, "shadow_depth.vert.spv", shadowDepthVert_) ||
         !loadShader(ctx, "shadow_depth_skinned.vert.spv", shadowDepthSkinnedVert_) ||
         !loadShader(ctx, "shadow_depth.frag.spv", shadowDepthFrag_) ||
-        !loadShader(ctx, "cluster_assign.comp.spv", clusterAssignComp_))
+        !loadShader(ctx, "cluster_assign.comp.spv", clusterAssignComp_) ||
+        !loadShader(ctx, "volfog_inject.comp.spv", volfogInjectComp_) ||
+        !loadShader(ctx, "volfog_light.comp.spv", volfogLightComp_) ||
+        !loadShader(ctx, "volfog_temporal.comp.spv", volfogTemporalComp_) ||
+        !loadShader(ctx, "volfog_march.comp.spv", volfogMarchComp_) ||
+        !loadShader(ctx, "volfog_composite.comp.spv", volfogCompositeComp_))
         return false;
 
     if (!createLayouts(ctx)) return false;
@@ -495,8 +500,112 @@ bool DeferredCore::createLayouts(const VulkanContext& ctx) {
     exposureLayoutCi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
     exposureLayoutCi.bindingCount = 3;
     exposureLayoutCi.pBindings = exposureBindings;
-    return vkCreateDescriptorSetLayout(ctx.device, &exposureLayoutCi, nullptr,
-                                       &exposureSetLayout_) == VK_SUCCESS;
+    if (vkCreateDescriptorSetLayout(ctx.device, &exposureLayoutCi, nullptr,
+                                    &exposureSetLayout_) != VK_SUCCESS)
+        return false;
+
+    // --- Froxel volumetric fog (Phase 5a; binding shapes per volfog_*.comp) ---
+    // Inject: binding 0 = inject volume (storage image3D).
+    VkDescriptorSetLayoutBinding volfogInjectBinding = {};
+    volfogInjectBinding.binding = 0;
+    volfogInjectBinding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    volfogInjectBinding.descriptorCount = 1;
+    volfogInjectBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    VkDescriptorSetLayoutCreateInfo volfogInjectLayoutCi = {};
+    volfogInjectLayoutCi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    volfogInjectLayoutCi.bindingCount = 1;
+    volfogInjectLayoutCi.pBindings = &volfogInjectBinding;
+    if (vkCreateDescriptorSetLayout(ctx.device, &volfogInjectLayoutCi, nullptr,
+                                    &volfogInjectSetLayout_) != VK_SUCCESS)
+        return false;
+
+    // Light accumulation: 0 = LightingUBO, 1/2 = cluster lights + grid SSBOs,
+    // 3/4 = CSM + spot atlas (comparison samplers), 5 = inject volume
+    // (sampler3D), 6 = raw-lit volume out (storage image3D).
+    VkDescriptorSetLayoutBinding volfogLightBindings[7] = {};
+    volfogLightBindings[0].binding = 0;
+    volfogLightBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    volfogLightBindings[0].descriptorCount = 1;
+    volfogLightBindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    for (uint32_t i = 1; i < 3; ++i) {
+        volfogLightBindings[i].binding = i;
+        volfogLightBindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        volfogLightBindings[i].descriptorCount = 1;
+        volfogLightBindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+    for (uint32_t i = 3; i < 6; ++i) {
+        volfogLightBindings[i].binding = i;
+        volfogLightBindings[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        volfogLightBindings[i].descriptorCount = 1;
+        volfogLightBindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+    volfogLightBindings[6].binding = 6;
+    volfogLightBindings[6].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    volfogLightBindings[6].descriptorCount = 1;
+    volfogLightBindings[6].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    VkDescriptorSetLayoutCreateInfo volfogLightLayoutCi = {};
+    volfogLightLayoutCi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    volfogLightLayoutCi.bindingCount = 7;
+    volfogLightLayoutCi.pBindings = volfogLightBindings;
+    if (vkCreateDescriptorSetLayout(ctx.device, &volfogLightLayoutCi, nullptr,
+                                    &volfogLightSetLayout_) != VK_SUCCESS)
+        return false;
+
+    // Temporal: 0 = raw lit (sampler3D), 1 = history read (sampler3D),
+    // 2 = history write (storage image3D).
+    VkDescriptorSetLayoutBinding volfogTemporalBindings[3] = {};
+    for (uint32_t i = 0; i < 3; ++i) {
+        volfogTemporalBindings[i].binding = i;
+        volfogTemporalBindings[i].descriptorCount = 1;
+        volfogTemporalBindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        volfogTemporalBindings[i].descriptorType =
+            i == 2 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    }
+    VkDescriptorSetLayoutCreateInfo volfogTemporalLayoutCi = {};
+    volfogTemporalLayoutCi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    volfogTemporalLayoutCi.bindingCount = 3;
+    volfogTemporalLayoutCi.pBindings = volfogTemporalBindings;
+    if (vkCreateDescriptorSetLayout(ctx.device, &volfogTemporalLayoutCi, nullptr,
+                                    &volfogTemporalSetLayout_) != VK_SUCCESS)
+        return false;
+
+    // March: 0 = filtered lit volume (sampler3D), 1 = integrated out (storage).
+    VkDescriptorSetLayoutBinding volfogMarchBindings[2] = {};
+    volfogMarchBindings[0].binding = 0;
+    volfogMarchBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    volfogMarchBindings[0].descriptorCount = 1;
+    volfogMarchBindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    volfogMarchBindings[1].binding = 1;
+    volfogMarchBindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    volfogMarchBindings[1].descriptorCount = 1;
+    volfogMarchBindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    VkDescriptorSetLayoutCreateInfo volfogMarchLayoutCi = {};
+    volfogMarchLayoutCi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    volfogMarchLayoutCi.bindingCount = 2;
+    volfogMarchLayoutCi.pBindings = volfogMarchBindings;
+    if (vkCreateDescriptorSetLayout(ctx.device, &volfogMarchLayoutCi, nullptr,
+                                    &volfogMarchSetLayout_) != VK_SUCCESS)
+        return false;
+
+    // Composite: 0 = lit HDR scene colour (storage image2D, RMW), 1 = GBuffer
+    // depth (sampler2D), 2 = integrated volume (sampler3D, trilinear).
+    VkDescriptorSetLayoutBinding volfogCompositeBindings[3] = {};
+    volfogCompositeBindings[0].binding = 0;
+    volfogCompositeBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    volfogCompositeBindings[0].descriptorCount = 1;
+    volfogCompositeBindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    for (uint32_t i = 1; i < 3; ++i) {
+        volfogCompositeBindings[i].binding = i;
+        volfogCompositeBindings[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        volfogCompositeBindings[i].descriptorCount = 1;
+        volfogCompositeBindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo volfogCompositeLayoutCi = {};
+    volfogCompositeLayoutCi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    volfogCompositeLayoutCi.bindingCount = 3;
+    volfogCompositeLayoutCi.pBindings = volfogCompositeBindings;
+    return vkCreateDescriptorSetLayout(ctx.device, &volfogCompositeLayoutCi, nullptr,
+                                       &volfogCompositeSetLayout_) == VK_SUCCESS;
 }
 
 bool DeferredCore::createPipelines(const VulkanContext& ctx) {
@@ -1066,6 +1175,52 @@ bool DeferredCore::createPipelines(const VulkanContext& ctx) {
     if (createComputePipeline(ctx, clusterCi, clusterPipeline_) != VK_SUCCESS)
         return false;
 
+    // --- Froxel volumetric fog (Phase 5a): one compute pipeline per pass ------
+    // A small helper builds each set-layout + push-range pipeline layout pair;
+    // the push sizes differ per pass (VolFog*Push).
+    struct VolFogPipeSpec {
+        VkDescriptorSetLayout setLayout;
+        uint32_t pushSize;
+        VkShaderModule module;
+        VkPipelineLayout* layoutOut;
+        VkPipeline* pipelineOut;
+    };
+    const VolFogPipeSpec volfogSpecs[5] = {
+        {volfogInjectSetLayout_, sizeof(VolFogInjectPush), volfogInjectComp_,
+         &volfogInjectPipelineLayout_, &volfogInjectPipeline_},
+        {volfogLightSetLayout_, sizeof(VolFogLightPush), volfogLightComp_,
+         &volfogLightPipelineLayout_, &volfogLightPipeline_},
+        {volfogTemporalSetLayout_, sizeof(VolFogTemporalPush), volfogTemporalComp_,
+         &volfogTemporalPipelineLayout_, &volfogTemporalPipeline_},
+        {volfogMarchSetLayout_, sizeof(VolFogMarchPush), volfogMarchComp_,
+         &volfogMarchPipelineLayout_, &volfogMarchPipeline_},
+        {volfogCompositeSetLayout_, sizeof(VolFogCompositePush), volfogCompositeComp_,
+         &volfogCompositePipelineLayout_, &volfogCompositePipeline_},
+    };
+    for (const VolFogPipeSpec& spec : volfogSpecs) {
+        VkPushConstantRange volfogPush = {};
+        volfogPush.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        volfogPush.offset = 0;
+        volfogPush.size = spec.pushSize;
+        VkPipelineLayoutCreateInfo layoutCi = {};
+        layoutCi.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        layoutCi.setLayoutCount = 1;
+        layoutCi.pSetLayouts = &spec.setLayout;
+        layoutCi.pushConstantRangeCount = 1;
+        layoutCi.pPushConstantRanges = &volfogPush;
+        if (vkCreatePipelineLayout(ctx.device, &layoutCi, nullptr, spec.layoutOut) != VK_SUCCESS)
+            return false;
+        VkComputePipelineCreateInfo pipeCi = {};
+        pipeCi.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        pipeCi.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        pipeCi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        pipeCi.stage.module = spec.module;
+        pipeCi.stage.pName = "main";
+        pipeCi.layout = *spec.layoutOut;
+        if (createComputePipeline(ctx, pipeCi, *spec.pipelineOut) != VK_SUCCESS)
+            return false;
+    }
+
     // --- CSM shadow depth pass ------------------------------------------------
     // Depth-only rendering into one cascade layer at a time.  Reuses the scene
     // pipeline layout (set0 = scene/material UBO, set1 = texture array); the
@@ -1150,6 +1305,11 @@ void DeferredCore::destroy(const VulkanContext& ctx) {
     if (shadowPipeline_) { vkDestroyPipeline(ctx.device, shadowPipeline_, nullptr); shadowPipeline_ = VK_NULL_HANDLE; }
     if (shadowSkinnedPipeline_) { vkDestroyPipeline(ctx.device, shadowSkinnedPipeline_, nullptr); shadowSkinnedPipeline_ = VK_NULL_HANDLE; }
     if (clusterPipeline_) { vkDestroyPipeline(ctx.device, clusterPipeline_, nullptr); clusterPipeline_ = VK_NULL_HANDLE; }
+    if (volfogInjectPipeline_) { vkDestroyPipeline(ctx.device, volfogInjectPipeline_, nullptr); volfogInjectPipeline_ = VK_NULL_HANDLE; }
+    if (volfogLightPipeline_) { vkDestroyPipeline(ctx.device, volfogLightPipeline_, nullptr); volfogLightPipeline_ = VK_NULL_HANDLE; }
+    if (volfogTemporalPipeline_) { vkDestroyPipeline(ctx.device, volfogTemporalPipeline_, nullptr); volfogTemporalPipeline_ = VK_NULL_HANDLE; }
+    if (volfogMarchPipeline_) { vkDestroyPipeline(ctx.device, volfogMarchPipeline_, nullptr); volfogMarchPipeline_ = VK_NULL_HANDLE; }
+    if (volfogCompositePipeline_) { vkDestroyPipeline(ctx.device, volfogCompositePipeline_, nullptr); volfogCompositePipeline_ = VK_NULL_HANDLE; }
     if (scenePipelineLayout_) { vkDestroyPipelineLayout(ctx.device, scenePipelineLayout_, nullptr); scenePipelineLayout_ = VK_NULL_HANDLE; }
     if (lightingPipelineLayout_) { vkDestroyPipelineLayout(ctx.device, lightingPipelineLayout_, nullptr); lightingPipelineLayout_ = VK_NULL_HANDLE; }
     if (transparentPipelineLayout_) { vkDestroyPipelineLayout(ctx.device, transparentPipelineLayout_, nullptr); transparentPipelineLayout_ = VK_NULL_HANDLE; }
@@ -1163,6 +1323,11 @@ void DeferredCore::destroy(const VulkanContext& ctx) {
     if (histogramPipelineLayout_) { vkDestroyPipelineLayout(ctx.device, histogramPipelineLayout_, nullptr); histogramPipelineLayout_ = VK_NULL_HANDLE; }
     if (exposureSolvePipelineLayout_) { vkDestroyPipelineLayout(ctx.device, exposureSolvePipelineLayout_, nullptr); exposureSolvePipelineLayout_ = VK_NULL_HANDLE; }
     if (clusterPipelineLayout_) { vkDestroyPipelineLayout(ctx.device, clusterPipelineLayout_, nullptr); clusterPipelineLayout_ = VK_NULL_HANDLE; }
+    if (volfogInjectPipelineLayout_) { vkDestroyPipelineLayout(ctx.device, volfogInjectPipelineLayout_, nullptr); volfogInjectPipelineLayout_ = VK_NULL_HANDLE; }
+    if (volfogLightPipelineLayout_) { vkDestroyPipelineLayout(ctx.device, volfogLightPipelineLayout_, nullptr); volfogLightPipelineLayout_ = VK_NULL_HANDLE; }
+    if (volfogTemporalPipelineLayout_) { vkDestroyPipelineLayout(ctx.device, volfogTemporalPipelineLayout_, nullptr); volfogTemporalPipelineLayout_ = VK_NULL_HANDLE; }
+    if (volfogMarchPipelineLayout_) { vkDestroyPipelineLayout(ctx.device, volfogMarchPipelineLayout_, nullptr); volfogMarchPipelineLayout_ = VK_NULL_HANDLE; }
+    if (volfogCompositePipelineLayout_) { vkDestroyPipelineLayout(ctx.device, volfogCompositePipelineLayout_, nullptr); volfogCompositePipelineLayout_ = VK_NULL_HANDLE; }
     if (gbufferVert_) { vkDestroyShaderModule(ctx.device, gbufferVert_, nullptr); gbufferVert_ = VK_NULL_HANDLE; }
     if (gbufferSkinnedVert_) { vkDestroyShaderModule(ctx.device, gbufferSkinnedVert_, nullptr); gbufferSkinnedVert_ = VK_NULL_HANDLE; }
     if (gbufferFrag_) { vkDestroyShaderModule(ctx.device, gbufferFrag_, nullptr); gbufferFrag_ = VK_NULL_HANDLE; }
@@ -1188,6 +1353,11 @@ void DeferredCore::destroy(const VulkanContext& ctx) {
     if (shadowDepthSkinnedVert_) { vkDestroyShaderModule(ctx.device, shadowDepthSkinnedVert_, nullptr); shadowDepthSkinnedVert_ = VK_NULL_HANDLE; }
     if (shadowDepthFrag_) { vkDestroyShaderModule(ctx.device, shadowDepthFrag_, nullptr); shadowDepthFrag_ = VK_NULL_HANDLE; }
     if (clusterAssignComp_) { vkDestroyShaderModule(ctx.device, clusterAssignComp_, nullptr); clusterAssignComp_ = VK_NULL_HANDLE; }
+    if (volfogInjectComp_) { vkDestroyShaderModule(ctx.device, volfogInjectComp_, nullptr); volfogInjectComp_ = VK_NULL_HANDLE; }
+    if (volfogLightComp_) { vkDestroyShaderModule(ctx.device, volfogLightComp_, nullptr); volfogLightComp_ = VK_NULL_HANDLE; }
+    if (volfogTemporalComp_) { vkDestroyShaderModule(ctx.device, volfogTemporalComp_, nullptr); volfogTemporalComp_ = VK_NULL_HANDLE; }
+    if (volfogMarchComp_) { vkDestroyShaderModule(ctx.device, volfogMarchComp_, nullptr); volfogMarchComp_ = VK_NULL_HANDLE; }
+    if (volfogCompositeComp_) { vkDestroyShaderModule(ctx.device, volfogCompositeComp_, nullptr); volfogCompositeComp_ = VK_NULL_HANDLE; }
     if (sceneSetLayout_) { vkDestroyDescriptorSetLayout(ctx.device, sceneSetLayout_, nullptr); sceneSetLayout_ = VK_NULL_HANDLE; }
     if (textureSetLayout_) { vkDestroyDescriptorSetLayout(ctx.device, textureSetLayout_, nullptr); textureSetLayout_ = VK_NULL_HANDLE; }
     if (lightingSetLayout_) { vkDestroyDescriptorSetLayout(ctx.device, lightingSetLayout_, nullptr); lightingSetLayout_ = VK_NULL_HANDLE; }
@@ -1200,6 +1370,11 @@ void DeferredCore::destroy(const VulkanContext& ctx) {
     if (ssrTemporalSetLayout_) { vkDestroyDescriptorSetLayout(ctx.device, ssrTemporalSetLayout_, nullptr); ssrTemporalSetLayout_ = VK_NULL_HANDLE; }
     if (exposureSetLayout_) { vkDestroyDescriptorSetLayout(ctx.device, exposureSetLayout_, nullptr); exposureSetLayout_ = VK_NULL_HANDLE; }
     if (clusterSetLayout_) { vkDestroyDescriptorSetLayout(ctx.device, clusterSetLayout_, nullptr); clusterSetLayout_ = VK_NULL_HANDLE; }
+    if (volfogInjectSetLayout_) { vkDestroyDescriptorSetLayout(ctx.device, volfogInjectSetLayout_, nullptr); volfogInjectSetLayout_ = VK_NULL_HANDLE; }
+    if (volfogLightSetLayout_) { vkDestroyDescriptorSetLayout(ctx.device, volfogLightSetLayout_, nullptr); volfogLightSetLayout_ = VK_NULL_HANDLE; }
+    if (volfogTemporalSetLayout_) { vkDestroyDescriptorSetLayout(ctx.device, volfogTemporalSetLayout_, nullptr); volfogTemporalSetLayout_ = VK_NULL_HANDLE; }
+    if (volfogMarchSetLayout_) { vkDestroyDescriptorSetLayout(ctx.device, volfogMarchSetLayout_, nullptr); volfogMarchSetLayout_ = VK_NULL_HANDLE; }
+    if (volfogCompositeSetLayout_) { vkDestroyDescriptorSetLayout(ctx.device, volfogCompositeSetLayout_, nullptr); volfogCompositeSetLayout_ = VK_NULL_HANDLE; }
     if (textureSampler_) { vkDestroySampler(ctx.device, textureSampler_, nullptr); textureSampler_ = VK_NULL_HANDLE; }
     if (gbufferSampler_) { vkDestroySampler(ctx.device, gbufferSampler_, nullptr); gbufferSampler_ = VK_NULL_HANDLE; }
     if (shadowSampler_) { vkDestroySampler(ctx.device, shadowSampler_, nullptr); shadowSampler_ = VK_NULL_HANDLE; }
@@ -2652,6 +2827,380 @@ void DeferredCore::recordSsrTemporalPass(VkCommandBuffer cmd, const SsrHistory& 
     imageBarrier(cmd, history.image[i], VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
                  sync::kCompute, sync::kStorageWrite, sync::kCompute, sync::kSampled,
                  VK_IMAGE_ASPECT_COLOR_BIT, 0, 1);
+}
+
+// --- Froxel volumetric fog (Phase 5a) -----------------------------------------
+
+bool DeferredCore::createVolFogVolume(const VulkanContext& ctx, uint32_t w, uint32_t h,
+                                      VolFogVolume& out) const {
+    out.dimX = (w + kFroxelTileSize - 1) / kFroxelTileSize;
+    out.dimY = (h + kFroxelTileSize - 1) / kFroxelTileSize;
+    out.dimZ = kFroxelSlices;
+    const VkImageUsageFlags usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    struct Slot {
+        VkImage* image;
+        VmaAllocation* memory;
+        VkImageView* view;
+    };
+    const Slot slots[5] = {
+        {&out.injectImage, &out.injectMemory, &out.injectView},
+        {&out.rawImage, &out.rawMemory, &out.rawView},
+        {&out.histImage[0], &out.histMemory[0], &out.histView[0]},
+        {&out.histImage[1], &out.histMemory[1], &out.histView[1]},
+        {&out.intImage, &out.intMemory, &out.intView},
+    };
+    for (const Slot& s : slots) {
+        if (createImage3D(ctx, out.dimX, out.dimY, out.dimZ, kFroxelFormat, usage, *s.image,
+                          *s.memory) != VK_SUCCESS)
+            return false;
+        *s.view = createImageView(ctx, *s.image, kFroxelFormat, VK_IMAGE_ASPECT_COLOR_BIT, 0, 1,
+                                  VK_IMAGE_VIEW_TYPE_3D);
+        if (!*s.view) return false;
+    }
+    // GENERAL for life (same model as the AO/SSR histories): every volume
+    // ping-pongs between compute storage writes and compute sampled reads.
+    submitOneShot(ctx, [&](VkCommandBuffer cmd) {
+        for (const Slot& s : slots)
+            imageBarrier(cmd, *s.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                         VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                         VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, VK_IMAGE_ASPECT_COLOR_BIT, 0, 1);
+    });
+    return true;
+}
+
+bool DeferredCore::writeVolFogSets(const VulkanContext& ctx, VkDescriptorPool pool,
+                                   VolFogVolume& fog, const ClusterGrid& cluster,
+                                   const VkBuffer* lightingUbos, VkImageView shadowMap,
+                                   VkImageView shadowAtlas, VkImageView depth,
+                                   VkImageView sceneColor) const {
+    auto allocSet = [&](VkDescriptorSetLayout layout, VkDescriptorSet& out) {
+        VkDescriptorSetAllocateInfo alloc = {};
+        alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        alloc.descriptorPool = pool;
+        alloc.descriptorSetCount = 1;
+        alloc.pSetLayouts = &layout;
+        return vkAllocateDescriptorSets(ctx.device, &alloc, &out) == VK_SUCCESS;
+    };
+    auto imageWrite = [](VkDescriptorSet set, uint32_t binding, VkDescriptorType type,
+                         VkSampler sampler, VkImageView view, VkImageLayout layout,
+                         VkWriteDescriptorSet& w, VkDescriptorImageInfo& img) {
+        img.sampler = sampler;
+        img.imageView = view;
+        img.imageLayout = layout;
+        w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w.dstSet = set;
+        w.dstBinding = binding;
+        w.descriptorCount = 1;
+        w.descriptorType = type;
+        w.pImageInfo = &img;
+    };
+
+    // Inject: storage-only set.
+    if (!allocSet(volfogInjectSetLayout_, fog.injectSet)) return false;
+    {
+        VkDescriptorImageInfo img = {};
+        VkWriteDescriptorSet w = {};
+        imageWrite(fog.injectSet, 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_NULL_HANDLE,
+                   fog.injectView, VK_IMAGE_LAYOUT_GENERAL, w, img);
+        vkUpdateDescriptorSets(ctx.device, 1, &w, 0, nullptr);
+    }
+
+    // Light accumulation, per slot (per-slot LightingUBO + ClusterGrid SSBOs).
+    for (uint32_t slot = 0; slot < kClusterSlots; ++slot) {
+        if (!allocSet(volfogLightSetLayout_, fog.lightSet[slot])) return false;
+        VkDescriptorBufferInfo ubo = {};
+        ubo.buffer = lightingUbos[slot];
+        ubo.range = sizeof(LightingUBO);
+        VkDescriptorBufferInfo ssbo[2] = {};
+        ssbo[0].buffer = cluster.lightsBuffer[slot];
+        ssbo[0].range = VK_WHOLE_SIZE;
+        ssbo[1].buffer = cluster.gridBuffer[slot];
+        ssbo[1].range = VK_WHOLE_SIZE;
+        VkWriteDescriptorSet w[7] = {};
+        for (uint32_t k = 0; k < 3; ++k) {
+            w[k].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            w[k].dstSet = fog.lightSet[slot];
+            w[k].dstBinding = k;
+            w[k].descriptorCount = 1;
+        }
+        w[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        w[0].pBufferInfo = &ubo;
+        w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        w[1].pBufferInfo = &ssbo[0];
+        w[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        w[2].pBufferInfo = &ssbo[1];
+        // Shadow maps follow the writeLightingSet convention: unwritten
+        // binding when the host has no map (shadowParams.z == 0 then).
+        uint32_t writeCount = 3;
+        VkDescriptorImageInfo img[4] = {};
+        if (shadowMap) {
+            imageWrite(fog.lightSet[slot], 3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                       shadowSampler_, shadowMap, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                       w[writeCount], img[0]);
+            ++writeCount;
+        }
+        if (shadowAtlas) {
+            imageWrite(fog.lightSet[slot], 4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                       shadowSampler_, shadowAtlas, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                       w[writeCount], img[1]);
+            ++writeCount;
+        }
+        imageWrite(fog.lightSet[slot], 5, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                   gbufferSampler_, fog.injectView, VK_IMAGE_LAYOUT_GENERAL, w[writeCount],
+                   img[2]);
+        ++writeCount;
+        imageWrite(fog.lightSet[slot], 6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_NULL_HANDLE,
+                   fog.rawView, VK_IMAGE_LAYOUT_GENERAL, w[writeCount], img[3]);
+        ++writeCount;
+        vkUpdateDescriptorSets(ctx.device, writeCount, w, 0, nullptr);
+    }
+
+    // Temporal ping-pong: set i reads raw + hist[1-i], writes hist[i].
+    for (uint32_t i = 0; i < 2; ++i) {
+        if (!allocSet(volfogTemporalSetLayout_, fog.temporalSet[i])) return false;
+        VkDescriptorImageInfo img[3] = {};
+        VkWriteDescriptorSet w[3] = {};
+        imageWrite(fog.temporalSet[i], 0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                   gbufferSampler_, fog.rawView, VK_IMAGE_LAYOUT_GENERAL, w[0], img[0]);
+        imageWrite(fog.temporalSet[i], 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                   gbufferSampler_, fog.histView[1 - i], VK_IMAGE_LAYOUT_GENERAL, w[1], img[1]);
+        imageWrite(fog.temporalSet[i], 2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_NULL_HANDLE,
+                   fog.histView[i], VK_IMAGE_LAYOUT_GENERAL, w[2], img[2]);
+        vkUpdateDescriptorSets(ctx.device, 3, w, 0, nullptr);
+
+        // March: reads the filtered hist[i], writes the integrated volume.
+        if (!allocSet(volfogMarchSetLayout_, fog.marchSet[i])) return false;
+        VkDescriptorImageInfo mimg[2] = {};
+        VkWriteDescriptorSet mw[2] = {};
+        imageWrite(fog.marchSet[i], 0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                   gbufferSampler_, fog.histView[i], VK_IMAGE_LAYOUT_GENERAL, mw[0], mimg[0]);
+        imageWrite(fog.marchSet[i], 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_NULL_HANDLE,
+                   fog.intView, VK_IMAGE_LAYOUT_GENERAL, mw[1], mimg[1]);
+        vkUpdateDescriptorSets(ctx.device, 2, mw, 0, nullptr);
+    }
+
+    // Composite: lit HDR target RMW + GBuffer depth + integrated volume.
+    if (!allocSet(volfogCompositeSetLayout_, fog.compositeSet)) return false;
+    {
+        VkDescriptorImageInfo img[3] = {};
+        VkWriteDescriptorSet w[3] = {};
+        imageWrite(fog.compositeSet, 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_NULL_HANDLE,
+                   sceneColor, VK_IMAGE_LAYOUT_GENERAL, w[0], img[0]);
+        imageWrite(fog.compositeSet, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                   gbufferSampler_, depth, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, w[1], img[1]);
+        imageWrite(fog.compositeSet, 2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                   gbufferSampler_, fog.intView, VK_IMAGE_LAYOUT_GENERAL, w[2], img[2]);
+        vkUpdateDescriptorSets(ctx.device, 3, w, 0, nullptr);
+    }
+    return true;
+}
+
+void DeferredCore::destroyVolFogVolume(const VulkanContext& ctx, VolFogVolume& fog) const {
+    struct Slot {
+        VkImage* image;
+        VmaAllocation* memory;
+        VkImageView* view;
+    };
+    const Slot slots[5] = {
+        {&fog.injectImage, &fog.injectMemory, &fog.injectView},
+        {&fog.rawImage, &fog.rawMemory, &fog.rawView},
+        {&fog.histImage[0], &fog.histMemory[0], &fog.histView[0]},
+        {&fog.histImage[1], &fog.histMemory[1], &fog.histView[1]},
+        {&fog.intImage, &fog.intMemory, &fog.intView},
+    };
+    for (const Slot& s : slots) {
+        if (*s.view) {
+            vkDestroyImageView(ctx.device, *s.view, nullptr);
+            *s.view = VK_NULL_HANDLE;
+        }
+        if (*s.image) {
+            vmaDestroyImage(ctx.allocator, *s.image, *s.memory);
+            *s.image = VK_NULL_HANDLE;
+            *s.memory = VK_NULL_HANDLE;
+        }
+    }
+    // Sets are pool-owned.
+    fog.injectSet = VK_NULL_HANDLE;
+    for (uint32_t i = 0; i < kClusterSlots; ++i) fog.lightSet[i] = VK_NULL_HANDLE;
+    for (uint32_t i = 0; i < 2; ++i) {
+        fog.temporalSet[i] = VK_NULL_HANDLE;
+        fog.marchSet[i] = VK_NULL_HANDLE;
+    }
+    fog.compositeSet = VK_NULL_HANDLE;
+    fog.dimX = fog.dimY = 0;
+}
+
+void DeferredCore::recordVolFogAccumulate(VkCommandBuffer cmd, VolFogVolume& fog,
+                                          const ClusterGrid& cluster, uint32_t slot,
+                                          const Mat4& view, const Mat4& proj,
+                                          const Mat4& prevViewProj, const VolFogParams& params,
+                                          uint32_t frameIndex, uint32_t writeIndex,
+                                          bool reset) const {
+    if (!fog.injectImage) return;
+    const uint32_t s = slot % kClusterSlots;
+    const Mat4 invView = Mat4::inverse(view);
+    const float nearZ = proj.m[14] / proj.m[10]; // see recordLightingPass
+    const float fogFar = params.maxDistance > nearZ ? params.maxDistance : nearZ * 2.f;
+    // Shared grid dims / proj params for every pass (fog far range, not the
+    // camera far plane: the volume covers [near, maxDistance]).
+    auto fillProj = [&](float* projParams) {
+        projParams[0] = proj.m[0];
+        projParams[1] = proj.m[5];
+        projParams[2] = nearZ;
+        projParams[3] = fogFar;
+    };
+    auto volumeBarrier = [&](VkImage image, VkAccessFlags2 srcAccess,
+                             VkAccessFlags2 dstAccess) {
+        imageBarrier(cmd, image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+                     sync::kCompute, srcAccess, sync::kCompute, dstAccess,
+                     VK_IMAGE_ASPECT_COLOR_BIT, 0, 1);
+    };
+    const uint32_t gx = (fog.dimX + 3) / 4;
+    const uint32_t gy = (fog.dimY + 3) / 4;
+    const uint32_t gz = (fog.dimZ + 3) / 4;
+
+    // --- 1) inject (height fog + static noise -> density/albedo) -------------
+    // WAR: last frame's light pass sampled the inject volume.
+    volumeBarrier(fog.injectImage, sync::kSampled, sync::kStorageWrite);
+    {
+        VolFogInjectPush push = {};
+        std::memcpy(push.invView, invView.m, sizeof(push.invView));
+        fillProj(push.projParams);
+        push.fogA[0] = params.density;
+        push.fogA[1] = params.heightFalloff;
+        push.fogA[2] = params.baseHeight;
+        push.fogA[3] = params.noiseScale;
+        push.fogAlbedo[0] = params.albedo.x;
+        push.fogAlbedo[1] = params.albedo.y;
+        push.fogAlbedo[2] = params.albedo.z;
+        push.fogAlbedo[3] = params.noiseStrength;
+        push.fogB[0] = static_cast<float>(frameIndex);
+        push.grid[0] = fog.dimX;
+        push.grid[1] = fog.dimY;
+        push.grid[2] = fog.dimZ;
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, volfogInjectPipeline_);
+        vkCmdPushConstants(cmd, volfogInjectPipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                           sizeof(push), &push);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, volfogInjectPipelineLayout_,
+                                0, 1, &fog.injectSet, 0, nullptr);
+        vkCmdDispatch(cmd, gx, gy, gz);
+    }
+
+    // --- 2) light accumulation (sun CSM + cluster lights + ambient) ----------
+    volumeBarrier(fog.injectImage, sync::kStorageWrite, sync::kSampled);
+    // WAR: last frame's temporal pass sampled the raw-lit volume.
+    volumeBarrier(fog.rawImage, sync::kSampled, sync::kStorageWrite);
+    {
+        // The cluster assignment for this frame/slot ran inside
+        // recordLightingPass (compute write -> fragment read barrier); extend
+        // the read scope to this compute pass.
+        VkBufferMemoryBarrier2 clusterBar = {};
+        clusterBar.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2;
+        clusterBar.srcStageMask =
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+        clusterBar.srcAccessMask =
+            VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+        clusterBar.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        clusterBar.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+        clusterBar.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        clusterBar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        clusterBar.buffer = cluster.gridBuffer[s];
+        clusterBar.offset = 0;
+        clusterBar.size = VK_WHOLE_SIZE;
+        VkDependencyInfo dep = {};
+        dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+        dep.bufferMemoryBarrierCount = 1;
+        dep.pBufferMemoryBarriers = &clusterBar;
+        vkCmdPipelineBarrier2(cmd, &dep);
+
+        VolFogLightPush push = {};
+        std::memcpy(push.invView, invView.m, sizeof(push.invView));
+        fillProj(push.projParams);
+        push.fogA[0] = params.anisotropy;
+        push.fogA[1] = params.ambient;
+        push.grid[0] = fog.dimX;
+        push.grid[1] = fog.dimY;
+        push.grid[2] = fog.dimZ;
+        push.misc[0] = cluster.gridX * kClusterTileSize; // screen px covered by the grid
+        push.misc[1] = cluster.gridY * kClusterTileSize;
+        push.misc[2] = kClusterTileSize;
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, volfogLightPipeline_);
+        vkCmdPushConstants(cmd, volfogLightPipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                           sizeof(push), &push);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, volfogLightPipelineLayout_,
+                                0, 1, &fog.lightSet[s], 0, nullptr);
+        vkCmdDispatch(cmd, gx, gy, gz);
+    }
+
+    // --- 3) temporal reprojection + EMA (ping-pong history) ------------------
+    const uint32_t i = writeIndex & 1u;
+    // Raw-lit writes -> temporal reads; WAR: the march pass of the previous
+    // accumulate sampled hist[i] (two frames of ping-pong ago it was also the
+    // temporal write target).
+    volumeBarrier(fog.rawImage, sync::kStorageWrite, sync::kSampled);
+    volumeBarrier(fog.histImage[i], sync::kSampled, sync::kStorageWrite);
+    {
+        VolFogTemporalPush push = {};
+        std::memcpy(push.invView, invView.m, sizeof(push.invView));
+        std::memcpy(push.prevViewProj, prevViewProj.m, sizeof(push.prevViewProj));
+        fillProj(push.projParams);
+        push.params[0] = kVolFogTemporalBlend;
+        push.params[1] = reset ? 1.f : 0.f;
+        push.grid[0] = fog.dimX;
+        push.grid[1] = fog.dimY;
+        push.grid[2] = fog.dimZ;
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, volfogTemporalPipeline_);
+        vkCmdPushConstants(cmd, volfogTemporalPipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                           sizeof(push), &push);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, volfogTemporalPipelineLayout_,
+                                0, 1, &fog.temporalSet[i], 0, nullptr);
+        vkCmdDispatch(cmd, gx, gy, gz);
+    }
+
+    // --- 4) front-to-back ray integration (per column) -------------------------
+    // Filtered writes -> march reads; WAR: last frame's composite sampled the
+    // integrated volume.
+    volumeBarrier(fog.histImage[i], sync::kStorageWrite, sync::kSampled);
+    volumeBarrier(fog.intImage, sync::kSampled, sync::kStorageWrite);
+    {
+        VolFogMarchPush push = {};
+        std::memcpy(push.invView, invView.m, sizeof(push.invView));
+        fillProj(push.projParams);
+        push.grid[0] = fog.dimX;
+        push.grid[1] = fog.dimY;
+        push.grid[2] = fog.dimZ;
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, volfogMarchPipeline_);
+        vkCmdPushConstants(cmd, volfogMarchPipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                           sizeof(push), &push);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, volfogMarchPipelineLayout_,
+                                0, 1, &fog.marchSet[i], 0, nullptr);
+        vkCmdDispatch(cmd, (fog.dimX + 7) / 8, (fog.dimY + 7) / 8, 1);
+    }
+    // The march -> composite barrier lives at the top of recordVolFogComposite
+    // (the host may record other passes in between).
+}
+
+void DeferredCore::recordVolFogComposite(VkCommandBuffer cmd, const VolFogVolume& fog,
+                                         const Mat4& proj, float fogFar, uint32_t width,
+                                         uint32_t height) const {
+    if (!fog.intImage) return;
+    // The march pass just wrote the integrated volume; make the writes
+    // visible to this pass's trilinear samples.
+    imageBarrier(cmd, fog.intImage, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+                 sync::kCompute, sync::kStorageWrite, sync::kCompute, sync::kSampled,
+                 VK_IMAGE_ASPECT_COLOR_BIT, 0, 1);
+    VolFogCompositePush push = {};
+    push.depthParams[0] = proj.m[10];
+    push.depthParams[1] = proj.m[14];
+    push.depthParams[2] = proj.m[14] / proj.m[10]; // near (see recordLightingPass)
+    push.depthParams[3] = fogFar;
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, volfogCompositePipeline_);
+    vkCmdPushConstants(cmd, volfogCompositePipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                       sizeof(push), &push);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, volfogCompositePipelineLayout_,
+                            0, 1, &fog.compositeSet, 0, nullptr);
+    vkCmdDispatch(cmd, (width + 7) / 8, (height + 7) / 8, 1);
 }
 
 void DeferredCore::writeBloomSet(const VulkanContext& ctx, VkDescriptorSet set, VkImageView src,

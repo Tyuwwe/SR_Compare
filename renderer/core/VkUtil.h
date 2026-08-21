@@ -21,6 +21,11 @@ VkResult createImage(const VulkanContext& ctx, uint32_t width, uint32_t height, 
                      uint32_t mipLevels = 1, uint32_t arrayLayers = 1,
                      VkImageCreateFlags flags = 0);
 
+// 3D volume variant (froxel fog grids); single mip, no layers.
+VkResult createImage3D(const VulkanContext& ctx, uint32_t width, uint32_t height, uint32_t depth,
+                       VkFormat format, VkImageUsageFlags usage, VkImage& image,
+                       VmaAllocation& allocation);
+
 VkImageView createImageView(const VulkanContext& ctx, VkImage image, VkFormat format,
                             VkImageAspectFlags aspect, uint32_t baseMip = 0, uint32_t levelCount = 1,
                             VkImageViewType viewType = VK_IMAGE_VIEW_TYPE_2D,

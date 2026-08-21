@@ -51,6 +51,9 @@ struct RendererOptions {
     // Screen-space contact shadows for the CSM sun (CLI: --no-contact-shadows);
     // needs shadows on (rides the CSM sun selection).
     bool contactShadows = true;
+    // Froxel volumetric fog (Phase 5a, CLI: --no-volfog); the scene lighting
+    // preset carries the media parameters (VolFogParams::enabled gates too).
+    bool volFog = true;
     // Offline reflection-probe baking (CLI: --bake-probes): renders each
     // probe's 6 cube faces and writes the .probes file, then exits without
     // entering the frame loop.  Not part of bench.
@@ -188,6 +191,20 @@ private:
     // per-slot full-lights SSBO + per-cluster light list SSBO (DeferredCore).
     ClusterGrid gbCluster_;
     ClusterGrid gtCluster_;
+
+    // Froxel volumetric fog (Phase 5a), one volume set per path: the grid
+    // scales with the path resolution like the cluster grid.  The temporal
+    // filter uses the UN-JITTERED previous view-projection per path; a zero
+    // frame counter resets (bypasses) the history — same convention as the
+    // GTAO/SSR temporal state above.
+    VolFogVolume gbFog_;
+    VolFogVolume gtFog_;
+    Mat4 prevFogViewProjGb_ = Mat4::identity();
+    Mat4 prevFogViewProjGt_ = Mat4::identity();
+    uint32_t fogFramesGb_ = 0;
+    uint32_t fogFramesGt_ = 0;
+    VolFogParams fogParams_;    // scene preset media parameters
+    bool volFogActive_ = false; // opts.volFog && fogParams_.enabled && volumes created
 
     // Shared deferred pipeline (shaders/layouts/pipelines/samplers + IBL maps).
     DeferredCore deferred_;

@@ -36,6 +36,9 @@ struct LightingPreset {
     // When true and the glTF has KHR_lights, authored directionals are
     // replaced by this preset's sun so Bistro keeps the golden-hour key.
     bool preferPresetSun = false;
+    // Froxel volumetric fog (Phase 5a); presets opt in via fog.enabled.
+    // The CLI --no-volfog / GUI checkbox AND-gate this per frame.
+    VolFogParams fog;
 };
 
 LightingPreset defaultLightingPreset();

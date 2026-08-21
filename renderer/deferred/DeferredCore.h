@@ -25,6 +25,7 @@ namespace sr {
 class Scene;
 class Camera;
 struct Light;
+struct VolFogParams;
 
 // Default equirect HDR environment map (Bistro san_giuseppe_bridge, bundled
 // in the project's assets; override with --env-map).
@@ -462,6 +463,105 @@ struct SsrPush {
 };
 static_assert(sizeof(SsrPush) == 64, "SsrPush size mismatch");
 
+// --- Froxel volumetric fog (Phase 5a) ----------------------------------------
+// Frostbite 2015 unified participating media (Hillaire, "Physically Based
+// Sky, Atmosphere and Cloud Rendering in Frostbite") / UE4.16 Volumetric Fog
+// (Wronski, SIGGRAPH 2014 + UE4 docs): a camera-frustum-aligned voxel grid
+// ("froxels") fed by four compute passes per frame and path:
+//   1. inject   (volfog_inject.comp): exponential height fog + static 3D
+//      value noise (frame-index domain offset) -> density + scattering albedo;
+//   2. light    (volfog_light.comp): CSM sun (shadow-map visibility -> god
+//      rays) + the froxel's cluster light list (Phase 4a SSBO reuse) +
+//      isotropic ambient; single scattering with a Schlick phase function;
+//   3. temporal (volfog_temporal.comp): previous-frame volume reprojection +
+//      EMA — the same pattern as the GTAO/SSR temporal filters;
+//   4. march    (volfog_march.comp): front-to-back analytic per-slice
+//      integration -> per-froxel accumulated inscatter + transmittance.
+// volfog_composite.comp then applies color * transmittance + inscatter to the
+// lit HDR target right after the lighting pass (before tonemapping).
+// All volumes are RGBA16F 3D, GENERAL for life (same ownership/layout model
+// as AoHistory/SsrHistory).  All inputs derive from the frame index:
+// deterministic, no wall clock.  The fog passes use the UN-JITTERED camera
+// matrices for both paths so the volume does not swim under TAA jitter.
+constexpr uint32_t kFroxelTileSize = 12; // px per froxel XY at path res (160x90 at 1080p)
+constexpr uint32_t kFroxelSlices = 64;   // exponential Z slices (UE4 volumetric fog default)
+constexpr VkFormat kFroxelFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+// Temporal EMA window (~8 frames), same convention as GTAO/SSR.
+constexpr float kVolFogTemporalBlend = 0.125f;
+
+// Push blocks of the froxel passes; all carry the un-jittered view inverse +
+// projection parameters so the shader derives each froxel's world position
+// analytically (volfog.glsl froxelWorldPos).
+struct VolFogInjectPush {
+    float invView[16];
+    float projParams[4];  // x = proj.m[0], y = proj.m[5], z = near, w = fog far
+    float fogA[4];        // density, heightFalloff, baseHeight, noiseScale
+    float fogAlbedo[4];   // rgb = albedo, w = noiseStrength
+    float fogB[4];        // x = frame index, yzw unused
+    uint32_t grid[4];     // dimX, dimY, dimZ, unused
+};
+static_assert(sizeof(VolFogInjectPush) == 144, "VolFogInjectPush size mismatch");
+
+struct VolFogLightPush {
+    float invView[16];
+    float projParams[4];  // x = proj.m[0], y = proj.m[5], z = near, w = fog far
+    float fogA[4];        // x = anisotropy g, y = ambient scale, zw unused
+    uint32_t grid[4];     // dimX, dimY, dimZ, unused
+    uint32_t misc[4];     // screenW, screenH, kClusterTileSize, unused
+};
+static_assert(sizeof(VolFogLightPush) == 128, "VolFogLightPush size mismatch");
+
+struct VolFogTemporalPush {
+    float invView[16];      // current frame (un-jittered)
+    float prevViewProj[16]; // previous frame (un-jittered)
+    float projParams[4];    // x = proj.m[0], y = proj.m[5], z = near, w = fog far
+    float params[4];        // x = EMA blend, y = reset (1 = pass-through)
+    uint32_t grid[4];       // dimX, dimY, dimZ, unused
+};
+static_assert(sizeof(VolFogTemporalPush) == 176, "VolFogTemporalPush size mismatch");
+
+struct VolFogMarchPush {
+    float invView[16];
+    float projParams[4];  // x = proj.m[0], y = proj.m[5], z = near, w = fog far
+    uint32_t grid[4];     // dimX, dimY, dimZ, unused
+};
+static_assert(sizeof(VolFogMarchPush) == 96, "VolFogMarchPush size mismatch");
+
+struct VolFogCompositePush {
+    float depthParams[4]; // x = proj.m[10], y = proj.m[14] (NDC -> view Z),
+                          // z = near, w = fog far
+};
+static_assert(sizeof(VolFogCompositePush) == 16, "VolFogCompositePush size mismatch");
+
+// Host-owned froxel volume set, one per deferred render path (grid resolution
+// scales with the path resolution — same rule as ClusterGrid).  Five volumes:
+// the inject target (per-frame media properties), the raw lit volume (light
+// pass output), the temporal ping-pong pair and the ray-integrated result.
+// Sets are pool-owned; the light sets are per-slot because they bind the
+// per-slot LightingUBO + ClusterGrid buffers.
+struct VolFogVolume {
+    VkImage injectImage = VK_NULL_HANDLE;
+    VmaAllocation injectMemory = VK_NULL_HANDLE;
+    VkImageView injectView = VK_NULL_HANDLE;
+    VkImage rawImage = VK_NULL_HANDLE;
+    VmaAllocation rawMemory = VK_NULL_HANDLE;
+    VkImageView rawView = VK_NULL_HANDLE;
+    VkImage histImage[2] = {};
+    VmaAllocation histMemory[2] = {};
+    VkImageView histView[2] = {};
+    VkImage intImage = VK_NULL_HANDLE;
+    VmaAllocation intMemory = VK_NULL_HANDLE;
+    VkImageView intView = VK_NULL_HANDLE;
+    VkDescriptorSet injectSet = VK_NULL_HANDLE;
+    VkDescriptorSet lightSet[kClusterSlots] = {}; // per-slot (UBO + cluster SSBOs)
+    VkDescriptorSet temporalSet[2] = {};          // [i]: read raw + hist[1-i], write hist[i]
+    VkDescriptorSet marchSet[2] = {};             // [i]: read hist[i], write intImage
+    VkDescriptorSet compositeSet = VK_NULL_HANDLE;
+    uint32_t dimX = 0;
+    uint32_t dimY = 0;
+    uint32_t dimZ = kFroxelSlices;
+};
+
 // Bloom (half-res extract + separable Gaussian, added back before upscale).
 struct BloomPush {
     float params[4]; // extract: threshold, knee; blur: dir.xy; composite: strength
@@ -834,6 +934,45 @@ public:
                                const Mat4& prevViewProj, uint32_t width, uint32_t height,
                                bool reset) const;
 
+    // --- Froxel volumetric fog (Phase 5a; see the constants above) ------------
+    // Creates the five RGBA16F 3D volumes (inject / raw-lit / history x2 /
+    // integrated) for a path of resolution w x h; GENERAL for life via a
+    // one-shot transition.  Descriptor sets are written by writeVolFogSets
+    // once the host's pool exists.
+    bool createVolFogVolume(const VulkanContext& ctx, uint32_t w, uint32_t h,
+                            VolFogVolume& out) const;
+    // Allocates all sets from the caller's pool: inject (storage only); light
+    // per slot (LightingUBO + this path's ClusterGrid SSBOs + CSM/spot shadow
+    // maps + inject volume + raw-lit out); temporal x2; march x2; composite
+    // (lit HDR target RMW + GBuffer depth + integrated volume).  shadowMap /
+    // shadowAtlas follow the writeLightingSet VK_NULL_HANDLE convention (the
+    // binding stays unwritten; shadowParams.z == 0 short-circuits the sample).
+    bool writeVolFogSets(const VulkanContext& ctx, VkDescriptorPool pool, VolFogVolume& fog,
+                         const ClusterGrid& cluster, const VkBuffer* lightingUbos,
+                         VkImageView shadowMap, VkImageView shadowAtlas, VkImageView depth,
+                         VkImageView sceneColor) const;
+    void destroyVolFogVolume(const VulkanContext& ctx, VolFogVolume& fog) const;
+    // Records inject -> light -> temporal -> march with internal barriers.
+    // view/proj are the UN-JITTERED camera matrices (the volume stays stable
+    // under TAA jitter); prevViewProj is last frame's proj*view of this path.
+    // The cluster assignment for this frame/slot must already be recorded
+    // (recordLightingPass does it) and the CSM/spot maps must be
+    // shader-readable.  writeIndex is the temporal ping-pong index (the
+    // host's per-path fog frame counter & 1); reset = first frame of this
+    // path (history bypassed).
+    void recordVolFogAccumulate(VkCommandBuffer cmd, VolFogVolume& fog,
+                                const ClusterGrid& cluster, uint32_t slot, const Mat4& view,
+                                const Mat4& proj, const Mat4& prevViewProj,
+                                const VolFogParams& params, uint32_t frameIndex,
+                                uint32_t writeIndex, bool reset) const;
+    // In-place composite on the lit HDR target (per-texel RMW, same contract
+    // as ssr_temporal.comp): color * transmittance + inscatter.  The lit
+    // target must be GENERAL (storage RMW) and the GBuffer depth
+    // SHADER_READ_ONLY on entry; proj supplies the depth unpack (m[10]/m[14])
+    // of this path's projection, fogFar the volume's far range.
+    void recordVolFogComposite(VkCommandBuffer cmd, const VolFogVolume& fog, const Mat4& proj,
+                               float fogFar, uint32_t width, uint32_t height) const;
+
     // --- Auto exposure (after lighting + bloom, before upscale/present) -------
     // Creates the histogram + state buffers; initialEV seeds the smoothed EV
     // (pick -log2(initialExposure) so the first frames match the manual look
@@ -993,6 +1132,22 @@ private:
     VkPipeline ssrPipeline_ = VK_NULL_HANDLE;
     VkPipelineLayout ssrTemporalPipelineLayout_ = VK_NULL_HANDLE;
     VkPipeline ssrTemporalPipeline_ = VK_NULL_HANDLE;
+    // Froxel volumetric fog (Phase 5a): one set layout + pipeline per pass.
+    VkDescriptorSetLayout volfogInjectSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout volfogLightSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout volfogTemporalSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout volfogMarchSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout volfogCompositeSetLayout_ = VK_NULL_HANDLE;
+    VkPipelineLayout volfogInjectPipelineLayout_ = VK_NULL_HANDLE;
+    VkPipelineLayout volfogLightPipelineLayout_ = VK_NULL_HANDLE;
+    VkPipelineLayout volfogTemporalPipelineLayout_ = VK_NULL_HANDLE;
+    VkPipelineLayout volfogMarchPipelineLayout_ = VK_NULL_HANDLE;
+    VkPipelineLayout volfogCompositePipelineLayout_ = VK_NULL_HANDLE;
+    VkPipeline volfogInjectPipeline_ = VK_NULL_HANDLE;
+    VkPipeline volfogLightPipeline_ = VK_NULL_HANDLE;
+    VkPipeline volfogTemporalPipeline_ = VK_NULL_HANDLE;
+    VkPipeline volfogMarchPipeline_ = VK_NULL_HANDLE;
+    VkPipeline volfogCompositePipeline_ = VK_NULL_HANDLE;
     VkPipelineLayout bloomPipelineLayout_ = VK_NULL_HANDLE;
     VkPipeline bloomExtractPipeline_ = VK_NULL_HANDLE;
     VkPipeline bloomBlurPipeline_ = VK_NULL_HANDLE;
@@ -1020,6 +1175,11 @@ private:
     VkShaderModule colorDownsampleComp_ = VK_NULL_HANDLE;
     VkShaderModule ssrOpaqueComp_ = VK_NULL_HANDLE;
     VkShaderModule ssrTemporalComp_ = VK_NULL_HANDLE;
+    VkShaderModule volfogInjectComp_ = VK_NULL_HANDLE;
+    VkShaderModule volfogLightComp_ = VK_NULL_HANDLE;
+    VkShaderModule volfogTemporalComp_ = VK_NULL_HANDLE;
+    VkShaderModule volfogMarchComp_ = VK_NULL_HANDLE;
+    VkShaderModule volfogCompositeComp_ = VK_NULL_HANDLE;
     VkShaderModule bloomExtractComp_ = VK_NULL_HANDLE;
     VkShaderModule bloomBlurComp_ = VK_NULL_HANDLE;
     VkShaderModule bloomCompositeComp_ = VK_NULL_HANDLE;

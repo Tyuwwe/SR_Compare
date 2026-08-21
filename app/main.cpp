@@ -49,6 +49,7 @@ void printUsage() {
                  "  --no-bloom                       disable HDR bloom\n"
                  "  --no-ssr                         disable opaque screen-space reflections\n"
                  "  --no-contact-shadows             disable screen-space contact shadows (sun)\n"
+                 "  --no-volfog                      disable froxel volumetric fog\n"
                  "  --bake-probes                    bake reflection probes to the scene's .probes file, then exit\n");
 }
 
@@ -112,6 +113,8 @@ int runViewer(int argc, char** argv) {
             opts.ssr = false;
         } else if (a == "--no-contact-shadows") {
             opts.contactShadows = false;
+        } else if (a == "--no-volfog") {
+            opts.volFog = false;
         } else if (a == "--bake-probes") {
             opts.bakeProbes = true;
         } else {
