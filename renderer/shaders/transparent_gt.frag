@@ -51,6 +51,9 @@ layout(set = 2, binding = 0) uniform LightingUBO {
     // lighting.frag; the forward pass does not sample spot shadows.
     mat4 shadowTileVp[16];
     vec4 shadowAtlasParams;
+    // Forward view-projection for the lighting pass's contact-shadow march
+    // (Phase 4c); layout parity, unused here.
+    mat4 viewProj;
 } lighting;
 layout(set = 2, binding = 1) uniform samplerCube iblIrradiance;
 layout(set = 2, binding = 2) uniform samplerCube iblPrefilter;
@@ -219,7 +222,7 @@ void main() {
     vec3 R = reflect(-V, N);
     vec3 prefiltered = textureLod(iblPrefilter, R, roughness * lighting.iblParams.y).rgb;
     vec2 brdf = texture(iblBrdfLut, vec2(NdV, roughness)).rg;
-    vec3 envBrdf = F * brdf.x + brdf.y;
+    vec3 envBrdf = specularIblMultiScatter(F, F0, brdf); // same as transparent.frag
     vec3 specularIbl = prefiltered * envBrdf;
 
     float ssao = texelFetch(ssaoTex, ivec2(gl_FragCoord.xy), 0).r;

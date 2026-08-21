@@ -54,6 +54,28 @@ vec3 Fd_Hammon(vec3 albedo, float NdV, float NdL, float NdH, float LdV, float ro
     return albedo * (single + albedo * multi);
 }
 
+// Fdez-Agüera 2019 "Multiple-Scattering Physically-Based Discriminants"
+// (JCGT; the form Filament ships): multi-scatter compensation for the
+// split-sum IBL specular lobe.  The BRDF LUT integrates only the first
+// microfacet bounce; the missing fraction Ems = 1 - Ess (Ess = single-scatter
+// directional albedo at F = 1, i.e. LUT scale + bias) re-emerges scaled by
+// the hemispheric average Fresnel Favg = F0 + (1 - F0)/21 through the
+// geometric series Fms = FssEss * Favg / (1 - Ems * Favg).  Brightens rough
+// metals (and, mildly, rough dielectrics) back toward the ground truth.
+//
+// lighting.frag, transparent*.frag AND ssr_opaque.comp must all go through
+// this helper: the opaque-SSR pass subtracts the exact IBL term lighting.frag
+// added before compositing the traced reflection, so any divergence reads as
+// energy drift on SSR hits.
+vec3 specularIblMultiScatter(vec3 F, vec3 F0, vec2 brdf) {
+    const vec3 FssEss = F * brdf.x + brdf.y;
+    const float Ess = clamp(brdf.x + brdf.y, 0.0, 1.0);
+    const float Ems = 1.0 - Ess;
+    const vec3 Favg = F0 + (vec3(1.0) - F0) * (1.0 / 21.0);
+    const vec3 Fms = FssEss * Favg / max(vec3(1.0) - Ems * Favg, vec3(1e-4));
+    return FssEss + Fms * Ems;
+}
+
 // Direct-light BRDF split into diffuse / specular (no radiance, no NdL).
 void evalBrdf(vec3 N, vec3 V, vec3 L, vec3 albedo, float metallic, float roughness, vec3 F0,
               out vec3 diffuse, out vec3 specular) {

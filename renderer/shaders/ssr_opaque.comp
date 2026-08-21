@@ -115,7 +115,9 @@ void main() {
     const vec3 F0 = mix(vec3(0.04), albedo, metallic);
     const vec3 F = F_SchlickRoughness(NdV, F0, roughness);
     const vec2 brdf = texture(iblBrdfLut, vec2(NdV, roughness)).rg;
-    const vec3 envBrdf = F * brdf.x + brdf.y; // UE EnvBRDF, applied at composite
+    const vec3 envBrdf = specularIblMultiScatter(F, F0, brdf); // IBL specular weight
+    // (single-scatter LUT + Fdez-Agüera multi-scatter), applied at composite; must
+    // stay identical to the specularIbl term lighting.frag added to this pixel.
 
     // Early-out where the specular lobe carries no energy: roughness ~ 1 and
     // diffuse-dominated dielectrics push envBrdf to ~0, so the composite below

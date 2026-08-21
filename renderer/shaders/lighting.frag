@@ -364,7 +364,7 @@ void main() {
     vec3 R = reflect(-V, N);
     vec3 prefiltered = textureLod(iblPrefilter, R, roughness * u.iblParams.y).rgb;
     vec2 brdf = texture(iblBrdfLut, vec2(NdV, roughness)).rg;
-    vec3 specularIbl = prefiltered * (F * brdf.x + brdf.y);
+    vec3 specularIbl = prefiltered * specularIblMultiScatter(F, F0, brdf);
 
     color += (kd * diffuseIbl + specularIbl) * ao * ssao * u.iblParams.x;
     color += emissive;
