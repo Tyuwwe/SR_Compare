@@ -159,7 +159,10 @@ bool Scene::uploadTexture(const VulkanContext& ctx, uint32_t width, uint32_t hei
     submitOneShot(ctx, [&](VkCommandBuffer cmd) {
         // Level 0: UNDEFINED -> TRANSFER_DST, upload, -> TRANSFER_SRC.
         imageBarrier(cmd, out.image, VK_IMAGE_LAYOUT_UNDEFINED,
-                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, 0, 1);
+                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                     VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+                     VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                     VK_IMAGE_ASPECT_COLOR_BIT, 0, 1);
         VkBufferImageCopy region = {};
         region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         region.imageSubresource.layerCount = 1;
@@ -167,12 +170,18 @@ bool Scene::uploadTexture(const VulkanContext& ctx, uint32_t width, uint32_t hei
         vkCmdCopyBufferToImage(cmd, staging, out.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
                                &region);
         imageBarrier(cmd, out.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, 0, 1);
+                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                     VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                     VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+                     VK_IMAGE_ASPECT_COLOR_BIT, 0, 1);
 
         // Downsample level by level; each finished level goes SHADER_READ_ONLY.
         for (uint32_t level = 1; level < mipLevels; ++level) {
             imageBarrier(cmd, out.image, VK_IMAGE_LAYOUT_UNDEFINED,
-                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, level, 1);
+                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                         VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+                         VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                         VK_IMAGE_ASPECT_COLOR_BIT, level, 1);
             VkImageBlit blit = {};
             blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level - 1, 0, 1};
             blit.srcOffsets[0] = {0, 0, 0};
@@ -184,16 +193,25 @@ bool Scene::uploadTexture(const VulkanContext& ctx, uint32_t width, uint32_t hei
                                   static_cast<int32_t>(std::max(1u, height >> level)), 1};
             vkCmdBlitImage(cmd, out.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, out.image,
                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+            // Finished levels are sampled by the GBuffer/transparent fragment shaders.
             imageBarrier(cmd, out.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT,
+                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                         VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+                         VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                         VK_ACCESS_2_SHADER_SAMPLED_READ_BIT, VK_IMAGE_ASPECT_COLOR_BIT,
                          level - 1, 1);
             // The new level becomes the source for the next blit.
             imageBarrier(cmd, out.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, level, 1);
+                         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                         VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                         VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+                         VK_IMAGE_ASPECT_COLOR_BIT, level, 1);
         }
         imageBarrier(cmd, out.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT,
-                     mipLevels - 1, 1);
+                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                     VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+                     VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                     VK_IMAGE_ASPECT_COLOR_BIT, mipLevels - 1, 1);
     }, pool);
 
     vmaDestroyBuffer(ctx.allocator, staging, stagingMemory);

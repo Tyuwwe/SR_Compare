@@ -313,19 +313,25 @@ bool IblMaps::build(const VulkanContext& ctx, const char* hdrPath) {
         writeSet(set, cubeSampler, eqView, envStoreMip0);
         submitOneShot(ctx, [&](VkCommandBuffer cmd) {
             imageBarrier(cmd, envImage_, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                         VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                          VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 6);
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, equirectStage_.pipeline);
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, equirectStage_.layout, 0,
                                     1, &set, 0, nullptr);
             vkCmdDispatch(cmd, kEnvSize / 8, kEnvSize / 8, 6);
             imageBarrier(cmd, envImage_, VK_IMAGE_LAYOUT_GENERAL,
-                         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0,
-                         6);
+                         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                         VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+                         VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 6);
             // Downsample the remaining env mip levels (per layer).
             for (uint32_t level = 1; level < envMips; ++level) {
                 imageBarrier(cmd, envImage_, VK_IMAGE_LAYOUT_UNDEFINED,
-                             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT,
-                             level, 1, 0, 6);
+                             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                             VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+                             VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                             VK_IMAGE_ASPECT_COLOR_BIT, level, 1, 0, 6);
                 for (uint32_t layer = 0; layer < 6; ++layer) {
                     VkImageBlit blit = {};
                     blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level - 1, layer, 1};
@@ -341,11 +347,19 @@ bool IblMaps::build(const VulkanContext& ctx, const char* hdrPath) {
                                    VK_FILTER_LINEAR);
                 }
                 imageBarrier(cmd, envImage_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                             VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT,
-                             level, 1, 0, 6);
+                             VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                             VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                             VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+                             VK_IMAGE_ASPECT_COLOR_BIT, level, 1, 0, 6);
             }
+            // Consumers: the irradiance/prefilter compute passes and the
+            // lighting/skybox fragment shaders.
             imageBarrier(cmd, envImage_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, 0,
+                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                         VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+                             VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                         VK_ACCESS_2_SHADER_SAMPLED_READ_BIT, VK_IMAGE_ASPECT_COLOR_BIT, 0,
                          envMips, 0, 6);
         });
     }
@@ -356,6 +370,8 @@ bool IblMaps::build(const VulkanContext& ctx, const char* hdrPath) {
         writeSet(set, cubeSampler, envView, irrStore);
         submitOneShot(ctx, [&](VkCommandBuffer cmd) {
             imageBarrier(cmd, irrImage_, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                         VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                          VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 6);
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, irradianceStage_.pipeline);
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, irradianceStage_.layout,
@@ -366,9 +382,12 @@ bool IblMaps::build(const VulkanContext& ctx, const char* hdrPath) {
             vkCmdPushConstants(cmd, irradianceStage_.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 4,
                                &maxLod);
             vkCmdDispatch(cmd, kIrradianceSize / 8, kIrradianceSize / 8, 6);
+            // Consumer: lighting/transparent fragment shaders (diffuse IBL).
             imageBarrier(cmd, irrImage_, VK_IMAGE_LAYOUT_GENERAL,
-                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, 0, 1,
-                         0, 6);
+                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                         VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                         VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 6);
         });
     }
 
@@ -384,6 +403,8 @@ bool IblMaps::build(const VulkanContext& ctx, const char* hdrPath) {
         const uint32_t size = kPrefilterSize >> mip;
         submitOneShot(ctx, [&](VkCommandBuffer cmd) {
             imageBarrier(cmd, preImage_, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                         VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                          VK_IMAGE_ASPECT_COLOR_BIT, mip, 1, 0, 6);
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, prefilterStage_.pipeline);
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, prefilterStage_.layout, 0,
@@ -391,9 +412,12 @@ bool IblMaps::build(const VulkanContext& ctx, const char* hdrPath) {
             vkCmdPushConstants(cmd, prefilterStage_.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8,
                                push);
             vkCmdDispatch(cmd, (size + 7) / 8, (size + 7) / 8, 6);
+            // Consumer: lighting/transparent fragment shaders (specular IBL).
             imageBarrier(cmd, preImage_, VK_IMAGE_LAYOUT_GENERAL,
-                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, mip,
-                         1, 0, 6);
+                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                         VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                         VK_IMAGE_ASPECT_COLOR_BIT, mip, 1, 0, 6);
         });
         vkDestroyImageView(ctx.device, dst, nullptr); // set holds no ownership; safe post-submit
     }
@@ -403,13 +427,18 @@ bool IblMaps::build(const VulkanContext& ctx, const char* hdrPath) {
         VkDescriptorSet set = allocSet(brdfLutStage_.setLayout);
         writeSet(set, VK_NULL_HANDLE, VK_NULL_HANDLE, brdfLutView);
         submitOneShot(ctx, [&](VkCommandBuffer cmd) {
-            imageBarrier(cmd, lutImage_, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+            imageBarrier(cmd, lutImage_, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                         VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, brdfLutStage_.pipeline);
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, brdfLutStage_.layout, 0,
                                     1, &set, 0, nullptr);
             vkCmdDispatch(cmd, kLutSize / 8, kLutSize / 8, 1);
+            // Consumer: lighting/transparent fragment shaders (split-sum LUT).
             imageBarrier(cmd, lutImage_, VK_IMAGE_LAYOUT_GENERAL,
-                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                         VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
         });
     }
 

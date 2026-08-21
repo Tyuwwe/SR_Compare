@@ -85,35 +85,6 @@ VkSampler createSampler(const VulkanContext& ctx, VkFilter filter, VkSamplerAddr
     return sampler;
 }
 
-namespace {
-
-VkAccessFlags accessForLayout(VkImageLayout layout, bool isSource) {
-    (void)isSource;
-    switch (layout) {
-    case VK_IMAGE_LAYOUT_UNDEFINED:
-    case VK_IMAGE_LAYOUT_PREINITIALIZED:
-    case VK_IMAGE_LAYOUT_PRESENT_SRC_KHR:
-        return 0;
-    case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:
-        return VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:
-        return VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-    case VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL:
-        return VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
-    case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
-        return VK_ACCESS_SHADER_READ_BIT;
-    case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
-        return VK_ACCESS_TRANSFER_READ_BIT;
-    case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
-        return VK_ACCESS_TRANSFER_WRITE_BIT;
-    case VK_IMAGE_LAYOUT_GENERAL:
-    default:
-        return VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-    }
-}
-
-} // namespace
-
 VkResult createGraphicsPipeline(const VulkanContext& ctx, const VkGraphicsPipelineCreateInfo& ci,
                                 VkPipeline& out) {
     std::lock_guard<std::mutex> lk(ctx.pipelineMutex);
@@ -127,10 +98,22 @@ VkResult createComputePipeline(const VulkanContext& ctx, const VkComputePipeline
 }
 
 void imageBarrier(VkCommandBuffer cmd, VkImage image, VkImageLayout oldLayout,
-                  VkImageLayout newLayout, VkImageAspectFlags aspect, uint32_t baseMip,
+                  VkImageLayout newLayout, VkPipelineStageFlags2 srcStage,
+                  VkAccessFlags2 srcAccess, VkPipelineStageFlags2 dstStage,
+                  VkAccessFlags2 dstAccess, VkImageAspectFlags aspect, uint32_t baseMip,
                   uint32_t levelCount, uint32_t baseLayer, uint32_t layerCount) {
-    VkImageMemoryBarrier barrier = {};
-    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    if (oldLayout == VK_IMAGE_LAYOUT_UNDEFINED) {
+        // Contents are discarded; there is no producer to synchronize with.
+        srcStage = VK_PIPELINE_STAGE_2_NONE;
+        srcAccess = VK_ACCESS_2_NONE;
+    }
+
+    VkImageMemoryBarrier2 barrier = {};
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    barrier.srcStageMask = srcStage;
+    barrier.srcAccessMask = srcAccess;
+    barrier.dstStageMask = dstStage;
+    barrier.dstAccessMask = dstAccess;
     barrier.oldLayout = oldLayout;
     barrier.newLayout = newLayout;
     barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -141,21 +124,20 @@ void imageBarrier(VkCommandBuffer cmd, VkImage image, VkImageLayout oldLayout,
     barrier.subresourceRange.levelCount = levelCount;
     barrier.subresourceRange.baseArrayLayer = baseLayer;
     barrier.subresourceRange.layerCount = layerCount;
-    barrier.srcAccessMask = accessForLayout(oldLayout, true);
-    barrier.dstAccessMask = accessForLayout(newLayout, false);
 
-    VkPipelineStageFlags srcStage = barrier.srcAccessMask == 0 ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
-                                                               : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-    VkPipelineStageFlags dstStage = barrier.dstAccessMask == 0 ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT
-                                                               : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-
-    vkCmdPipelineBarrier(cmd, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+    VkDependencyInfo dependency = {};
+    dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dependency.imageMemoryBarrierCount = 1;
+    dependency.pImageMemoryBarriers = &barrier;
+    vkCmdPipelineBarrier2(cmd, &dependency);
 }
 
 void copyBufferToImage(VkCommandBuffer cmd, VkBuffer src, VkImage dst, uint32_t width,
                        uint32_t height, VkFormat format) {
     (void)format; // format is implicit in the source data; kept for API clarity
-    imageBarrier(cmd, dst, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    imageBarrier(cmd, dst, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                 VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+                 VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
 
     VkBufferImageCopy region = {};
     region.bufferOffset = 0;
@@ -169,7 +151,12 @@ void copyBufferToImage(VkCommandBuffer cmd, VkBuffer src, VkImage dst, uint32_t 
     region.imageExtent = {width, height, 1};
     vkCmdCopyBufferToImage(cmd, src, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 
-    imageBarrier(cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    // Consumers: fragment (font atlas) and compute (IBL equirect) sampling.
+    imageBarrier(cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                 VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                 VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                 VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
 }
 
 void submitOneShot(const VulkanContext& ctx, const std::function<void(VkCommandBuffer)>& fn,

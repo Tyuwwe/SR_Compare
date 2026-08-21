@@ -691,7 +691,10 @@ void Renderer::updateCamera(uint32_t frameIndex, float dt) {
 }
 
 void Renderer::captureScreenshotIntoStaging(VkCommandBuffer cmd) {
-    imageBarrier(cmd, finalImage_.image, finalImage_.layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    // finalImage_ is SHADER_READ_ONLY here (sampled by the present pass).
+    imageBarrier(cmd, finalImage_.image, finalImage_.layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                 VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                 VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
     VkBufferImageCopy region = {};
     region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     region.imageSubresource.layerCount = 1;
@@ -699,7 +702,9 @@ void Renderer::captureScreenshotIntoStaging(VkCommandBuffer cmd) {
     vkCmdCopyImageToBuffer(cmd, finalImage_.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                            screenshotStaging_, 1, &region);
     imageBarrier(cmd, finalImage_.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                 VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+                 VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
     finalImage_.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 }
 
@@ -795,19 +800,30 @@ void Renderer::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     const uint32_t sceneH = gbuffer ? renderHeight_ : opts_.displayHeight;
 
     auto transition = [&](ImageResource& rt, VkImageLayout target,
+                          VkPipelineStageFlags2 srcStage, VkAccessFlags2 srcAccess,
+                          VkPipelineStageFlags2 dstStage, VkAccessFlags2 dstAccess,
                           VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT) {
-        imageBarrier(cmd, rt.image, rt.layout, target, aspect);
+        imageBarrier(cmd, rt.image, rt.layout, target, srcStage, srcAccess, dstStage, dstAccess,
+                     aspect);
         rt.layout = target;
     };
 
-    transition(tgtAlbedo, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-    transition(tgtNormal, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-    transition(tgtMaterial, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-    transition(tgtEmissive, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    // GBuffer targets: last frame they were sampled by the lighting fragment
+    // shader (or the upscaler, which may run compute) -> attachment writes.
+    transition(tgtAlbedo, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+               sync::kSampleStages, sync::kSampled, sync::kColorAttach, sync::kColorWrite);
+    transition(tgtNormal, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+               sync::kSampleStages, sync::kSampled, sync::kColorAttach, sync::kColorWrite);
+    transition(tgtMaterial, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+               sync::kSampleStages, sync::kSampled, sync::kColorAttach, sync::kColorWrite);
+    transition(tgtEmissive, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+               sync::kSampleStages, sync::kSampled, sync::kColorAttach, sync::kColorWrite);
     transition(tgtDepth, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+               sync::kSampleStages, sync::kSampled, sync::kDepthTests, sync::kDepthReadWrite,
                VK_IMAGE_ASPECT_DEPTH_BIT);
     if (gbuffer) {
-        transition(gbMotion_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        transition(gbMotion_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                   sync::kSampleStages, sync::kSampled, sync::kColorAttach, sync::kColorWrite);
     }
 
     timestamps_.sceneBegin(cmd, slot);
@@ -840,37 +856,57 @@ void Renderer::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     // --- Shadow pass (sun CSM, one 2048^2 layer per cascade) -----------------
     // Runs once per frame and feeds both the LR and the GT lighting paths.
     if (shadow) {
+        // Sampled by the lighting fragment shaders last frame -> depth attach.
         imageBarrier(cmd, shadow_.image, shadow_.layout,
-                     VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT,
-                     0, 1, 0, kShadowCascadeCount);
+                     VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                     sync::kFragment, sync::kSampled, sync::kDepthTests, sync::kDepthReadWrite,
+                     VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, kShadowCascadeCount);
         shadow_.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
         deferred_.recordShadowPass(cmd, shadow_, scene_, shadow->cascadeVp, fr.sceneSet,
                                    textureSet_, materialStride_);
+        // Depth writes -> shadow-comparison samples in the lighting shaders.
         imageBarrier(cmd, shadow_.image, shadow_.layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                     VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT, sync::kDepthWrite,
+                     sync::kFragment, sync::kSampled,
                      VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, kShadowCascadeCount);
         shadow_.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     }
 
     // --- Lighting pass (deferred PBR + IBL, skybox on far-plane pixels) --------
-    transition(tgtAlbedo, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    transition(tgtNormal, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    transition(tgtMaterial, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    transition(tgtEmissive, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    transition(tgtDepth, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
+    transition(tgtAlbedo, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+               sync::kColorAttach, sync::kColorWrite, sync::kFragment, sync::kSampled);
+    transition(tgtNormal, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+               sync::kColorAttach, sync::kColorWrite, sync::kFragment, sync::kSampled);
+    transition(tgtMaterial, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+               sync::kColorAttach, sync::kColorWrite, sync::kFragment, sync::kSampled);
+    transition(tgtEmissive, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+               sync::kColorAttach, sync::kColorWrite, sync::kFragment, sync::kSampled);
+    transition(tgtDepth, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+               sync::kDepthTests, sync::kDepthWrite, sync::kFragment, sync::kSampled,
+               VK_IMAGE_ASPECT_DEPTH_BIT);
     if (gbuffer) {
-        transition(gbMotion_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        transition(gbMotion_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                   sync::kColorAttach, sync::kColorWrite, sync::kFragment, sync::kSampled);
     }
 
     // --- GTAO (depth + normal -> working AO/Z -> 5x5 bilateral denoise) ---------
-    transition(tgtAoRaw, VK_IMAGE_LAYOUT_GENERAL);
+    // AoRaw ping-pongs between ssao main (storage write) and blur (sampled).
+    transition(tgtAoRaw, VK_IMAGE_LAYOUT_GENERAL,
+               sync::kCompute, sync::kSampled, sync::kCompute, sync::kStorageWrite);
     deferred_.recordSsaoPass(cmd, gbuffer ? ssaoSetGb_ : ssaoSetGt_, viewProjUsed, frameIndex,
                              sceneW, sceneH);
-    transition(tgtAoRaw, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    transition(tgtAo, VK_IMAGE_LAYOUT_GENERAL);
+    transition(tgtAoRaw, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+               sync::kCompute, sync::kStorageWrite, sync::kCompute, sync::kSampled);
+    // Ao: sampled by the lighting fragment shader, rewritten by the blur pass.
+    transition(tgtAo, VK_IMAGE_LAYOUT_GENERAL,
+               sync::kFragment, sync::kSampled, sync::kCompute, sync::kStorageWrite);
     deferred_.recordSsaoBlurPass(cmd, gbuffer ? ssaoBlurSetGb_ : ssaoBlurSetGt_, sceneW, sceneH);
-    transition(tgtAo, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    transition(tgtAo, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+               sync::kCompute, sync::kStorageWrite, sync::kFragment, sync::kSampled);
 
-    transition(litTarget, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    // litTarget was sampled by last frame's upscaler (GB) or present pass (GT).
+    transition(litTarget, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+               sync::kSampleStages, sync::kSampled, sync::kColorAttach, sync::kColorWrite);
 
     deferred_.recordLightingPass(cmd, gbuffer ? fr.lightingSetGb : fr.lightingSetGt,
                                  litTarget.view, sceneW, sceneH);
@@ -879,20 +915,28 @@ void Renderer::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     // Copy opaque HDR for SSR: the transparent pass writes the same color
     // target, so glass cannot sample it in-place.
     if (hasTransparency_) {
-        transition(litTarget, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        transition(litTarget, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                   sync::kColorAttach, sync::kColorWrite, sync::kCopy, sync::kTransferRead);
         ImageResource& ssrSrc = gbuffer ? gbSsrSrc_ : gtSsrSrc_;
-        transition(ssrSrc, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        // ssrSrc was sampled by the transparent fragment shader last frame.
+        transition(ssrSrc, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                   sync::kFragment, sync::kSampled, sync::kCopy, sync::kTransferWrite);
         copyColorImage(cmd, litTarget.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, ssrSrc.image,
                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, sceneW, sceneH);
-        transition(ssrSrc, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-        transition(litTarget, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        transition(ssrSrc, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                   sync::kCopy, sync::kTransferWrite, sync::kFragment, sync::kSampled);
+        transition(litTarget, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                   sync::kCopy, sync::kTransferRead, sync::kColorAttach, sync::kColorReadWrite);
     }
     if (hasTransparency_) {
         if (gbuffer) {
-            transition(gbMotion_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-            transition(gbReactive_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+            transition(gbMotion_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                       sync::kFragment, sync::kSampled, sync::kColorAttach, sync::kColorReadWrite);
+            transition(gbReactive_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                       sync::kSampleStages, sync::kSampled, sync::kColorAttach, sync::kColorWrite);
         }
         transition(tgtDepth, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+                   sync::kFragment, sync::kSampled, sync::kDepthTests, sync::kDepthRead,
                    VK_IMAGE_ASPECT_DEPTH_BIT);
 
         VkRenderingAttachmentInfo tColors[3] = {};
@@ -918,13 +962,18 @@ void Renderer::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         vkCmdEndRendering(cmd);
 
         if (gbuffer) {
-            transition(gbMotion_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-            transition(gbReactive_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            transition(gbMotion_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                       sync::kColorAttach, sync::kColorWrite, sync::kSampleStages, sync::kSampled);
+            transition(gbReactive_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                       sync::kColorAttach, sync::kColorWrite, sync::kSampleStages, sync::kSampled);
         }
-        transition(tgtDepth, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
+        transition(tgtDepth, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                   sync::kDepthTests, sync::kDepthRead, sync::kSampleStages, sync::kSampled,
+                   VK_IMAGE_ASPECT_DEPTH_BIT);
     }
 
-    transition(litTarget, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    transition(litTarget, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+               sync::kColorAttach, sync::kColorWrite, sync::kSampleStages, sync::kSampled);
     if (opts_.bloom) {
         if (gbuffer) {
             deferred_.recordBloomPass(cmd, bloomExtractGb_, bloomBlurHGb_, bloomBlurVGb_,
@@ -950,8 +999,10 @@ void Renderer::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     if (gbuffer) {
         // gbColor_/gbMotion_/gbDepth_ are already SHADER_READ_ONLY (lighting
         // wrote gbColor_ and sampled depth; motion was resolved right after
-        // the GBuffer pass).
-        transition(finalImage_, VK_IMAGE_LAYOUT_GENERAL);
+        // the GBuffer pass).  finalImage_ was sampled by the present pass;
+        // the upscaler writes it as a storage image (fragment or compute).
+        transition(finalImage_, VK_IMAGE_LAYOUT_GENERAL,
+                   sync::kFragment, sync::kSampled, sync::kSampleStages, sync::kStorageWrite);
 
         UpscalerResources res;
         res.color = gbColor_.image;
@@ -989,13 +1040,16 @@ void Renderer::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         upscaler_->dispatch(cmd, res, cam, frame);
         timestamps_.upscaleEnd(cmd, slot);
 
-        transition(finalImage_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        transition(finalImage_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                   sync::kSampleStages, sync::kStorageWrite, sync::kFragment, sync::kSampled);
     }
     // GT path: finalImage_ is already SHADER_READ_ONLY (post-lighting).
 
     const VkImage swapImage = swapchain_.image(swapchainIndex);
     const VkImageView swapView = swapchain_.view(swapchainIndex);
-    imageBarrier(cmd, swapImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    imageBarrier(cmd, swapImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                 VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+                 sync::kColorAttach, sync::kColorWrite);
 
     VkRenderingAttachmentInfo presentColor =
         makeColorAttachment(swapView, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_ATTACHMENT_LOAD_OP_CLEAR);
@@ -1014,7 +1068,9 @@ void Renderer::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     vkCmdDraw(cmd, 3, 1, 0, 0);
     vkCmdEndRendering(cmd);
 
-    imageBarrier(cmd, swapImage, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+    imageBarrier(cmd, swapImage, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                 VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                 sync::kColorAttach, sync::kColorWrite, VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE);
 
     const bool capturing = !opts_.screenshotPath.empty() && static_cast<int>(frameIndex) == opts_.frames - 1;
     if (capturing) {

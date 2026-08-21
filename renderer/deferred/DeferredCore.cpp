@@ -1281,40 +1281,64 @@ void DeferredCore::recordBloomPass(VkCommandBuffer cmd, VkDescriptorSet extractS
         vkCmdDispatch(cmd, gx, gy, 1);
     };
 
-    imageBarrier(cmd, bloomA, bloomALayout, VK_IMAGE_LAYOUT_GENERAL);
+    // All passes below are compute; images ping-pong between storage writes
+    // (GENERAL) and sampled reads (SHADER_READ_ONLY) in COMPUTE_SHADER.
+    imageBarrier(cmd, bloomA, bloomALayout, VK_IMAGE_LAYOUT_GENERAL,
+                 VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                 VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
     bloomALayout = VK_IMAGE_LAYOUT_GENERAL;
     BloomPush extractPush{};
     extractPush.params[0] = kBloomThreshold;
     extractPush.params[1] = kBloomKnee;
     dispatch(bloomExtractPipeline_, extractSet, extractPush, hx, hy);
 
-    imageBarrier(cmd, bloomA, bloomALayout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    imageBarrier(cmd, bloomA, bloomALayout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                 VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                 VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
     bloomALayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    imageBarrier(cmd, bloomB, bloomBLayout, VK_IMAGE_LAYOUT_GENERAL);
+    imageBarrier(cmd, bloomB, bloomBLayout, VK_IMAGE_LAYOUT_GENERAL,
+                 VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                 VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
     bloomBLayout = VK_IMAGE_LAYOUT_GENERAL;
     BloomPush blurH{};
     blurH.params[0] = 1.f;
     blurH.params[1] = 0.f;
     dispatch(bloomBlurPipeline_, blurHSet, blurH, hx, hy);
 
-    imageBarrier(cmd, bloomB, bloomBLayout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    imageBarrier(cmd, bloomB, bloomBLayout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                 VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                 VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
     bloomBLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    imageBarrier(cmd, bloomA, bloomALayout, VK_IMAGE_LAYOUT_GENERAL);
+    imageBarrier(cmd, bloomA, bloomALayout, VK_IMAGE_LAYOUT_GENERAL,
+                 VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                 VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
     bloomALayout = VK_IMAGE_LAYOUT_GENERAL;
     BloomPush blurV{};
     blurV.params[0] = 0.f;
     blurV.params[1] = 1.f;
     dispatch(bloomBlurPipeline_, blurVSet, blurV, hx, hy);
 
-    imageBarrier(cmd, bloomA, bloomALayout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    imageBarrier(cmd, bloomA, bloomALayout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                 VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                 VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
     bloomALayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    imageBarrier(cmd, color, colorLayout, VK_IMAGE_LAYOUT_GENERAL);
+    // The composite reads (imageLoad) and writes (imageStore) color in place;
+    // the previous users are the upscaler/compose/present shader reads.
+    imageBarrier(cmd, color, colorLayout, VK_IMAGE_LAYOUT_GENERAL,
+                 VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                 VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                 VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                 VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
     colorLayout = VK_IMAGE_LAYOUT_GENERAL;
     BloomPush comp{};
     comp.params[0] = strength;
     dispatch(bloomCompositePipeline_, compositeSet, comp, (fullW + 7) / 8, (fullH + 7) / 8);
 
-    imageBarrier(cmd, color, colorLayout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    imageBarrier(cmd, color, colorLayout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                 VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                 VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                 VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                 VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
     colorLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 }
 
