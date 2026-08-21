@@ -1172,6 +1172,17 @@ bool GuiApp::createRenderTargets() {
         return false;
     if (!deferred_.createClusterGrid(ctx_, gtW, gtH, gtCluster_))
         return false;
+    // Froxel volumetric fog volumes (Phase 5a), one per path; the runtime
+    // checkbox skips the passes, so creation follows the preset only.
+    if (fogParams_.enabled) {
+        if (!deferred_.createVolFogVolume(ctx_, renderWidth_, renderHeight_, gbFog_) ||
+            !deferred_.createVolFogVolume(ctx_, gtW, gtH, gtFog_)) {
+            std::fprintf(stderr, "warning: volumetric fog volume creation failed; fog disabled\n");
+            deferred_.destroyVolFogVolume(ctx_, gbFog_);
+            deferred_.destroyVolFogVolume(ctx_, gtFog_);
+            fogParams_.enabled = false;
+        }
+    }
 
     // 200% SSAA ground truth: deferred render at 2x, downsample into gtColor_.
     if (active_.gtSsaa) {
@@ -1222,6 +1233,12 @@ bool GuiApp::createRenderTargets() {
             return false;
         if (!deferred_.createClusterGrid(ctx_, dw * 2, dh * 2, gtSsaaCluster_))
             return false;
+        if (fogParams_.enabled &&
+            !deferred_.createVolFogVolume(ctx_, dw * 2, dh * 2, gtSsaaFog_)) {
+            std::fprintf(stderr,
+                         "warning: SSAA volumetric fog volume creation failed; SSAA fog off\n");
+            deferred_.destroyVolFogVolume(ctx_, gtSsaaFog_);
+        }
     }
 
     // Hi-Z depth pyramids for the SSR march (LR / GT paths).
@@ -1432,27 +1449,37 @@ bool GuiApp::createDescriptors() {
     const uint32_t colorSets =
         gbColorPyramid_.mipCount + gtColorPyramid_.mipCount + gtSsaaColorPyramid_.mipCount;
     VkDescriptorPoolSize sizes[5] = {};
+    // Froxel fog sets (Phase 5a): per path 14 samplers + 8 storage images +
+    // per-slot light sets (1 UBO + 2 SSBO each).
+    const uint32_t fogPaths = gbFog_.injectImage != VK_NULL_HANDLE
+                                  ? (gtSsaaFog_.injectImage != VK_NULL_HANDLE ? 3 : 2)
+                                  : 0;
     sizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     sizes[0].descriptorCount =
         deferred::kMaxTextures + numColumns * 2 + 2 + numAlgos * 6 + 14 * kFramesInFlight * 4 +
         7 * kFramesInFlight * 4 + 11 * kFramesInFlight * 4 + 10 * 3 + 3 * 6 + hizSets + colorSets +
-        2; // + ssr temporal samplers (GB/GT/SSAA x2 sets); auto-exposure HDR sources (LR + GT);
-           // lighting sets: 14 samplers each (GB/GT/SSAA/spatial), incl. shadow + spot atlas +
-           // 2 probe arrays; SSR trace sets: 11 each (incl. 2 probe arrays)
+        2 + 14 * fogPaths; // + ssr temporal samplers (GB/GT/SSAA x2 sets); auto-exposure HDR
+                           // sources (LR + GT); volfog light/temporal/march/composite samplers;
+                           // lighting sets: 14 samplers each (GB/GT/SSAA/spatial), incl. shadow +
+                           // spot atlas + 2 probe arrays; SSR trace sets: 11 each
     sizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     sizes[1].descriptorCount = kFramesInFlight * 3 + numColumns + numAlgos + kFramesInFlight * 4 +
                                kFramesInFlight * 4 + kFramesInFlight * 4 + // + opaque-SSR UBOs
-                               kFramesInFlight * 8; // + probe UBOs (lighting + SSR sets)
+                               kFramesInFlight * 8 + // + probe UBOs (lighting + SSR sets)
+                               kClusterSlots * fogPaths; // volfog light sets
     sizes[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
     sizes[2].descriptorCount = kFramesInFlight * 3;
     sizes[3].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     sizes[3].descriptorCount = numAlgos * 2 + 4 + // metric blocks/result + auto-exposure (LR + GT)
                                2 * kFramesInFlight * 4 + // lighting sets: cluster lights + grid SSBOs
-                               2 * kClusterSlots * 3;    // cluster assign sets (GB/GT/SSAA paths)
+                               2 * kClusterSlots * 3 +    // cluster assign sets (GB/GT/SSAA paths)
+                               2 * kClusterSlots * fogPaths; // volfog light sets
     sizes[4].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     // ssao raw + temporal history + blur outputs (GB/GT/SSAA) + pyramid mips +
     // SSR trace targets + SSR temporal history write / scene-color RMW (x2 sets per path)
-    sizes[4].descriptorCount = 15 + hizSets + colorSets + kFramesInFlight * 4 + 2 * 6;
+    // + volfog inject/light/temporal/march/composite storage (per fog path)
+    sizes[4].descriptorCount = 15 + hizSets + colorSets + kFramesInFlight * 4 + 2 * 6 +
+                               8 * fogPaths;
     VkDescriptorPoolCreateInfo poolCi = {};
     poolCi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     poolCi.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
@@ -1463,6 +1490,7 @@ bool GuiApp::createDescriptors() {
                      6 +                   // ssr temporal sets (GB/GT/SSAA x2, static)
                      2 +                   // auto-exposure sets (LR + GT)
                      kClusterSlots * 3 +   // cluster assign sets (GB/GT/SSAA)
+                     8 * fogPaths +        // volfog sets (per fog path)
                      hizSets + colorSets;
     poolCi.poolSizeCount = 5;
     poolCi.pPoolSizes = sizes;
@@ -2045,6 +2073,29 @@ bool GuiApp::createSyncResources() {
         }
     }
 
+    // Froxel volumetric fog sets (Phase 5a), one writeVolFogSets per path.
+    // GB light sets bind the non-spatial lightingUboGb for both slots (the
+    // fog light pass only reads camera-independent fields; see CompareApp).
+    if (gbFog_.injectImage != VK_NULL_HANDLE) {
+        const VkImageView shadowView = shadowsActive_ ? shadow_.arrayView : VK_NULL_HANDLE;
+        const VkImageView spotAtlasView = spotAtlasActive_ ? spotAtlas_.view : VK_NULL_HANDLE;
+        const VkBuffer gbFogUbos[kClusterSlots] = {frames_[0].lightingUboGb,
+                                                   frames_[1].lightingUboGb};
+        const VkBuffer gtFogUbos[kClusterSlots] = {frames_[0].lightingUboGt,
+                                                   frames_[1].lightingUboGt};
+        if (!deferred_.writeVolFogSets(ctx_, descriptorPool_, gbFog_, gbCluster_, gbFogUbos,
+                                       shadowView, spotAtlasView, gbDepth_.view, gbColor_.view))
+            return false;
+        if (!deferred_.writeVolFogSets(ctx_, descriptorPool_, gtFog_, gtCluster_, gtFogUbos,
+                                       shadowView, spotAtlasView, gtDepth_.view, gtColor_.view))
+            return false;
+        if (active_.gtSsaa && gtSsaaFog_.injectImage != VK_NULL_HANDLE &&
+            !deferred_.writeVolFogSets(ctx_, descriptorPool_, gtSsaaFog_, gtSsaaCluster_,
+                                       gtFogUbos, shadowView, spotAtlasView, gtSsaaDepth_.view,
+                                       gtSsaaColor_.view))
+            return false;
+    }
+
     // SSAO sets (static bindings; per-frame data goes through push constants).
     deferred_.writeSsaoSet(ctx_, ssaoSetGb_, gbPyramidAo_.chainView, gbNormal_.view,
                            gbAoRaw_.view);
@@ -2315,11 +2366,18 @@ void GuiApp::destroyStackResources() {
     gbSsrTrace_.destroy(ctx_);
     gtSsrTrace_.destroy(ctx_);
     gtSsaaSsrTrace_.destroy(ctx_);
+    deferred_.destroyVolFogVolume(ctx_, gbFog_);
+    deferred_.destroyVolFogVolume(ctx_, gtFog_);
+    deferred_.destroyVolFogVolume(ctx_, gtSsaaFog_);
     // AO/SSR temporal state restarts after a stack rebuild (history buffers are fresh).
     aoFramesGb_ = aoFramesGt_ = aoFramesSsaa_ = 0;
     prevAoViewProjGb_ = prevAoViewProjGt_ = prevAoViewProjSsaa_ = Mat4::identity();
     ssrFramesGb_ = ssrFramesGt_ = ssrFramesSsaa_ = 0;
     prevSsrViewProjGb_ = prevSsrViewProjGt_ = prevSsrViewProjSsaa_ = Mat4::identity();
+    // Same for the froxel fog history volumes.
+    fogFramesGb_ = fogFramesGt_ = fogFramesSsaa_ = 0;
+    prevFogViewProjGb_ = prevFogViewProjGt_ = prevFogViewProjSsaa_ = Mat4::identity();
+    fogAccumFrameGb_ = fogAccumFrameGt_ = fogAccumFrameSsaa_ = ~0u;
     composeImage_.destroy(ctx_);
     uiShotImage_.destroy(ctx_);
     uiShotLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -2508,6 +2566,8 @@ void GuiApp::applyLightingPreset(const LightingPreset& p) {
     fillEnabled_ = p.fillEnabled;
     iblIntensity_ = p.iblIntensity;
     exposure_ = p.exposure;
+    fogParams_ = p.fog;
+    volFogEnabled_ = p.fog.enabled;
 }
 
 void GuiApp::updateLightingUBO(void* mapped, const Mat4& viewProj,
@@ -3058,6 +3118,29 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         deferred_.recordLightingPass(cmd, lightingSet, gbCluster_, slot, view, projUsed,
                                      gbColor_.view, renderWidth_, renderHeight_);
 
+        // Froxel volumetric fog (Phase 5a): accumulate once per frame (mixed
+        // mode records LR lighting twice; the first record wins the guard),
+        // composite into the lit HDR target on every record.  Un-jittered
+        // matrices so the volume does not swim under TAA jitter.
+        if (volFogEnabled_ && fogParams_.enabled && gbFog_.injectImage != VK_NULL_HANDLE) {
+            if (fogAccumFrameGb_ != frameIndex) {
+                deferred_.recordVolFogAccumulate(cmd, gbFog_, gbCluster_, slot, view, proj,
+                                                 prevFogViewProjGb_, fogParams_, frameIndex,
+                                                 fogFramesGb_ & 1u, /*reset=*/fogFramesGb_ == 0);
+                prevFogViewProjGb_ = cullViewProj;
+                ++fogFramesGb_;
+                fogAccumFrameGb_ = frameIndex;
+            }
+            transition(gbColor_.image, gbColorLayout_, VK_IMAGE_LAYOUT_GENERAL,
+                       sync::kColorAttach, sync::kColorWrite, sync::kCompute,
+                       sync::kStorageReadWrite, VK_IMAGE_ASPECT_COLOR_BIT);
+            deferred_.recordVolFogComposite(cmd, gbFog_, proj, fogParams_.maxDistance,
+                                            renderWidth_, renderHeight_);
+            transition(gbColor_.image, gbColorLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                       sync::kCompute, sync::kStorageWrite, sync::kColorAttach,
+                       sync::kColorReadWrite, VK_IMAGE_ASPECT_COLOR_BIT);
+        }
+
         if (hasTransparency_ || ssrEnabled_) {
             // Color mip chain: mip 0 is the opaque HDR copy glass SSR used to
             // make with a transfer; the chain stays GENERAL for life.  The
@@ -3371,6 +3454,28 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         deferred_.recordLightingPass(cmd, fr.lightingSetSsaa, gtSsaaCluster_, slot, viewGt, projGt,
                                      gtSsaaColor_.view, sw, sh);
 
+        // Froxel volumetric fog (Phase 5a) on the 2x GT path.
+        if (volFogEnabled_ && fogParams_.enabled && gtSsaaFog_.injectImage != VK_NULL_HANDLE) {
+            if (fogAccumFrameSsaa_ != frameIndex) {
+                deferred_.recordVolFogAccumulate(cmd, gtSsaaFog_, gtSsaaCluster_, slot, viewGt,
+                                                 projGt, prevFogViewProjSsaa_, fogParams_,
+                                                 frameIndex, fogFramesSsaa_ & 1u,
+                                                 /*reset=*/fogFramesSsaa_ == 0);
+                prevFogViewProjSsaa_ = cullViewProjGt;
+                ++fogFramesSsaa_;
+                fogAccumFrameSsaa_ = frameIndex;
+            }
+            transition(gtSsaaColor_.image, gtSsaaColorLayout_, VK_IMAGE_LAYOUT_GENERAL,
+                       sync::kColorAttach, sync::kColorWrite, sync::kCompute,
+                       sync::kStorageReadWrite, VK_IMAGE_ASPECT_COLOR_BIT);
+            deferred_.recordVolFogComposite(cmd, gtSsaaFog_, projGt, fogParams_.maxDistance,
+                                            sw, sh);
+            transition(gtSsaaColor_.image, gtSsaaColorLayout_,
+                       VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, sync::kCompute,
+                       sync::kStorageWrite, sync::kColorAttach, sync::kColorReadWrite,
+                       VK_IMAGE_ASPECT_COLOR_BIT);
+        }
+
         if (hasTransparency_ || ssrEnabled_) {
             // Same color mip chain build as the GB path (GENERAL for life);
             // the opaque-SSR pass consumes the same chain.
@@ -3545,6 +3650,25 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                    VK_IMAGE_ASPECT_COLOR_BIT);
         deferred_.recordLightingPass(cmd, fr.lightingSetGt, gtCluster_, slot, viewGt, projGt,
                                      gtColor_.view, gtW, gtH);
+
+        // Froxel volumetric fog (Phase 5a) on the 1x GT path.
+        if (volFogEnabled_ && fogParams_.enabled && gtFog_.injectImage != VK_NULL_HANDLE) {
+            if (fogAccumFrameGt_ != frameIndex) {
+                deferred_.recordVolFogAccumulate(cmd, gtFog_, gtCluster_, slot, viewGt, projGt,
+                                                 prevFogViewProjGt_, fogParams_, frameIndex,
+                                                 fogFramesGt_ & 1u, /*reset=*/fogFramesGt_ == 0);
+                prevFogViewProjGt_ = cullViewProjGt;
+                ++fogFramesGt_;
+                fogAccumFrameGt_ = frameIndex;
+            }
+            transition(gtColor_.image, gtColorLayout_, VK_IMAGE_LAYOUT_GENERAL,
+                       sync::kColorAttach, sync::kColorWrite, sync::kCompute,
+                       sync::kStorageReadWrite, VK_IMAGE_ASPECT_COLOR_BIT);
+            deferred_.recordVolFogComposite(cmd, gtFog_, projGt, fogParams_.maxDistance, gtW, gtH);
+            transition(gtColor_.image, gtColorLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                       sync::kCompute, sync::kStorageWrite, sync::kColorAttach,
+                       sync::kColorReadWrite, VK_IMAGE_ASPECT_COLOR_BIT);
+        }
 
         if (hasTransparency_ || ssrEnabled_) {
             // Same color mip chain build as the GB path (GENERAL for life);
@@ -4589,6 +4713,14 @@ void GuiApp::drawViewerTab() {
     if (!shadowsActive_) ImGui::EndDisabled();
     // Opaque SSR: per-frame pass skip (no rebuild), all deferred paths.
     ImGui::Checkbox("ssr (opaque)", &ssrEnabled_);
+    // Froxel volumetric fog: per-frame pass skip; re-enabling restarts the
+    // temporal history so stale frames do not bleed in.
+    if (!fogParams_.enabled || gbFog_.injectImage == VK_NULL_HANDLE) ImGui::BeginDisabled();
+    if (ImGui::Checkbox("volumetric fog", &volFogEnabled_)) {
+        fogFramesGb_ = fogFramesGt_ = fogFramesSsaa_ = 0;
+        fogAccumFrameGb_ = fogAccumFrameGt_ = fogAccumFrameSsaa_ = ~0u;
+    }
+    if (!fogParams_.enabled || gbFog_.injectImage == VK_NULL_HANDLE) ImGui::EndDisabled();
     // Screen-size LOD + small-object cull: per-frame CPU selection, no rebuild.
     ImGui::Checkbox("lod", &lodEnabled_);
     ImGui::Separator();

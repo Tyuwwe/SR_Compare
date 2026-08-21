@@ -497,6 +497,10 @@ private:
     bool contactShadowsEnabled_ = true;
     // Opaque screen-space reflections (per-frame pass skip, no rebuild).
     bool ssrEnabled_ = true;
+    // Froxel volumetric fog (per-frame pass skip; params from the scene
+    // lighting preset, toggling resets the temporal history).
+    bool volFogEnabled_ = true;
+    VolFogParams fogParams_;
     // Screen-size LOD switching + distance cull (per-frame CPU selection).
     bool lodEnabled_ = lodEnabledByDefault();
 
@@ -576,6 +580,21 @@ private:
     uint32_t ssrFramesGb_ = 0;
     uint32_t ssrFramesGt_ = 0;
     uint32_t ssrFramesSsaa_ = 0;
+    // Froxel volumetric fog volumes + temporal state (Phase 5a), one per
+    // path.  Accumulate runs once per frame per path (fogAccumFrame* guard,
+    // mixed mode records LR lighting twice); composite runs in every record.
+    VolFogVolume gbFog_;
+    VolFogVolume gtFog_;
+    VolFogVolume gtSsaaFog_; // compare GT SSAA only
+    Mat4 prevFogViewProjGb_ = Mat4::identity();
+    Mat4 prevFogViewProjGt_ = Mat4::identity();
+    Mat4 prevFogViewProjSsaa_ = Mat4::identity();
+    uint32_t fogFramesGb_ = 0;
+    uint32_t fogFramesGt_ = 0;
+    uint32_t fogFramesSsaa_ = 0;
+    uint32_t fogAccumFrameGb_ = ~0u;
+    uint32_t fogAccumFrameGt_ = ~0u;
+    uint32_t fogAccumFrameSsaa_ = ~0u;
     ImageResource composeImage_; // RGBA8 composite; presentation + screenshot source
     ImageResource uiShotImage_;  // BGRA8 debug screenshot target incl. ImGui
     VkImageLayout uiShotLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;

@@ -29,6 +29,7 @@ void printCompareUsage() {
                  "  --no-shadows                   disable CSM sun shadows\n"
                  "  --no-ssr                       disable opaque screen-space reflections\n"
                  "  --no-contact-shadows           disable screen-space contact shadows (sun)\n"
+                 "  --no-volfog                    disable froxel volumetric fog\n"
                  "  --shadow-debug                 tint pixels per shadow cascade\n"
                  "  --env-map <hdr>                IBL environment map (default san_giuseppe_bridge)\n"
                  "  --exposure <f>                 manual display exposure (disables auto exposure)\n"
@@ -78,6 +79,8 @@ int runCompareMode(int argc, char** argv) {
             opts.ssr = false;
         } else if (a == "--no-contact-shadows") {
             opts.contactShadows = false;
+        } else if (a == "--no-volfog") {
+            opts.volFog = false;
         } else if (a == "--shadow-debug") {
             opts.shadowDebug = true;
         } else if (a == "--env-map") {

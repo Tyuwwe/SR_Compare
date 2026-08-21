@@ -46,6 +46,7 @@ struct CompareOptions {
     // Screen-space contact shadows for the CSM sun (CLI: --no-contact-shadows);
     // needs shadows on (rides the CSM sun selection).
     bool contactShadows = true;
+    bool volFog = true;                 // froxel volumetric fog (CLI: --no-volfog)
     float zoom = 1.f;                   // compare-view zoom (1..16)
     float zoomCenterU = 0.5f;           // zoom window center, normalized source UV
     float zoomCenterV = 0.5f;
@@ -255,6 +256,25 @@ private:
     uint32_t ssrFramesGb_ = 0;
     uint32_t ssrFramesGt_ = 0;
     uint32_t ssrFramesSsaa_ = 0;
+    // Froxel volumetric fog (Phase 5a), one volume set per path.  Temporal
+    // history reprojects with the un-jittered view-projection on all paths
+    // (fog must not swim with the TAA jitter).  Unlike AO/SSR the accumulate
+    // step runs once per frame per path even in mixed mode (fogAccumFrame*
+    // guards), while the composite runs inside every lighting record.
+    VolFogVolume gbFog_;
+    VolFogVolume gtFog_;
+    VolFogVolume gtSsaaFog_; // gtSsaa only
+    Mat4 prevFogViewProjGb_ = Mat4::identity();
+    Mat4 prevFogViewProjGt_ = Mat4::identity();
+    Mat4 prevFogViewProjSsaa_ = Mat4::identity();
+    uint32_t fogFramesGb_ = 0;
+    uint32_t fogFramesGt_ = 0;
+    uint32_t fogFramesSsaa_ = 0;
+    uint32_t fogAccumFrameGb_ = ~0u;
+    uint32_t fogAccumFrameGt_ = ~0u;
+    uint32_t fogAccumFrameSsaa_ = ~0u;
+    VolFogParams fogParams_;
+    bool volFogActive_ = false;
     ImageResource composeImage_; // RGBA8, tonemapped columns + overlay
     ImageResource fontAtlas_;
 
