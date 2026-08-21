@@ -21,15 +21,18 @@ file(MAKE_DIRECTORY "${SR_SHADER_OUT_DIR}")
 set(SR_SHADER_INCLUDE_DIR "${CMAKE_SOURCE_DIR}/renderer/shaders")
 set(SR_TONE_MAP_GLSL "${SR_SHADER_INCLUDE_DIR}/tonemap.glsl")
 
-# sr_compile_shader(<out_var> <glsl_source> [extra_depends...])
+# sr_compile_shader(<out_var> <glsl_source> [INCLUDE_DIR <dir>] [extra_depends...])
 # Creates a custom command that compiles <glsl_source> to
 # ${SR_SHADER_OUT_DIR}/<basename>.spv and returns the .spv path in <out_var>.
 # Callers collect the outputs and add_dependencies() their target on them.
+# INCLUDE_DIR adds one extra glslangValidator -I root (e.g. FidelityFX GPU
+# headers for the TAA CAS pass).
 #
 # GLSL #include'd headers are NOT discovered automatically: callers must pass
 # them as extra arguments after <glsl_source> so they appear in the custom
 # command's DEPENDS and trigger a recompile when a header changes.
 function(sr_compile_shader OUT_VAR GLSL_SOURCE)
+    cmake_parse_arguments(SR "" "INCLUDE_DIR" "" ${ARGN})
     get_filename_component(SRC_ABS "${GLSL_SOURCE}" ABSOLUTE)
     get_filename_component(FNAME "${GLSL_SOURCE}" NAME)
     set(SPV "${SR_SHADER_OUT_DIR}/${FNAME}.spv")
@@ -43,10 +46,15 @@ function(sr_compile_shader OUT_VAR GLSL_SOURCE)
     endif()
     set_property(GLOBAL APPEND PROPERTY SR_SHADER_OUTPUTS "${SPV}")
 
+    set(_sr_extra_inc "")
+    if(SR_INCLUDE_DIR)
+        set(_sr_extra_inc "-I${SR_INCLUDE_DIR}")
+    endif()
+
     add_custom_command(
         OUTPUT "${SPV}"
-        COMMAND "${SR_GLSLANG_VALIDATOR}" -V "-I${SR_SHADER_INCLUDE_DIR}" "${SRC_ABS}" -o "${SPV}" --target-env vulkan1.3
-        DEPENDS "${SRC_ABS}" ${ARGN}
+        COMMAND "${SR_GLSLANG_VALIDATOR}" -V "-I${SR_SHADER_INCLUDE_DIR}" ${_sr_extra_inc} "${SRC_ABS}" -o "${SPV}" --target-env vulkan1.3
+        DEPENDS "${SRC_ABS}" ${SR_UNPARSED_ARGUMENTS}
         COMMENT "Compiling shader ${FNAME} -> SPIR-V"
         VERBATIM)
     set(${OUT_VAR} "${SPV}" PARENT_SCOPE)
