@@ -161,10 +161,11 @@ bool CompareApp::init(const CompareOptions& opts) {
     if (!sceneOk) sceneOk = scene_.loadProcedural(ctx_);
     if (!sceneOk) return false;
     hasTransparency_ = deferred_.sceneHasTransparency(scene_);
-    iblIntensity_ = lightingPresetForScene(opts.scenePath).iblIntensity;
+    const LightingPreset preset = lightingPresetForScene(opts.scenePath);
+    iblIntensity_ = preset.iblIntensity;
     // Froxel volumetric fog (Phase 5a): media parameters from the scene
     // preset; --no-volfog gates the passes (same rule as the viewer).
-    fogParams_ = lightingPresetForScene(opts.scenePath).fog;
+    fogParams_ = preset.fog;
     volFogActive_ = opts_.volFog && fogParams_.enabled;
     // Reflection probe placements (Phase 4c-2); inert without a bake file.
     scene_.probes = reflectionProbesForScene(opts.scenePath);
@@ -183,8 +184,15 @@ bool CompareApp::init(const CompareOptions& opts) {
     }
 
     if (!initAlgorithms()) return false;
-    // Shared deferred pipeline: IBL maps + shaders + layouts + pipelines.
-    if (!deferred_.init(ctx_, opts_.envMapPath.c_str())) return false;
+    // Shared deferred pipeline: IBL maps + shaders + layouts + pipelines.  Env
+    // source priority: CLI --env-map, then the preset's envFile, else the
+    // procedural sky atmosphere for the preset sun direction.
+    const std::string envPath =
+        !opts_.envMapPath.empty() ? opts_.envMapPath : preset.envFile;
+    if (!deferred_.init(ctx_, envPath.c_str(),
+                        sunDirectionFromElevAzimuth(preset.sunElevationDeg,
+                                                    preset.sunAzimuthDeg)))
+        return false;
     // Baked reflection probes (Phase 4c-2): count 0 without a bake file.
     deferred_.loadProbes(ctx_, scene_.probes, probeFilePathForScene(opts_.scenePath));
     // CSM shadow targets (fixed size; a failure degrades to no shadows).

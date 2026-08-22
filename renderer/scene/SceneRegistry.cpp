@@ -1,10 +1,22 @@
 #include "renderer/scene/SceneRegistry.h"
 
 #include "renderer/core/PathUtil.h"
+#include "renderer/ibl/SkyAtmosphere.h"
 
+#include <algorithm>
 #include <cstdio>
 
 namespace sr {
+
+// Warm low-sun key colour straight from the atmosphere model (Hillaire 2020):
+// transmittance from the ground towards the sun, normalized so the strongest
+// channel stays 1 and sunIntensity keeps its meaning.
+Vec3 atmosphereSunColor(float elevationDeg, float azimuthDeg) {
+    const Vec3 t = SkyAtmosphere::sunTransmittanceFromGround(
+        sunDirectionFromElevAzimuth(elevationDeg, azimuthDeg));
+    const float m = std::max({t.x, t.y, t.z, 1e-4f});
+    return t / m;
+}
 
 std::vector<SceneEntry> listScenes() {
     std::vector<SceneEntry> scenes;
@@ -38,6 +50,10 @@ std::string resolveSceneArg(const std::string& arg) {
 
 LightingPreset defaultLightingPreset() {
     LightingPreset p;
+    // Neutral high sun: atmosphere-derived near-white key (matches the old
+    // hand-tuned (1, 0.95, 0.85) closely).  envFile stays empty: the sky and
+    // IBL come from the procedural atmosphere.
+    p.sunColor = atmosphereSunColor(p.sunElevationDeg, p.sunAzimuthDeg);
     // Mild neutral height fog (boxes room / Sponza atrium): visible shafts
     // through the Sponza arches without washing the scene out.
     p.fog.enabled = true;
@@ -55,15 +71,21 @@ LightingPreset defaultLightingPreset() {
 
 LightingPreset goldenHourPreset() {
     LightingPreset p;
-    // Low warm sun in front-left of the BistroExterior start camera (looking
-    // down -Z): long shadows toward the camera-right, matching the ORCA shot.
+    // Low sun in front-left of the BistroExterior start camera (looking down
+    // -Z): long shadows toward the camera-right, matching the ORCA shot.  The
+    // warm key colour now comes from the atmosphere model itself (low sun ->
+    // long optical path -> red-shifted transmittance), replacing the old
+    // hand-tuned (1, 0.72, 0.45).
     p.sunElevationDeg = 22.f;
     p.sunAzimuthDeg = 215.f;
     p.sunIntensity = 4.5f;
-    p.sunColor = {1.f, 0.72f, 0.45f};
+    p.sunColor = atmosphereSunColor(p.sunElevationDeg, p.sunAzimuthDeg);
     p.sunEnabled = true;
     p.fillEnabled = false;
-    p.iblIntensity = 0.45f;
+    // The procedural sky at 22 deg elevation is already dimmer and warmer than
+    // the noon default, so the old hand-lowered iblIntensity (0.45, tuned for
+    // the static san_giuseppe HDR) is gone: keep 1.0.
+    p.iblIntensity = 1.f;
     p.exposure = 1.f;
     p.preferPresetSun = true;
     // Showcase volumetric fog: warm dense street-level haze with strong

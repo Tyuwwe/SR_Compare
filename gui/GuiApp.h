@@ -73,7 +73,7 @@ struct GuiOptions {
     std::string screenshotPath;
     float compareZoom = 0.f;   // > 0: preset compare-tab zoom (automation)
     bool compareGtSsaa = false; // preset the compare-tab GT SSAA checkbox
-    std::string envMapPath;    // empty = kDefaultEnvMapPath
+    std::string envMapPath;    // empty = procedural sky atmosphere (default)
     float exposure = 0.f;      // > 0 overrides the scene lighting preset
 };
 
@@ -299,6 +299,9 @@ private:
     // recordFrame and shared by both lighting UBOs.
     std::vector<Light> buildLightOverride() const;
     void applyLightingPreset(const LightingPreset& p);
+    // Re-renders the sky-atmosphere env + IBL maps from the current sun
+    // sliders (no-op in static-env mode or while a load is in flight).
+    void updateSkyFromUiSun();
     void updateCamera(float dt);
     void recordFrame(uint32_t frameIndex, uint32_t swapchainIndex);
     // Compose columns into composeImage_ and copy to the swapchain with ImGui.

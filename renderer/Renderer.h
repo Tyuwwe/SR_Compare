@@ -34,9 +34,15 @@ struct RendererOptions {
     std::string frameTimesPath;  // non-empty: dump per-frame GPU timings + VRAM to CSV
     std::string cameraPath;    // empty = orbit (automation) / free-fly (interactive)
     std::string scenePath;     // empty = procedural
-    // Equirect HDR environment map for IBL + skybox; empty or unreadable file
-    // falls back to a procedural gradient (constant-ambient look).
-    std::string envMapPath = kDefaultEnvMapPath;
+    // Equirect HDR environment map for IBL + skybox; empty = procedural sky
+    // atmosphere (default) driven by the scene preset's sun direction, unless
+    // the preset names an envFile.  An unreadable file falls back to a
+    // procedural gradient (constant-ambient look).
+    std::string envMapPath;
+    // Debug/verification overrides for the preset sun angles (sky atmosphere
+    // + key light); negative = use the scene preset.  CLI: --sun-elev/--sun-az.
+    float sunElevationDeg = -1.f;
+    float sunAzimuthDeg = -1.f;
     bool shadows = true;      // CSM sun shadows (CLI: --no-shadows)
     bool shadowDebug = false; // cascade tint overlay (CLI: --shadow-debug)
     float exposure = 1.f;     // manual display exposure (ACES input multiplier);
@@ -219,6 +225,9 @@ private:
     ShadowAtlas spotAtlas_;
     bool spotAtlasActive_ = false;
     float iblIntensity_ = 1.f; // from lightingPresetForScene; not a CLI flag
+    // Effective sun angles used for the sky atmosphere (preset + CLI override).
+    float sunElevationDeg_ = 65.3f;
+    float sunAzimuthDeg_ = 49.4f;
 
     VkDescriptorSetLayout presentSetLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout presentPipelineLayout_ = VK_NULL_HANDLE;

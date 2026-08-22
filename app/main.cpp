@@ -31,7 +31,7 @@ void printUsage() {
                  "  --compare <a,b,...>       start in the Compare tab with these columns\n"
                  "  --compare-zoom <f>        preset compare-tab zoom 1..16 (automation)\n"
                  "  --compare-gt-ssaa         preset the compare-tab GT 200%% SSAA checkbox\n"
-                 "  --env-map <hdr>           IBL environment map (default san_giuseppe_bridge)\n"
+                 "  --env-map <hdr>           static IBL environment map (default: sky atmosphere)\n"
                  "  --exposure <f>            manual display exposure (disables auto exposure)\n"
                  "  --bench <a,b,...>         start in the Bench tab and auto-run\n"
                  "viewer options:\n"
@@ -40,7 +40,9 @@ void printUsage() {
                  "  --render-scale <f>               render resolution scale (default 0.5)\n"
                  "  --output <WxH>                   output resolution (default 1920x1080)\n"
                  "  --camera-path <json>             fixed camera path\n"
-                 "  --env-map <hdr>                    equirect HDR for IBL/skybox (default: Bistro san_giuseppe)\n"
+                 "  --env-map <hdr>                    static equirect HDR for IBL/skybox (default: procedural sky atmosphere)\n"
+                 "  --sun-elev <deg>                   override the preset sun elevation (sky + key light)\n"
+                 "  --sun-az <deg>                     override the preset sun azimuth (sky + key light)\n"
                  "  --frames <N>                     render N frames then exit\n"
                  "  --screenshot <out.png>           save the final frame as PNG\n"
                  "  --no-shadows                     disable CSM sun shadows\n"
@@ -88,6 +90,12 @@ int runViewer(int argc, char** argv) {
             opts.cameraPath = sr::nextArg(i, argc, argv, "--camera-path");
         } else if (a == "--env-map") {
             opts.envMapPath = sr::nextArg(i, argc, argv, "--env-map");
+        } else if (a == "--sun-elev") {
+            opts.sunElevationDeg =
+                static_cast<float>(std::atof(sr::nextArg(i, argc, argv, "--sun-elev")));
+        } else if (a == "--sun-az") {
+            opts.sunAzimuthDeg =
+                static_cast<float>(std::atof(sr::nextArg(i, argc, argv, "--sun-az")));
         } else if (a == "--frames") {
             opts.frames = std::atoi(sr::nextArg(i, argc, argv, "--frames"));
         } else if (a == "--screenshot") {

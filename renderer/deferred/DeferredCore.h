@@ -15,6 +15,7 @@
 #include "renderer/core/VulkanContext.h"
 #include "renderer/ibl/Ibl.h"
 #include "renderer/ibl/Probes.h"
+#include "renderer/ibl/SkyAtmosphere.h"
 #include "renderer/math/Math.h"
 
 #include <cstdint>
@@ -27,8 +28,9 @@ class Camera;
 struct Light;
 struct VolFogParams;
 
-// Default equirect HDR environment map (Bistro san_giuseppe_bridge, bundled
-// in the project's assets; override with --env-map).
+// Bundled equirect HDR environment map (Bistro san_giuseppe_bridge).  An
+// explicit static-env choice for --env-map / preset envFile; the default is
+// the procedural sky atmosphere (ibl/SkyAtmosphere.h).
 inline const char* kDefaultEnvMapPath = "assets/env/san_giuseppe_bridge_4k.hdr";
 
 // Attachment formats of the deferred pipeline (identical everywhere).
@@ -648,11 +650,20 @@ struct ExposureChannel {
 
 class DeferredCore {
 public:
-    // Builds the IBL maps (envMapPath empty/unreadable -> procedural gradient
-    // fallback inside IblMaps), loads the deferred shaders and creates all
-    // layouts/pipelines/samplers.
-    bool init(const VulkanContext& ctx, const char* envMapPath);
+    // Builds the IBL maps and loads the deferred shaders/layouts/pipelines.
+    // envMapPath non-empty: static equirect HDR (unreadable file -> procedural
+    // gradient fallback inside IblMaps).  envMapPath empty: procedural sky
+    // atmosphere (Hillaire 2020, ibl/SkyAtmosphere.h) rendered for skySunDir;
+    // the sky + IBL maps then follow updateAtmosphereSky().
+    bool init(const VulkanContext& ctx, const char* envMapPath, const Vec3& skySunDir);
     void destroy(const VulkanContext& ctx);
+
+    // Atmosphere mode only (init with an empty envMapPath): re-renders the
+    // sky and regenerates the sun-dependent IBL maps for a new sun direction.
+    // Blocking one-shot submission — call on sun changes, not per frame.
+    // Returns false in static-env mode.
+    bool updateAtmosphereSky(const VulkanContext& ctx, const Vec3& sunDir);
+    bool atmosphereSky() const { return atmosphereSky_; }
 
     // --- UBO fillers (shared defaults: fallback lights, ambient, PI scaling) ---
     void fillSceneUBO(SceneUBO& out, const Scene& scene, const Camera& camera,
@@ -1095,6 +1106,11 @@ private:
 
     IblMaps ibl_;
     ReflectionProbes probes_; // baked local reflection captures (empty until loadProbes)
+    // Procedural sky atmosphere (Hillaire 2020): LUTs baked once when init()
+    // runs without an env map file; ibl_ then renders + re-renders the sky
+    // from them.  atmosphereSky_ mirrors ibl().fromAtmosphere.
+    SkyAtmosphere sky_;
+    bool atmosphereSky_ = false;
 
     VkDescriptorSetLayout sceneSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout textureSetLayout_ = VK_NULL_HANDLE;

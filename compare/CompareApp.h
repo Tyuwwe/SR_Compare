@@ -50,7 +50,7 @@ struct CompareOptions {
     float zoom = 1.f;                   // compare-view zoom (1..16)
     float zoomCenterU = 0.5f;           // zoom window center, normalized source UV
     float zoomCenterV = 0.5f;
-    std::string envMapPath = kDefaultEnvMapPath; // equirect HDR for IBL/skybox
+    std::string envMapPath; // equirect HDR for IBL/skybox; empty = sky atmosphere (default)
     float exposure = 1.f;                       // manual display exposure (ACES input);
                                                 // also the seed value for auto exposure
     // Histogram-based auto exposure (UE4 AutoExposure style; see DeferredCore's

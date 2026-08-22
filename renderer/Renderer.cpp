@@ -88,11 +88,28 @@ bool Renderer::init(const RendererOptions& opts) {
     if (!sceneOk) sceneOk = scene_.loadProcedural(ctx_);
     if (!sceneOk) return false;
     hasTransparency_ = deferred_.sceneHasTransparency(scene_);
-    iblIntensity_ = lightingPresetForScene(opts.scenePath).iblIntensity;
+    const LightingPreset preset = lightingPresetForScene(opts.scenePath);
+    iblIntensity_ = preset.iblIntensity;
     // Froxel volumetric fog (Phase 5a): media parameters come from the scene
     // preset; --no-volfog / a preset with fog disabled both gate the passes.
-    fogParams_ = lightingPresetForScene(opts.scenePath).fog;
+    fogParams_ = preset.fog;
     volFogActive_ = opts_.volFog && fogParams_.enabled;
+    // Sky atmosphere sun: preset angles, overridable via --sun-elev/--sun-az.
+    // The override also rewrites the directional key light so the sun disk,
+    // shadows and the sky stay consistent.
+    sunElevationDeg_ = opts_.sunElevationDeg >= 0.f ? opts_.sunElevationDeg
+                                                    : preset.sunElevationDeg;
+    sunAzimuthDeg_ = opts_.sunAzimuthDeg >= 0.f ? opts_.sunAzimuthDeg : preset.sunAzimuthDeg;
+    if (opts_.sunElevationDeg >= 0.f || opts_.sunAzimuthDeg >= 0.f) {
+        const Vec3 dir = sunDirectionFromElevAzimuth(sunElevationDeg_, sunAzimuthDeg_);
+        const Vec3 color = atmosphereSunColor(sunElevationDeg_, sunAzimuthDeg_);
+        for (Light& l : scene_.lights) {
+            if (l.type == LightType::Directional) {
+                l.positionOrDirection = dir;
+                l.color = color;
+            }
+        }
+    }
     // Reflection probe placements (Phase 4c-2): hand-placed per scene in the
     // registry; inert until a matching .probes bake file is loaded below.
     scene_.probes = reflectionProbesForScene(opts.scenePath);
@@ -130,8 +147,14 @@ bool Renderer::init(const RendererOptions& opts) {
     }
 
     if (!createRenderTargets()) return false;
-    // Shared deferred pipeline: IBL maps + shaders + layouts + pipelines.
-    if (!deferred_.init(ctx_, opts_.envMapPath.c_str())) return false;
+    // Shared deferred pipeline: IBL maps + shaders + layouts + pipelines.  Env
+    // source priority: CLI --env-map, then the preset's envFile, else the
+    // procedural sky atmosphere for the preset sun direction.
+    const std::string envPath =
+        !opts_.envMapPath.empty() ? opts_.envMapPath : preset.envFile;
+    if (!deferred_.init(ctx_, envPath.c_str(),
+                        sunDirectionFromElevAzimuth(sunElevationDeg_, sunAzimuthDeg_)))
+        return false;
     // Baked reflection probes (Phase 4c-2): no bake file -> count 0, rendering
     // identical to the global-env-only path.
     deferred_.loadProbes(ctx_, scene_.probes, probeFilePathForScene(opts_.scenePath));

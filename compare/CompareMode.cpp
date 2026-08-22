@@ -31,7 +31,7 @@ void printCompareUsage() {
                  "  --no-contact-shadows           disable screen-space contact shadows (sun)\n"
                  "  --no-volfog                    disable froxel volumetric fog\n"
                  "  --shadow-debug                 tint pixels per shadow cascade\n"
-                 "  --env-map <hdr>                IBL environment map (default san_giuseppe_bridge)\n"
+                 "  --env-map <hdr>                static IBL environment map (default: sky atmosphere)\n"
                  "  --exposure <f>                 manual display exposure (disables auto exposure)\n"
                  "  --zoom <f>                     compare-view zoom 1..16 (default 1)\n"
                  "  --zoom-center <u,v>            zoom window center, normalized (default 0.5,0.5)\n"

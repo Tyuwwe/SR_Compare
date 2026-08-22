@@ -17,6 +17,7 @@ add_library(renderer STATIC
     scene/SceneRegistry.cpp
     ibl/Ibl.cpp
     ibl/Probes.cpp
+    ibl/SkyAtmosphere.cpp
     deferred/DeferredCore.cpp
     Renderer.cpp
     Screenshot.cpp
@@ -68,6 +69,9 @@ set(RENDERER_SHADERS
     shaders/ibl_irradiance.comp
     shaders/ibl_prefilter.comp
     shaders/ibl_brdf_lut.comp
+    shaders/sky_transmittance.comp
+    shaders/sky_multiscatter.comp
+    shaders/sky_render.comp
     shaders/volfog_inject.comp
     shaders/volfog_light.comp
     shaders/volfog_temporal.comp
@@ -88,6 +92,8 @@ foreach(SHADER ${RENDERER_SHADERS})
         sr_compile_shader(SPV ${SHADER} "${SR_SHADER_INCLUDE_DIR}/brdf.glsl")
     elseif(SHADER MATCHES "^shaders/volfog_.*\\.comp$")
         sr_compile_shader(SPV ${SHADER} "${SR_SHADER_INCLUDE_DIR}/volfog.glsl")
+    elseif(SHADER MATCHES "^shaders/sky_.*\\.comp$")
+        sr_compile_shader(SPV ${SHADER} "${SR_SHADER_INCLUDE_DIR}/atmosphere.glsl")
     else()
         sr_compile_shader(SPV ${SHADER})
     endif()

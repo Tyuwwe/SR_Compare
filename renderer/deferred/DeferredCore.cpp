@@ -116,8 +116,16 @@ void packLightGpu(const Light& l, LightGPU& g) {
 
 } // namespace
 
-bool DeferredCore::init(const VulkanContext& ctx, const char* envMapPath) {
-    if (!ibl_.build(ctx, envMapPath)) {
+bool DeferredCore::init(const VulkanContext& ctx, const char* envMapPath, const Vec3& skySunDir) {
+    atmosphereSky_ = !envMapPath || envMapPath[0] == '\0';
+    if (atmosphereSky_) {
+        // Procedural sky atmosphere (Hillaire 2020): bake the LUTs once, then
+        // render the sky for the initial sun direction into the IBL chain.
+        if (!sky_.init(ctx) || !ibl_.buildAtmosphere(ctx, sky_, skySunDir)) {
+            std::fprintf(stderr, "sky atmosphere IBL preprocessing failed\n");
+            return false;
+        }
+    } else if (!ibl_.build(ctx, envMapPath)) {
         std::fprintf(stderr, "IBL preprocessing failed\n");
         return false;
     }
@@ -1381,7 +1389,14 @@ void DeferredCore::destroy(const VulkanContext& ctx) {
     if (hizSampler_) { vkDestroySampler(ctx.device, hizSampler_, nullptr); hizSampler_ = VK_NULL_HANDLE; }
     if (colorPyramidSampler_) { vkDestroySampler(ctx.device, colorPyramidSampler_, nullptr); colorPyramidSampler_ = VK_NULL_HANDLE; }
     ibl_.destroy(ctx);
+    sky_.destroy(ctx);
     probes_.destroy(ctx);
+    atmosphereSky_ = false;
+}
+
+bool DeferredCore::updateAtmosphereSky(const VulkanContext& ctx, const Vec3& sunDir) {
+    if (!atmosphereSky_) return false;
+    return ibl_.updateAtmosphereSky(ctx, sky_, sunDir);
 }
 
 void DeferredCore::fillSceneUBO(SceneUBO& out, const Scene& scene, const Camera& camera,

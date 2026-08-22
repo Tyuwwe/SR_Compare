@@ -314,8 +314,10 @@ bool GuiApp::init(const GuiOptions& opts) {
 
     active_ = configFromUi(currentTab_ == 1 ? Mode::Compare : Mode::Viewer);
     // IBL maps + deferred pipelines are built once per env map, not per Apply.
+    // Empty env map = sky atmosphere, rendered for the current UI sun.
     envMapActive_ = active_.envMapPath;
-    stackOk_ = deferred_.init(ctx_, envMapActive_.c_str());
+    stackOk_ = deferred_.init(ctx_, envMapActive_.c_str(),
+                              sunDirectionFromElevAzimuth(sunElevationDeg_, sunAzimuthDeg_));
     if (stackOk_) {
         // CSM shadow targets: resolution-independent, so they live next to
         // deferred_ and survive scene/config rebuilds.  A failure degrades to
@@ -490,8 +492,8 @@ GuiApp::RenderConfig GuiApp::configFromUi(Mode mode) const {
 }
 
 void GuiApp::applyLaunchOptions() {
-    std::snprintf(ui_.envMap, sizeof(ui_.envMap), "%s",
-                  opts_.envMapPath.empty() ? kDefaultEnvMapPath : opts_.envMapPath.c_str());
+    // Empty env map field = procedural sky atmosphere (the default look).
+    std::snprintf(ui_.envMap, sizeof(ui_.envMap), "%s", opts_.envMapPath.c_str());
     if (opts_.renderScale > 0.f) ui_.renderScale = opts_.renderScale;
     if (opts_.displayW > 0 && opts_.displayH > 0) {
         for (int i = 0; i < 4; ++i) {
@@ -772,11 +774,12 @@ void GuiApp::finishAsyncRebuild() {
         loadResult_.algos.clear();
 
         // The env map is part of the deferred core (IBL maps): rebuild it only
-        // when the path actually changed.
+        // when the path actually changed.  Empty = sky atmosphere.
         if (active_.envMapPath != envMapActive_) {
             deferred_.destroy(ctx_);
             envMapActive_ = active_.envMapPath;
-            if (!deferred_.init(ctx_, envMapActive_.c_str())) {
+            if (!deferred_.init(ctx_, envMapActive_.c_str(),
+                                sunDirectionFromElevAzimuth(sunElevationDeg_, sunAzimuthDeg_))) {
                 statusLine_ = "deferred core init failed (env map: " + envMapActive_ + ")";
                 stackOk_ = false;
                 return;
@@ -2568,6 +2571,17 @@ void GuiApp::applyLightingPreset(const LightingPreset& p) {
     exposure_ = p.exposure;
     fogParams_ = p.fog;
     volFogEnabled_ = p.fog.enabled;
+    // Atmosphere mode: the sky + IBL follow the preset sun.
+    updateSkyFromUiSun();
+}
+
+void GuiApp::updateSkyFromUiSun() {
+    if (!stackOk_ || !deferred_.atmosphereSky()) return;
+    // The one-shot command pool is shared with the async loader; skip while a
+    // load is in flight (the post-load applyLightingPreset re-runs this).
+    if (loadPhase_.load(std::memory_order_acquire) == LoadPhase::Loading) return;
+    deferred_.updateAtmosphereSky(
+        ctx_, sunDirectionFromElevAzimuth(sunElevationDeg_, sunAzimuthDeg_));
 }
 
 void GuiApp::updateLightingUBO(void* mapped, const Mat4& viewProj,
@@ -4670,7 +4684,12 @@ void GuiApp::drawViewerTab() {
     ImGui::Checkbox("sun", &sunEnabled_);
     if (!sunEnabled_) ImGui::BeginDisabled();
     ImGui::SliderFloat("elevation", &sunElevationDeg_, 5.f, 90.f, "%.0f deg");
+    bool sunMoved = ImGui::IsItemDeactivatedAfterEdit();
     ImGui::SliderFloat("azimuth", &sunAzimuthDeg_, 0.f, 360.f, "%.0f deg");
+    sunMoved = sunMoved || ImGui::IsItemDeactivatedAfterEdit();
+    // Sky atmosphere follows the sun (Phase 5b); the IBL re-render is a
+    // blocking one-shot, so it runs on slider release only, atmosphere mode.
+    if (sunMoved) updateSkyFromUiSun();
     ImGui::SliderFloat("intensity", &sunIntensity_, 0.f, 10.f, "%.2f");
     if (!sunEnabled_) ImGui::EndDisabled();
     ImGui::Checkbox("fill light", &fillEnabled_);
