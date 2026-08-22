@@ -22,19 +22,46 @@ its performance numbers are not representative of real hardware.
 ## Renderer
 
 - Deferred PBR: Heitz height-correlated GGX + Hammon 2017 diffuse (no Lambert),
-  punctual lights, full IBL (irradiance + prefiltered specular + BRDF LUT),
-  normal/ORM/AO/emissive maps, alphaMode MASK cutouts, mipmaps + 16x anisotropy,
-  frustum culling, merged scene buffers
+  punctual lights, full IBL (irradiance + prefiltered specular + BRDF LUT) with
+  Fdez-Aguera multi-scatter compensation, normal/ORM/AO/emissive maps,
+  alphaMode MASK cutouts, mipmaps + 16x anisotropy, merged scene buffers
+- Sky: Hillaire 2020 atmosphere (transmittance/multiscatter LUTs) rendered
+  into the IBL env cube, sun direction driven by the scene preset (CLI
+  `--sun-elev` / `--sun-az`); `--env-map <hdr>` swaps in a static equirect
+  HDR instead.  Bistro's golden hour gets its sun color from the atmosphere
+- Clustered shading: 64 px tiles × 24 exponential depth slices, up to 1024
+  point + spot lights in an SSBO (≤64 per cluster), per-cluster assignment on
+  the GPU; the CSM sun bypasses the clusters
+- Shadows: CSM sun (4 × 2048² cascades, bounding-sphere stabilized, IGN
+  dithered transitions), spot shadow atlas (4096², 16 × 1024² tiles, per-frame
+  importance selection), screen-space contact shadows for the sun
+  (`--no-contact-shadows`)
+- SSR: full-screen opaque Hi-Z cone march sampling the color mip by roughness,
+  energy-conserving replacement of the IBL specular term, temporal EMA
+  accumulation (`--no-ssr`).  Reflection fallback chain: SSR → baked local
+  probes (box projection, two-probe blending; bake with `--bake-probes`) → env
+- GTAO (XeGTAO-style depth-mip sampling + temporal accumulation; Jimenez 2016
+  3 slices × 3 steps/side + 5×5 depth-aware denoise)
+- Auto exposure: log-luminance histogram + smoothed EV, fixed-dt deterministic,
+  feeds TAA/upscaler preExposure; CLI `--exposure <f>` switches to manual
+- TAA: YCoCg history clipping, depth-based disocclusion, adaptive alpha, RCAS
+  sharpening
+- Volumetric fog: froxel grid (inject/light/temporal/march/composite) lit by
+  the CSM + cluster lights, god rays; scene presets carry the media params
+  (`--no-volfog`)
+- Post chain: thresholded bloom pyramid (13-tap down / tent up), HDR motion
+  blur (McGuire 2012 tile-max gather), depth of field (UE4 scatter-as-gather
+  CoC, centre-texel autofocus) — same algorithm and parameters on the LR, GT
+  and GT-SSAA paths, deterministic frame-index-driven noise
+  (`--no-bloom` / `--no-motion-blur` / `--no-dof`; DOF off in free-fly viewer)
+- Color grading: simplified-ACEScc log domain (temperature/tint/contrast/
+  saturation, CLI `--temperature`/`--tint`/`--contrast`/`--saturation`, GUI
+  sliders) + `.cube` 3D LUT (`--lut`), mirrored on the CPU for PNG
+  screenshots; terminal lens chain (chromatic aberration / dirt / vignette /
+  grain, `--no-lens-fx`); HDR swapchain output probing HDR10 PQ then scRGB
+  with SDR fallback (viewer `--hdr`)
 - Display transform: Stephen Hill fitted ACES + gamma 2.2 (shared by present,
-  compare compose, GPU metrics, and CPU screenshots); display exposure is a
-  push-constant multiplier (CLI `--exposure`, GUI slider)
-- Scene lighting presets: Bistro exterior uses a low warm sun and reduced IBL
-  (golden hour); other scenes keep the generic high sun + cool fill
-- Up to 16 punctual lights packed per frame (shadowed sun always kept; extra
-  point lights scored by intensity/distance).  Bistro street lamps need a
-  reconvert with `export_lights=True` to appear as `KHR_lights_punctual`
-- GTAO (XeGTAO-style, Jimenez 2016: 3 slices × 3 steps/side + 5×5 depth-aware
-  denoise). Replaces the previous Crytek SSAO; same GBuffer→lighting slot
+  compare compose, GPU metrics, and CPU screenshots)
 - Forward transparency pass (after lighting, before upscaling): dielectric
   shop-window model (coated Fresnel, clip-space SSR / McGuire DDA against the
   opaque HDR, EnvBRDF composite), back-to-front sorted, writes camera motion
@@ -43,13 +70,21 @@ its performance numbers are not representative of real hardware.
   supports it: TAA (history weight), FSR2/FSR3 (reactive + T&C mask), DLSS
   (bias-current-color / reactive / transparency hints), XeSS (responsive
   pixel mask). NSS and SGSR2 have no such input.
-- Motion blur (McGuire 2012 tile-max gather, 20px tiles, 12 taps, half
-  shutter) + depth of field (UE4-style scatter-as-gather, half-res CoC +
-  foreground/background bokeh layers, centre-texel autofocus), in HDR after
-  lighting, before tonemap/upscaling.  Same algorithm and parameters on the
-  LR, GT and GT-SSAA paths so the reference blurs identically; deterministic
-  (frame-index-driven noise).  CLI `--no-motion-blur` / `--no-dof`, GUI
-  checkboxes; on by default in compare/bench, DOF off in free-fly viewer.
+- Animation: glTF node trees, animations and GPU skinning (double-buffered
+  joint palettes), poses sampled at frame index × fixed dt (never wall clock);
+  per-object motion vectors; the boxes scene has two animated boxes
+- LOD: per-mesh chains generated with meshoptimizer (+ `MSFT_lod` when
+  present), screen-size selection with hysteresis, disk-cached
+  (`SR_LOD=0` opts out); GPU occlusion culling against the previous frame's
+  Hi-Z pyramid feeding SSBO instancing + indirect draws (`SR_OCCLUSION=0`
+  opts out, GUI checkbox)
+- Textures: BC7 KTX2 preferred over PNG/JPG siblings (offline transcode with
+  `scripts/transcode_textures.py`, AMD Compressonator), fine-mip streaming in
+  the interactive viewer/GUI (bench/compare/screenshot runs upload fully for
+  determinism; `SR_TEX_STREAM=0/1` overrides)
+- Infrastructure: VMA allocation, persistent pipeline cache, sync2 barriers, a
+  dedicated transfer queue for one-shot uploads, and a lightweight render
+  graph with transient aliasing driving the viewer frame recording
 - Ground truth: native display resolution, optional 200% SSAA (4K→1080p)
 
 ## Modes
@@ -77,6 +112,27 @@ sr_compare compare --scene boxes --upscalers taa,fsr2,xess,dlss-m --render-scale
 sr_compare bench --scene sponza --frames 300 --warmup 60
 sr_compare viewer --list-upscalers
 ```
+
+Common viewer/compare switches (see `sr_compare <mode>` with no args for the
+full text):
+
+```
+--env-map <hdr>      static equirect HDR for IBL/skybox (default: sky atmosphere)
+--sun-elev / --sun-az <deg>   override the preset sun direction
+--exposure <f>       manual display exposure (disables auto exposure)
+--no-shadows / --shadow-debug / --no-contact-shadows
+--no-ssr             disable opaque screen-space reflections
+--no-volfog          disable froxel volumetric fog
+--no-bloom / --no-motion-blur / --no-dof / --no-lens-fx
+--bake-probes        bake reflection probes to the scene's .probes file, then exit
+--hdr                HDR swapchain output (HDR10 PQ or scRGB probe, SDR fallback)
+--lut <file.cube>    3D LUT (17^3/33^3), log domain pre-ACES
+--temperature <K> / --tint <-1..1> / --contrast <f> / --saturation <f>
+```
+
+compare additionally takes `--upscalers a,b,...`, `--gt-ssaa`, `--zoom <f>`,
+`--zoom-center <u,v>`, `--metric-interval <N>`; bench takes `--upscalers`,
+`--frames`, `--warmup`, `--out <csv>`.
 
 ## Scenes (`--scene`)
 

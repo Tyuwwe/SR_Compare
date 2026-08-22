@@ -1,7 +1,9 @@
 # third_party/ — SDK 说明
 
-本目录由 `scripts/fetch_sdks.py` 生成（不入 git，见仓库根 `.gitignore` 的
-`third_party/*/`）。下表为每个 SDK 的版本、来源与许可证。
+本目录大部分由 `scripts/fetch_sdks.py` 生成（不入 git，见仓库根 `.gitignore` 的
+`third_party/*/`）；例外：`vma/` 与 `meshoptimizer/` 为随源码 vendor 的精简拷贝，
+已入 git；`compressonator/` 由 `scripts/transcode_textures.py` 首次运行时下载。
+下表为每个 SDK 的版本、来源与许可证。
 
 | 子目录 | 名称 | 实际版本 | 许可证 |
 |---|---|---|---|
@@ -11,6 +13,8 @@
 | `snapdragon-gsr/` | Snapdragon SGSR 1/2（shader 源码） | git `d926f07`（main，浅克隆） | BSD-3-Clause |
 | `arm-nss/` | Arm Neural Super Sampling（SDK + 模型 + Vulkan ML 模拟层） | 见下 | SDK MIT + 模型 Arm AI Model Community License |
 | `meshoptimizer/` | zeux meshoptimizer（仅 `meshoptimizer.h` + `simplifier.cpp` + `allocator.cpp`，LOD 简化用） | **v0.25** | MIT |
+| `vma/` | GPUOpen Vulkan Memory Allocator（仅 `vk_mem_alloc.h` 单头文件） | **v3.4.0** | MIT |
+| `compressonator/` | AMD CompressonatorCLI（BC7 KTX2 离线转码用，见 `scripts/transcode_textures.py`） | **v4.5.52**（win64 命令行包） | MIT |
 | `../assets/sponza/` | Sponza glTF 测试场景 | Khronos glTF-Sample-Assets `main` | 模型文件 Cryengine Limited License Agreement；文档 CC-BY-4.0 |
 | `../assets/bistro/` | Amazon Lumberyard Bistro | NVIDIA ORCA 2017（FBX 转 glTF） | CC-BY 4.0 |
 
@@ -173,6 +177,25 @@
   的 Scenes / Bistro 一节。
 - 可加载入口：`assets/bistro/BistroExterior.gltf`、
   `assets/bistro/BistroInterior.gltf`
+
+---
+
+## Vulkan Memory Allocator — `vma/`
+
+- 来源：https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator
+- 版本：v3.4.0（头文件内 `VMA_VERSION`），只保留 `vk_mem_alloc.h` 单头文件（随源码 vendor，不经 fetch_sdks.py）
+- 许可证：MIT
+
+---
+
+## AMD Compressonator — `compressonator/`
+
+- 来源：https://github.com/GPUOpen-Tools/compressonator 的 release 资产
+  `compressonatorcli-4.5.52-win64.zip`（版本在 `scripts/transcode_textures.py`
+  中 pin 住，首次运行转码脚本时自动下载解压到本目录，不经 fetch_sdks.py）
+- 许可证：MIT（见包内 license）
+- 用途：把 `assets/` 下的 PNG/JPG 离线转码为 BC7 KTX2（含完整 mip 链），渲染器
+  的 glTF 加载器优先读同名 `.ktx2`。步骤见仓库根 `README.md` 渲染器小节。
 
 ---
 

@@ -18,24 +18,53 @@ Arm NSS 在 PC 上经 Vulkan ML Emulation Layer 软件模拟推理，性能数�
 ## 渲染器
 
 - Deferred PBR：Heitz 高度相关 GGX + Hammon 2017 漫反射（不用 Lambert）、punctual
-  灯、完整 IBL（irradiance + prefiltered specular + BRDF LUT）、法线/ORM/AO/
-  自发光贴图、MASK 镂空、mipmap + 16x 各向异性、视锥剔除、合并场景缓冲
+  灯、完整 IBL（irradiance + prefiltered specular + BRDF LUT）+ Fdez-Aguera
+  多散射补偿、法线/ORM/AO/自发光贴图、MASK 镂空、mipmap + 16x 各向异性、
+  合并场景缓冲
+- 天空：Hillaire 2020 大气（transmittance/multiscatter LUT）渲进 IBL env cube，
+  太阳方向由场景预设驱动（CLI `--sun-elev` / `--sun-az`）；`--env-map <hdr>`
+  可换回静态 equirect HDR。Bistro 黄昏预设的太阳色来自大气模型
+- Clustered shading：64 px tile × 24 指数深度 slice，SSBO 最多 1024 盏
+  点光 + 聚光灯（每 cluster ≤64），GPU 上逐 cluster 分配；CSM 太阳不走 cluster
+- 阴影：CSM 太阳（4 × 2048² 级联，包围球稳定，IGN dither 级联过渡）、聚光灯
+  阴影 atlas（4096²，16 × 1024² tile，逐帧按重要性选灯）、太阳屏幕空间接触阴影
+  （`--no-contact-shadows`）
+- SSR：全屏不透明 Hi-Z 锥体步进，按 roughness 采颜色 mip，能量守恒地替换 IBL
+  specular 项，temporal EMA 累积（`--no-ssr`）。反射回退链：SSR → 烘焙局部反射
+  探针（box projection、双探针混合；`--bake-probes` 离线烘焙）→ env
+- GTAO（XeGTAO 风格深度 mip 采样 + temporal 累积；Jimenez 2016 3 切片 ×
+  每侧 3 步 + 5×5 深度双边滤波）
+- 自动曝光：log 亮度直方图 + EV 平滑，固定 dt 确定性，给 TAA/超分喂真实
+  preExposure；CLI `--exposure <f>` 切回手动
+- TAA：YCoCg 历史 clip、深度 disocclusion、自适应 alpha、RCAS 锐化
+- 体积雾：froxel 网格（注入/光照/temporal/march/composite 五 pass），复用 CSM +
+  cluster 灯光，god rays；介质参数由场景预设携带（`--no-volfog`）
+- 后处理链：阈值提取 bloom 金字塔（13-tap 降采样 / tent 上采样）、HDR 运动模糊
+  （McGuire 2012 tile-max gather）、景深（UE4 scatter-as-gather CoC，中心像素自动
+  对焦）——LR/GT/GT-SSAA 三条路径同算法同参数，帧号驱动噪声保证确定性
+  （`--no-bloom` / `--no-motion-blur` / `--no-dof`；自由视角 viewer 默认关 DOF）
+- 色彩分级：简化 ACEScc log 域（色温/tint/对比度/饱和度，CLI
+  `--temperature`/`--tint`/`--contrast`/`--saturation`，GUI 滑条）+ `.cube`
+  3D LUT（`--lut`），CPU 镜像用于 PNG 截图；末端镜头链（色差/污渍/暗角/颗粒，
+  `--no-lens-fx`）；HDR 输出探测 HDR10 PQ 再 scRGB，失败回退 SDR（viewer `--hdr`）
 - 显示变换：Stephen Hill fitted ACES + gamma 2.2（present / compare compose /
-  GPU 指标 / CPU 截图共用同一套）；显示曝光为 push constant（CLI `--exposure`，
-  GUI 滑条）
-- 场景光预设：Bistro 室外为低角度暖太阳 + 降低 IBL（黄昏）；其余场景仍是高太阳
-  + 冷补光
-- 每帧最多打包 16 盏 punctual 灯（CSM 太阳始终保留；多余点光按强度/距离排序）。
-  Bistro 路灯需要用 `export_lights=True` 重新转换才会作为 `KHR_lights_punctual`
-  进场景
-- GTAO（XeGTAO 风格，Jimenez 2016：3 切片 × 每侧 3 步 + 5×5 深度双边滤波）。
-  替换原先的 Crytek SSAO，仍插在 GBuffer 与 lighting 之间
+  GPU 指标 / CPU 截图共用同一套）
 - 前向透明 pass（lighting 之后、upscale 之前）：电介质橱窗模型（镀膜菲涅尔、
   McGuire clip-space DDA SSR，合成时乘 EnvBRDF）、后往前排序、写相机运动矢量与
   半透明覆盖度 mask
 - 覆盖度 mask 接入了所有官方支持的接口：TAA（历史权重）、FSR2/FSR3（reactive + T&C
   mask）、DLSS（bias-current-color / reactive / transparency hint）、XeSS（responsive
   pixel mask）。NSS 与 SGSR2 无此输入。
+- 动画：glTF 节点树、动画与 GPU 蒙皮（双缓冲 joint palette），姿态按
+  帧号 × 固定 dt 采样（不用墙钟）；per-object 运动矢量；boxes 场景有两个动态盒子
+- LOD：meshoptimizer 生成逐 mesh 链（有 `MSFT_lod` 时直接读），按屏幕尺寸切换 +
+  hysteresis，磁盘缓存（`SR_LOD=0` 关闭）；GPU 遮挡剔除对照上一帧 Hi-Z 金字塔，
+  配合 SSBO 实例化 + indirect draw（`SR_OCCLUSION=0` 关闭，GUI 有 checkbox）
+- 贴图：优先加载同名的 BC7 KTX2（`scripts/transcode_textures.py` 离线转码，AMD
+  Compressonator），viewer/GUI 交互时细 mip 流送（bench/compare/截图运行为保确定性
+  全量上传；`SR_TEX_STREAM=0/1` 强制覆盖）
+- 基础设施：VMA 分配器、持久化管线缓存、sync2 屏障、一次性上传走独立 transfer
+  队列、轻量 render graph（transient 别名）驱动 viewer 的帧录制
 - 参考真值：原生分辨率，可选 200% SSAA（4K→1080p）
 
 ## 运行模式
@@ -60,6 +89,26 @@ sr_compare compare --scene boxes --upscalers taa,fsr2,xess,dlss-m --render-scale
 sr_compare bench --scene sponza --frames 300 --warmup 60
 sr_compare viewer --list-upscalers
 ```
+
+常用 viewer/compare 开关（无参数运行 `sr_compare <mode>` 看完整文案）：
+
+```
+--env-map <hdr>      静态 equirect HDR 作 IBL/天空盒（默认：大气天空）
+--sun-elev / --sun-az <deg>   覆盖预设太阳方向
+--exposure <f>       手动显示曝光（关闭自动曝光）
+--no-shadows / --shadow-debug / --no-contact-shadows
+--no-ssr             关闭不透明 SSR
+--no-volfog          关闭 froxel 体积雾
+--no-bloom / --no-motion-blur / --no-dof / --no-lens-fx
+--bake-probes        烘焙反射探针到场景的 .probes 文件后退出
+--hdr                HDR 交换链输出（探测 HDR10 PQ 或 scRGB，回退 SDR）
+--lut <file.cube>    3D LUT（17^3/33^3），ACES 前 log 域
+--temperature <K> / --tint <-1..1> / --contrast <f> / --saturation <f>
+```
+
+compare 另有 `--upscalers a,b,...`、`--gt-ssaa`、`--zoom <f>`、
+`--zoom-center <u,v>`、`--metric-interval <N>`；bench 另有 `--upscalers`、
+`--frames`、`--warmup`、`--out <csv>`。
 
 ## 场景（`--scene`）
 
