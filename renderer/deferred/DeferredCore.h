@@ -679,7 +679,8 @@ struct VolFogVolume {
 // COD:AW / Unity-style bloom (Jimenez, "Next Generation Post Processing in
 // Call of Duty: Advanced Warfare", SIGGRAPH 2014; Unity HDRP/URP bloom):
 //   1. extract (bloom_extract.comp): quadratic soft-knee threshold into mip 0
-//      at half resolution (threshold/knee semantics unchanged from the old
+//      at half resolution, after a 4-tap prefilter that stabilises sub-texel
+//      emitters (threshold/knee semantics unchanged from the old
 //      single-level bloom);
 //   2. downsample (bloom_downsample.comp): 13-tap energy-preserving filter,
 //      kBloomMipCount - 1 levels (1080p: 960x540 -> 60x34);
@@ -689,6 +690,11 @@ struct VolFogVolume {
 //      Gaussian);
 //   4. composite (bloom_composite.comp): accumulated mip 0 added onto the
 //      lit HDR target, still before tonemapping (HDR domain, as before).
+// Both paths run the chain at display resolution on finalImage_: the GT path
+// blooms its lit target directly, the upscaler path blooms post-upscale so
+// the extract input is the temporally resolved image (Halton coverage flicker
+// of sub-texel emitters otherwise crosses the threshold per frame and the
+// halo pulses).
 // The chain is independent of ColorPyramid (see its comment).  Host-owned,
 // GENERAL-for-life resource model matching ColorPyramid.
 constexpr uint32_t kBloomMipCount = 5; // mip 0 = half-res extract, 1..4 = downsamples

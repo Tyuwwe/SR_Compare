@@ -3,6 +3,7 @@
 // ============================================================================
 #include "gui/GuiApp.h"
 
+#include "app/CliUtils.h"
 #include "compare/Font5x7.h"
 #include "renderer/Screenshot.h"
 #include "renderer/core/MemoryBudget.h"
@@ -39,7 +40,7 @@ namespace {
 // Debug hook (SR_GUI_DEBUG_INPUT=1): verify the backend actually queues a
 // wheel event when the message arrives.
 bool dbgInputEnabled() {
-    static const bool enabled = std::getenv("SR_GUI_DEBUG_INPUT") != nullptr;
+    static const bool enabled = sr::envFlag("SR_GUI_DEBUG_INPUT");
     return enabled;
 }
 
@@ -271,8 +272,20 @@ bool GuiApp::init(const GuiOptions& opts) {
     opts_ = opts;
     // CLI --exposure is a manual override: start in manual exposure mode.
     if (opts_.exposure > 0.f) autoExposureEnabled_ = false;
+    // _dupenv_s / envFlag: plain getenv trips C4996 (this project builds /W4).
+#ifdef _MSC_VER
+    {
+        char* f = nullptr;
+        size_t fLen = 0;
+        if (_dupenv_s(&f, &fLen, "SR_GUI_INPUT_FILE") == 0 && f != nullptr) {
+            inputFile_ = f;
+            std::free(f);
+        }
+    }
+#else
     if (const char* f = std::getenv("SR_GUI_INPUT_FILE")) inputFile_ = f;
-    uiShot_ = std::getenv("SR_GUI_UI_SHOT") != nullptr;
+#endif
+    uiShot_ = envFlag("SR_GUI_UI_SHOT");
     scenes_ = listScenes();
     upscalerNames_ = listUpscalers();
     applyLaunchOptions();
@@ -2891,7 +2904,7 @@ void GuiApp::handleCompareZoomInput() {
     const ImGuiIO& io = ImGui::GetIO();
     // Debug hook (SR_GUI_DEBUG_INPUT=1): trace the input path for the
     // interactive zoom/pan verification.
-    static const bool dbgInput = std::getenv("SR_GUI_DEBUG_INPUT") != nullptr;
+    static const bool dbgInput = envFlag("SR_GUI_DEBUG_INPUT");
     if (dbgInput && (io.MouseWheel != 0.f || ImGui::IsMouseDown(ImGuiMouseButton_Middle))) {
         std::fprintf(stderr,
                      "[zoomdbg] wheel=%.2f mbtn=%d pos=%.0f,%.0f wantCapture=%d drag=%d "
@@ -5252,7 +5265,8 @@ void GuiApp::drawViewerTab() {
 
     // Live performance readout.
     {
-        const float dispMs = fps_ > 1.f ? 1000.f / fps_ : lastTimings_.frameMs;
+        const float dispMs =
+            fps_ > 1.f ? 1000.f / fps_ : static_cast<float>(lastTimings_.frameMs);
         ImGui::Text("display %6.2f ms  (%5.1f FPS)", static_cast<double>(dispMs),
                     static_cast<double>(fps_));
     }

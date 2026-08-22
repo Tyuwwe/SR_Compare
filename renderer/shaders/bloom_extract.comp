@@ -1,6 +1,15 @@
 #version 450
 // Half-resolution bright-pass extract (quadratic knee).  Input is full-res
 // linear HDR; output is half-res RGBA16F.  Must match BloomPush in DeferredCore.
+//
+// Prefilter: instead of one bilinear tap at the output texel centre, average
+// four bilinear taps at +-1 source texel (the Unity URP/HDRP bloom prefilter).
+// The single centre tap only integrates the 2x2 texel quad exactly under the
+// sample point, so a sub-texel emissive (Bistro string lights, specular
+// glints) crossing the jittered TAA/upscaler grid frame-to-frame flickers
+// across the threshold ("bling").  The wider ~4x4-texel tent footprint makes
+// the extracted energy insensitive to sub-texel phase; threshold/knee and the
+// downsample/upsample chain are unchanged, so halo shape is preserved.
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
@@ -16,8 +25,13 @@ void main() {
     ivec2 size = imageSize(outBright);
     if (pix.x >= size.x || pix.y >= size.y) return;
 
-    vec2 uv = (vec2(pix) + 0.5) / vec2(size);
-    vec3 c = texture(srcHdr, uv).rgb;
+    const vec2 uv = (vec2(pix) + 0.5) / vec2(size);
+    const vec2 t = 1.0 / vec2(textureSize(srcHdr, 0));
+    vec3 c = texture(srcHdr, uv + t * vec2(-1.0, -1.0)).rgb
+           + texture(srcHdr, uv + t * vec2( 1.0, -1.0)).rgb
+           + texture(srcHdr, uv + t * vec2(-1.0,  1.0)).rgb
+           + texture(srcHdr, uv + t * vec2( 1.0,  1.0)).rgb;
+    c *= 0.25;
     float lum = max(dot(c, vec3(0.2126, 0.7152, 0.0722)), 1e-4);
     float threshold = pc.params.x;
     float knee = max(pc.params.y, 1e-4);

@@ -398,8 +398,10 @@ bool Renderer::createRenderTargets() {
     if (!createRT(gtAo_, dw, dh, VK_FORMAT_R16_SFLOAT, aoUsage, VK_IMAGE_ASPECT_COLOR_BIT))
         return false;
     // Bloom pyramids (Phase 6a): 5-level thresholded chains, one per path;
-    // GENERAL-for-life, no host layout tracking.
-    if (!deferred_.createBloomPyramid(ctx_, renderWidth_, renderHeight_, gbBloom_))
+    // GENERAL-for-life, no host layout tracking.  Both chains are display-res:
+    // the upscaler path blooms the resolved finalImage_ post-upscale (see the
+    // Bloom pass in buildFrameGraph), so its pyramid matches the GT chain.
+    if (!deferred_.createBloomPyramid(ctx_, dw, dh, gbBloom_))
         return false;
     if (!deferred_.createBloomPyramid(ctx_, dw, dh, gtBloom_))
         return false;
@@ -1034,8 +1036,10 @@ bool Renderer::createSyncResources() {
             return false;
     }
 
-    // Bloom pyramid sets (pool-owned; mip views already exist).
-    if (!deferred_.writeBloomPyramidSets(ctx_, descriptorPool_, gbColor_.view, gbBloom_))
+    // Bloom pyramid sets (pool-owned; mip views already exist).  Both chains
+    // extract from / composite into finalImage_: the upscaler path blooms the
+    // resolved display-res image post-upscale (see buildFrameGraph).
+    if (!deferred_.writeBloomPyramidSets(ctx_, descriptorPool_, finalImage_.view, gbBloom_))
         return false;
     if (!deferred_.writeBloomPyramidSets(ctx_, descriptorPool_, finalImage_.view, gtBloom_))
         return false;
@@ -1947,7 +1951,11 @@ void Renderer::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         };
     }
 
-    if (opts_.bloom) {
+    if (opts_.bloom && !gbuffer) {
+        // GT path only: bloom the lit target in place.  The upscaler path
+        // blooms finalImage_ after the Upscale pass instead (see there) —
+        // extracting from the jittered LR target let sub-texel emitters cross
+        // the threshold per frame (coverage flicker -> pulsing halo).
         // The helper transitions the lit target internally (GENERAL RMW
         // composite) and hands it back SHADER_READ_ONLY: entry via the
         // declaration, the in/out layout through the tracker's layoutRef, the
@@ -1958,14 +1966,14 @@ void Renderer::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         p.leaves(litTarget.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                  sync::kFragment | sync::kCompute, sync::kSampled);
         p.record = [&](VkCommandBuffer c) {
-            const BloomPyramid& bloom = gbuffer ? gbBloom_ : gtBloom_;
-            deferred_.recordBloomPyramidPass(c, bloom, litTarget.image,
+            deferred_.recordBloomPyramidPass(c, gtBloom_, litTarget.image,
                                              rg_.layoutRef(litTarget.image), sceneW, sceneH);
         };
     }
     // --- Motion blur + depth of field (Phase 6b) -------------------------------
-    // HDR domain, after bloom and before upscale/present.  Same algorithm and
-    // parameters on the LR and GT paths (the GT blurs identically, so compare
+    // HDR domain on the lit target: after bloom on the GT path, before upscale
+    // (and therefore before the LR bloom) on the upscaler path.  Same algorithm
+    // and parameters on both paths (the GT blurs identically, so compare
     // metrics stay fair); the blur-radius clamps scale with path height so the
     // display-space blur is resolution-independent.
     if (opts_.motionBlur || opts_.dof) {
@@ -2091,6 +2099,25 @@ void Renderer::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
             upscaler_->dispatch(c, res, cam, frame);
             timestamps_.upscaleEnd(c, slot);
         };
+        if (opts_.bloom) {
+            // Bloom the temporally-resolved display-res image (UE/Unity run
+            // bloom post-TAA for the same reason): the extract input no longer
+            // carries the per-frame Halton coverage flicker of sub-texel
+            // emitters, so their halo stops pulsing ("bling").  Same pyramid
+            // algorithm and constants as the GT path; finalImage_ is GENERAL
+            // (storage write) from the upscaler, the helper hands it back
+            // SHADER_READ_ONLY for present.
+            RenderGraph::Pass& bp = rg_.addPass("BloomUpscaled");
+            bp.access(finalImage_.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kCompute,
+                      sync::kSampled);
+            bp.leaves(finalImage_.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                      sync::kFragment | sync::kCompute, sync::kSampled);
+            bp.record = [&](VkCommandBuffer c) {
+                deferred_.recordBloomPyramidPass(c, gbBloom_, finalImage_.image,
+                                                 rg_.layoutRef(finalImage_.image),
+                                                 opts_.displayWidth, opts_.displayHeight);
+            };
+        }
         rg_.addPass("PostUpscale")
             .access(finalImage_.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kFragment,
                     sync::kSampled);
