@@ -4334,6 +4334,7 @@ void DeferredCore::recordPostFxPass(VkCommandBuffer cmd, const PostFxTargets& fx
         cocPush.depthParams[3] = params.maxCocPx * 0.5f;
         cocPush.params[0] = params.aperture;
         cocPush.params[1] = kDofSkyFocus;
+        cocPush.params[2] = params.focusDistance;
         dispatch(dofCocPipeline_, dofCocPipelineLayout_, mb ? fx.cocSetMb : fx.cocSetLit,
                  &cocPush, sizeof(cocPush), halfW, halfH);
 

@@ -535,6 +535,14 @@ private:
     // path so the GT column blurs identically.
     bool motionBlurEnabled_ = true;
     bool dofEnabled_ = true;
+    // DOF tuning (Phase 6b; sliders in the viewer tab, applied per-frame via
+    // PostFxParams — no rebuild, no temporal state).  focus 0 = auto-focus on
+    // the screen-centre texel; f-stop maps to the aperture scale as
+    // kDofAperture * (kDofDefaultFstop / fstop); max blur is the CoC radius
+    // clamp in display px at 1080p, scaled by path height.
+    float dofFocus_ = 0.f;
+    float dofFstop_ = kDofDefaultFstop;
+    float dofMaxBlur_ = kDofMaxCoC;
     // Log-domain color grading (Phase 6c, compose push constants; identical
     // parameters for every column — sliders in the shared controls).  The LUT
     // is the procedural identity (no LUT file UI); the GUI is the interactive

@@ -720,8 +720,9 @@ struct BloomPyramid {
 //      frame index (deterministic).
 // Depth of field (UE4 scatter-as-gather CoC; Guertin, GDC 2013):
 //   1. coc        (dof_coc.comp): half-res RGBA16F, rgb = downsampled color,
-//      a = signed CoC / maxRadius (thin-lens approximation, auto-focus on the
-//      screen-centre depth texel — deterministic, no CPU readback);
+//      a = signed CoC / maxRadius (thin-lens approximation, manual focus
+//      distance or auto-focus on the screen-centre depth texel —
+//      deterministic, no CPU readback);
 //   2. gather     (dof_gather.comp): half-res Poisson-disk gather with
 //      cylinder coverage into premultiplied foreground/background layers;
 //   3. composite  (dof_composite.comp): full-res, background layer behind the
@@ -738,6 +739,10 @@ constexpr float kMotionBlurMaxPixels = 32.f;
 constexpr uint32_t kMotionBlurGatherTaps = 12;
 constexpr float kDofMaxCoC = 12.f;   // max bokeh radius at 1080p, scaled by path height
 constexpr float kDofAperture = 1.5f; // CoC scale of the (focus - z) / z thin-lens term
+// f-stop front end for the aperture scale: aperture = kDofAperture *
+// (kDofDefaultFstop / fstop), so the default f/4 reproduces kDofAperture and
+// smaller f-stops widen the bokeh (CLI --dof-fstop, GUI slider).
+constexpr float kDofDefaultFstop = 4.f;
 constexpr float kDofSkyFocus = 20.f; // focus fallback (m) when the screen centre is sky
 constexpr uint32_t kDofGatherTaps = 24;
 
@@ -757,7 +762,8 @@ static_assert(sizeof(MotionBlurGatherPush) == 32, "MotionBlurGatherPush size mis
 struct DofCocPush {
     float depthParams[4]; // x = proj m[10], y = proj m[14] (NDC -> view Z),
                           // z = far, w = max CoC (half-res px)
-    float params[4];      // x = aperture scale, y = sky focus fallback (m), zw unused
+    float params[4];      // x = aperture scale, y = sky focus fallback (m),
+                          // z = manual focus (m; <= 0 = auto-focus), w unused
 };
 static_assert(sizeof(DofCocPush) == 32, "DofCocPush size mismatch");
 
@@ -821,6 +827,9 @@ struct PostFxParams {
     float maxBlurPx = kMotionBlurMaxPixels;
     float maxCocPx = kDofMaxCoC;
     float aperture = kDofAperture;
+    // Manual DOF focus distance (m); <= 0 = auto-focus on the screen-centre
+    // depth texel (dof_coc.comp).  CLI --dof-focus / GUI slider.
+    float focusDistance = 0.f;
     bool motionBlur = true;
     bool dof = true;
 };

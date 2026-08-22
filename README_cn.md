@@ -100,6 +100,8 @@ sr_compare viewer --list-upscalers
 --no-ssr             关闭不透明 SSR
 --no-volfog          关闭 froxel 体积雾
 --no-bloom / --no-motion-blur / --no-dof / --no-lens-fx
+--dof-focus <m> / --dof-fstop <f> / --dof-max-blur <px>
+                     DOF 调节（viewer + compare；focus 0 = 屏幕中心自动对焦）
 --bake-probes        烘焙反射探针到场景的 .probes 文件后退出
 --hdr                HDR 交换链输出（探测 HDR10 PQ 或 scRGB，回退 SDR）
 --lut <file.cube>    3D LUT（17^3/33^3），ACES 前 log 域

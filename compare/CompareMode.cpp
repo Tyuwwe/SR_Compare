@@ -32,6 +32,12 @@ void printCompareUsage() {
                  "  --no-volfog                    disable froxel volumetric fog\n"
                  "  --no-motion-blur               disable motion blur (all paths)\n"
                  "  --no-dof                       disable depth of field (all paths)\n"
+                 "  --dof-focus <m>                DOF focus distance in metres (0 = auto-focus on the\n"
+                 "                               screen centre; default 0; all paths)\n"
+                 "  --dof-fstop <f>                DOF aperture f-stop 0.5..64 (default 4; smaller =\n"
+                 "                               wider bokeh; all paths)\n"
+                 "  --dof-max-blur <px>            DOF max bokeh radius at 1080p, 1..64 (default 12;\n"
+                 "                               all paths)\n"
                  "  --no-lens-fx                   disable the compose lens chain (CA/vignette/grain)\n"
                  "                                 (grading is the neutral default set; HDR output is\n"
                  "                                 viewer/GUI-only — compare/bench stay SDR)\n"
@@ -90,6 +96,21 @@ int runCompareMode(int argc, char** argv) {
             opts.motionBlur = false;
         } else if (a == "--no-dof") {
             opts.dof = false;
+        } else if (a == "--dof-focus") {
+            if (!parseDofFocus(nextArg(i, argc, argv, "--dof-focus"), opts.dofFocus)) {
+                std::fprintf(stderr, "invalid --dof-focus value\n");
+                return 1;
+            }
+        } else if (a == "--dof-fstop") {
+            if (!parseDofFstop(nextArg(i, argc, argv, "--dof-fstop"), opts.dofFstop)) {
+                std::fprintf(stderr, "invalid --dof-fstop value\n");
+                return 1;
+            }
+        } else if (a == "--dof-max-blur") {
+            if (!parseDofMaxBlur(nextArg(i, argc, argv, "--dof-max-blur"), opts.dofMaxBlurPx)) {
+                std::fprintf(stderr, "invalid --dof-max-blur value\n");
+                return 1;
+            }
         } else if (a == "--no-lens-fx") {
             opts.lensFx = false;
         } else if (a == "--shadow-debug") {

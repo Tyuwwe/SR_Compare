@@ -124,6 +124,8 @@ full text):
 --no-ssr             disable opaque screen-space reflections
 --no-volfog          disable froxel volumetric fog
 --no-bloom / --no-motion-blur / --no-dof / --no-lens-fx
+--dof-focus <m> / --dof-fstop <f> / --dof-max-blur <px>
+                     DOF tuning (viewer + compare; focus 0 = screen-centre auto-focus)
 --bake-probes        bake reflection probes to the scene's .probes file, then exit
 --hdr                HDR swapchain output (HDR10 PQ or scRGB probe, SDR fallback)
 --lut <file.cube>    3D LUT (17^3/33^3), log domain pre-ACES

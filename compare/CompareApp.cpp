@@ -1704,7 +1704,9 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         fx.farPlane = camera_.farPlane;
         const float resScale = static_cast<float>(pathH) / 1080.f;
         fx.maxBlurPx = std::max(8.f, kMotionBlurMaxPixels * resScale);
-        fx.maxCocPx = std::max(2.f, kDofMaxCoC * resScale);
+        fx.maxCocPx = std::max(2.f, opts_.dofMaxBlurPx * resScale);
+        fx.aperture = kDofAperture * (kDofDefaultFstop / opts_.dofFstop);
+        fx.focusDistance = opts_.dofFocus;
         fx.motionBlur = opts_.motionBlur;
         fx.dof = opts_.dof;
         deferred_.recordPostFxPass(cmd, fxTargets, color, colorLayout, fx, frameIndex);

@@ -77,6 +77,14 @@ struct RendererOptions {
     // free-fly (screen-centre autofocus gets in the way while flying);
     // runViewer applies that rule.  The GUI has a checkbox for interactive use.
     bool dof = true;
+    // DOF tuning (CLI: --dof-focus/--dof-fstop/--dof-max-blur).  focus 0 =
+    // auto-focus on the screen-centre depth texel; the f-stop maps to the
+    // thin-lens aperture scale as kDofAperture * (kDofDefaultFstop / fstop),
+    // so the default f/4 reproduces the Phase 6b look; max blur is the CoC
+    // radius clamp in display px at 1080p, scaled by path height.
+    float dofFocus = 0.f;
+    float dofFstop = kDofDefaultFstop;
+    float dofMaxBlurPx = kDofMaxCoC;
     // Offline reflection-probe baking (CLI: --bake-probes): renders each
     // probe's 6 cube faces and writes the .probes file, then exits without
     // entering the frame loop.  Not part of bench.

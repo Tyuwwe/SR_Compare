@@ -61,6 +61,14 @@ struct CompareOptions {
     // MB/DOF change the pixel content of EVERY column's input by design.
     bool motionBlur = true;
     bool dof = true;
+    // DOF tuning (CLI: --dof-focus/--dof-fstop/--dof-max-blur); applied to
+    // every path identically, so GT and algorithm columns blur the same.
+    // focus 0 = auto-focus on the screen-centre texel; f-stop maps to the
+    // aperture scale as kDofAperture * (kDofDefaultFstop / fstop); max blur is
+    // the CoC radius clamp in display px at 1080p, scaled by path height.
+    float dofFocus = 0.f;
+    float dofFstop = kDofDefaultFstop;
+    float dofMaxBlurPx = kDofMaxCoC;
     float zoom = 1.f;                   // compare-view zoom (1..16)
     float zoomCenterU = 0.5f;           // zoom window center, normalized source UV
     float zoomCenterV = 0.5f;

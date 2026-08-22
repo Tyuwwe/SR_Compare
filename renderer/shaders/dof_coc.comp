@@ -7,9 +7,10 @@
 // Abashov / Sousa GDC talks): coc = aperture * |focus - z| / z, signed by
 // which side of the focal plane the pixel is on (positive = foreground,
 // nearer than the focus distance; negative = background), clamped to the
-// max bokeh radius.  The focus distance is auto-focused on the screen-centre
-// depth texel (same texel for every invocation -> deterministic, no CPU
-// readback); a sky centre (far plane) falls back to a fixed distance.
+// max bokeh radius.  The focus distance is either the manual push-constant
+// value or, when that is <= 0, auto-focused on the screen-centre depth texel
+// (same texel for every invocation -> deterministic, no CPU readback); a sky
+// centre (far plane) falls back to a fixed distance.
 //
 //   binding 0 = lit HDR color (sampler, full res)
 //   binding 1 = depth (sampler, full res; nearest of the 2x2 quad is used)
@@ -29,7 +30,8 @@ layout(push_constant) uniform Push {
     vec4 depthParams; // x = proj m[10], y = proj m[14], z = far, w = max CoC
                       // (half-res px)
     vec4 params;      // x = aperture scale, y = sky-centre focus fallback (m),
-                      // zw unused
+                      // z = manual focus distance (m; <= 0 = auto-focus on the
+                      // screen centre), w unused
 } pc;
 
 // Non-reversed Vulkan depth: viewZ = m14 / (ndc + m10) (m10/m14 < 0).
@@ -50,10 +52,12 @@ void main() {
         for (int dx = 0; dx < 2; ++dx)
             z = min(z, viewZ(texelFetch(depth, base + ivec2(dx, dy), 0).r));
 
-    // Auto-focus on the screen centre (this frame's depth; deterministic).
+    // Manual focus distance, or auto-focus on the screen centre (this frame's
+    // depth; deterministic).
     const float centerZ = viewZ(texelFetch(depth, fullSize / 2, 0).r);
     const float far = pc.depthParams.z;
-    const float focus = (centerZ >= 0.98 * far) ? pc.params.y : centerZ;
+    const float autoFocus = (centerZ >= 0.98 * far) ? pc.params.y : centerZ;
+    const float focus = (pc.params.z > 0.0) ? pc.params.z : autoFocus;
 
     const float maxCoc = pc.depthParams.w;
     const float coc = clamp(pc.params.x * (focus - z) / z, -maxCoc, maxCoc);

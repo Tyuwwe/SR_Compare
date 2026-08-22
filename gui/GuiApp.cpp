@@ -3259,7 +3259,9 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         fx.farPlane = camera_.farPlane;
         const float resScale = static_cast<float>(pathH) / 1080.f;
         fx.maxBlurPx = std::max(8.f, kMotionBlurMaxPixels * resScale);
-        fx.maxCocPx = std::max(2.f, kDofMaxCoC * resScale);
+        fx.maxCocPx = std::max(2.f, dofMaxBlur_ * resScale);
+        fx.aperture = kDofAperture * (kDofDefaultFstop / dofFstop_);
+        fx.focusDistance = dofFocus_;
         fx.motionBlur = motionBlurEnabled_;
         fx.dof = dofEnabled_;
         deferred_.recordPostFxPass(cmd, fxTargets, color, colorLayout, fx, frameIndex);
@@ -5153,6 +5155,13 @@ void GuiApp::drawViewerTab() {
     // Motion blur + DOF (Phase 6b): per-frame pass skip, no temporal state.
     ImGui::Checkbox("motion blur", &motionBlurEnabled_);
     ImGui::Checkbox("depth of field", &dofEnabled_);
+    // DOF tuning: per-frame push constants, no rebuild.  Focus 0 = auto-focus
+    // on the screen-centre depth texel.
+    if (!dofEnabled_) ImGui::BeginDisabled();
+    ImGui::SliderFloat("dof focus (m)", &dofFocus_, 0.f, 60.f, "%.1f (0 = auto)");
+    ImGui::SliderFloat("dof f-stop", &dofFstop_, 0.7f, 22.f, "f/%.1f");
+    ImGui::SliderFloat("dof max blur (px)", &dofMaxBlur_, 1.f, 32.f, "%.0f");
+    if (!dofEnabled_) ImGui::EndDisabled();
     // Terminal lens-effects chain (Phase 6a, compare_compose.frag; per-frame
     // push constants, no rebuild).  Lens dirt is viewer-only: it modulates the
     // HDR bloom pyramid, which the GUI/compare paths do not build.

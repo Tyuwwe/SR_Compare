@@ -68,6 +68,30 @@ inline bool parseRenderScale(const char* s, float& out) {
     return true;
 }
 
+// DOF tuning (Phase 6b).  Focus distance in metres, >= 0 (0 = auto-focus on
+// the screen-centre texel); f-stop in [0.5, 64]; max bokeh radius in [1, 64]
+// display px at 1080p.  NaN is rejected via !(v >= ...).
+inline bool parseDofFocus(const char* s, float& out) {
+    const float v = static_cast<float>(std::atof(s));
+    if (!(v >= 0.0f) || v > 10000.0f) return false;
+    out = v;
+    return true;
+}
+
+inline bool parseDofFstop(const char* s, float& out) {
+    const float v = static_cast<float>(std::atof(s));
+    if (!(v >= 0.5f) || v > 64.0f) return false;
+    out = v;
+    return true;
+}
+
+inline bool parseDofMaxBlur(const char* s, float& out) {
+    const float v = static_cast<float>(std::atof(s));
+    if (!(v >= 1.0f) || v > 64.0f) return false;
+    out = v;
+    return true;
+}
+
 // True when environment variable `name` is set (any value).  Uses _dupenv_s
 // on MSVC: plain getenv trips C4996 and this project builds /W4 zero-warning.
 inline bool envFlag(const char* name) {

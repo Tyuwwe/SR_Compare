@@ -56,6 +56,11 @@ void printUsage() {
                  "  --no-motion-blur                 disable HDR motion blur (McGuire 2012 tile-max gather)\n"
                  "  --no-dof                         disable depth of field (default on for --frames runs,\n"
                  "                                 off for interactive free-fly)\n"
+                 "  --dof-focus <m>                  DOF focus distance in metres (0 = auto-focus on\n"
+                 "                                 the screen centre; default 0)\n"
+                 "  --dof-fstop <f>                  DOF aperture f-stop 0.5..64 (default 4; smaller =\n"
+                 "                                 wider bokeh)\n"
+                 "  --dof-max-blur <px>              DOF max bokeh radius at 1080p, 1..64 (default 12)\n"
                  "  --bake-probes                    bake reflection probes to the scene's .probes file, then exit\n"
                  "  --hdr                            HDR swapchain output (HDR10 PQ or scRGB probe, SDR fallback)\n"
                  "  --lut <file.cube>                3D LUT (17^3/33^3), log domain pre-ACES (default: identity)\n"
@@ -139,6 +144,22 @@ int runViewer(int argc, char** argv) {
             opts.motionBlur = false;
         } else if (a == "--no-dof") {
             opts.dof = false;
+        } else if (a == "--dof-focus") {
+            if (!sr::parseDofFocus(sr::nextArg(i, argc, argv, "--dof-focus"), opts.dofFocus)) {
+                std::fprintf(stderr, "invalid --dof-focus value\n");
+                return 1;
+            }
+        } else if (a == "--dof-fstop") {
+            if (!sr::parseDofFstop(sr::nextArg(i, argc, argv, "--dof-fstop"), opts.dofFstop)) {
+                std::fprintf(stderr, "invalid --dof-fstop value\n");
+                return 1;
+            }
+        } else if (a == "--dof-max-blur") {
+            if (!sr::parseDofMaxBlur(sr::nextArg(i, argc, argv, "--dof-max-blur"),
+                                     opts.dofMaxBlurPx)) {
+                std::fprintf(stderr, "invalid --dof-max-blur value\n");
+                return 1;
+            }
         } else if (a == "--bake-probes") {
             opts.bakeProbes = true;
         } else if (a == "--hdr") {
