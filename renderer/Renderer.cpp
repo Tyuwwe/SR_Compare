@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <mutex>
 #include <vector>
 
 namespace sr {
@@ -93,6 +94,13 @@ bool Renderer::init(const RendererOptions& opts) {
     renderHeight_ = std::max(1u, static_cast<uint32_t>(static_cast<float>(opts.displayHeight) * opts.renderScale));
 
     bool sceneOk = false;
+    // Mip streaming (Phase 7b) only in interactive free-fly: fixed-frame bench
+    // runs and one-shot screenshots need the full mip chain resident from
+    // frame 0 for bit-reproducible output.  SR_TEX_STREAM=1 forces it on for
+    // validation of the streaming path itself.
+    const int streamOv = texStreamingOverride();
+    scene_.streamingEnabled =
+        streamOv > 0 || (streamOv == 0 && opts.frames < 0 && opts.screenshotPath.empty());
     if (!opts.scenePath.empty()) sceneOk = scene_.loadGltf(ctx_, opts.scenePath.c_str());
     if (!sceneOk) sceneOk = scene_.loadProcedural(ctx_);
     if (!sceneOk) return false;
@@ -1999,6 +2007,8 @@ void Renderer::run() {
         // CPU LOD selection for this frame's camera (viewer: always enabled).
         // Before recording; both GT and upscaled paths share the result.
         scene_.updateLodSelection(camera_.position, camera_.fovY, lodEnabledByDefault());
+        // Background fine-mip streaming tick (no-op when streaming is off).
+        scene_.updateTextureStreaming(ctx_, camera_.position);
         // complete; harvest its GPU timings before the slot is reused.
         if (!opts_.frameTimesPath.empty() && frameIndex >= kFramesInFlight) {
             frameTimes_.push_back(timestamps_.read(ctx_, slot));
@@ -2027,7 +2037,14 @@ void Renderer::run() {
         submit.pCommandBuffers = &frames_[slot].cmd;
         submit.signalSemaphoreCount = 1;
         submit.pSignalSemaphores = &renderFinished_[swapIndex];
-        if (vkQueueSubmit(ctx_.graphicsQueue, 1, &submit, frames_[slot].fence) != VK_SUCCESS) break;
+        VkResult submitRes = VK_SUCCESS;
+        {
+            // The texture-streaming worker submits one-shot uploads off-thread
+            // (Phase 7b); all queue access is serialized via queueMutex.
+            std::lock_guard<std::mutex> lk(ctx_.queueMutex);
+            submitRes = vkQueueSubmit(ctx_.graphicsQueue, 1, &submit, frames_[slot].fence);
+        }
+        if (submitRes != VK_SUCCESS) break;
 
         VkResult pres = swapchain_.present(ctx_, swapIndex, renderFinished_[swapIndex]);
         if (pres == VK_ERROR_OUT_OF_DATE_KHR || pres == VK_SUBOPTIMAL_KHR) {

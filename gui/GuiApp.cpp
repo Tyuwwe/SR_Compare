@@ -668,6 +668,10 @@ void GuiApp::loadWorkerMain(RenderConfig cfg) {
         // null and finishAsyncRebuild preserves scene_).
         if (loadSceneDirty_) {
             bool sceneOk = false;
+            // GUI is interactive: enable background fine-mip streaming
+            // (Phase 7b).  Bench subprocesses run the viewer with --frames,
+            // which disables it there.
+            scene->streamingEnabled = texStreamingOverride() >= 0;
             if (!cfg.scenePath.empty())
                 sceneOk = scene->loadGltf(ctx_, cfg.scenePath.c_str(), loadPool_, progress);
             if (!sceneOk) {
@@ -912,6 +916,7 @@ bool GuiApp::buildRenderStack() {
     if (!beginStackConfig()) return false;
 
     bool sceneOk = false;
+    scene_.streamingEnabled = texStreamingOverride() >= 0; // interactive GUI (Phase 7b)
     if (!active_.scenePath.empty()) sceneOk = scene_.loadGltf(ctx_, active_.scenePath.c_str());
     if (!sceneOk) sceneOk = scene_.loadProcedural(ctx_);
     if (!sceneOk || !ensureSceneFallbacks(scene_, ctx_, VK_NULL_HANDLE)) {
@@ -3102,6 +3107,8 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     scene_.advanceToFrame(frameIndex);
     // CPU LOD selection for this frame's camera (GUI checkbox toggles it).
     scene_.updateLodSelection(camera_.position, camera_.fovY, lodEnabled_);
+    // Background fine-mip streaming tick (no-op until a streamed scene loads).
+    scene_.updateTextureStreaming(ctx_, camera_.position);
 
     vkResetCommandBuffer(cmd, 0);
     VkCommandBufferBeginInfo begin = {};
