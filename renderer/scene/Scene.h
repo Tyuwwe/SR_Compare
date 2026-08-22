@@ -145,6 +145,10 @@ struct Material {
     float occlusionStrength = 1.f;
     float alphaCutoff = 0.f;       // > 0: alphaMode MASK, discard below cutoff
     bool blend = false;            // alphaMode BLEND: drawn in the transparency pass
+    // Opaque-mirror glass (still routed through the transparency pass so it
+    // gets SSR + motion/mask outputs): the shader kills transmission and
+    // writes alpha = 1.  Set by GltfLoader's per-scene mirror table.
+    bool mirror = false;
 };
 
 struct MeshInstance {

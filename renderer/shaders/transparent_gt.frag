@@ -208,6 +208,12 @@ void main() {
         roughness = min(roughness, 0.05);
         F0 = mix(vec3(0.04), vec3(0.22), 0.75);
     }
+    // Mirror-mode panes (same as transparent.frag — keep in sync).
+    const bool mirror = material.emissive.w > 0.5;
+    if (mirror) {
+        roughness = min(roughness, 0.04);
+        F0 = vec3(0.30);
+    }
 
     vec3 lightDiffuse = vec3(0.0);
     vec3 lightSpecular = vec3(0.0);
@@ -260,6 +266,11 @@ void main() {
     if (shopGlass && ssrHit < 0.35)
         alpha = max(alpha, mix(0.84, 1.0, Fg.r));
     float transmit = base.a * (1.0 - max(ssrHit, shopGlass ? 0.75 : 0.0) * 0.92);
+    if (mirror) {
+        // Pure mirror (same as transparent.frag — keep in sync).
+        alpha = 1.0;
+        transmit = 0.0;
+    }
 
     vec3 glassColor = (lightDiffuse + emissive + kd * diffuseIbl * ambientScale) * transmit +
                       lightSpecular + specSsr;

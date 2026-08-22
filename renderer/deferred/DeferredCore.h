@@ -63,7 +63,7 @@ static_assert(sizeof(SceneUBO) == 240, "SceneUBO std140 size mismatch");
 struct MaterialUBO {
     float baseColor[4];
     float factors[4];  // metallic, roughness, occlusionStrength, alphaCutoff
-    float emissive[4]; // rgb factor
+    float emissive[4]; // rgb factor, w = mirror-glass flag (Material::mirror)
     float tex0[4];     // baseColor, normal, mr, ao texture indices
     float tex1[4];     // emissive texture index
 };

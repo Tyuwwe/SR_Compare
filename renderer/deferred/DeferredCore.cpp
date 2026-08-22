@@ -2148,7 +2148,7 @@ bool DeferredCore::createMaterialUbo(const VulkanContext& ctx, const Scene& scen
         ubo.emissive[0] = m.emissiveFactor.x;
         ubo.emissive[1] = m.emissiveFactor.y;
         ubo.emissive[2] = m.emissiveFactor.z;
-        ubo.emissive[3] = 0.f;
+        ubo.emissive[3] = m.mirror ? 1.f : 0.f; // w = mirror-glass flag
         ubo.tex0[0] = static_cast<float>(m.texIndex);
         ubo.tex0[1] = static_cast<float>(m.normalTexIndex);
         ubo.tex0[2] = static_cast<float>(m.mrTexIndex);

@@ -15,7 +15,12 @@
 //                        "Output Velocity" for translucency
 //   RT2 mask    R16F     translucent coverage accumulated additively
 //                        (ONE, ONE); consumed by upscalers as the
-//                        reactive / transparency-composition / bias mask
+//                        reactive / transparency-composition / bias mask.
+//                        Mirror-mode panes (no transmission) write full
+//                        coverage: their reflected content is just as
+//                        dynamic under motion as a transmitted layer, and
+//                        reactive_dilate's motion gate keeps static panes
+//                        at zero either way
 // Depth is tested (opaque GBuffer depth) but never written.
 
 layout(set = 0, binding = 0) uniform SceneUBO {
@@ -30,7 +35,7 @@ layout(set = 0, binding = 0) uniform SceneUBO {
 layout(set = 0, binding = 1) uniform MaterialUBO {
     vec4 baseColor; // rgb + alpha factor
     vec4 factors;   // x = metallic, y = roughness, z = occlusionStrength, w = alphaCutoff
-    vec4 emissive;  // rgb factor
+    vec4 emissive;  // rgb factor, w = mirror-glass flag (1 = opaque mirror)
     vec4 tex0;      // texture indices: baseColor, normal, mr, ao (-1 = none)
     vec4 tex1;      // x = emissive texture index
 } material;
@@ -235,6 +240,14 @@ void main() {
         roughness = min(roughness, 0.05);
         F0 = mix(vec3(0.04), vec3(0.22), 0.75);
     }
+    // Mirror-mode panes (Material::mirror, e.g. the BistroExterior café
+    // storefront): opaque-mirror look — a sharper, stronger coating than
+    // shopGlass, and transmission is disabled entirely below.
+    const bool mirror = material.emissive.w > 0.5;
+    if (mirror) {
+        roughness = min(roughness, 0.04);
+        F0 = vec3(0.30);
+    }
 
     vec3 lightDiffuse = vec3(0.0);
     vec3 lightSpecular = vec3(0.0);
@@ -310,6 +323,11 @@ void main() {
     if (shopGlass && ssrHit < 0.35)
         alpha = max(alpha, mix(0.84, 1.0, Fg.r));
     float transmit = base.a * (1.0 - max(ssrHit, shopGlass ? 0.75 : 0.0) * 0.92);
+    if (mirror) {
+        // Pure mirror: no background show-through, specular lobes only.
+        alpha = 1.0;
+        transmit = 0.0;
+    }
 
     // Premultiplied: transmissive terms scale with opacity, specular does not
     // (blend uses ONE, ONE_MINUS_SRC_ALPHA).

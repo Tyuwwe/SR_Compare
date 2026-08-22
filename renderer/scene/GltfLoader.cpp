@@ -106,6 +106,37 @@ std::string dirOfPath(const char* path) {
     return slash == std::string::npos ? std::string() : p.substr(0, slash + 1);
 }
 
+// Mirror-mode glass: panes that must read as opaque mirrors instead of
+// transmissive glass (user feedback: the BistroExterior café storefront did
+// not look like a mirror).  The transparency pass shades these with
+// transmission disabled and alpha = 1 (Material::mirror).
+//
+// Classification is scene + exact material name, kept deliberately narrow:
+// a broad "glass" substring would wrongly catch small-item glass that must
+// stay transmissive (MenuSign_02_Glass, Vespa_Odometer_Glass,
+// Spotlight_Glass_Emissive, Paris_LiquorBottle_*_Glass tableware) and the
+// dirty upper-floor panes (MASTER_Glass_Dirty[_MASKED]).  The two storefront
+// materials: MASTER_Frosted_Glass is the boulangerie/patisserie storefront
+// (paris_building_04, the default exterior camera target), MASTER_Glass_Exterior
+// the restaurant ground floor (paris_building_01_bottom).  Both are gated to
+// the EXTERIOR scene only — BistroInterior reuses MASTER_Glass_Exterior for
+// windows seen from inside, which keep the transmissive path there.
+const char* const kMirrorGlassScenes[] = {"bistroexterior"};
+const char* const kMirrorGlassMaterials[] = {"MASTER_Glass_Exterior", "MASTER_Frosted_Glass"};
+
+bool isMirrorGlass(const char* path, const char* materialName) {
+    if (!materialName) return false;
+    std::string lower(path);
+    for (char& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    bool sceneHit = false;
+    for (const char* s : kMirrorGlassScenes)
+        if (lower.find(s) != std::string::npos) { sceneHit = true; break; }
+    if (!sceneHit) return false;
+    for (const char* m : kMirrorGlassMaterials)
+        if (std::strcmp(materialName, m) == 0) return true;
+    return false;
+}
+
 // cgltf keeps unparsed extensions as raw JSON (name + data); MSFT_lod carries
 // {"ids":[n0,n1,...]} — nodes that are the next-coarser LODs of this node.
 std::vector<int32_t> parseMsftLodIds(const cgltf_node* node, cgltf_size nodeCount) {
@@ -332,6 +363,7 @@ bool Scene::loadGltf(const VulkanContext& ctx, const char* path, VkCommandPool p
         }
         if (m->alpha_mode == cgltf_alpha_mode_mask) mat.alphaCutoff = m->alpha_cutoff;
         if (m->alpha_mode == cgltf_alpha_mode_blend) mat.blend = true;
+        if (mat.blend) mat.mirror = isMirrorGlass(path, m->name);
         materials.push_back(mat);
         materialRemap[i] = static_cast<int32_t>(materials.size() - 1);
     }
