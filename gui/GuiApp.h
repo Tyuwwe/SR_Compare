@@ -33,6 +33,7 @@
 // ============================================================================
 #include "gui/BenchRunner.h"
 #include "gui/GpuProfilerWindow.h"
+#include "gui/RenderGraphEditor.h"
 #include "renderer/ColorGrading.h"
 #include "renderer/core/GpuProfiler.h"
 #include "renderer/core/Swapchain.h"
@@ -346,7 +347,10 @@ private:
     // frame from the file and inject it into the ImGui IO queue directly,
     // bypassing OS focus/cursor state (deterministic on attended machines).
     // Commands: "pos x y", "wheel f", "down n" / "up n" (0=left, 2=middle),
-    // "key F1" / "keyup F1", "shot path.png", "wait" (one frame gap).
+    // "key F1" / "keyup F1", "shot path.png", "graph" (toggle the Render
+    // Graph editor window), "pass <name> <0|1>" (toggle a runtime pass
+    // switch: shadows/contact/ssr/volfog/occlusion/bloom/mb/dof/autoexp),
+    // "wait" (one frame gap).
     void pumpInputFile();
     // Column layout origin: while the side panel is visible the render
     // columns start right of it; collapsed, they span the full window (the
@@ -811,6 +815,14 @@ private:
     // panel records no timestamps at all.
     GpuProfiler profiler_;
     GpuProfilerWindow profilerWindow_;
+    // "Render Graph" ImNodes editor window: visualizes the PassRegistry
+    // mirror of recordFrame; node toggles go through applyPassToggle.
+    RenderGraphEditor graphWindow_;
+    // Resolve/apply a PassToggle (shared by the panel checkboxes and the
+    // graph editor nodes; applyPassToggle carries the checkbox side effects
+    // like the fog history reset).
+    bool passToggleValue(rg::PassToggle t) const;
+    void applyPassToggle(rg::PassToggle t, bool value);
     float cpuRecordMs_ = 0.f; // CPU duration of the last recordFrame
 
     // --- runtime/UI state ----------------------------------------------------------

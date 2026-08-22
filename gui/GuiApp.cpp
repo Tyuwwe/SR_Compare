@@ -449,6 +449,7 @@ bool GuiApp::initImGuiVulkanBackend() {
 }
 
 void GuiApp::shutdownImGui() {
+    graphWindow_.destroy(); // ImNodes context (independent of the ImGui one)
     window_.setWndProcHook(nullptr);
     ImGui_ImplVulkan_Shutdown();
     ImGui_ImplWin32_Shutdown();
@@ -4773,6 +4774,25 @@ void GuiApp::pumpInputFile() {
             std::string path;
             ss >> path;
             if (!path.empty()) saveScreenshot(path.c_str());
+        } else if (cmd == "graph") {
+            graphWindow_.open = !graphWindow_.open; // Render Graph editor window
+        } else if (cmd == "pass") {
+            // pass <name> <0|1>: toggle a runtime-switchable pass by its
+            // PassToggle shorthand (same path as the graph node checkbox).
+            std::string name;
+            int on = 0;
+            ss >> name >> on;
+            rg::PassToggle t = rg::PassToggle::None;
+            if (name == "shadows") t = rg::PassToggle::Shadows;
+            else if (name == "contact") t = rg::PassToggle::ContactShadows;
+            else if (name == "ssr") t = rg::PassToggle::Ssr;
+            else if (name == "volfog") t = rg::PassToggle::VolFog;
+            else if (name == "occlusion") t = rg::PassToggle::Occlusion;
+            else if (name == "bloom") t = rg::PassToggle::Bloom;
+            else if (name == "mb") t = rg::PassToggle::MotionBlur;
+            else if (name == "dof") t = rg::PassToggle::Dof;
+            else if (name == "autoexp") t = rg::PassToggle::AutoExposure;
+            if (t != rg::PassToggle::None) applyPassToggle(t, on != 0);
         } // "wait" and unknown commands just consume the frame
         if (dbgInputEnabled())
             std::fprintf(stderr, "[inputfile] line %llu: %s\n",
@@ -4964,8 +4984,10 @@ void GuiApp::run() {
             saveScreenshot(opts_.screenshotPath.c_str());
 
         // The profiler panel's open flag is the profiler's enable switch: a
-        // closed panel records no timestamps (near-zero overhead).
-        profiler_.setEnabled(profilerWindow_.open);
+        // closed panel records no timestamps (near-zero overhead).  The
+        // Render Graph window shows per-pass timings too, so it enables the
+        // profiler the same way while open.
+        profiler_.setEnabled(profilerWindow_.open || graphWindow_.open);
         const auto recordStart = std::chrono::steady_clock::now();
         recordFrame(frameIndex, swapIndex);
         cpuRecordMs_ = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() -
@@ -5292,11 +5314,12 @@ void GuiApp::drawViewerTab() {
     // Auto exposure: histogram-based EV solver (UE4 AutoExposure style),
     // per-frame parameters — no rebuild.  The manual slider applies when the
     // checkbox is off; switching back to manual keeps the current auto value.
-    if (ImGui::Checkbox("auto exposure", &autoExposureEnabled_)) {
-        if (autoExposureEnabled_)
-            autoExposureJustEnabled_ = true; // snap the solver next frame
-        else
-            exposure_ = lrExposure_.value; // keep the current look
+    {
+        // Routed through applyPassToggle so the Render Graph editor's node
+        // checkbox applies the identical side effects.
+        bool autoExposure = autoExposureEnabled_;
+        if (ImGui::Checkbox("auto exposure", &autoExposure))
+            applyPassToggle(rg::PassToggle::AutoExposure, autoExposure);
     }
     if (autoExposureEnabled_) {
         ImGui::SliderFloat("min EV", &exposureMinEV_, -16.f, 16.f, "%.1f");
@@ -5335,9 +5358,11 @@ void GuiApp::drawViewerTab() {
     // Froxel volumetric fog: per-frame pass skip; re-enabling restarts the
     // temporal history so stale frames do not bleed in.
     if (!fogParams_.enabled || gbFog_.injectImage == VK_NULL_HANDLE) ImGui::BeginDisabled();
-    if (ImGui::Checkbox("volumetric fog", &volFogEnabled_)) {
-        fogFramesGb_ = fogFramesGt_ = fogFramesSsaa_ = 0;
-        fogAccumFrameGb_ = fogAccumFrameGt_ = fogAccumFrameSsaa_ = ~0u;
+    {
+        // Same applyPassToggle routing as "auto exposure" above.
+        bool volFog = volFogEnabled_;
+        if (ImGui::Checkbox("volumetric fog", &volFog))
+            applyPassToggle(rg::PassToggle::VolFog, volFog);
     }
     if (!fogParams_.enabled || gbFog_.injectImage == VK_NULL_HANDLE) ImGui::EndDisabled();
     // Screen-size LOD + small-object cull: per-frame CPU selection, no rebuild.
@@ -5692,6 +5717,57 @@ void GuiApp::drawCameraPose() {
     ImGui::End();
 }
 
+bool GuiApp::passToggleValue(rg::PassToggle t) const {
+    switch (t) {
+    case rg::PassToggle::Shadows: return shadowsEnabled_;
+    case rg::PassToggle::ContactShadows: return contactShadowsEnabled_;
+    case rg::PassToggle::Ssr: return ssrEnabled_;
+    case rg::PassToggle::VolFog: return volFogEnabled_;
+    case rg::PassToggle::Occlusion: return occlusionEnabled_;
+    case rg::PassToggle::Bloom: return bloomEnabled_;
+    case rg::PassToggle::MotionBlur: return motionBlurEnabled_;
+    case rg::PassToggle::Dof: return dofEnabled_;
+    case rg::PassToggle::AutoExposure: return autoExposureEnabled_;
+    case rg::PassToggle::LensCa: return lensCaEnabled_;
+    case rg::PassToggle::LensVignette: return lensVignetteEnabled_;
+    case rg::PassToggle::LensGrain: return lensGrainEnabled_;
+    case rg::PassToggle::None: break;
+    }
+    return true;
+}
+
+void GuiApp::applyPassToggle(rg::PassToggle t, bool value) {
+    switch (t) {
+    case rg::PassToggle::Shadows: shadowsEnabled_ = value; break;
+    case rg::PassToggle::ContactShadows: contactShadowsEnabled_ = value; break;
+    case rg::PassToggle::Ssr: ssrEnabled_ = value; break;
+    case rg::PassToggle::VolFog:
+        volFogEnabled_ = value;
+        // Same side effect as the panel checkbox: restart the temporal
+        // history so stale frames do not bleed in.
+        fogFramesGb_ = fogFramesGt_ = fogFramesSsaa_ = 0;
+        fogAccumFrameGb_ = fogAccumFrameGt_ = fogAccumFrameSsaa_ = ~0u;
+        break;
+    case rg::PassToggle::Occlusion: occlusionEnabled_ = value; break;
+    case rg::PassToggle::Bloom: bloomEnabled_ = value; break;
+    case rg::PassToggle::MotionBlur: motionBlurEnabled_ = value; break;
+    case rg::PassToggle::Dof: dofEnabled_ = value; break;
+    case rg::PassToggle::AutoExposure:
+        autoExposureEnabled_ = value;
+        // Same side effect as the panel checkbox: snap the solver when
+        // re-enabling, keep the current look when switching to manual.
+        if (value)
+            autoExposureJustEnabled_ = true;
+        else
+            exposure_ = lrExposure_.value;
+        break;
+    case rg::PassToggle::LensCa: lensCaEnabled_ = value; break;
+    case rg::PassToggle::LensVignette: lensVignetteEnabled_ = value; break;
+    case rg::PassToggle::LensGrain: lensGrainEnabled_ = value; break;
+    case rg::PassToggle::None: break;
+    }
+}
+
 void GuiApp::drawUi() {
     const ImGuiIO& io = ImGui::GetIO();
 
@@ -5702,6 +5778,9 @@ void GuiApp::drawUi() {
     // Independent floating profiler panel (default closed, anchored top-right
     // on first open); drawn in both panel states.
     profilerWindow_.draw(profiler_, cpuRecordMs_);
+    // Render Graph editor window (default closed); same both-states rule.
+    graphWindow_.draw(profiler_, [this](rg::PassToggle t) { return passToggleValue(t); },
+                      [this](rg::PassToggle t, bool v) { applyPassToggle(t, v); });
 
     if (panelCollapsed_) {
         // Slim strip with just an expand button; the render columns span the
@@ -5738,6 +5817,8 @@ void GuiApp::drawUi() {
     ImGui::TextDisabled("hide panel (F1)");
     ImGui::SameLine();
     ImGui::Checkbox("gpu profiler", &profilerWindow_.open);
+    ImGui::SameLine();
+    ImGui::Checkbox("render graph", &graphWindow_.open);
 
     // Global reference selector, shared by all three tabs.
     drawReferenceSection();
