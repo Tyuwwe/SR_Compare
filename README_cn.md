@@ -39,10 +39,11 @@ Arm NSS 在 PC 上经 Vulkan ML Emulation Layer 软件模拟推理，性能数�
 - TAA：YCoCg 历史 clip、深度 disocclusion、自适应 alpha、RCAS 锐化
 - 体积雾：froxel 网格（注入/光照/temporal/march/composite 五 pass），复用 CSM +
   cluster 灯光，god rays；介质参数由场景预设携带（`--no-volfog`）
-- 后处理链：阈值提取 bloom 金字塔（13-tap 降采样 / tent 上采样）、HDR 运动模糊
-  （McGuire 2012 tile-max gather）、景深（UE4 scatter-as-gather CoC，中心像素自动
-  对焦）——LR/GT/GT-SSAA 三条路径同算法同参数，帧号驱动噪声保证确定性
-  （`--no-bloom` / `--no-motion-blur` / `--no-dof`；自由视角 viewer 默认关 DOF）
+- 后处理链：阈值提取 bloom 金字塔（13-tap 降采样 / tent 上采样；默认开，
+  `--no-bloom`）、HDR 运动模糊（McGuire 2012 tile-max gather）、景深
+  （UE4 scatter-as-gather CoC，中心像素自动对焦）——运动模糊与景深在所有模式下
+  默认关闭，用 `--motion-blur` / `--dof`（viewer + compare）或 GUI checkbox 显式
+  打开；LR/GT/GT-SSAA 三条路径同算法同参数，帧号驱动噪声保证确定性
 - 色彩分级：简化 ACEScc log 域（色温/tint/对比度/饱和度，CLI
   `--temperature`/`--tint`/`--contrast`/`--saturation`，GUI 滑条）+ `.cube`
   3D LUT（`--lut`），CPU 镜像用于 PNG 截图；末端镜头链（色差/污渍/暗角/颗粒，
@@ -99,7 +100,10 @@ sr_compare viewer --list-upscalers
 --no-shadows / --shadow-debug / --no-contact-shadows
 --no-ssr             关闭不透明 SSR
 --no-volfog          关闭 froxel 体积雾
---no-bloom / --no-motion-blur / --no-dof / --no-lens-fx
+--no-bloom / --no-lens-fx
+--motion-blur / --dof
+                     打开运动模糊 / 景深（所有模式默认关；--no-motion-blur /
+                     --no-dof 保留兼容旧脚本）
 --dof-focus <m> / --dof-fstop <f> / --dof-max-blur <px>
                      DOF 调节（viewer + compare；focus 0 = 屏幕中心自动对焦）
 --bake-probes        烘焙反射探针到场景的 .probes 文件后退出

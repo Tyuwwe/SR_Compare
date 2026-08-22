@@ -49,11 +49,12 @@ its performance numbers are not representative of real hardware.
 - Volumetric fog: froxel grid (inject/light/temporal/march/composite) lit by
   the CSM + cluster lights, god rays; scene presets carry the media params
   (`--no-volfog`)
-- Post chain: thresholded bloom pyramid (13-tap down / tent up), HDR motion
-  blur (McGuire 2012 tile-max gather), depth of field (UE4 scatter-as-gather
-  CoC, centre-texel autofocus) — same algorithm and parameters on the LR, GT
+- Post chain: thresholded bloom pyramid (13-tap down / tent up; on by default,
+  `--no-bloom`), HDR motion blur (McGuire 2012 tile-max gather) and depth of
+  field (UE4 scatter-as-gather CoC, centre-texel autofocus) — both off by
+  default in every mode, opt in with `--motion-blur` / `--dof` (viewer +
+  compare) or the GUI checkboxes; same algorithm and parameters on the LR, GT
   and GT-SSAA paths, deterministic frame-index-driven noise
-  (`--no-bloom` / `--no-motion-blur` / `--no-dof`; DOF off in free-fly viewer)
 - Color grading: simplified-ACEScc log domain (temperature/tint/contrast/
   saturation, CLI `--temperature`/`--tint`/`--contrast`/`--saturation`, GUI
   sliders) + `.cube` 3D LUT (`--lut`), mirrored on the CPU for PNG
@@ -123,7 +124,10 @@ full text):
 --no-shadows / --shadow-debug / --no-contact-shadows
 --no-ssr             disable opaque screen-space reflections
 --no-volfog          disable froxel volumetric fog
---no-bloom / --no-motion-blur / --no-dof / --no-lens-fx
+--no-bloom / --no-lens-fx
+--motion-blur / --dof
+                     enable motion blur / depth of field (default off in every
+                     mode; --no-motion-blur / --no-dof accepted for compatibility)
 --dof-focus <m> / --dof-fstop <f> / --dof-max-blur <px>
                      DOF tuning (viewer + compare; focus 0 = screen-centre auto-focus)
 --bake-probes        bake reflection probes to the scene's .probes file, then exit

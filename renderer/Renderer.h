@@ -68,15 +68,17 @@ struct RendererOptions {
     bool volFog = true;
     // Motion blur (Phase 6b, McGuire 2012 tile-max gather) in the HDR domain,
     // after bloom and before upscale/present, applied to the LR and GT paths
-    // with identical algorithm + parameters (CLI: --no-motion-blur).  On by
-    // default everywhere, including bench: the GT blurs identically, so
-    // compare/bench stay fair (every column's input pixels change by design).
-    bool motionBlur = true;
-    // Depth of field (Phase 6b, UE4 scatter-as-gather CoC; CLI: --no-dof).
-    // Default ON for bench/automation (--frames set), OFF for interactive
-    // free-fly (screen-centre autofocus gets in the way while flying);
-    // runViewer applies that rule.  The GUI has a checkbox for interactive use.
-    bool dof = true;
+    // with identical algorithm + parameters (CLI: --motion-blur to enable;
+    // --no-motion-blur accepted for compatibility).  Off by default in every
+    // mode, interactive and --frames/bench alike; when enabled the GT blurs
+    // identically, so compare/bench stay fair (every column's input pixels
+    // change by design).
+    bool motionBlur = false;
+    // Depth of field (Phase 6b, UE4 scatter-as-gather CoC; CLI: --dof to
+    // enable; --no-dof accepted for compatibility).  Off by default in every
+    // mode — same default policy as motion blur.  The GUI has a checkbox for
+    // interactive use.
+    bool dof = false;
     // DOF tuning (CLI: --dof-focus/--dof-fstop/--dof-max-blur).  focus 0 =
     // auto-focus on the screen-centre depth texel; the f-stop maps to the
     // thin-lens aperture scale as kDofAperture * (kDofDefaultFstop / fstop),

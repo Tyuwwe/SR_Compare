@@ -53,9 +53,10 @@ void printUsage() {
                  "  --no-ssr                         disable opaque screen-space reflections\n"
                  "  --no-contact-shadows             disable screen-space contact shadows (sun)\n"
                  "  --no-volfog                      disable froxel volumetric fog\n"
-                 "  --no-motion-blur                 disable HDR motion blur (McGuire 2012 tile-max gather)\n"
-                 "  --no-dof                         disable depth of field (default on for --frames runs,\n"
-                 "                                 off for interactive free-fly)\n"
+                 "  --motion-blur                    enable HDR motion blur (McGuire 2012 tile-max gather;\n"
+                 "                                 default off; --no-motion-blur accepted for compatibility)\n"
+                 "  --dof                            enable depth of field (default off; --no-dof accepted\n"
+                 "                                 for compatibility)\n"
                  "  --dof-focus <m>                  DOF focus distance in metres (0 = auto-focus on\n"
                  "                                 the screen centre; default 0)\n"
                  "  --dof-fstop <f>                  DOF aperture f-stop 0.5..64 (default 4; smaller =\n"
@@ -140,8 +141,12 @@ int runViewer(int argc, char** argv) {
             opts.contactShadows = false;
         } else if (a == "--no-volfog") {
             opts.volFog = false;
+        } else if (a == "--motion-blur") {
+            opts.motionBlur = true;
         } else if (a == "--no-motion-blur") {
             opts.motionBlur = false;
+        } else if (a == "--dof") {
+            opts.dof = true;
         } else if (a == "--no-dof") {
             opts.dof = false;
         } else if (a == "--dof-focus") {
@@ -186,9 +191,9 @@ int runViewer(int argc, char** argv) {
 
     // Explicit --vsync wins; automated runs default to vsync off.
     opts.vsync = opts.vsync || (opts.frames < 0);
-    // DOF default (see RendererOptions): on for bench/automation, off for
-    // interactive free-fly.  Motion blur stays on in both.
-    if (opts.frames < 0) opts.dof = false;
+    // Motion blur and DOF default off in every mode (see RendererOptions);
+    // --motion-blur / --dof opt in, --no-motion-blur / --no-dof are accepted
+    // for compatibility with older scripts.
 
     sr::Renderer renderer;
     if (!renderer.init(opts)) {

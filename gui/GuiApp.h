@@ -525,16 +525,23 @@ private:
     // either way — off means "all candidates visible".
     bool occlusionEnabled_ = occlusionEnabledByDefault();
     // Terminal lens-effects chain (Phase 6a, compose push constants; lens
-    // dirt is viewer-only — it needs the HDR bloom pyramid).  Strengths are
+    // dirt stays viewer-only — the compose pass has no dirt binding, though
+    // the bloom pyramid it modulates is now built per path).  Strengths are
     // the shared DeferredCore defaults (kLens*Strength).
     bool lensCaEnabled_ = true;
     bool lensVignetteEnabled_ = true;
     bool lensGrainEnabled_ = true;
+    // HDR bloom (Phase 6a pyramid): per-frame pass skip like SSR, no rebuild —
+    // the per-path chains stay allocated either way.  On by default, matching
+    // the viewer CLI (bloom on, --no-bloom to disable).
+    bool bloomEnabled_ = true;
     // Motion blur + depth of field (Phase 6b, per-frame pass skip, no temporal
-    // state — no history reset needed).  Same algorithm + parameters on every
-    // path so the GT column blurs identically.
-    bool motionBlurEnabled_ = true;
-    bool dofEnabled_ = true;
+    // state — no history reset needed).  Off by default in every mode (same
+    // default policy as the viewer/compare CLI); when enabled the same
+    // algorithm + parameters run on every path so the GT column blurs
+    // identically.
+    bool motionBlurEnabled_ = false;
+    bool dofEnabled_ = false;
     // DOF tuning (Phase 6b; sliders in the viewer tab, applied per-frame via
     // PostFxParams — no rebuild, no temporal state).  focus 0 = auto-focus on
     // the screen-centre texel; f-stop maps to the aperture scale as
@@ -672,6 +679,12 @@ private:
     PostFxTargets gbPostFx_;
     PostFxTargets gtPostFx_;
     PostFxTargets gtSsaaPostFx_; // compare GT SSAA only
+    // HDR bloom pyramids (Phase 6a), one per path; same host-owned
+    // GENERAL-for-life resource model as the post-fx targets.  The runtime
+    // checkbox skips the pass; the chains stay allocated either way.
+    BloomPyramid gbBloom_;
+    BloomPyramid gtBloom_;
+    BloomPyramid gtSsaaBloom_; // compare GT SSAA only
     ImageResource composeImage_; // RGBA8 composite; presentation + screenshot source
     ImageResource uiShotImage_;  // BGRA8 debug screenshot target incl. ImGui
     VkImageLayout uiShotLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;

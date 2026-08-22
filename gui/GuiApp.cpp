@@ -99,8 +99,8 @@ Camera lerpCamera(const Camera& a, const Camera& b, float t) {
 // Compose pass push constants: column pixel size + text scale + text slot,
 // the source-region window (normalized offset/size) and source dimensions,
 // plus the terminal lens-effects chain (Phase 6a; same algorithm/defaults as
-// the viewer present.frag — lens dirt excluded, the GUI paths have no bloom
-// chain) and the log-domain grading set (Phase 6c; identical for every
+// the viewer present.frag — lens dirt excluded, the compose has no dirt
+// binding) and the log-domain grading set (Phase 6c; identical for every
 // column, sliders in the shared controls).
 struct ComposePush {
     float colSize[2];
@@ -1200,6 +1200,12 @@ bool GuiApp::createRenderTargets() {
         return false;
     if (!deferred_.createPostFxTargets(ctx_, gtW, gtH, gtPostFx_))
         return false;
+    // HDR bloom pyramids (Phase 6a), one per path; the runtime checkbox skips
+    // the pass, so creation is unconditional.
+    if (!deferred_.createBloomPyramid(ctx_, renderWidth_, renderHeight_, gbBloom_))
+        return false;
+    if (!deferred_.createBloomPyramid(ctx_, gtW, gtH, gtBloom_))
+        return false;
     // Color mip chains for roughness-aware SSR (mip 0 = the lit-color copy).
     if (!deferred_.createColorPyramid(ctx_, renderWidth_, renderHeight_, gbColorPyramid_))
         return false;
@@ -1276,6 +1282,8 @@ bool GuiApp::createRenderTargets() {
         if (!deferred_.createClusterGrid(ctx_, dw * 2, dh * 2, gtSsaaCluster_))
             return false;
         if (!deferred_.createPostFxTargets(ctx_, dw * 2, dh * 2, gtSsaaPostFx_))
+            return false;
+        if (!deferred_.createBloomPyramid(ctx_, dw * 2, dh * 2, gtSsaaBloom_))
             return false;
         if (fogParams_.enabled &&
             !deferred_.createVolFogVolume(ctx_, dw * 2, dh * 2, gtSsaaFog_)) {
@@ -1505,15 +1513,19 @@ bool GuiApp::createDescriptors() {
     // + 9 sets (tile/neighbor/gather + coc/gather/composite x MB/lit variants
     // + MB copy-back).
     const uint32_t postFxPaths = active_.gtSsaa ? 3 : 2;
+    // Bloom pyramid sets (Phase 6a): per path 2*kBloomMipCount sets (extract +
+    // down/up pairs + composite), 1 sampler + 1 storage image each.
+    const uint32_t bloomSets = 2 * kBloomMipCount * postFxPaths;
     sizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     sizes[0].descriptorCount =
         deferred::kMaxTextures + numColumns * 3 + 2 + numAlgos * 8 + 14 * kFramesInFlight * 4 +
         8 * kFramesInFlight * 4 + 11 * kFramesInFlight * 4 + 10 * 3 + 3 * 6 + hizSets + colorSets +
-        2 + 14 * fogPaths + 17 * postFxPaths + 3; // + ssr temporal samplers (GB/GT/SSAA x2 sets); auto-exposure HDR
+        2 + 14 * fogPaths + 17 * postFxPaths + bloomSets + 3; // + ssr temporal samplers (GB/GT/SSAA x2 sets); auto-exposure HDR
                            // sources (LR + GT); volfog light/temporal/march/composite samplers;
                            // lighting sets: 14 samplers each (GB/GT/SSAA/spatial), incl. shadow +
                            // spot atlas + 2 probe arrays; transparent sets: 8 each (incl. the
-                           // froxel fog volume); SSR trace sets: 11 each; post-fx sets;
+                           // froxel fog volume); SSR trace sets: 11 each; post-fx sets; bloom
+                           // pyramid src taps (Phase 6a);
                            // occlusion cull sets: Hi-Z chains (GB/GT/SSAA, Phase 7a)
     sizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     sizes[1].descriptorCount = kFramesInFlight * 3 + numColumns + numAlgos + kFramesInFlight * 4 +
@@ -1533,8 +1545,9 @@ bool GuiApp::createDescriptors() {
     // ssao raw + temporal history + blur outputs (GB/GT/SSAA) + pyramid mips +
     // SSR trace targets + SSR temporal history write / scene-color RMW (x2 sets per path)
     // + volfog inject/light/temporal/march/composite storage (per fog path)
+    // + bloom pyramid dst mips (Phase 6a, per path)
     sizes[4].descriptorCount = 15 + hizSets + colorSets + kFramesInFlight * 4 + 2 * 6 +
-                               8 * fogPaths + 11 * postFxPaths + 2 * postFxPaths;
+                               8 * fogPaths + 11 * postFxPaths + 2 * postFxPaths + bloomSets;
     VkDescriptorPoolCreateInfo poolCi = {};
     poolCi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     poolCi.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
@@ -1548,6 +1561,7 @@ bool GuiApp::createDescriptors() {
                      8 * fogPaths +        // volfog sets (per fog path)
                      8 * postFxPaths +     // MB/DOF post-fx sets (Phase 6b)
                      1 * postFxPaths +     // MB copy-back set (Phase 6b)
+                     bloomSets +           // bloom pyramid sets (Phase 6a)
                      3 +                   // occlusion cull sets (GB/GT/SSAA, Phase 7a)
                      hizSets + colorSets;
     poolCi.poolSizeCount = 5;
@@ -1597,6 +1611,15 @@ bool GuiApp::createDescriptors() {
     if (active_.gtSsaa &&
         !deferred_.writePostFxSets(ctx_, descriptorPool_, gtSsaaColor_.view, gtSsaaMotion_.view,
                                    gtSsaaDepth_.view, gtSsaaPostFx_))
+        return false;
+
+    // Bloom pyramid sets (Phase 6a): srcColor = the path's lit HDR target.
+    if (!deferred_.writeBloomPyramidSets(ctx_, descriptorPool_, gbColor_.view, gbBloom_))
+        return false;
+    if (!deferred_.writeBloomPyramidSets(ctx_, descriptorPool_, gtColor_.view, gtBloom_))
+        return false;
+    if (active_.gtSsaa &&
+        !deferred_.writeBloomPyramidSets(ctx_, descriptorPool_, gtSsaaColor_.view, gtSsaaBloom_))
         return false;
 
     if (!createAutoExposureResources()) return false;
@@ -2576,6 +2599,9 @@ void GuiApp::destroyStackResources() {
     deferred_.destroyPostFxTargets(ctx_, gbPostFx_);
     deferred_.destroyPostFxTargets(ctx_, gtPostFx_);
     deferred_.destroyPostFxTargets(ctx_, gtSsaaPostFx_);
+    deferred_.destroyBloomPyramid(ctx_, gbBloom_);
+    deferred_.destroyBloomPyramid(ctx_, gtBloom_);
+    deferred_.destroyBloomPyramid(ctx_, gtSsaaBloom_);
     gbAoRaw_.destroy(ctx_);
     gbAo_.destroy(ctx_);
     gtAoRaw_.destroy(ctx_);
@@ -3267,6 +3293,15 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         deferred_.recordPostFxPass(cmd, fxTargets, color, colorLayout, fx, frameIndex);
     };
 
+    // Phase 6a bloom on the lit HDR target, before the Phase 6b post-fx chain
+    // (same order as the viewer).  Per-frame pass skip; the color image is
+    // SHADER_READ_ONLY on entry and the helper hands it back the same way.
+    auto recordBloom = [&](BloomPyramid& pyramid, VkImage color, VkImageLayout& colorLayout,
+                           uint32_t pathW, uint32_t pathH) {
+        if (!bloomEnabled_) return;
+        deferred_.recordBloomPyramidPass(cmd, pyramid, color, colorLayout, pathW, pathH);
+    };
+
     // --- Shadow pass (sun CSM, one 2048^2 layer per cascade) -------------------
     // Must run BEFORE any lighting pass: the LR lighting below samples the map
     // while the LightingUBO already carries this frame's cascade VPs, so a map
@@ -3534,6 +3569,7 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         transition(gbColor_.image, gbColorLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                    sync::kColorAttach, sync::kColorWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
+        recordBloom(gbBloom_, gbColor_.image, gbColorLayout_, renderWidth_, renderHeight_);
         recordPostFx(gbPostFx_, gbColor_.image, gbColorLayout_, proj, renderHeight_);
     };
 
@@ -3875,7 +3911,9 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                    sync::kColorAttach, sync::kColorWrite, sync::kFragment, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
 
-        // Phase 6b: MB/DOF in the 2x domain, before the box downsample.
+        // Phase 6a/6b: bloom, then MB/DOF in the 2x domain, before the box
+        // downsample.
+        recordBloom(gtSsaaBloom_, gtSsaaColor_.image, gtSsaaColorLayout_, sw, sh);
         recordPostFx(gtSsaaPostFx_, gtSsaaColor_.image, gtSsaaColorLayout_, projGt, sh);
 
         transition(gtColor_.image, gtColorLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
@@ -4098,7 +4136,8 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         transition(gtColor_.image, gtColorLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                    sync::kColorAttach, sync::kColorWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
-        // Phase 6b: MB/DOF on the 1x GT HDR.
+        // Phase 6a/6b: bloom, then MB/DOF on the 1x GT HDR.
+        recordBloom(gtBloom_, gtColor_.image, gtColorLayout_, gtW, gtH);
         recordPostFx(gtPostFx_, gtColor_.image, gtColorLayout_, projGt, gtH);
     }
     // --- Auto exposure: GT histogram (own HDR source; gtSsaa uses its 2x HDR) --
@@ -5152,6 +5191,9 @@ void GuiApp::drawViewerTab() {
     ImGui::Checkbox("lod", &lodEnabled_);
     // GPU Hi-Z occlusion culling (Phase 7a): per-frame pass skip, no rebuild.
     ImGui::Checkbox("occlusion cull", &occlusionEnabled_);
+    // HDR bloom (Phase 6a pyramid): per-frame pass skip like SSR, no rebuild —
+    // the per-path chains stay allocated either way.
+    ImGui::Checkbox("bloom", &bloomEnabled_);
     // Motion blur + DOF (Phase 6b): per-frame pass skip, no temporal state.
     ImGui::Checkbox("motion blur", &motionBlurEnabled_);
     ImGui::Checkbox("depth of field", &dofEnabled_);
@@ -5163,8 +5205,8 @@ void GuiApp::drawViewerTab() {
     ImGui::SliderFloat("dof max blur (px)", &dofMaxBlur_, 1.f, 32.f, "%.0f");
     if (!dofEnabled_) ImGui::EndDisabled();
     // Terminal lens-effects chain (Phase 6a, compare_compose.frag; per-frame
-    // push constants, no rebuild).  Lens dirt is viewer-only: it modulates the
-    // HDR bloom pyramid, which the GUI/compare paths do not build.
+    // push constants, no rebuild).  Lens dirt stays viewer-only: the compose
+    // pass has no dirt binding to modulate with the bloom pyramid.
     ImGui::Text("lens fx");
     ImGui::Checkbox("chromatic aberration", &lensCaEnabled_);
     ImGui::Checkbox("vignette", &lensVignetteEnabled_);

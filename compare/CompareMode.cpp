@@ -30,8 +30,10 @@ void printCompareUsage() {
                  "  --no-ssr                       disable opaque screen-space reflections\n"
                  "  --no-contact-shadows           disable screen-space contact shadows (sun)\n"
                  "  --no-volfog                    disable froxel volumetric fog\n"
-                 "  --no-motion-blur               disable motion blur (all paths)\n"
-                 "  --no-dof                       disable depth of field (all paths)\n"
+                 "  --motion-blur                  enable motion blur (default off, all paths;\n"
+                 "                               --no-motion-blur accepted for compatibility)\n"
+                 "  --dof                          enable depth of field (default off, all paths;\n"
+                 "                               --no-dof accepted for compatibility)\n"
                  "  --dof-focus <m>                DOF focus distance in metres (0 = auto-focus on the\n"
                  "                               screen centre; default 0; all paths)\n"
                  "  --dof-fstop <f>                DOF aperture f-stop 0.5..64 (default 4; smaller =\n"
@@ -92,8 +94,12 @@ int runCompareMode(int argc, char** argv) {
             opts.contactShadows = false;
         } else if (a == "--no-volfog") {
             opts.volFog = false;
+        } else if (a == "--motion-blur") {
+            opts.motionBlur = true;
         } else if (a == "--no-motion-blur") {
             opts.motionBlur = false;
+        } else if (a == "--dof") {
+            opts.dof = true;
         } else if (a == "--no-dof") {
             opts.dof = false;
         } else if (a == "--dof-focus") {

@@ -56,11 +56,13 @@ struct CompareOptions {
     // Motion blur + depth of field (Phase 6b), HDR domain on every path (LR
     // at render res before upscale, GT at native res, GT-SSAA at 2x before
     // the downsample) with identical algorithm + parameters; CLI:
-    // --no-motion-blur / --no-dof.  On by default: the GT column runs the
-    // same post chain as the algorithm columns, so the metrics stay fair —
-    // MB/DOF change the pixel content of EVERY column's input by design.
-    bool motionBlur = true;
-    bool dof = true;
+    // --motion-blur / --dof to enable (--no-motion-blur / --no-dof accepted
+    // for compatibility).  Off by default; when enabled the GT column runs
+    // the same post chain as the algorithm columns, so the metrics stay
+    // fair — MB/DOF change the pixel content of EVERY column's input by
+    // design.
+    bool motionBlur = false;
+    bool dof = false;
     // DOF tuning (CLI: --dof-focus/--dof-fstop/--dof-max-blur); applied to
     // every path identically, so GT and algorithm columns blur the same.
     // focus 0 = auto-focus on the screen-centre texel; f-stop maps to the
