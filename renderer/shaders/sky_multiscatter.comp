@@ -1,0 +1,110 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// Multi-scatter LUT bake (Hillaire 2020, equations 5/7/10; UE4
+// MultiScatLut.usf / sebh NewMultiScattCS).  For each (sunZenithCos, altitude)
+// cell: integrate 2nd-order scattered luminance L_2nd and the isotropic
+// scattering factor f_ms over 64 uniform sphere directions, then store the
+// infinite-order geometric series Psi_ms = L_2nd / (1 - f_ms).
+// The transfer function assumes unit sun illuminance; the sky render
+// multiplies by the actual illuminance.  Deterministic (fixed stratified
+// directions, fixed 20-step marches).
+
+#include "atmosphere.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D transmittanceLut;
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D dstLut;
+
+const float ISOTROPIC_PHASE = 1.0 / (4.0 * ATM_PI);
+const int SQRT_SAMPLE_COUNT = 8; // 64 uniform sphere directions
+const int RAY_SAMPLE_COUNT = 20; // per reference: accuracy floor
+
+void main() {
+    ivec2 size = imageSize(dstLut);
+    ivec2 id = ivec2(gl_GlobalInvocationID.xy);
+    if (id.x >= size.x || id.y >= size.y) return;
+
+    vec2 uv = (vec2(id) + 0.5) / vec2(size);
+    float cosSunZenith = uv.x * 2.0 - 1.0;
+    // +Z-up planet frame matching the reference; offset keeps the sample above
+    // the ground sphere (PLANET_RADIUS_OFFSET).
+    float viewHeight =
+        ATM_BOTTOM_RADIUS +
+        clamp(uv.y + ATM_PLANET_OFFSET, 0.0, 1.0) *
+            (ATM_TOP_RADIUS - ATM_BOTTOM_RADIUS - ATM_PLANET_OFFSET);
+    vec3 pos = vec3(0.0, 0.0, viewHeight);
+    vec3 sunDir = vec3(0.0, sqrt(clamp(1.0 - cosSunZenith * cosSunZenith, 0.0, 1.0)),
+                       cosSunZenith);
+
+    vec3 lumSum = vec3(0.0); // L_2ndOrder accumulator (before 4pi average)
+    vec3 fmsSum = vec3(0.0); // MultiScatAs1 accumulator
+
+    for (int i = 0; i < SQRT_SAMPLE_COUNT; ++i) {
+        for (int j = 0; j < SQRT_SAMPLE_COUNT; ++j) {
+            // Uniform sphere direction (sphere point picking, stratified).
+            float randA = (float(i) + 0.5) / float(SQRT_SAMPLE_COUNT);
+            float randB = (float(j) + 0.5) / float(SQRT_SAMPLE_COUNT);
+            float theta = 2.0 * ATM_PI * randA;
+            float phi = acos(1.0 - 2.0 * randB);
+            vec3 dir = vec3(cos(theta) * sin(phi), sin(theta) * sin(phi), cos(phi));
+
+            float tGround = atmRaySphereNearest(pos, dir, ATM_BOTTOM_RADIUS);
+            float tTop = atmRaySphereNearest(pos, dir, ATM_TOP_RADIUS);
+            float tMax = tGround >= 0.0 ? tGround : tTop;
+            if (tMax < 0.0) continue;
+
+            vec3 lum = vec3(0.0);
+            vec3 fms = vec3(0.0);
+            vec3 throughput = vec3(1.0);
+            float tPrev = 0.0;
+            for (int s = 0; s < RAY_SAMPLE_COUNT; ++s) {
+                float t = tMax * (float(s) + 0.3) / float(RAY_SAMPLE_COUNT);
+                float dt = t - tPrev;
+                tPrev = t;
+                vec3 p = pos + t * dir;
+
+                vec3 sigmaSRay, sigmaSMie, sigmaT;
+                atmSampleMedium(p, sigmaSRay, sigmaSMie, sigmaT);
+                vec3 sigmaS = sigmaSRay + sigmaSMie;
+                vec3 sampleTransmittance = exp(-sigmaT * dt);
+
+                float shadow = atmEarthShadow(p, sunDir);
+                vec3 transmittanceToSun = atmTransmittanceToSun(transmittanceLut, p, sunDir);
+
+                // S: first-order in-scattering with unit sun illuminance and
+                // isotropic phase (multi-scatter input itself is disabled while
+                // building the LUT).
+                vec3 S = shadow * transmittanceToSun * sigmaS * ISOTROPIC_PHASE;
+                // Frostbite 2015 slide 28: closed-form per-segment integral.
+                vec3 sInt = (S - S * sampleTransmittance) / sigmaT;
+                lum += throughput * sInt;
+
+                vec3 msInt = (sigmaS - sigmaS * sampleTransmittance) / sigmaT;
+                fms += throughput * msInt;
+
+                throughput *= sampleTransmittance;
+            }
+
+            // Ground bounce: Lambertian ground lit by the sun through the
+            // atmosphere (reference: ground branch of the integrator).
+            if (tGround >= 0.0) {
+                vec3 p = pos + tGround * dir;
+                vec3 up = p / length(p);
+                float ndl = clamp(dot(up, sunDir), 0.0, 1.0);
+                vec3 transmittanceToSun = atmTransmittanceToSun(transmittanceLut, p, sunDir);
+                lum += transmittanceToSun * throughput * ndl * ATM_GROUND_ALBEDO / ATM_PI;
+            }
+
+            lumSum += lum;
+            fmsSum += fms;
+        }
+    }
+
+    const float sphereSamples = float(SQRT_SAMPLE_COUNT * SQRT_SAMPLE_COUNT);
+    vec3 lum2nd = lumSum / sphereSamples; // 4pi * isotropicPhase = 1 average
+    vec3 fms = fmsSum / sphereSamples;
+    // Geometric series sum of all scattering orders (Hillaire eq. 10).
+    vec3 multiScat = lum2nd / max(vec3(1.0) - fms, vec3(1e-4));
+    imageStore(dstLut, id, vec4(multiScat, 1.0));
+}
