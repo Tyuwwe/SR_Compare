@@ -52,7 +52,11 @@ struct RendererOptions {
     bool autoExposure = true;
     float exposureMinEV = -8.f; // auto-exposure EV clamp range
     float exposureMaxEV = 8.f;
-    bool bloom = true;        // HDR bloom before upscale (CLI: --no-bloom)
+    bool bloom = true;        // HDR bloom pyramid before upscale (CLI: --no-bloom)
+    // Terminal lens-effects chain at present (chromatic aberration / lens dirt
+    // in HDR, vignette + film grain in display domain; CLI: --no-lens-fx).
+    // Strengths are the shared DeferredCore defaults (kLens*Strength).
+    bool lensFx = true;
     bool ssr = true;          // opaque screen-space reflections (CLI: --no-ssr)
     // Screen-space contact shadows for the CSM sun (CLI: --no-contact-shadows);
     // needs shadows on (rides the CSM sun selection).
@@ -154,13 +158,19 @@ private:
     ImageResource gbAo_;
     ImageResource gtAoRaw_;
     ImageResource gtAo_;
-    ImageResource gbBloomA_; // half-res ping-pong
-    ImageResource gbBloomB_;
-    ImageResource gtBloomA_;
-    ImageResource gtBloomB_;
+    // HDR bloom pyramids (thresholded 5-level chains; Phase 6a), one per path.
+    // GENERAL-for-life, host-owned — same resource model as the color
+    // pyramids below.  The accumulated mip 0 also feeds the present pass's
+    // lens-dirt term.
+    BloomPyramid gbBloom_;
+    BloomPyramid gtBloom_;
+    // Procedural lens-dirt mask (R8, radial blobs; generated at init — no
+    // external asset).  Sampled by present.frag.
+    ImageResource lensDirt_;
     // HDR color mip chains (lit opaque color, box-filtered) for
     // roughness-aware glass SSR; same GENERAL-for-life resource model as the
-    // depth pyramids.  Phase 6's bloom pyramid is expected to reuse them.
+    // depth pyramids.  Deliberately separate from the bloom pyramids (see
+    // ColorPyramid in DeferredCore.h).
     ColorPyramid gbColorPyramid_;
     ColorPyramid gtColorPyramid_;
     // Hi-Z depth pyramids for the SSR march (LR / GT); general DeferredCore
@@ -244,17 +254,10 @@ private:
     VkDescriptorSet textureSet_ = VK_NULL_HANDLE;
     VkDescriptorSet presentSet_ = VK_NULL_HANDLE;
     // SSAO descriptor sets (static: the referenced textures never change).
-    // The blur sets live inside AoHistory (one per ping-pong buffer).
+    // The blur sets live inside AoHistory (one per ping-pong buffer); the
+    // bloom pyramid sets live inside BloomPyramid.
     VkDescriptorSet ssaoSetGb_ = VK_NULL_HANDLE;
     VkDescriptorSet ssaoSetGt_ = VK_NULL_HANDLE;
-    VkDescriptorSet bloomExtractGb_ = VK_NULL_HANDLE;
-    VkDescriptorSet bloomBlurHGb_ = VK_NULL_HANDLE;
-    VkDescriptorSet bloomBlurVGb_ = VK_NULL_HANDLE;
-    VkDescriptorSet bloomCompGb_ = VK_NULL_HANDLE;
-    VkDescriptorSet bloomExtractGt_ = VK_NULL_HANDLE;
-    VkDescriptorSet bloomBlurHGt_ = VK_NULL_HANDLE;
-    VkDescriptorSet bloomBlurVGt_ = VK_NULL_HANDLE;
-    VkDescriptorSet bloomCompGt_ = VK_NULL_HANDLE;
 
     // Auto exposure: one channel bound to the active path's lit HDR target
     // (gbColor_ for the LR path, finalImage_ for native GT).  The harvested
@@ -270,6 +273,9 @@ private:
     std::vector<TimestampQuery::Timings> frameTimes_;  // per-frame, when frameTimesPath set
 
     bool createRenderTargets();
+    // Procedural 512x512 R8 lens-dirt mask (deterministic radial blobs),
+    // uploaded to SHADER_READ_ONLY; sampled by present.frag.
+    bool createLensDirtTexture();
     bool createShaders();
     bool createSceneDescriptors();
     bool createPipelines();

@@ -1,0 +1,28 @@
+#version 450
+// Bloom pyramid upsample + accumulate (COD:AW / Unity HDRP bloom): a 3x3 tent
+// filter of the next, lower-resolution (already accumulated) mip is ADDED
+// onto this mip's downsampled content.  The tent is evaluated with four
+// bilinear taps at half-texel offsets — bilinear weights reproduce the
+// 1-2-1 / 2-4-2 / 1-2-1 kernel exactly.  dst is read+written in place; each
+// invocation only touches its own texel, so the RMW is race-free.  Binding
+// shape matches the downsample: 0 = lower mip (sampler), 1 = this mip.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D lowMip;
+layout(set = 0, binding = 1, rgba16f) uniform image2D dst;
+
+void main() {
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(dst);
+    if (pix.x >= size.x || pix.y >= size.y) return;
+
+    const vec2 uv = (vec2(pix) + 0.5) / vec2(size);
+    const vec2 ht = 0.5 / vec2(textureSize(lowMip, 0)); // half low-mip texel
+    vec3 tent = texture(lowMip, uv + vec2(-ht.x, -ht.y)).rgb
+              + texture(lowMip, uv + vec2( ht.x, -ht.y)).rgb
+              + texture(lowMip, uv + vec2(-ht.x,  ht.y)).rgb
+              + texture(lowMip, uv + vec2( ht.x,  ht.y)).rgb;
+    tent *= 0.25;
+    imageStore(dst, pix, vec4(imageLoad(dst, pix).rgb + tent, 1.0));
+}

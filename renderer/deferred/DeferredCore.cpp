@@ -189,7 +189,8 @@ bool DeferredCore::init(const VulkanContext& ctx, const char* envMapPath, const 
         !loadShader(ctx, "ssr_opaque.comp.spv", ssrOpaqueComp_) ||
         !loadShader(ctx, "ssr_temporal.comp.spv", ssrTemporalComp_) ||
         !loadShader(ctx, "bloom_extract.comp.spv", bloomExtractComp_) ||
-        !loadShader(ctx, "bloom_blur.comp.spv", bloomBlurComp_) ||
+        !loadShader(ctx, "bloom_downsample.comp.spv", bloomDownsampleComp_) ||
+        !loadShader(ctx, "bloom_upsample.comp.spv", bloomUpsampleComp_) ||
         !loadShader(ctx, "bloom_composite.comp.spv", bloomCompositeComp_) ||
         !loadShader(ctx, "exposure_histogram.comp.spv", exposureHistogramComp_) ||
         !loadShader(ctx, "exposure_solve.comp.spv", exposureSolveComp_) ||
@@ -1107,8 +1108,11 @@ bool DeferredCore::createPipelines(const VulkanContext& ctx) {
     bloomCi.stage.module = bloomExtractComp_;
     if (createComputePipeline(ctx, bloomCi, bloomExtractPipeline_) != VK_SUCCESS)
         return false;
-    bloomCi.stage.module = bloomBlurComp_;
-    if (createComputePipeline(ctx, bloomCi, bloomBlurPipeline_) != VK_SUCCESS)
+    bloomCi.stage.module = bloomDownsampleComp_;
+    if (createComputePipeline(ctx, bloomCi, bloomDownsamplePipeline_) != VK_SUCCESS)
+        return false;
+    bloomCi.stage.module = bloomUpsampleComp_;
+    if (createComputePipeline(ctx, bloomCi, bloomUpsamplePipeline_) != VK_SUCCESS)
         return false;
     bloomCi.stage.module = bloomCompositeComp_;
     if (createComputePipeline(ctx, bloomCi, bloomCompositePipeline_) != VK_SUCCESS)
@@ -1306,7 +1310,8 @@ void DeferredCore::destroy(const VulkanContext& ctx) {
     if (ssrPipeline_) { vkDestroyPipeline(ctx.device, ssrPipeline_, nullptr); ssrPipeline_ = VK_NULL_HANDLE; }
     if (ssrTemporalPipeline_) { vkDestroyPipeline(ctx.device, ssrTemporalPipeline_, nullptr); ssrTemporalPipeline_ = VK_NULL_HANDLE; }
     if (bloomExtractPipeline_) { vkDestroyPipeline(ctx.device, bloomExtractPipeline_, nullptr); bloomExtractPipeline_ = VK_NULL_HANDLE; }
-    if (bloomBlurPipeline_) { vkDestroyPipeline(ctx.device, bloomBlurPipeline_, nullptr); bloomBlurPipeline_ = VK_NULL_HANDLE; }
+    if (bloomDownsamplePipeline_) { vkDestroyPipeline(ctx.device, bloomDownsamplePipeline_, nullptr); bloomDownsamplePipeline_ = VK_NULL_HANDLE; }
+    if (bloomUpsamplePipeline_) { vkDestroyPipeline(ctx.device, bloomUpsamplePipeline_, nullptr); bloomUpsamplePipeline_ = VK_NULL_HANDLE; }
     if (bloomCompositePipeline_) { vkDestroyPipeline(ctx.device, bloomCompositePipeline_, nullptr); bloomCompositePipeline_ = VK_NULL_HANDLE; }
     if (histogramPipeline_) { vkDestroyPipeline(ctx.device, histogramPipeline_, nullptr); histogramPipeline_ = VK_NULL_HANDLE; }
     if (exposureSolvePipeline_) { vkDestroyPipeline(ctx.device, exposureSolvePipeline_, nullptr); exposureSolvePipeline_ = VK_NULL_HANDLE; }
@@ -1353,7 +1358,8 @@ void DeferredCore::destroy(const VulkanContext& ctx) {
     if (ssrOpaqueComp_) { vkDestroyShaderModule(ctx.device, ssrOpaqueComp_, nullptr); ssrOpaqueComp_ = VK_NULL_HANDLE; }
     if (ssrTemporalComp_) { vkDestroyShaderModule(ctx.device, ssrTemporalComp_, nullptr); ssrTemporalComp_ = VK_NULL_HANDLE; }
     if (bloomExtractComp_) { vkDestroyShaderModule(ctx.device, bloomExtractComp_, nullptr); bloomExtractComp_ = VK_NULL_HANDLE; }
-    if (bloomBlurComp_) { vkDestroyShaderModule(ctx.device, bloomBlurComp_, nullptr); bloomBlurComp_ = VK_NULL_HANDLE; }
+    if (bloomDownsampleComp_) { vkDestroyShaderModule(ctx.device, bloomDownsampleComp_, nullptr); bloomDownsampleComp_ = VK_NULL_HANDLE; }
+    if (bloomUpsampleComp_) { vkDestroyShaderModule(ctx.device, bloomUpsampleComp_, nullptr); bloomUpsampleComp_ = VK_NULL_HANDLE; }
     if (bloomCompositeComp_) { vkDestroyShaderModule(ctx.device, bloomCompositeComp_, nullptr); bloomCompositeComp_ = VK_NULL_HANDLE; }
     if (exposureHistogramComp_) { vkDestroyShaderModule(ctx.device, exposureHistogramComp_, nullptr); exposureHistogramComp_ = VK_NULL_HANDLE; }
     if (exposureSolveComp_) { vkDestroyShaderModule(ctx.device, exposureSolveComp_, nullptr); exposureSolveComp_ = VK_NULL_HANDLE; }
@@ -3218,43 +3224,114 @@ void DeferredCore::recordVolFogComposite(VkCommandBuffer cmd, const VolFogVolume
     vkCmdDispatch(cmd, (width + 7) / 8, (height + 7) / 8, 1);
 }
 
-void DeferredCore::writeBloomSet(const VulkanContext& ctx, VkDescriptorSet set, VkImageView src,
-                                 VkImageView dst) const {
-    VkDescriptorImageInfo img[2] = {};
-    img[0].sampler = gbufferSampler_;
-    img[0].imageView = src;
-    img[0].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    img[1].sampler = VK_NULL_HANDLE;
-    img[1].imageView = dst;
-    img[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+// --- Bloom pyramid (Phase 6a) --------------------------------------------------
+// Same resource model as the color pyramid above: one GENERAL-for-life image
+// with per-mip views, pool-owned descriptor sets.  Every set shares the
+// ssaoBlur binding shape (0 = sampler src, 1 = storage dst).
 
-    VkWriteDescriptorSet w[2] = {};
-    w[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    w[0].dstSet = set;
-    w[0].dstBinding = 0;
-    w[0].descriptorCount = 1;
-    w[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    w[0].pImageInfo = &img[0];
-    w[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    w[1].dstSet = set;
-    w[1].dstBinding = 1;
-    w[1].descriptorCount = 1;
-    w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    w[1].pImageInfo = &img[1];
-    vkUpdateDescriptorSets(ctx.device, 2, w, 0, nullptr);
+bool DeferredCore::createBloomPyramid(const VulkanContext& ctx, uint32_t fullW, uint32_t fullH,
+                                      BloomPyramid& out) const {
+    out.width = std::max(1u, fullW / 2);  // mip 0 = half-res extract
+    out.height = std::max(1u, fullH / 2);
+    if (createImage(ctx, out.width, out.height, deferred::kHdrColorFormat,
+                    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, out.image,
+                    out.memory, kBloomMipCount) != VK_SUCCESS)
+        return false;
+    out.mipViews.resize(kBloomMipCount, VK_NULL_HANDLE);
+    for (uint32_t i = 0; i < kBloomMipCount; ++i) {
+        out.mipViews[i] = createImageView(ctx, out.image, deferred::kHdrColorFormat,
+                                          VK_IMAGE_ASPECT_COLOR_BIT, i, 1);
+        if (!out.mipViews[i]) return false;
+    }
+    // GENERAL for life: every mip is both a compute storage target and a
+    // sampled source, so a fixed layout beats per-frame transitions.
+    submitOneShot(ctx, [&](VkCommandBuffer cmd) {
+        imageBarrier(cmd, out.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                     VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+                     VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                     VK_IMAGE_ASPECT_COLOR_BIT, 0, kBloomMipCount);
+    });
+    return true;
 }
 
-void DeferredCore::recordBloomPass(VkCommandBuffer cmd, VkDescriptorSet extractSet,
-                                   VkDescriptorSet blurHSet, VkDescriptorSet blurVSet,
-                                   VkDescriptorSet compositeSet, VkImage bloomA, VkImage bloomB,
-                                   VkImage color, VkImageLayout& bloomALayout,
-                                   VkImageLayout& bloomBLayout, VkImageLayout& colorLayout,
-                                   uint32_t fullW, uint32_t fullH, float strength) const {
-    if (strength <= 0.f || fullW == 0 || fullH == 0) return;
-    const uint32_t halfW = std::max(1u, fullW / 2);
-    const uint32_t halfH = std::max(1u, fullH / 2);
-    const uint32_t hx = (halfW + 7) / 8;
-    const uint32_t hy = (halfH + 7) / 8;
+bool DeferredCore::writeBloomPyramidSets(const VulkanContext& ctx, VkDescriptorPool pool,
+                                         VkImageView srcColor, BloomPyramid& out) const {
+    // Helper: one ssaoBlur-layout set, binding 0 = src sampler, 1 = dst storage.
+    auto writeSet = [&](VkDescriptorSet set, VkImageView src, VkImageLayout srcLayout,
+                        VkImageView dst) {
+        VkDescriptorImageInfo s = {};
+        s.sampler = gbufferSampler_; // linear clamp (extract/downsample/upsample taps)
+        s.imageView = src;
+        s.imageLayout = srcLayout;
+        VkDescriptorImageInfo d = {};
+        d.imageView = dst;
+        d.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        VkWriteDescriptorSet w[2] = {};
+        w[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w[0].dstSet = set;
+        w[0].dstBinding = 0;
+        w[0].descriptorCount = 1;
+        w[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        w[0].pImageInfo = &s;
+        w[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w[1].dstSet = set;
+        w[1].dstBinding = 1;
+        w[1].descriptorCount = 1;
+        w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        w[1].pImageInfo = &d;
+        vkUpdateDescriptorSets(ctx.device, 2, w, 0, nullptr);
+    };
+    auto allocSet = [&](VkDescriptorSet& set) {
+        VkDescriptorSetAllocateInfo alloc = {};
+        alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        alloc.descriptorPool = pool;
+        alloc.descriptorSetCount = 1;
+        alloc.pSetLayouts = &ssaoBlurSetLayout_;
+        return vkAllocateDescriptorSets(ctx.device, &alloc, &set) == VK_SUCCESS;
+    };
+
+    // Extract: full-res HDR (SHADER_READ_ONLY) -> mip 0.
+    if (!allocSet(out.extractSet)) return false;
+    writeSet(out.extractSet, srcColor, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, out.mipViews[0]);
+    // Downsample [i]: mip i -> mip i+1.
+    out.downSets.resize(kBloomMipCount - 1, VK_NULL_HANDLE);
+    for (uint32_t i = 0; i + 1 < kBloomMipCount; ++i) {
+        if (!allocSet(out.downSets[i])) return false;
+        writeSet(out.downSets[i], out.mipViews[i], VK_IMAGE_LAYOUT_GENERAL, out.mipViews[i + 1]);
+    }
+    // Upsample [i]: accumulated mip i+1 -> tent-add into mip i (RMW).
+    out.upSets.resize(kBloomMipCount - 1, VK_NULL_HANDLE);
+    for (uint32_t i = 0; i + 1 < kBloomMipCount; ++i) {
+        if (!allocSet(out.upSets[i])) return false;
+        writeSet(out.upSets[i], out.mipViews[i + 1], VK_IMAGE_LAYOUT_GENERAL, out.mipViews[i]);
+    }
+    // Composite: accumulated mip 0 -> full-res HDR RMW.  srcColor is bound as
+    // storage here; the host transitions it SHADER_READ_ONLY -> GENERAL ->
+    // SHADER_READ_ONLY around the pass.
+    if (!allocSet(out.compositeSet)) return false;
+    writeSet(out.compositeSet, out.mipViews[0], VK_IMAGE_LAYOUT_GENERAL, srcColor);
+    return true;
+}
+
+void DeferredCore::destroyBloomPyramid(const VulkanContext& ctx, BloomPyramid& pyramid) const {
+    for (VkImageView v : pyramid.mipViews)
+        if (v) vkDestroyImageView(ctx.device, v, nullptr);
+    pyramid.mipViews.clear();
+    pyramid.downSets.clear(); // pool-owned; freed with the host's descriptor pool
+    pyramid.upSets.clear();
+    pyramid.extractSet = pyramid.compositeSet = VK_NULL_HANDLE;
+    if (pyramid.image) {
+        vmaDestroyImage(ctx.allocator, pyramid.image, pyramid.memory);
+        pyramid.image = VK_NULL_HANDLE;
+        pyramid.memory = VK_NULL_HANDLE;
+    }
+    pyramid.width = pyramid.height = 0;
+}
+
+void DeferredCore::recordBloomPyramidPass(VkCommandBuffer cmd, const BloomPyramid& pyramid,
+                                          VkImage color, VkImageLayout& colorLayout,
+                                          uint32_t fullW, uint32_t fullH, float strength) const {
+    if (strength <= 0.f || !pyramid.image || fullW == 0 || fullH == 0) return;
 
     auto dispatch = [&](VkPipeline pipe, VkDescriptorSet set, const BloomPush& push, uint32_t gx,
                         uint32_t gy) {
@@ -3265,50 +3342,54 @@ void DeferredCore::recordBloomPass(VkCommandBuffer cmd, VkDescriptorSet extractS
                            &push);
         vkCmdDispatch(cmd, gx, gy, 1);
     };
+    // All pyramid passes are compute on one GENERAL image: a whole-chain
+    // same-layout barrier between steps keeps the bookkeeping trivial (per-mip
+    // subresource tracking buys nothing at 5 levels / ~10 barriers).
+    auto chainBarrier = [&](VkAccessFlags2 srcAccess, VkAccessFlags2 dstAccess) {
+        imageBarrier(cmd, pyramid.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+                     sync::kCompute, srcAccess, sync::kCompute, dstAccess,
+                     VK_IMAGE_ASPECT_COLOR_BIT, 0, kBloomMipCount);
+    };
+    auto mipGroups = [&](uint32_t level, uint32_t& gx, uint32_t& gy) {
+        const uint32_t w = std::max(1u, pyramid.width >> level);
+        const uint32_t h = std::max(1u, pyramid.height >> level);
+        gx = (w + 7) / 8;
+        gy = (h + 7) / 8;
+    };
 
-    // All passes below are compute; images ping-pong between storage writes
-    // (GENERAL) and sampled reads (SHADER_READ_ONLY) in COMPUTE_SHADER.
-    imageBarrier(cmd, bloomA, bloomALayout, VK_IMAGE_LAYOUT_GENERAL,
-                 VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
-                 VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
-    bloomALayout = VK_IMAGE_LAYOUT_GENERAL;
+    // WAR: last frame's readers — this pass's downsample/upsample/composite
+    // and the present pass's lens-dirt sample of mip 0 (fragment).
+    imageBarrier(cmd, pyramid.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+                 sync::kSampleStages, sync::kSampled, sync::kCompute, sync::kStorageWrite,
+                 VK_IMAGE_ASPECT_COLOR_BIT, 0, kBloomMipCount);
+
+    // 1) threshold extract (full-res HDR is SHADER_READ_ONLY) -> mip 0.
     BloomPush extractPush{};
     extractPush.params[0] = kBloomThreshold;
     extractPush.params[1] = kBloomKnee;
-    dispatch(bloomExtractPipeline_, extractSet, extractPush, hx, hy);
+    uint32_t gx, gy;
+    mipGroups(0, gx, gy);
+    dispatch(bloomExtractPipeline_, pyramid.extractSet, extractPush, gx, gy);
 
-    imageBarrier(cmd, bloomA, bloomALayout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                 VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                 VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
-    bloomALayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    imageBarrier(cmd, bloomB, bloomBLayout, VK_IMAGE_LAYOUT_GENERAL,
-                 VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
-                 VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
-    bloomBLayout = VK_IMAGE_LAYOUT_GENERAL;
-    BloomPush blurH{};
-    blurH.params[0] = 1.f;
-    blurH.params[1] = 0.f;
-    dispatch(bloomBlurPipeline_, blurHSet, blurH, hx, hy);
+    // 2) 13-tap downsample mip i -> mip i+1.
+    const BloomPush noPush{};
+    for (uint32_t i = 0; i + 1 < kBloomMipCount; ++i) {
+        chainBarrier(sync::kStorageWrite, sync::kSampled);
+        mipGroups(i + 1, gx, gy);
+        dispatch(bloomDownsamplePipeline_, pyramid.downSets[i], noPush, gx, gy);
+    }
 
-    imageBarrier(cmd, bloomB, bloomBLayout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                 VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                 VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
-    bloomBLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    imageBarrier(cmd, bloomA, bloomALayout, VK_IMAGE_LAYOUT_GENERAL,
-                 VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
-                 VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
-    bloomALayout = VK_IMAGE_LAYOUT_GENERAL;
-    BloomPush blurV{};
-    blurV.params[0] = 0.f;
-    blurV.params[1] = 1.f;
-    dispatch(bloomBlurPipeline_, blurVSet, blurV, hx, hy);
+    // 3) tent upsample: accumulate mip i+1 into mip i (in-place RMW; the WAR
+    //    against this level's downsample reads is covered by the barrier).
+    for (uint32_t i = kBloomMipCount - 1; i-- > 0;) {
+        chainBarrier(sync::kStorageWrite, sync::kSampled | sync::kStorageReadWrite);
+        mipGroups(i, gx, gy);
+        dispatch(bloomUpsamplePipeline_, pyramid.upSets[i], noPush, gx, gy);
+    }
 
-    imageBarrier(cmd, bloomA, bloomALayout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                 VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                 VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
-    bloomALayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    // The composite reads (imageLoad) and writes (imageStore) color in place;
-    // the previous users are the upscaler/compose/present shader reads.
+    // 4) composite accumulated mip 0 onto the lit HDR target (in-place RMW;
+    //    the previous users are the upscaler/compose/present shader reads).
+    chainBarrier(sync::kStorageWrite, sync::kSampled);
     imageBarrier(cmd, color, colorLayout, VK_IMAGE_LAYOUT_GENERAL,
                  VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                  VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
@@ -3317,7 +3398,8 @@ void DeferredCore::recordBloomPass(VkCommandBuffer cmd, VkDescriptorSet extractS
     colorLayout = VK_IMAGE_LAYOUT_GENERAL;
     BloomPush comp{};
     comp.params[0] = strength;
-    dispatch(bloomCompositePipeline_, compositeSet, comp, (fullW + 7) / 8, (fullH + 7) / 8);
+    dispatch(bloomCompositePipeline_, pyramid.compositeSet, comp, (fullW + 7) / 8,
+             (fullH + 7) / 8);
 
     imageBarrier(cmd, color, colorLayout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                  VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,

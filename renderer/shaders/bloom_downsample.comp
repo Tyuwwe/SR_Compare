@@ -1,0 +1,45 @@
+#version 450
+// Bloom pyramid downsample: the 13-tap filter from "Next Generation Post
+// Processing in Call of Duty: Advanced Warfare" (Jimenez, SIGGRAPH 2014
+// Advances in Real-Time Rendering; the same kernel Unity HDRP/URP bloom
+// uses).  Four inner +-1 texel taps at 1/8 each plus four outer 2x2 quads at
+// +-2 texels (1/32 per tap): weights sum to 1.0, so the chain is energy
+// preserving and can be up-filtered without brightness drift.  Binding shape
+// matches ssao_blur / hiz: 0 = src (previous mip, sampler), 1 = dst mip.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D src;
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D dst;
+
+void main() {
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(dst);
+    if (pix.x >= size.x || pix.y >= size.y) return;
+
+    const vec2 uv = (vec2(pix) + 0.5) / vec2(size);
+    const vec2 t = 1.0 / vec2(textureSize(src, 0)); // bound view: single mip
+
+    // Inner 2x2 quad (weights 4 x 1/8 = 1/2).
+    const vec3 d = texture(src, uv + t * vec2(-1.0, -1.0)).rgb;
+    const vec3 e = texture(src, uv + t * vec2( 1.0, -1.0)).rgb;
+    const vec3 i = texture(src, uv + t * vec2(-1.0,  1.0)).rgb;
+    const vec3 j = texture(src, uv + t * vec2( 1.0,  1.0)).rgb;
+    // Outer ring: 9 taps forming four 2x2 quads with the center (4 x 4 x 1/32 = 1/2).
+    const vec3 a = texture(src, uv + t * vec2(-2.0, -2.0)).rgb;
+    const vec3 b = texture(src, uv + t * vec2( 0.0, -2.0)).rgb;
+    const vec3 c = texture(src, uv + t * vec2( 2.0, -2.0)).rgb;
+    const vec3 f = texture(src, uv + t * vec2(-2.0,  0.0)).rgb;
+    const vec3 g = texture(src, uv).rgb;
+    const vec3 h = texture(src, uv + t * vec2( 2.0,  0.0)).rgb;
+    const vec3 k = texture(src, uv + t * vec2(-2.0,  2.0)).rgb;
+    const vec3 l = texture(src, uv + t * vec2( 0.0,  2.0)).rgb;
+    const vec3 m = texture(src, uv + t * vec2( 2.0,  2.0)).rgb;
+
+    vec3 sum = (d + e + i + j) * 0.125;
+    sum += (a + b + f + g) * 0.03125;
+    sum += (b + c + g + h) * 0.03125;
+    sum += (f + g + k + l) * 0.03125;
+    sum += (g + h + l + m) * 0.03125;
+    imageStore(dst, pix, vec4(sum, 1.0));
+}

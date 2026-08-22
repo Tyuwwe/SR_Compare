@@ -436,10 +436,13 @@ constexpr float kSsrTemporalDepthReject = 0.04f;
 // --- HDR color mip chain (box-filtered lit-color pyramid) --------------------
 // Roughness-aware SSR (Phase 1b-2) samples this chain at lod = roughness *
 // (mipCount - 1) instead of a single sharp mip-0 read, so one ray
-// approximates the widened GGX lobe; Phase 6's bloom pyramid is expected to
-// reuse the same resource.  RGBA16F like the lighting target, mip 0 =
-// straight copy of the lit opaque HDR color, mips 1..N = 2x2 box average.
-// The chain length rule matches the depth pyramid (full chain down to 1x1).
+// approximates the widened GGX lobe.  The Phase 6a bloom pyramid is a
+// SEPARATE chain (BloomPyramid below) on purpose: this chain is a plain box
+// average feeding reflection LOD, while bloom starts from a thresholded
+// extract — merging them would couple the bloom threshold to the reflection
+// blur.  RGBA16F like the lighting target, mip 0 = straight copy of the lit
+// opaque HDR color, mips 1..N = 2x2 box average.  The chain length rule
+// matches the depth pyramid (full chain down to 1x1).
 constexpr VkFormat kColorPyramidFormat = deferred::kHdrColorFormat;
 
 // Host-owned color pyramid.  Same ownership/layout model as DepthPyramid:
@@ -564,14 +567,56 @@ struct VolFogVolume {
     uint32_t dimZ = kFroxelSlices;
 };
 
-// Bloom (half-res extract + separable Gaussian, added back before upscale).
+// --- Bloom pyramid (Phase 6a) --------------------------------------------------
+// COD:AW / Unity-style bloom (Jimenez, "Next Generation Post Processing in
+// Call of Duty: Advanced Warfare", SIGGRAPH 2014; Unity HDRP/URP bloom):
+//   1. extract (bloom_extract.comp): quadratic soft-knee threshold into mip 0
+//      at half resolution (threshold/knee semantics unchanged from the old
+//      single-level bloom);
+//   2. downsample (bloom_downsample.comp): 13-tap energy-preserving filter,
+//      kBloomMipCount - 1 levels (1080p: 960x540 -> 60x34);
+//   3. upsample (bloom_upsample.comp): 3x3 tent filter of the lower mip
+//      accumulated back into each level (widest radius per cost — one
+//      thresholded chain blurred at every scale instead of one half-res
+//      Gaussian);
+//   4. composite (bloom_composite.comp): accumulated mip 0 added onto the
+//      lit HDR target, still before tonemapping (HDR domain, as before).
+// The chain is independent of ColorPyramid (see its comment).  Host-owned,
+// GENERAL-for-life resource model matching ColorPyramid.
+constexpr uint32_t kBloomMipCount = 5; // mip 0 = half-res extract, 1..4 = downsamples
 struct BloomPush {
-    float params[4]; // extract: threshold, knee; blur: dir.xy; composite: strength
+    float params[4]; // extract: threshold, knee; composite: strength
 };
 static_assert(sizeof(BloomPush) == 16, "BloomPush size mismatch");
 constexpr float kBloomThreshold = 1.0f;
 constexpr float kBloomKnee = 0.5f;
 constexpr float kBloomStrength = 0.15f;
+
+// Host-owned bloom pyramid (one per deferred path).  Sets are pool-owned;
+// destroyBloomPyramid only releases the image and views.
+struct BloomPyramid {
+    VkImage image = VK_NULL_HANDLE;
+    VmaAllocation memory = VK_NULL_HANDLE;
+    std::vector<VkImageView> mipViews;        // kBloomMipCount single-mip views
+    VkDescriptorSet extractSet = VK_NULL_HANDLE;   // HDR src -> mip 0
+    std::vector<VkDescriptorSet> downSets;         // [i]: mip i -> mip i+1
+    std::vector<VkDescriptorSet> upSets;           // [i]: mip i+1 -> accumulate into mip i
+    VkDescriptorSet compositeSet = VK_NULL_HANDLE; // mip 0 -> HDR color RMW
+    uint32_t width = 0;  // mip 0 extent (half res)
+    uint32_t height = 0;
+};
+
+// --- Terminal lens-effects chain (Phase 6a) ------------------------------------
+// Shared by the viewer present pass (present.frag) and the compare/GUI column
+// compose (compare_compose.frag).  Defaults are deliberately weak — the
+// effects should texture the image, not announce themselves.  Every effect
+// keys off its own strength; a zero strength skips it (GUI checkboxes / CLI
+// --no-lens-fx).  Lens dirt is viewer-only: it modulates the HDR bloom
+// pyramid, which the compare/GUI paths do not build.
+constexpr float kLensCaStrength = 0.003f;       // radial UV split scale (corner ~2px @1080p)
+constexpr float kLensVignetteStrength = 0.15f;  // corner darkening factor
+constexpr float kLensGrainStrength = 0.008f;    // display-domain noise amplitude
+constexpr float kLensDirtStrength = 0.5f;       // dirt mask x accumulated bloom (viewer)
 
 // --- Auto exposure (UE4 AutoExposure / Frostbite histogram + EV solver) -------
 // Two compute passes per frame and path: exposure_histogram.comp builds a
@@ -832,19 +877,27 @@ public:
                             VkImageView depth, VkImageView aoOut, AoHistory& out) const;
     void destroyAoHistory(const VulkanContext& ctx, AoHistory& history) const;
 
-    // --- Bloom (after lighting+transparency, before upscale) ------------------
-    // Reuses ssaoBlurSetLayout (sampler + storage).  writeBloomSet binds src
-    // (sampled) and dst (GENERAL storage).
-    void writeBloomSet(const VulkanContext& ctx, VkDescriptorSet set, VkImageView src,
-                       VkImageView dst) const;
-    // Extract + H blur + V blur + composite.  colorLayout must be
-    // SHADER_READ_ONLY on entry; it is left SHADER_READ_ONLY.  bloomA/B layouts
-    // are tracked across frames.  No-op when strength <= 0.
-    void recordBloomPass(VkCommandBuffer cmd, VkDescriptorSet extractSet, VkDescriptorSet blurHSet,
-                         VkDescriptorSet blurVSet, VkDescriptorSet compositeSet, VkImage bloomA,
-                         VkImage bloomB, VkImage color, VkImageLayout& bloomALayout,
-                         VkImageLayout& bloomBLayout, VkImageLayout& colorLayout, uint32_t fullW,
-                         uint32_t fullH, float strength = kBloomStrength) const;
+    // --- Bloom pyramid (after lighting+transparency, before upscale) ----------
+    // Reuses ssaoBlurSetLayout (sampler + storage) for every set.  Creates the
+    // kBloomMipCount-level RGBA16F pyramid (mip 0 = half res) and transitions
+    // it to GENERAL for life.  Sets are allocated by writeBloomPyramidSets
+    // once the host's pool exists.
+    bool createBloomPyramid(const VulkanContext& ctx, uint32_t fullW, uint32_t fullH,
+                            BloomPyramid& out) const;
+    // Allocates extract/downsample/upsample/composite sets from the caller's
+    // pool; extract samples srcColor (the lit HDR target, read while in
+    // SHADER_READ_ONLY), all mips are bound in GENERAL.
+    bool writeBloomPyramidSets(const VulkanContext& ctx, VkDescriptorPool pool,
+                               VkImageView srcColor, BloomPyramid& out) const;
+    void destroyBloomPyramid(const VulkanContext& ctx, BloomPyramid& pyramid) const;
+    // Extract -> 4x downsample -> 4x upsample-accumulate -> composite.  color
+    // must be SHADER_READ_ONLY on entry and is left SHADER_READ_ONLY; the
+    // pyramid itself needs no layout tracking (GENERAL for life).  No-op when
+    // strength <= 0.  The pass barriers against last frame's readers
+    // (including the present pass's lens-dirt sample of mip 0).
+    void recordBloomPyramidPass(VkCommandBuffer cmd, const BloomPyramid& pyramid, VkImage color,
+                                VkImageLayout& colorLayout, uint32_t fullW, uint32_t fullH,
+                                float strength = kBloomStrength) const;
 
     // --- Hi-Z depth pyramid (between the GBuffer and the lighting pass) ------
     // Full mip chain length for w x h (down to 1x1): 1 + floor(log2(max)).
@@ -1081,7 +1134,6 @@ public:
     VkDescriptorSetLayout ssrSetLayout() const { return ssrSetLayout_; }
     VkDescriptorSetLayout ssrTemporalSetLayout() const { return ssrTemporalSetLayout_; }
     VkDescriptorSetLayout clusterSetLayout() const { return clusterSetLayout_; }
-    VkDescriptorSetLayout bloomSetLayout() const { return ssaoBlurSetLayout_; }
     VkDescriptorSetLayout exposureSetLayout() const { return exposureSetLayout_; }
     VkPipelineLayout scenePipelineLayout() const { return scenePipelineLayout_; }
     VkPipelineLayout lightingPipelineLayout() const { return lightingPipelineLayout_; }
@@ -1166,7 +1218,8 @@ private:
     VkPipeline volfogCompositePipeline_ = VK_NULL_HANDLE;
     VkPipelineLayout bloomPipelineLayout_ = VK_NULL_HANDLE;
     VkPipeline bloomExtractPipeline_ = VK_NULL_HANDLE;
-    VkPipeline bloomBlurPipeline_ = VK_NULL_HANDLE;
+    VkPipeline bloomDownsamplePipeline_ = VK_NULL_HANDLE;
+    VkPipeline bloomUpsamplePipeline_ = VK_NULL_HANDLE;
     VkPipeline bloomCompositePipeline_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout exposureSetLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout histogramPipelineLayout_ = VK_NULL_HANDLE;
@@ -1197,7 +1250,8 @@ private:
     VkShaderModule volfogMarchComp_ = VK_NULL_HANDLE;
     VkShaderModule volfogCompositeComp_ = VK_NULL_HANDLE;
     VkShaderModule bloomExtractComp_ = VK_NULL_HANDLE;
-    VkShaderModule bloomBlurComp_ = VK_NULL_HANDLE;
+    VkShaderModule bloomDownsampleComp_ = VK_NULL_HANDLE;
+    VkShaderModule bloomUpsampleComp_ = VK_NULL_HANDLE;
     VkShaderModule bloomCompositeComp_ = VK_NULL_HANDLE;
     VkShaderModule exposureHistogramComp_ = VK_NULL_HANDLE;
     VkShaderModule exposureSolveComp_ = VK_NULL_HANDLE;

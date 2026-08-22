@@ -29,23 +29,57 @@ layout(push_constant) uniform Push {
     vec4 uvRect;   // xy = source region offset (normalized), zw = region size
     vec4 params;   // xy = source image size in pixels, z = 1 => nearest sampling,
                    // w = display exposure
+    // Terminal lens-effects chain (same constants/algorithm as the viewer's
+    // present.frag; lens dirt is viewer-only because the compare/GUI paths
+    // have no HDR bloom chain).  All effects are skipped in nearest
+    // (pixel-peep) mode so magnified pixels stay unmodified.  w = frame index
+    // (grain hash seed).
+    vec4 lensA;    // x = chromatic aberration, y = vignette, z = film grain
 } pc;
 
 layout(location = 0) in vec2 vUV;
 layout(location = 0) out vec4 outColor;
 
+// Same deterministic integer hash as present.frag (film grain seed).
+float hash13(uvec3 v) {
+    v = v * 1664525u + 1013904223u;
+    v.x += v.y * v.z;
+    v.y += v.z * v.x;
+    v.z += v.x * v.y;
+    v ^= v >> 16u;
+    v.x += v.y * v.z;
+    return float(v.x & 0x00FFFFFFu) * (1.0 / 16777216.0);
+}
+
 void main() {
     const vec2 suv = pc.uvRect.xy + vUV * pc.uvRect.zw;
+    // Lens chain runs at the same strength for every column (each column is
+    // an independent present).  Off in nearest mode (pixel-level inspection).
+    const bool lensFx = pc.params.z <= 0.5 && pc.lensA.xyz != vec3(0.0);
+    const vec2 d = vUV - 0.5;
     vec3 c;
     if (pc.params.z > 0.5) {
         // Nearest: round the source-texel coordinate, clamp to the image.
         vec2 t = suv * pc.params.xy - 0.5;
         ivec2 ip = ivec2(clamp(floor(t + 0.5), vec2(0.0), pc.params.xy - 1.0));
         c = texelFetch(uSource, ip, 0).rgb;
+    } else if (lensFx && pc.lensA.x > 0.0) {
+        // Chromatic aberration: radial RGB split, squared-distance falloff.
+        const vec2 off = d * dot(d, d) * pc.lensA.x;
+        c.r = texture(uSource, suv - off).r;
+        c.g = texture(uSource, suv).g;
+        c.b = texture(uSource, suv + off).b;
     } else {
         c = texture(uSource, suv).rgb;
     }
     c = tonemapToDisplay(c, pc.params.w);
+    if (lensFx) {
+        if (pc.lensA.y > 0.0) c *= 1.0 - pc.lensA.y * dot(d, d) * 2.0;
+        if (pc.lensA.z > 0.0) {
+            const float n = hash13(uvec3(uvec2(gl_FragCoord.xy), uint(pc.lensA.w))) - 0.5;
+            c += pc.lensA.z * n;
+        }
+    }
 
     const uint scale = uint(pc.colSize.z);
     const uint slot = uint(pc.colSize.w);

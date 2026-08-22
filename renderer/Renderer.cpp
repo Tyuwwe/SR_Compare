@@ -294,22 +294,13 @@ bool Renderer::createRenderTargets() {
         return false;
     if (!createRT(gtAo_, dw, dh, VK_FORMAT_R16_SFLOAT, aoUsage, VK_IMAGE_ASPECT_COLOR_BIT))
         return false;
-    const VkImageUsageFlags bloomUsage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-    const uint32_t gbHalfW = std::max(1u, renderWidth_ / 2);
-    const uint32_t gbHalfH = std::max(1u, renderHeight_ / 2);
-    const uint32_t gtHalfW = std::max(1u, dw / 2);
-    const uint32_t gtHalfH = std::max(1u, dh / 2);
-    if (!createRT(gbBloomA_, gbHalfW, gbHalfH, deferred::kHdrColorFormat, bloomUsage,
-                  VK_IMAGE_ASPECT_COLOR_BIT))
+    // Bloom pyramids (Phase 6a): 5-level thresholded chains, one per path;
+    // GENERAL-for-life, no host layout tracking.
+    if (!deferred_.createBloomPyramid(ctx_, renderWidth_, renderHeight_, gbBloom_))
         return false;
-    if (!createRT(gbBloomB_, gbHalfW, gbHalfH, deferred::kHdrColorFormat, bloomUsage,
-                  VK_IMAGE_ASPECT_COLOR_BIT))
+    if (!deferred_.createBloomPyramid(ctx_, dw, dh, gtBloom_))
         return false;
-    if (!createRT(gtBloomA_, gtHalfW, gtHalfH, deferred::kHdrColorFormat, bloomUsage,
-                  VK_IMAGE_ASPECT_COLOR_BIT))
-        return false;
-    if (!createRT(gtBloomB_, gtHalfW, gtHalfH, deferred::kHdrColorFormat, bloomUsage,
-                  VK_IMAGE_ASPECT_COLOR_BIT))
+    if (!createLensDirtTexture())
         return false;
     if (!deferred_.createDepthPyramid(ctx_, renderWidth_, renderHeight_, gbPyramid_))
         return false;
@@ -366,6 +357,74 @@ bool Renderer::createRenderTargets() {
     return true;
 }
 
+bool Renderer::createLensDirtTexture() {
+    // Procedural lens-dirt mask (UE4-style lens dirt needs no external asset):
+    // a handful of soft radial blobs on a dim base, generated with a fixed-seed
+    // LCG so the texture is identical on every run.  Peaks are kept <= 0.6 so
+    // the default kLensDirtStrength stays subtle.  R8 is enough — the mask
+    // scales the (already colored) bloom.
+    constexpr uint32_t kSize = 512;
+    constexpr uint32_t kBlobCount = 14;
+    struct Blob { float x, y, r, i; };
+    Blob blobs[kBlobCount];
+    uint32_t rng = 0x9E3779B9u; // fixed seed: deterministic mask
+    auto frand = [&rng]() {
+        rng = rng * 1664525u + 1013904223u;
+        return static_cast<float>((rng >> 8) & 0xFFFFFFu) * (1.0f / 16777216.0f);
+    };
+    for (Blob& b : blobs) {
+        b.x = 0.12f + 0.76f * frand();
+        b.y = 0.12f + 0.76f * frand();
+        b.r = 0.03f + 0.11f * frand();
+        b.i = 0.08f + 0.25f * frand();
+    }
+    std::vector<uint8_t> pixels(static_cast<size_t>(kSize) * kSize);
+    for (uint32_t y = 0; y < kSize; ++y) {
+        for (uint32_t x = 0; x < kSize; ++x) {
+            const float u = (static_cast<float>(x) + 0.5f) / kSize;
+            const float v = (static_cast<float>(y) + 0.5f) / kSize;
+            float m = 0.05f; // faint uniform film so dirt never fully vanishes
+            for (const Blob& b : blobs) {
+                const float dx = u - b.x;
+                const float dy = v - b.y;
+                m += b.i * std::exp(-(dx * dx + dy * dy) / (b.r * b.r));
+            }
+            m = std::min(m, 0.6f);
+            pixels[static_cast<size_t>(y) * kSize + x] =
+                static_cast<uint8_t>(m * (255.0f / 0.6f) + 0.5f);
+        }
+    }
+
+    lensDirt_.width = kSize;
+    lensDirt_.height = kSize;
+    lensDirt_.format = VK_FORMAT_R8_UNORM;
+    if (createImage(ctx_, kSize, kSize, lensDirt_.format,
+                    VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, lensDirt_.image,
+                    lensDirt_.memory) != VK_SUCCESS)
+        return false;
+    lensDirt_.view = createImageView(ctx_, lensDirt_.image, lensDirt_.format,
+                                     VK_IMAGE_ASPECT_COLOR_BIT);
+    if (!lensDirt_.view) return false;
+
+    VkBuffer staging = VK_NULL_HANDLE;
+    VmaAllocation stagingMemory = VK_NULL_HANDLE;
+    if (createBuffer(ctx_, pixels.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                     staging, stagingMemory) != VK_SUCCESS)
+        return false;
+    void* mapped = nullptr;
+    if (vmaMapMemory(ctx_.allocator, stagingMemory, &mapped) != VK_SUCCESS) return false;
+    std::memcpy(mapped, pixels.data(), pixels.size());
+    vmaUnmapMemory(ctx_.allocator, stagingMemory);
+    // copyBufferToImage transitions UNDEFINED -> TRANSFER_DST -> SHADER_READ_ONLY.
+    submitOneShot(ctx_, [&](VkCommandBuffer cmd) {
+        copyBufferToImage(cmd, staging, lensDirt_.image, kSize, kSize, lensDirt_.format);
+    });
+    vmaDestroyBuffer(ctx_.allocator, staging, stagingMemory);
+    lensDirt_.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    return true;
+}
+
 bool Renderer::loadShader(const char* name, VkShaderModule& out) {
     const std::string path = sr::resolveShaderPath(SR_SHADER_DIR, name);
     std::ifstream file(path, std::ios::binary | std::ios::ate);
@@ -392,15 +451,19 @@ bool Renderer::createShaders() {
 }
 
 bool Renderer::createSceneDescriptors() {
-    VkDescriptorSetLayoutBinding presentBinding = {};
-    presentBinding.binding = 0;
-    presentBinding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    presentBinding.descriptorCount = 1;
-    presentBinding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    // Present set: 0 = final HDR image, 1 = accumulated bloom mip 0 of the
+    // presented path (lens dirt), 2 = procedural lens-dirt mask.
+    VkDescriptorSetLayoutBinding presentBindings[3] = {};
+    for (uint32_t i = 0; i < 3; ++i) {
+        presentBindings[i].binding = i;
+        presentBindings[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        presentBindings[i].descriptorCount = 1;
+        presentBindings[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    }
     VkDescriptorSetLayoutCreateInfo presentLayoutCi = {};
     presentLayoutCi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    presentLayoutCi.bindingCount = 1;
-    presentLayoutCi.pBindings = &presentBinding;
+    presentLayoutCi.bindingCount = 3;
+    presentLayoutCi.pBindings = presentBindings;
     if (vkCreateDescriptorSetLayout(ctx_.device, &presentLayoutCi, nullptr, &presentSetLayout_) != VK_SUCCESS)
         return false;
 
@@ -411,13 +474,13 @@ bool Renderer::createSceneDescriptors() {
     const uint32_t colorSets = gbColorPyramid_.mipCount + gtColorPyramid_.mipCount;
     const uint32_t fogPaths = volFogActive_ ? 2 : 0; // froxel fog sets per path (Phase 5a)
     sizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    sizes[0].descriptorCount = deferred::kMaxTextures + 1 + // texture array + present
+    sizes[0].descriptorCount = deferred::kMaxTextures + 3 + // texture array + present (image + bloom + dirt)
                                14 * kFramesInFlight * 2 + // lighting sets (GB/GT), shadow + atlas + 2 probe arrays
                                7 * kFramesInFlight * 2 +  // transparent sets (GB/GT), +SSR+shadow
                                11 * kFramesInFlight * 2 + // opaque-SSR trace sets (GB/GT), +2 probe arrays
                                2 * 2 + 3 * 4 + 1 * 4 +     // ssao + temporal + blur samplers
                                3 * 4 +                     // ssr temporal samplers (GB/GT x2 sets)
-                               8 +                         // bloom extract/blur/comp (GB/GT)
+                               20 +                        // bloom pyramid extract/down/up/comp (GB/GT)
                                1 +                         // auto-exposure HDR source
                                14 * fogPaths +             // volfog light/temporal/march/composite samplers
                                hizSets + colorSets;
@@ -430,7 +493,8 @@ bool Renderer::createSceneDescriptors() {
     // ssao raw + temporal history + blur (GB/GT) + pyramid mips + SSR trace
     // targets + SSR temporal history write / scene-color RMW (GB/GT x2 sets)
     // + volfog inject/light/temporal/march/composite storage (per fog path)
-    sizes[3].descriptorCount = 10 + 8 + hizSets + colorSets + kFramesInFlight * 2 + 8 +
+    // + bloom pyramid dst mips (GB/GT)
+    sizes[3].descriptorCount = 10 + 8 + hizSets + colorSets + kFramesInFlight * 2 + 20 +
                                8 * fogPaths;
     sizes[4].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     sizes[4].descriptorCount = 2 + // auto-exposure histogram + state
@@ -439,8 +503,8 @@ bool Renderer::createSceneDescriptors() {
                                2 * kClusterSlots * fogPaths; // volfog light sets: lights + grid SSBOs
     VkDescriptorPoolCreateInfo poolCi = {};
     poolCi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    poolCi.maxSets = kFramesInFlight * 7 + 12 + 8 + hizSets + colorSets + 1 + 4 +
-                     kClusterSlots * 2 + // +12 ssao/temporal/blur, +8 bloom, +1 auto-exposure, +4 ssr temporal, +cluster assign
+    poolCi.maxSets = kFramesInFlight * 7 + 12 + 20 + hizSets + colorSets + 1 + 4 +
+                     kClusterSlots * 2 + // +12 ssao/temporal/blur, +20 bloom pyramid, +1 auto-exposure, +4 ssr temporal, +cluster assign
                      8 * fogPaths;        // volfog inject/light/temporal/march/composite sets
     poolCi.poolSizeCount = 5;
     poolCi.pPoolSizes = sizes;
@@ -494,17 +558,29 @@ bool Renderer::createSceneDescriptors() {
         alloc.pSetLayouts = &presentSetLayout_;
         if (vkAllocateDescriptorSets(ctx_.device, &alloc, &presentSet_) != VK_SUCCESS) return false;
 
-        VkDescriptorImageInfo info = {};
-        info.sampler = deferred_.textureSampler();
-        info.imageView = finalImage_.view;
-        info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        // Binding 1: accumulated bloom mip 0 of the PRESENTED path (upscaler
+        // -> LR chain, native -> GT chain), for the lens-dirt term.  The
+        // pyramid lives in GENERAL; the mip content is undefined when bloom
+        // is off, but the dirt strength is forced to 0 then, so the shader
+        // never samples it.
+        const bool useUpscaler = opts_.upscalerName != "none" && upscaler_ != nullptr;
+        VkDescriptorImageInfo info[3] = {};
+        info[0].sampler = deferred_.textureSampler();
+        info[0].imageView = finalImage_.view;
+        info[0].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        info[1].sampler = deferred_.gbufferSampler(); // linear clamp
+        info[1].imageView = useUpscaler ? gbBloom_.mipViews[0] : gtBloom_.mipViews[0];
+        info[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        info[2].sampler = deferred_.gbufferSampler();
+        info[2].imageView = lensDirt_.view;
+        info[2].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         VkWriteDescriptorSet write = {};
         write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         write.dstSet = presentSet_;
         write.dstBinding = 0;
-        write.descriptorCount = 1;
+        write.descriptorCount = 3;
         write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        write.pImageInfo = &info;
+        write.pImageInfo = info;
         vkUpdateDescriptorSets(ctx_.device, 1, &write, 0, nullptr);
     }
 
@@ -528,7 +604,7 @@ bool Renderer::createPipelines() {
     VkPushConstantRange presentPush = {};
     presentPush.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     presentPush.offset = 0;
-    presentPush.size = 16; // vec4: exposure.x
+    presentPush.size = 48; // vec3 x vec4: exposure + lensA + lensB (present.frag)
     VkPipelineLayoutCreateInfo presentLayoutCi = {};
     presentLayoutCi.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     presentLayoutCi.setLayoutCount = 1;
@@ -787,30 +863,11 @@ bool Renderer::createSyncResources() {
             return false;
     }
 
-    {
-        VkDescriptorSetAllocateInfo bloomAlloc = {};
-        bloomAlloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-        bloomAlloc.descriptorPool = descriptorPool_;
-        bloomAlloc.descriptorSetCount = 1;
-        const VkDescriptorSetLayout bloomLayout = deferred_.bloomSetLayout();
-        bloomAlloc.pSetLayouts = &bloomLayout;
-        auto allocBloom = [&](VkDescriptorSet& set) {
-            return vkAllocateDescriptorSets(ctx_.device, &bloomAlloc, &set) == VK_SUCCESS;
-        };
-        if (!allocBloom(bloomExtractGb_) || !allocBloom(bloomBlurHGb_) ||
-            !allocBloom(bloomBlurVGb_) || !allocBloom(bloomCompGb_) ||
-            !allocBloom(bloomExtractGt_) || !allocBloom(bloomBlurHGt_) ||
-            !allocBloom(bloomBlurVGt_) || !allocBloom(bloomCompGt_))
-            return false;
-        deferred_.writeBloomSet(ctx_, bloomExtractGb_, gbColor_.view, gbBloomA_.view);
-        deferred_.writeBloomSet(ctx_, bloomBlurHGb_, gbBloomA_.view, gbBloomB_.view);
-        deferred_.writeBloomSet(ctx_, bloomBlurVGb_, gbBloomB_.view, gbBloomA_.view);
-        deferred_.writeBloomSet(ctx_, bloomCompGb_, gbBloomA_.view, gbColor_.view);
-        deferred_.writeBloomSet(ctx_, bloomExtractGt_, finalImage_.view, gtBloomA_.view);
-        deferred_.writeBloomSet(ctx_, bloomBlurHGt_, gtBloomA_.view, gtBloomB_.view);
-        deferred_.writeBloomSet(ctx_, bloomBlurVGt_, gtBloomB_.view, gtBloomA_.view);
-        deferred_.writeBloomSet(ctx_, bloomCompGt_, gtBloomA_.view, finalImage_.view);
-    }
+    // Bloom pyramid sets (pool-owned; mip views already exist).
+    if (!deferred_.writeBloomPyramidSets(ctx_, descriptorPool_, gbColor_.view, gbBloom_))
+        return false;
+    if (!deferred_.writeBloomPyramidSets(ctx_, descriptorPool_, finalImage_.view, gtBloom_))
+        return false;
 
     // One renderFinished semaphore per swapchain image: the submit signals the
     // semaphore for the acquired image, and present waits on that same image's
@@ -1577,15 +1634,11 @@ void Renderer::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                sync::kColorAttach, sync::kColorWrite, sync::kSampleStages, sync::kSampled);
     if (opts_.bloom) {
         if (gbuffer) {
-            deferred_.recordBloomPass(cmd, bloomExtractGb_, bloomBlurHGb_, bloomBlurVGb_,
-                                      bloomCompGb_, gbBloomA_.image, gbBloomB_.image, gbColor_.image,
-                                      gbBloomA_.layout, gbBloomB_.layout, gbColor_.layout,
-                                      renderWidth_, renderHeight_);
+            deferred_.recordBloomPyramidPass(cmd, gbBloom_, gbColor_.image, gbColor_.layout,
+                                             renderWidth_, renderHeight_);
         } else {
-            deferred_.recordBloomPass(cmd, bloomExtractGt_, bloomBlurHGt_, bloomBlurVGt_,
-                                      bloomCompGt_, gtBloomA_.image, gtBloomB_.image,
-                                      finalImage_.image, gtBloomA_.layout, gtBloomB_.layout,
-                                      finalImage_.layout, opts_.displayWidth, opts_.displayHeight);
+            deferred_.recordBloomPyramidPass(cmd, gtBloom_, finalImage_.image, finalImage_.layout,
+                                             opts_.displayWidth, opts_.displayHeight);
         }
     }
     // --- Auto exposure (lit HDR -> histogram -> smoothed EV) -------------------
@@ -1684,7 +1737,18 @@ void Renderer::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     vkCmdSetScissor(cmd, 0, 1, &psc);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, presentPipelineLayout_, 0, 1,
                             &presentSet_, 0, nullptr);
-    const float presentPush[4] = {displayExposure(), 0.f, 0.f, 0.f};
+    // Present: exposure + the terminal lens-effects chain (strengths zeroed
+    // when disabled; dirt also needs the bloom pyramid, so --no-bloom forces
+    // it off — the bound mip content is undefined then, see the present set).
+    const bool fx = opts_.lensFx;
+    const float presentPush[12] = {
+        displayExposure(), 0.f, 0.f, 0.f,
+        fx ? kLensCaStrength : 0.f,
+        fx ? kLensVignetteStrength : 0.f,
+        fx ? kLensGrainStrength : 0.f,
+        static_cast<float>(frameIndex),
+        (fx && opts_.bloom) ? kLensDirtStrength : 0.f, 0.f, 0.f, 0.f,
+    };
     vkCmdPushConstants(cmd, presentPipelineLayout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                        sizeof(presentPush), presentPush);
     vkCmdDraw(cmd, 3, 1, 0, 0);
@@ -1878,10 +1942,9 @@ void Renderer::shutdown() {
     gbAo_.destroy(ctx_);
     gtAoRaw_.destroy(ctx_);
     gtAo_.destroy(ctx_);
-    gbBloomA_.destroy(ctx_);
-    gbBloomB_.destroy(ctx_);
-    gtBloomA_.destroy(ctx_);
-    gtBloomB_.destroy(ctx_);
+    deferred_.destroyBloomPyramid(ctx_, gbBloom_);
+    deferred_.destroyBloomPyramid(ctx_, gtBloom_);
+    lensDirt_.destroy(ctx_);
     deferred_.destroyColorPyramid(ctx_, gbColorPyramid_);
     deferred_.destroyColorPyramid(ctx_, gtColorPyramid_);
     deferred_.destroyClusterGrid(ctx_, gbCluster_);

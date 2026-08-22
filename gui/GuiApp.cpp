@@ -97,7 +97,10 @@ Camera lerpCamera(const Camera& a, const Camera& b, float t) {
 // shared with the viewer renderer via renderer/deferred/DeferredCore.h.
 
 // Compose pass push constants: column pixel size + text scale + text slot,
-// the source-region window (normalized offset/size) and source dimensions.
+// the source-region window (normalized offset/size) and source dimensions,
+// plus the terminal lens-effects chain (Phase 6a; same algorithm/defaults as
+// the viewer present.frag — lens dirt excluded, the GUI paths have no bloom
+// chain).
 struct ComposePush {
     float colSize[2];
     float textScale;
@@ -106,8 +109,10 @@ struct ComposePush {
     float srcSize[2]; // source image pixels
     float nearest;    // != 0: sample nearest (magnification >= 1:1)
     float exposure;   // display-domain ACES input multiplier
+    float lensA[4];   // x = chromatic aberration, y = vignette, z = film grain,
+                      // w = frame index (grain hash seed)
 };
-static_assert(sizeof(ComposePush) == 48, "ComposePush size mismatch");
+static_assert(sizeof(ComposePush) == 64, "ComposePush size mismatch");
 
 // Metric compute push constants (two uvec4s in the shaders).
 struct MetricPush {
@@ -3940,10 +3945,19 @@ void GuiApp::recordComposePresent(VkCommandBuffer cmd, uint32_t swapchainIndex,
             push.srcSize[0] = srcW;
             push.srcSize[1] = srcH;
             const float srcRegionW = rect[2] * (srcW / static_cast<float>(dw));
-            push.nearest = (static_cast<float>(w) >= srcRegionW) ? 1.f : 0.f;
+            // Nearest only above 1:1 magnification (see CompareApp); at
+            // exactly 1:1 linear sampling hits texel centers anyway and the
+            // lens chain stays active.
+            push.nearest = (static_cast<float>(w) > srcRegionW) ? 1.f : 0.f;
             // Per-column exposure: GT column uses the GT path's solver,
             // algorithm columns the LR path's (manual mode shares the slider).
             push.exposure = isGtColumn ? gtExposureNow() : lrExposureNow();
+            // Terminal lens chain (Phase 6a): per-frame push constants, same
+            // strengths for every column (each column presents independently).
+            push.lensA[0] = lensCaEnabled_ ? kLensCaStrength : 0.f;
+            push.lensA[1] = lensVignetteEnabled_ ? kLensVignetteStrength : 0.f;
+            push.lensA[2] = lensGrainEnabled_ ? kLensGrainStrength : 0.f;
+            push.lensA[3] = static_cast<float>(renderFrameIndex_);
             vkCmdPushConstants(cmd, composePipelineLayout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                                sizeof(push), &push);
             vkCmdDraw(cmd, 3, 1, 0, 0);
@@ -4742,6 +4756,13 @@ void GuiApp::drawViewerTab() {
     if (!fogParams_.enabled || gbFog_.injectImage == VK_NULL_HANDLE) ImGui::EndDisabled();
     // Screen-size LOD + small-object cull: per-frame CPU selection, no rebuild.
     ImGui::Checkbox("lod", &lodEnabled_);
+    // Terminal lens-effects chain (Phase 6a, compare_compose.frag; per-frame
+    // push constants, no rebuild).  Lens dirt is viewer-only: it modulates the
+    // HDR bloom pyramid, which the GUI/compare paths do not build.
+    ImGui::Text("lens fx");
+    ImGui::Checkbox("chromatic aberration", &lensCaEnabled_);
+    ImGui::Checkbox("vignette", &lensVignetteEnabled_);
+    ImGui::Checkbox("film grain", &lensGrainEnabled_);
     ImGui::Separator();
 
     // Live performance readout.

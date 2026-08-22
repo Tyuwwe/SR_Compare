@@ -30,6 +30,7 @@ void printCompareUsage() {
                  "  --no-ssr                       disable opaque screen-space reflections\n"
                  "  --no-contact-shadows           disable screen-space contact shadows (sun)\n"
                  "  --no-volfog                    disable froxel volumetric fog\n"
+                 "  --no-lens-fx                   disable the compose lens chain (CA/vignette/grain)\n"
                  "  --shadow-debug                 tint pixels per shadow cascade\n"
                  "  --env-map <hdr>                static IBL environment map (default: sky atmosphere)\n"
                  "  --exposure <f>                 manual display exposure (disables auto exposure)\n"
@@ -81,6 +82,8 @@ int runCompareMode(int argc, char** argv) {
             opts.contactShadows = false;
         } else if (a == "--no-volfog") {
             opts.volFog = false;
+        } else if (a == "--no-lens-fx") {
+            opts.lensFx = false;
         } else if (a == "--shadow-debug") {
             opts.shadowDebug = true;
         } else if (a == "--env-map") {

@@ -29,7 +29,10 @@ constexpr VkFormat kComposeFormat = VK_FORMAT_R8G8B8A8_UNORM;
 // shared with the viewer via renderer/deferred/DeferredCore.h.
 
 // Compose pass push constants: column pixel size + text scale + text slot,
-// the source-region window (normalized offset/size) and source dimensions.
+// the source-region window (normalized offset/size) and source dimensions,
+// plus the terminal lens-effects chain (Phase 6a; same algorithm/defaults as
+// the viewer present.frag — lens dirt excluded, the compare paths have no
+// bloom chain).
 struct ComposePush {
     float colSize[2];
     float textScale;
@@ -38,8 +41,10 @@ struct ComposePush {
     float srcSize[2]; // source image pixels
     float nearest;    // != 0: sample nearest (magnification >= 1:1)
     float exposure;   // display-domain ACES input multiplier
+    float lensA[4];   // x = chromatic aberration, y = vignette, z = film grain,
+                      // w = frame index (grain hash seed)
 };
-static_assert(sizeof(ComposePush) == 48, "ComposePush size mismatch");
+static_assert(sizeof(ComposePush) == 64, "ComposePush size mismatch");
 
 // Metric compute push constants (two uvec4s in the shaders).
 struct MetricPush {
@@ -2421,12 +2426,21 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
             push.uvRect[3] = rect[3] / static_cast<float>(dh);
             push.srcSize[0] = static_cast<float>(dw);
             push.srcSize[1] = static_cast<float>(dh);
-            // Nearest sampling once the on-screen magnification passes 1:1.
-            push.nearest = (static_cast<float>(w) >= rect[2]) ? 1.f : 0.f;
+            // Nearest sampling only once the on-screen magnification passes
+            // 1:1 (strictly): at exactly 1:1 linear sampling hits texel
+            // centers anyway, and the lens chain stays active.  Pixel-peep
+            // (>1:1) shows raw texels and skips the lens chain.
+            push.nearest = (static_cast<float>(w) > rect[2]) ? 1.f : 0.f;
             // Per-column exposure: the GT column uses the GT path's solver,
             // algorithm columns the LR path's (auto mode; manual mode shares
             // opts_.exposure everywhere).
             push.exposure = (i == 0) ? gtExposure() : lrExposure();
+            // Terminal lens chain: identical parameters for every column —
+            // each column is an independent present of its own path.
+            push.lensA[0] = opts_.lensFx ? kLensCaStrength : 0.f;
+            push.lensA[1] = opts_.lensFx ? kLensVignetteStrength : 0.f;
+            push.lensA[2] = opts_.lensFx ? kLensGrainStrength : 0.f;
+            push.lensA[3] = static_cast<float>(frameIndex);
             vkCmdPushConstants(cmd, composePipelineLayout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                                sizeof(push), &push);
             vkCmdDraw(cmd, 3, 1, 0, 0);

@@ -506,6 +506,12 @@ private:
     VolFogParams fogParams_;
     // Screen-size LOD switching + distance cull (per-frame CPU selection).
     bool lodEnabled_ = lodEnabledByDefault();
+    // Terminal lens-effects chain (Phase 6a, compose push constants; lens
+    // dirt is viewer-only — it needs the HDR bloom pyramid).  Strengths are
+    // the shared DeferredCore defaults (kLens*Strength).
+    bool lensCaEnabled_ = true;
+    bool lensVignetteEnabled_ = true;
+    bool lensGrainEnabled_ = true;
 
     ImageResource gbColor_;
     ImageResource gbColorSpatial_; // unjittered LR HDR copy for spatial upscalers
@@ -537,7 +543,8 @@ private:
     ImageResource gtSsaaAo_;
     // HDR color mip chains (lit opaque color, box-filtered) for
     // roughness-aware SSR; same GENERAL-for-life resource model as the
-    // depth pyramids.  Phase 6's bloom pyramid is expected to reuse them.
+    // depth pyramids.  Deliberately separate from the Phase 6a bloom pyramid
+    // (box-average reflection LOD vs thresholded extract — see DeferredCore).
     ColorPyramid gbColorPyramid_;
     ColorPyramid gtColorPyramid_;
     ColorPyramid gtSsaaColorPyramid_; // compare GT SSAA only

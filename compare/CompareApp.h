@@ -42,6 +42,11 @@ struct CompareOptions {
     bool shadows = true;                // CSM sun shadows (all paths share one map)
     bool shadowDebug = false;           // tint pixels per shadow cascade
     bool bloom = true;                  // HDR bloom before upscale
+    // Terminal lens-effects chain in the column compose (chromatic
+    // aberration / vignette / film grain; same strengths as the viewer
+    // present pass).  CLI: --no-lens-fx.  Lens dirt is viewer-only (the
+    // compare paths have no HDR bloom chain for it to modulate).
+    bool lensFx = true;
     bool ssr = true;                    // opaque screen-space reflections (CLI: --no-ssr)
     // Screen-space contact shadows for the CSM sun (CLI: --no-contact-shadows);
     // needs shadows on (rides the CSM sun selection).
@@ -199,15 +204,10 @@ private:
     ImageResource gtAo_;
     ImageResource gtSsaaAoRaw_; // gtSsaa only
     ImageResource gtSsaaAo_;
-    ImageResource gbBloomA_;
-    ImageResource gbBloomB_;
-    ImageResource gtBloomA_;
-    ImageResource gtBloomB_;
-    ImageResource gtSsaaBloomA_;
-    ImageResource gtSsaaBloomB_;
     // HDR color mip chains (lit opaque color, box-filtered) for
     // roughness-aware SSR; same GENERAL-for-life resource model as the
-    // depth pyramids.  Phase 6's bloom pyramid is expected to reuse them.
+    // depth pyramids.  Deliberately separate from the Phase 6a bloom pyramid
+    // (box-average reflection LOD vs thresholded extract — see DeferredCore).
     ColorPyramid gbColorPyramid_;
     ColorPyramid gtColorPyramid_;
     ColorPyramid gtSsaaColorPyramid_; // gtSsaa only
@@ -319,18 +319,6 @@ private:
     VkDescriptorSet ssaoSetGb_ = VK_NULL_HANDLE;
     VkDescriptorSet ssaoSetGt_ = VK_NULL_HANDLE;
     VkDescriptorSet ssaoSetSsaa_ = VK_NULL_HANDLE;     // gtSsaa only
-    VkDescriptorSet bloomExtractGb_ = VK_NULL_HANDLE;
-    VkDescriptorSet bloomBlurHGb_ = VK_NULL_HANDLE;
-    VkDescriptorSet bloomBlurVGb_ = VK_NULL_HANDLE;
-    VkDescriptorSet bloomCompGb_ = VK_NULL_HANDLE;
-    VkDescriptorSet bloomExtractGt_ = VK_NULL_HANDLE;
-    VkDescriptorSet bloomBlurHGt_ = VK_NULL_HANDLE;
-    VkDescriptorSet bloomBlurVGt_ = VK_NULL_HANDLE;
-    VkDescriptorSet bloomCompGt_ = VK_NULL_HANDLE;
-    VkDescriptorSet bloomExtractSsaa_ = VK_NULL_HANDLE;
-    VkDescriptorSet bloomBlurHSsaa_ = VK_NULL_HANDLE;
-    VkDescriptorSet bloomBlurVSsaa_ = VK_NULL_HANDLE;
-    VkDescriptorSet bloomCompSsaa_ = VK_NULL_HANDLE;
     VkSampler linearSampler_ = VK_NULL_HANDLE;
     VkSampler fontSampler_ = VK_NULL_HANDLE;
 
@@ -357,12 +345,6 @@ private:
     VkImageLayout gtSsaaEmissiveLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gbAoRawLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gbAoLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
-    VkImageLayout gbBloomALayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
-    VkImageLayout gbBloomBLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
-    VkImageLayout gtBloomALayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
-    VkImageLayout gtBloomBLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
-    VkImageLayout gtSsaaBloomALayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
-    VkImageLayout gtSsaaBloomBLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gtAoRawLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gtAoLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gtSsaaAoRawLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;

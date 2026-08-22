@@ -61,7 +61,8 @@ set(RENDERER_SHADERS
     shaders/hiz_downsample.comp
     shaders/color_downsample.comp
     shaders/bloom_extract.comp
-    shaders/bloom_blur.comp
+    shaders/bloom_downsample.comp
+    shaders/bloom_upsample.comp
     shaders/bloom_composite.comp
     shaders/exposure_histogram.comp
     shaders/exposure_solve.comp

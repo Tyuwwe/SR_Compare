@@ -49,6 +49,7 @@ void printUsage() {
                  "  --shadow-debug                   tint pixels per shadow cascade\n"
                  "  --exposure <f>                   manual display exposure (disables auto exposure)\n"
                  "  --no-bloom                       disable HDR bloom\n"
+                 "  --no-lens-fx                     disable the present lens chain (CA/dirt/vignette/grain)\n"
                  "  --no-ssr                         disable opaque screen-space reflections\n"
                  "  --no-contact-shadows             disable screen-space contact shadows (sun)\n"
                  "  --no-volfog                      disable froxel volumetric fog\n"
@@ -117,6 +118,8 @@ int runViewer(int argc, char** argv) {
             opts.autoExposure = false;
         } else if (a == "--no-bloom") {
             opts.bloom = false;
+        } else if (a == "--no-lens-fx") {
+            opts.lensFx = false;
         } else if (a == "--no-ssr") {
             opts.ssr = false;
         } else if (a == "--no-contact-shadows") {
