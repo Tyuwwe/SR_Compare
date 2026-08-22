@@ -52,6 +52,14 @@ struct CompareOptions {
     // needs shadows on (rides the CSM sun selection).
     bool contactShadows = true;
     bool volFog = true;                 // froxel volumetric fog (CLI: --no-volfog)
+    // Motion blur + depth of field (Phase 6b), HDR domain on every path (LR
+    // at render res before upscale, GT at native res, GT-SSAA at 2x before
+    // the downsample) with identical algorithm + parameters; CLI:
+    // --no-motion-blur / --no-dof.  On by default: the GT column runs the
+    // same post chain as the algorithm columns, so the metrics stay fair —
+    // MB/DOF change the pixel content of EVERY column's input by design.
+    bool motionBlur = true;
+    bool dof = true;
     float zoom = 1.f;                   // compare-view zoom (1..16)
     float zoomCenterU = 0.5f;           // zoom window center, normalized source UV
     float zoomCenterV = 0.5f;
@@ -185,6 +193,9 @@ private:
     ImageResource gbEmissive_;
     ImageResource gtColor_;
     ImageResource gtDepth_;
+    // GT-path motion RT (Phase 6b): the GT GBuffer writes per-object motion so
+    // the GT column's motion blur matches the LR path.
+    ImageResource gtMotion_;
     // Deferred GBuffer attachments of the native-res GT pass.
     ImageResource gtAlbedo_;
     ImageResource gtNormal_;
@@ -192,6 +203,7 @@ private:
     ImageResource gtEmissive_;
     ImageResource gtSsaaColor_; // 2x GT render target (gtSsaa only)
     ImageResource gtSsaaDepth_;
+    ImageResource gtSsaaMotion_; // 2x GT motion RT (Phase 6b, gtSsaa only)
     // Deferred GBuffer attachments of the 2x GT pass (gtSsaa only).
     ImageResource gtSsaaAlbedo_;
     ImageResource gtSsaaNormal_;
@@ -275,6 +287,11 @@ private:
     uint32_t fogAccumFrameSsaa_ = ~0u;
     VolFogParams fogParams_;
     bool volFogActive_ = false;
+    // Motion-blur + DOF working targets (Phase 6b), one per path (SSAA only
+    // when gtSsaa); same host-owned GENERAL-for-life model as the pyramids.
+    PostFxTargets gbPostFx_;
+    PostFxTargets gtPostFx_;
+    PostFxTargets gtSsaaPostFx_; // gtSsaa only
     ImageResource composeImage_; // RGBA8, tonemapped columns + overlay
     ImageResource fontAtlas_;
 
@@ -333,12 +350,14 @@ private:
     VkImageLayout gbEmissiveLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gtColorLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gtDepthLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageLayout gtMotionLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gtAlbedoLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gtNormalLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gtMaterialLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gtEmissiveLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gtSsaaColorLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gtSsaaDepthLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageLayout gtSsaaMotionLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gtSsaaAlbedoLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gtSsaaNormalLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gtSsaaMaterialLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;

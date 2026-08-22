@@ -1,0 +1,52 @@
+#version 450
+// Depth-of-field composite pass (Phase 6b), full path resolution: combines
+// the sharp HDR color with the half-res background and foreground bokeh
+// layers (UE4 layering: background blur behind the focused image, foreground
+// blur on top of both).  The layers store sum(color*w) / sum(w) from
+// dof_gather.comp; the blend factor is the normalized coverage (saturated
+// weight sum), so a pixel fully covered by defocused neighbours goes fully
+// blurred while isolated coverage only bleeds the bokeh in slightly.
+//
+// The sharp source is bound as a storage image and read with imageLoad at
+// the pixel being written (same-texel RMW is race-free per invocation, same
+// pattern as bloom_composite.comp); the layers are separate images sampled
+// bilinearly.
+//
+//   binding 0 = sharp HDR color (storage image, read)
+//   binding 1 = half-res cocColor (sampler; a = signed CoC normalized)
+//   binding 2 = half-res background layer (sampler)
+//   binding 3 = half-res foreground layer (sampler)
+//   binding 4 = HDR color out (storage image, write)
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, rgba16f) uniform readonly image2D sharp;
+layout(set = 0, binding = 1) uniform sampler2D cocColor;
+layout(set = 0, binding = 2) uniform sampler2D bgLayer;
+layout(set = 0, binding = 3) uniform sampler2D fgLayer;
+layout(set = 0, binding = 4, rgba16f) uniform writeonly image2D outColor;
+
+layout(push_constant) uniform Push {
+    vec4 params; // x = 1 / kTaps (coverage normalization), yzw unused
+} pc;
+
+void main() {
+    const ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    if (pix.x >= imageSize(outColor).x || pix.y >= imageSize(outColor).y) return;
+
+    const vec2 uv = (vec2(pix) + 0.5) / vec2(imageSize(outColor));
+    const vec3 c0 = imageLoad(sharp, pix).rgb;
+
+    const vec4 bg = texture(bgLayer, uv);
+    const vec4 fg = texture(fgLayer, uv);
+    // tap.a = sum(cover weights); normalize by the tap count and saturate.
+    const float bgW = clamp(bg.a * pc.params.x, 0.0, 1.0);
+    const float fgW = clamp(fg.a * pc.params.x, 0.0, 1.0);
+    const vec3 bgC = bg.rgb / max(bg.a, 1e-3);
+    const vec3 fgC = fg.rgb / max(fg.a, 1e-3);
+
+    // Background layer behind the sharp image, foreground on top (UE4).
+    vec3 c = mix(c0, bgC, bgW);
+    c = mix(c, fgC, fgW);
+    imageStore(outColor, pix, vec4(c, 1.0));
+}

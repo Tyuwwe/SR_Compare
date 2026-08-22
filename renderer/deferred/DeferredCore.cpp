@@ -202,7 +202,14 @@ bool DeferredCore::init(const VulkanContext& ctx, const char* envMapPath, const 
         !loadShader(ctx, "volfog_light.comp.spv", volfogLightComp_) ||
         !loadShader(ctx, "volfog_temporal.comp.spv", volfogTemporalComp_) ||
         !loadShader(ctx, "volfog_march.comp.spv", volfogMarchComp_) ||
-        !loadShader(ctx, "volfog_composite.comp.spv", volfogCompositeComp_))
+        !loadShader(ctx, "volfog_composite.comp.spv", volfogCompositeComp_) ||
+        !loadShader(ctx, "motion_blur_tilemax.comp.spv", motionBlurTilemaxComp_) ||
+        !loadShader(ctx, "motion_blur_neighborhood.comp.spv", motionBlurNeighborhoodComp_) ||
+        !loadShader(ctx, "motion_blur_gather.comp.spv", motionBlurGatherComp_) ||
+        !loadShader(ctx, "dof_coc.comp.spv", dofCocComp_) ||
+        !loadShader(ctx, "dof_gather.comp.spv", dofGatherComp_) ||
+        !loadShader(ctx, "dof_composite.comp.spv", dofCompositeComp_) ||
+        !loadShader(ctx, "postfx_copyback.comp.spv", postFxCopybackComp_))
         return false;
 
     if (!createLayouts(ctx)) return false;
@@ -613,8 +620,131 @@ bool DeferredCore::createLayouts(const VulkanContext& ctx) {
     volfogCompositeLayoutCi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
     volfogCompositeLayoutCi.bindingCount = 3;
     volfogCompositeLayoutCi.pBindings = volfogCompositeBindings;
-    return vkCreateDescriptorSetLayout(ctx.device, &volfogCompositeLayoutCi, nullptr,
-                                       &volfogCompositeSetLayout_) == VK_SUCCESS;
+    if (vkCreateDescriptorSetLayout(ctx.device, &volfogCompositeLayoutCi, nullptr,
+                                    &volfogCompositeSetLayout_) != VK_SUCCESS)
+        return false;
+
+    // --- Motion blur + DOF (Phase 6b; binding shapes per motion_blur_*/dof_*.comp) ---
+    // Tile max + neighbourhood max: 0 = src (sampler), 1 = dst (storage) —
+    // one layout shared by both reduce passes.
+    VkDescriptorSetLayoutBinding mbTileBindings[2] = {};
+    mbTileBindings[0].binding = 0;
+    mbTileBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    mbTileBindings[0].descriptorCount = 1;
+    mbTileBindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    mbTileBindings[1].binding = 1;
+    mbTileBindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    mbTileBindings[1].descriptorCount = 1;
+    mbTileBindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    VkDescriptorSetLayoutCreateInfo mbTileLayoutCi = {};
+    mbTileLayoutCi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    mbTileLayoutCi.bindingCount = 2;
+    mbTileLayoutCi.pBindings = mbTileBindings;
+    if (vkCreateDescriptorSetLayout(ctx.device, &mbTileLayoutCi, nullptr, &mbTileSetLayout_) !=
+        VK_SUCCESS)
+        return false;
+
+    // Gather: 0 = color, 1 = motion, 2 = neighbourhood max, 3 = depth
+    // (samplers), 4 = blurred out (storage).
+    VkDescriptorSetLayoutBinding mbGatherBindings[5] = {};
+    for (uint32_t i = 0; i < 4; ++i) {
+        mbGatherBindings[i].binding = i;
+        mbGatherBindings[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        mbGatherBindings[i].descriptorCount = 1;
+        mbGatherBindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+    mbGatherBindings[4].binding = 4;
+    mbGatherBindings[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    mbGatherBindings[4].descriptorCount = 1;
+    mbGatherBindings[4].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    VkDescriptorSetLayoutCreateInfo mbGatherLayoutCi = {};
+    mbGatherLayoutCi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    mbGatherLayoutCi.bindingCount = 5;
+    mbGatherLayoutCi.pBindings = mbGatherBindings;
+    if (vkCreateDescriptorSetLayout(ctx.device, &mbGatherLayoutCi, nullptr, &mbGatherSetLayout_) !=
+        VK_SUCCESS)
+        return false;
+
+    // DOF CoC: 0 = color, 1 = depth (samplers), 2 = half-res cocColor (storage).
+    VkDescriptorSetLayoutBinding dofCocBindings[3] = {};
+    for (uint32_t i = 0; i < 2; ++i) {
+        dofCocBindings[i].binding = i;
+        dofCocBindings[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        dofCocBindings[i].descriptorCount = 1;
+        dofCocBindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+    dofCocBindings[2].binding = 2;
+    dofCocBindings[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    dofCocBindings[2].descriptorCount = 1;
+    dofCocBindings[2].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    VkDescriptorSetLayoutCreateInfo dofCocLayoutCi = {};
+    dofCocLayoutCi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    dofCocLayoutCi.bindingCount = 3;
+    dofCocLayoutCi.pBindings = dofCocBindings;
+    if (vkCreateDescriptorSetLayout(ctx.device, &dofCocLayoutCi, nullptr, &dofCocSetLayout_) !=
+        VK_SUCCESS)
+        return false;
+
+    // DOF gather: 0 = cocColor (sampler), 1/2 = background/foreground layers (storage).
+    VkDescriptorSetLayoutBinding dofGatherBindings[3] = {};
+    dofGatherBindings[0].binding = 0;
+    dofGatherBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    dofGatherBindings[0].descriptorCount = 1;
+    dofGatherBindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    for (uint32_t i = 1; i < 3; ++i) {
+        dofGatherBindings[i].binding = i;
+        dofGatherBindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        dofGatherBindings[i].descriptorCount = 1;
+        dofGatherBindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo dofGatherLayoutCi = {};
+    dofGatherLayoutCi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    dofGatherLayoutCi.bindingCount = 3;
+    dofGatherLayoutCi.pBindings = dofGatherBindings;
+    if (vkCreateDescriptorSetLayout(ctx.device, &dofGatherLayoutCi, nullptr,
+                                    &dofGatherSetLayout_) != VK_SUCCESS)
+        return false;
+
+    // DOF composite: 0 = sharp color (storage, imageLoad), 1-3 = cocColor /
+    // background / foreground layers (samplers), 4 = HDR out (storage).
+    VkDescriptorSetLayoutBinding dofCompositeBindings[5] = {};
+    dofCompositeBindings[0].binding = 0;
+    dofCompositeBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    dofCompositeBindings[0].descriptorCount = 1;
+    dofCompositeBindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    for (uint32_t i = 1; i < 4; ++i) {
+        dofCompositeBindings[i].binding = i;
+        dofCompositeBindings[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        dofCompositeBindings[i].descriptorCount = 1;
+        dofCompositeBindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+    dofCompositeBindings[4].binding = 4;
+    dofCompositeBindings[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    dofCompositeBindings[4].descriptorCount = 1;
+    dofCompositeBindings[4].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    VkDescriptorSetLayoutCreateInfo dofCompositeLayoutCi = {};
+    dofCompositeLayoutCi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    dofCompositeLayoutCi.bindingCount = 5;
+    dofCompositeLayoutCi.pBindings = dofCompositeBindings;
+    if (vkCreateDescriptorSetLayout(ctx.device, &dofCompositeLayoutCi, nullptr,
+                                    &dofCompositeSetLayout_) != VK_SUCCESS)
+        return false;
+
+    // MB copy-back (MB on, DOF off): 0 = blurred color (storage, read),
+    // 1 = lit HDR out (storage, write).
+    VkDescriptorSetLayoutBinding copybackBindings[2] = {};
+    for (uint32_t i = 0; i < 2; ++i) {
+        copybackBindings[i].binding = i;
+        copybackBindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        copybackBindings[i].descriptorCount = 1;
+        copybackBindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo copybackLayoutCi = {};
+    copybackLayoutCi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    copybackLayoutCi.bindingCount = 2;
+    copybackLayoutCi.pBindings = copybackBindings;
+    return vkCreateDescriptorSetLayout(ctx.device, &copybackLayoutCi, nullptr,
+                                       &postFxCopybackSetLayout_) == VK_SUCCESS;
 }
 
 bool DeferredCore::createPipelines(const VulkanContext& ctx) {
@@ -759,15 +889,16 @@ bool DeferredCore::createPipelines(const VulkanContext& ctx) {
     if (createGraphicsPipeline(ctx, sceneCi, gbufferPipeline_) != VK_SUCCESS)
         return false;
 
-    // GT GBuffer pipeline: same minus the motion attachment.
+    // GT GBuffer pipeline: same five attachments (Phase 6b: the GT path keeps
+    // a motion RT so GT motion blur matches the LR path's).
     VkPipelineRenderingCreateInfo gtRendering = {};
     gtRendering.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
-    gtRendering.colorAttachmentCount = 4;
+    gtRendering.colorAttachmentCount = 5;
     gtRendering.pColorAttachmentFormats = gbColorFormats;
     gtRendering.depthAttachmentFormat = deferred::kDepthFormat;
     sceneCi.pNext = &gtRendering;
-    colorBlend.attachmentCount = 4;
-    stages[1].module = gbufferGtFrag_; // GT shader has no motion output
+    colorBlend.attachmentCount = 5;
+    stages[1].module = gbufferGtFrag_;
     if (createGraphicsPipeline(ctx, sceneCi, gbufferGtPipeline_) != VK_SUCCESS)
         return false;
 
@@ -805,7 +936,7 @@ bool DeferredCore::createPipelines(const VulkanContext& ctx) {
     if (createGraphicsPipeline(ctx, sceneCi, gbufferSkinnedPipeline_) != VK_SUCCESS)
         return false;
     stages[1].module = gbufferGtFrag_;
-    colorBlend.attachmentCount = 4;
+    colorBlend.attachmentCount = 5;
     sceneCi.pNext = &gtRendering;
     if (createGraphicsPipeline(ctx, sceneCi, gbufferSkinnedGtPipeline_) != VK_SUCCESS)
         return false;
@@ -1118,6 +1249,120 @@ bool DeferredCore::createPipelines(const VulkanContext& ctx) {
     if (createComputePipeline(ctx, bloomCi, bloomCompositePipeline_) != VK_SUCCESS)
         return false;
 
+    // --- Motion blur + DOF (Phase 6b) ----------------------------------------
+    // One pipeline layout per pass (each carries its own push range); the
+    // tile-max and neighbourhood-max passes share mbTileSetLayout_.
+    {
+        VkPushConstantRange mbTilePushRange = {};
+        mbTilePushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        mbTilePushRange.offset = 0;
+        mbTilePushRange.size = sizeof(MotionBlurTilePush);
+        VkPipelineLayoutCreateInfo ci = {};
+        ci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        ci.setLayoutCount = 1;
+        ci.pSetLayouts = &mbTileSetLayout_;
+        ci.pushConstantRangeCount = 1;
+        ci.pPushConstantRanges = &mbTilePushRange;
+        if (vkCreatePipelineLayout(ctx.device, &ci, nullptr, &mbTilePipelineLayout_) != VK_SUCCESS)
+            return false;
+
+        VkPushConstantRange mbGatherPushRange = {};
+        mbGatherPushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        mbGatherPushRange.offset = 0;
+        mbGatherPushRange.size = sizeof(MotionBlurGatherPush);
+        VkPipelineLayoutCreateInfo gci = {};
+        gci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        gci.setLayoutCount = 1;
+        gci.pSetLayouts = &mbGatherSetLayout_;
+        gci.pushConstantRangeCount = 1;
+        gci.pPushConstantRanges = &mbGatherPushRange;
+        if (vkCreatePipelineLayout(ctx.device, &gci, nullptr, &mbGatherPipelineLayout_) !=
+            VK_SUCCESS)
+            return false;
+
+        VkPushConstantRange dofCocPushRange = {};
+        dofCocPushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        dofCocPushRange.offset = 0;
+        dofCocPushRange.size = sizeof(DofCocPush);
+        VkPipelineLayoutCreateInfo cci = {};
+        cci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        cci.setLayoutCount = 1;
+        cci.pSetLayouts = &dofCocSetLayout_;
+        cci.pushConstantRangeCount = 1;
+        cci.pPushConstantRanges = &dofCocPushRange;
+        if (vkCreatePipelineLayout(ctx.device, &cci, nullptr, &dofCocPipelineLayout_) != VK_SUCCESS)
+            return false;
+
+        VkPushConstantRange dofGatherPushRange = {};
+        dofGatherPushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        dofGatherPushRange.offset = 0;
+        dofGatherPushRange.size = sizeof(DofGatherPush);
+        VkPipelineLayoutCreateInfo dgci = {};
+        dgci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        dgci.setLayoutCount = 1;
+        dgci.pSetLayouts = &dofGatherSetLayout_;
+        dgci.pushConstantRangeCount = 1;
+        dgci.pPushConstantRanges = &dofGatherPushRange;
+        if (vkCreatePipelineLayout(ctx.device, &dgci, nullptr, &dofGatherPipelineLayout_) !=
+            VK_SUCCESS)
+            return false;
+
+        VkPushConstantRange dofCompositePushRange = {};
+        dofCompositePushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        dofCompositePushRange.offset = 0;
+        dofCompositePushRange.size = sizeof(DofCompositePush);
+        VkPipelineLayoutCreateInfo dcci = {};
+        dcci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        dcci.setLayoutCount = 1;
+        dcci.pSetLayouts = &dofCompositeSetLayout_;
+        dcci.pushConstantRangeCount = 1;
+        dcci.pPushConstantRanges = &dofCompositePushRange;
+        if (vkCreatePipelineLayout(ctx.device, &dcci, nullptr, &dofCompositePipelineLayout_) !=
+            VK_SUCCESS)
+            return false;
+
+        // Copy-back: no push constants.
+        VkPipelineLayoutCreateInfo kci = {};
+        kci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        kci.setLayoutCount = 1;
+        kci.pSetLayouts = &postFxCopybackSetLayout_;
+        if (vkCreatePipelineLayout(ctx.device, &kci, nullptr, &postFxCopybackPipelineLayout_) !=
+            VK_SUCCESS)
+            return false;
+    }
+    VkComputePipelineCreateInfo postFxCi = {};
+    postFxCi.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    postFxCi.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    postFxCi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    postFxCi.stage.pName = "main";
+    postFxCi.layout = mbTilePipelineLayout_;
+    postFxCi.stage.module = motionBlurTilemaxComp_;
+    if (createComputePipeline(ctx, postFxCi, mbTilePipeline_) != VK_SUCCESS)
+        return false;
+    postFxCi.stage.module = motionBlurNeighborhoodComp_;
+    if (createComputePipeline(ctx, postFxCi, mbNeighborPipeline_) != VK_SUCCESS)
+        return false;
+    postFxCi.layout = mbGatherPipelineLayout_;
+    postFxCi.stage.module = motionBlurGatherComp_;
+    if (createComputePipeline(ctx, postFxCi, mbGatherPipeline_) != VK_SUCCESS)
+        return false;
+    postFxCi.layout = dofCocPipelineLayout_;
+    postFxCi.stage.module = dofCocComp_;
+    if (createComputePipeline(ctx, postFxCi, dofCocPipeline_) != VK_SUCCESS)
+        return false;
+    postFxCi.layout = dofGatherPipelineLayout_;
+    postFxCi.stage.module = dofGatherComp_;
+    if (createComputePipeline(ctx, postFxCi, dofGatherPipeline_) != VK_SUCCESS)
+        return false;
+    postFxCi.layout = dofCompositePipelineLayout_;
+    postFxCi.stage.module = dofCompositeComp_;
+    if (createComputePipeline(ctx, postFxCi, dofCompositePipeline_) != VK_SUCCESS)
+        return false;
+    postFxCi.layout = postFxCopybackPipelineLayout_;
+    postFxCi.stage.module = postFxCopybackComp_;
+    if (createComputePipeline(ctx, postFxCi, postFxCopybackPipeline_) != VK_SUCCESS)
+        return false;
+
     // --- Auto exposure (histogram + EV solver) --------------------------------
     // Both passes share exposureSetLayout_ (bindings 0-2); each pipeline
     // layout carries its own push range.
@@ -1323,6 +1568,25 @@ void DeferredCore::destroy(const VulkanContext& ctx) {
     if (volfogTemporalPipeline_) { vkDestroyPipeline(ctx.device, volfogTemporalPipeline_, nullptr); volfogTemporalPipeline_ = VK_NULL_HANDLE; }
     if (volfogMarchPipeline_) { vkDestroyPipeline(ctx.device, volfogMarchPipeline_, nullptr); volfogMarchPipeline_ = VK_NULL_HANDLE; }
     if (volfogCompositePipeline_) { vkDestroyPipeline(ctx.device, volfogCompositePipeline_, nullptr); volfogCompositePipeline_ = VK_NULL_HANDLE; }
+    if (mbTilePipeline_) { vkDestroyPipeline(ctx.device, mbTilePipeline_, nullptr); mbTilePipeline_ = VK_NULL_HANDLE; }
+    if (mbNeighborPipeline_) { vkDestroyPipeline(ctx.device, mbNeighborPipeline_, nullptr); mbNeighborPipeline_ = VK_NULL_HANDLE; }
+    if (mbGatherPipeline_) { vkDestroyPipeline(ctx.device, mbGatherPipeline_, nullptr); mbGatherPipeline_ = VK_NULL_HANDLE; }
+    if (dofCocPipeline_) { vkDestroyPipeline(ctx.device, dofCocPipeline_, nullptr); dofCocPipeline_ = VK_NULL_HANDLE; }
+    if (dofGatherPipeline_) { vkDestroyPipeline(ctx.device, dofGatherPipeline_, nullptr); dofGatherPipeline_ = VK_NULL_HANDLE; }
+    if (dofCompositePipeline_) { vkDestroyPipeline(ctx.device, dofCompositePipeline_, nullptr); dofCompositePipeline_ = VK_NULL_HANDLE; }
+    if (postFxCopybackPipeline_) { vkDestroyPipeline(ctx.device, postFxCopybackPipeline_, nullptr); postFxCopybackPipeline_ = VK_NULL_HANDLE; }
+    if (mbTilePipelineLayout_) { vkDestroyPipelineLayout(ctx.device, mbTilePipelineLayout_, nullptr); mbTilePipelineLayout_ = VK_NULL_HANDLE; }
+    if (mbGatherPipelineLayout_) { vkDestroyPipelineLayout(ctx.device, mbGatherPipelineLayout_, nullptr); mbGatherPipelineLayout_ = VK_NULL_HANDLE; }
+    if (dofCocPipelineLayout_) { vkDestroyPipelineLayout(ctx.device, dofCocPipelineLayout_, nullptr); dofCocPipelineLayout_ = VK_NULL_HANDLE; }
+    if (dofGatherPipelineLayout_) { vkDestroyPipelineLayout(ctx.device, dofGatherPipelineLayout_, nullptr); dofGatherPipelineLayout_ = VK_NULL_HANDLE; }
+    if (dofCompositePipelineLayout_) { vkDestroyPipelineLayout(ctx.device, dofCompositePipelineLayout_, nullptr); dofCompositePipelineLayout_ = VK_NULL_HANDLE; }
+    if (postFxCopybackPipelineLayout_) { vkDestroyPipelineLayout(ctx.device, postFxCopybackPipelineLayout_, nullptr); postFxCopybackPipelineLayout_ = VK_NULL_HANDLE; }
+    if (mbTileSetLayout_) { vkDestroyDescriptorSetLayout(ctx.device, mbTileSetLayout_, nullptr); mbTileSetLayout_ = VK_NULL_HANDLE; }
+    if (mbGatherSetLayout_) { vkDestroyDescriptorSetLayout(ctx.device, mbGatherSetLayout_, nullptr); mbGatherSetLayout_ = VK_NULL_HANDLE; }
+    if (dofCocSetLayout_) { vkDestroyDescriptorSetLayout(ctx.device, dofCocSetLayout_, nullptr); dofCocSetLayout_ = VK_NULL_HANDLE; }
+    if (dofGatherSetLayout_) { vkDestroyDescriptorSetLayout(ctx.device, dofGatherSetLayout_, nullptr); dofGatherSetLayout_ = VK_NULL_HANDLE; }
+    if (dofCompositeSetLayout_) { vkDestroyDescriptorSetLayout(ctx.device, dofCompositeSetLayout_, nullptr); dofCompositeSetLayout_ = VK_NULL_HANDLE; }
+    if (postFxCopybackSetLayout_) { vkDestroyDescriptorSetLayout(ctx.device, postFxCopybackSetLayout_, nullptr); postFxCopybackSetLayout_ = VK_NULL_HANDLE; }
     if (scenePipelineLayout_) { vkDestroyPipelineLayout(ctx.device, scenePipelineLayout_, nullptr); scenePipelineLayout_ = VK_NULL_HANDLE; }
     if (lightingPipelineLayout_) { vkDestroyPipelineLayout(ctx.device, lightingPipelineLayout_, nullptr); lightingPipelineLayout_ = VK_NULL_HANDLE; }
     if (transparentPipelineLayout_) { vkDestroyPipelineLayout(ctx.device, transparentPipelineLayout_, nullptr); transparentPipelineLayout_ = VK_NULL_HANDLE; }
@@ -1372,6 +1636,13 @@ void DeferredCore::destroy(const VulkanContext& ctx) {
     if (volfogTemporalComp_) { vkDestroyShaderModule(ctx.device, volfogTemporalComp_, nullptr); volfogTemporalComp_ = VK_NULL_HANDLE; }
     if (volfogMarchComp_) { vkDestroyShaderModule(ctx.device, volfogMarchComp_, nullptr); volfogMarchComp_ = VK_NULL_HANDLE; }
     if (volfogCompositeComp_) { vkDestroyShaderModule(ctx.device, volfogCompositeComp_, nullptr); volfogCompositeComp_ = VK_NULL_HANDLE; }
+    if (motionBlurTilemaxComp_) { vkDestroyShaderModule(ctx.device, motionBlurTilemaxComp_, nullptr); motionBlurTilemaxComp_ = VK_NULL_HANDLE; }
+    if (motionBlurNeighborhoodComp_) { vkDestroyShaderModule(ctx.device, motionBlurNeighborhoodComp_, nullptr); motionBlurNeighborhoodComp_ = VK_NULL_HANDLE; }
+    if (motionBlurGatherComp_) { vkDestroyShaderModule(ctx.device, motionBlurGatherComp_, nullptr); motionBlurGatherComp_ = VK_NULL_HANDLE; }
+    if (dofCocComp_) { vkDestroyShaderModule(ctx.device, dofCocComp_, nullptr); dofCocComp_ = VK_NULL_HANDLE; }
+    if (dofGatherComp_) { vkDestroyShaderModule(ctx.device, dofGatherComp_, nullptr); dofGatherComp_ = VK_NULL_HANDLE; }
+    if (dofCompositeComp_) { vkDestroyShaderModule(ctx.device, dofCompositeComp_, nullptr); dofCompositeComp_ = VK_NULL_HANDLE; }
+    if (postFxCopybackComp_) { vkDestroyShaderModule(ctx.device, postFxCopybackComp_, nullptr); postFxCopybackComp_ = VK_NULL_HANDLE; }
     if (sceneSetLayout_) { vkDestroyDescriptorSetLayout(ctx.device, sceneSetLayout_, nullptr); sceneSetLayout_ = VK_NULL_HANDLE; }
     if (textureSetLayout_) { vkDestroyDescriptorSetLayout(ctx.device, textureSetLayout_, nullptr); textureSetLayout_ = VK_NULL_HANDLE; }
     if (lightingSetLayout_) { vkDestroyDescriptorSetLayout(ctx.device, lightingSetLayout_, nullptr); lightingSetLayout_ = VK_NULL_HANDLE; }
@@ -3408,6 +3679,311 @@ void DeferredCore::recordBloomPyramidPass(VkCommandBuffer cmd, const BloomPyrami
                  VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
     colorLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 }
+
+// --- Motion blur + depth of field (Phase 6b) ------------------------------------
+// Resource model matches BloomPyramid: host-owned GENERAL-for-life images,
+// pool-owned descriptor sets, DeferredCore provides create/write/record/
+// destroy.
+
+bool DeferredCore::createPostFxTargets(const VulkanContext& ctx, uint32_t w, uint32_t h,
+                                       PostFxTargets& out) const {
+    out.width = w;
+    out.height = h;
+    out.tilesX = (w + kMotionBlurTileSize - 1) / kMotionBlurTileSize;
+    out.tilesY = (h + kMotionBlurTileSize - 1) / kMotionBlurTileSize;
+    const uint32_t halfW = std::max(1u, w / 2);
+    const uint32_t halfH = std::max(1u, h / 2);
+    struct Spec {
+        uint32_t w, h;
+        VkFormat format;
+        VkImage* image;
+        VmaAllocation* memory;
+        VkImageView* view;
+    };
+    const Spec specs[] = {
+        {out.tilesX, out.tilesY, deferred::kMotionFormat, &out.tileMaxImage, &out.tileMaxMemory, &out.tileMaxView},
+        {out.tilesX, out.tilesY, deferred::kMotionFormat, &out.neighborMaxImage, &out.neighborMaxMemory, &out.neighborMaxView},
+        {w, h, deferred::kHdrColorFormat, &out.mbOutImage, &out.mbOutMemory, &out.mbOutView},
+        {halfW, halfH, deferred::kHdrColorFormat, &out.cocColorImage, &out.cocColorMemory, &out.cocColorView},
+        {halfW, halfH, deferred::kHdrColorFormat, &out.bgImage, &out.bgMemory, &out.bgView},
+        {halfW, halfH, deferred::kHdrColorFormat, &out.fgImage, &out.fgMemory, &out.fgView},
+    };
+    for (const Spec& s : specs) {
+        if (createImage(ctx, s.w, s.h, s.format,
+                        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, *s.image,
+                        *s.memory) != VK_SUCCESS)
+            return false;
+        *s.view = createImageView(ctx, *s.image, s.format, VK_IMAGE_ASPECT_COLOR_BIT, 0, 1);
+        if (!*s.view) return false;
+        // GENERAL for life: every image ping-pongs between compute storage
+        // writes and sampled reads within the pass chain.
+        VkImage img = *s.image;
+        submitOneShot(ctx, [&](VkCommandBuffer cmd) {
+            imageBarrier(cmd, img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                         VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                         VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
+        });
+    }
+    return true;
+}
+
+bool DeferredCore::writePostFxSets(const VulkanContext& ctx, VkDescriptorPool pool,
+                                   VkImageView srcColor, VkImageView motion, VkImageView depth,
+                                   PostFxTargets& out) const {
+    auto allocSet = [&](VkDescriptorSetLayout layout, VkDescriptorSet& set) {
+        VkDescriptorSetAllocateInfo alloc = {};
+        alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        alloc.descriptorPool = pool;
+        alloc.descriptorSetCount = 1;
+        alloc.pSetLayouts = &layout;
+        return vkAllocateDescriptorSets(ctx.device, &alloc, &set) == VK_SUCCESS;
+    };
+    auto samplerInfo = [&](VkImageView view, VkImageLayout layout, VkSampler sampler) {
+        VkDescriptorImageInfo info = {};
+        info.sampler = sampler;
+        info.imageView = view;
+        info.imageLayout = layout;
+        return info;
+    };
+    auto storageInfo = [](VkImageView view) {
+        VkDescriptorImageInfo info = {};
+        info.imageView = view;
+        info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        return info;
+    };
+    auto write = [&](VkDescriptorSet set, uint32_t binding, VkDescriptorType type,
+                     const VkDescriptorImageInfo& info) {
+        VkWriteDescriptorSet w = {};
+        w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w.dstSet = set;
+        w.dstBinding = binding;
+        w.descriptorCount = 1;
+        w.descriptorType = type;
+        w.pImageInfo = &info;
+        vkUpdateDescriptorSets(ctx.device, 1, &w, 0, nullptr);
+    };
+    const VkDescriptorType kSam = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    const VkDescriptorType kStor = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    const VkImageLayout kSro = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    const VkImageLayout kGen = VK_IMAGE_LAYOUT_GENERAL;
+
+    // Tile max: motion RT (SHADER_READ_ONLY) -> tileMax.
+    if (!allocSet(mbTileSetLayout_, out.tileSet)) return false;
+    write(out.tileSet, 0, kSam, samplerInfo(motion, kSro, hizSampler_)); // texelFetch
+    write(out.tileSet, 1, kStor, storageInfo(out.tileMaxView));
+    // Neighbourhood max: tileMax -> neighborMax (both GENERAL).
+    if (!allocSet(mbTileSetLayout_, out.neighborSet)) return false;
+    write(out.neighborSet, 0, kSam, samplerInfo(out.tileMaxView, kGen, hizSampler_));
+    write(out.neighborSet, 1, kStor, storageInfo(out.neighborMaxView));
+    // Gather: lit color + motion + neighbourhood max + depth -> mbOut.
+    if (!allocSet(mbGatherSetLayout_, out.gatherSet)) return false;
+    write(out.gatherSet, 0, kSam, samplerInfo(srcColor, kSro, gbufferSampler_));
+    write(out.gatherSet, 1, kSam, samplerInfo(motion, kSro, gbufferSampler_));
+    write(out.gatherSet, 2, kSam, samplerInfo(out.neighborMaxView, kGen, hizSampler_));
+    write(out.gatherSet, 3, kSam, samplerInfo(depth, kSro, hizSampler_));
+    write(out.gatherSet, 4, kStor, storageInfo(out.mbOutView));
+    // DOF CoC: color (mbOut GENERAL or lit SHADER_READ_ONLY) + depth -> cocColor.
+    if (!allocSet(dofCocSetLayout_, out.cocSetMb)) return false;
+    write(out.cocSetMb, 0, kSam, samplerInfo(out.mbOutView, kGen, gbufferSampler_));
+    write(out.cocSetMb, 1, kSam, samplerInfo(depth, kSro, hizSampler_));
+    write(out.cocSetMb, 2, kStor, storageInfo(out.cocColorView));
+    if (!allocSet(dofCocSetLayout_, out.cocSetLit)) return false;
+    write(out.cocSetLit, 0, kSam, samplerInfo(srcColor, kSro, gbufferSampler_));
+    write(out.cocSetLit, 1, kSam, samplerInfo(depth, kSro, hizSampler_));
+    write(out.cocSetLit, 2, kStor, storageInfo(out.cocColorView));
+    // DOF gather: cocColor -> bg/fg layers.
+    if (!allocSet(dofGatherSetLayout_, out.dofGatherSet)) return false;
+    write(out.dofGatherSet, 0, kSam, samplerInfo(out.cocColorView, kGen, gbufferSampler_));
+    write(out.dofGatherSet, 1, kStor, storageInfo(out.bgView));
+    write(out.dofGatherSet, 2, kStor, storageInfo(out.fgView));
+    // DOF composite: sharp (storage imageLoad) + cocColor + layers -> lit color
+    // (storage write; srcColor must be bound for both roles across two sets).
+    if (!allocSet(dofCompositeSetLayout_, out.compositeSetMb)) return false;
+    write(out.compositeSetMb, 0, kStor, storageInfo(out.mbOutView));
+    write(out.compositeSetMb, 1, kSam, samplerInfo(out.cocColorView, kGen, gbufferSampler_));
+    write(out.compositeSetMb, 2, kSam, samplerInfo(out.bgView, kGen, gbufferSampler_));
+    write(out.compositeSetMb, 3, kSam, samplerInfo(out.fgView, kGen, gbufferSampler_));
+    write(out.compositeSetMb, 4, kStor, storageInfo(srcColor));
+    if (!allocSet(dofCompositeSetLayout_, out.compositeSetLit)) return false;
+    write(out.compositeSetLit, 0, kStor, storageInfo(srcColor));
+    write(out.compositeSetLit, 1, kSam, samplerInfo(out.cocColorView, kGen, gbufferSampler_));
+    write(out.compositeSetLit, 2, kSam, samplerInfo(out.bgView, kGen, gbufferSampler_));
+    write(out.compositeSetLit, 3, kSam, samplerInfo(out.fgView, kGen, gbufferSampler_));
+    write(out.compositeSetLit, 4, kStor, storageInfo(srcColor));
+    // MB copy-back (MB on, DOF off): mbOut -> lit color (both storage).
+    if (!allocSet(postFxCopybackSetLayout_, out.copybackSet)) return false;
+    write(out.copybackSet, 0, kStor, storageInfo(out.mbOutView));
+    write(out.copybackSet, 1, kStor, storageInfo(srcColor));
+    return true;
+}
+
+void DeferredCore::destroyPostFxTargets(const VulkanContext& ctx, PostFxTargets& fx) const {
+    struct Res {
+        VkImage* image;
+        VmaAllocation* memory;
+        VkImageView* view;
+    };
+    const Res res[] = {
+        {&fx.tileMaxImage, &fx.tileMaxMemory, &fx.tileMaxView},
+        {&fx.neighborMaxImage, &fx.neighborMaxMemory, &fx.neighborMaxView},
+        {&fx.mbOutImage, &fx.mbOutMemory, &fx.mbOutView},
+        {&fx.cocColorImage, &fx.cocColorMemory, &fx.cocColorView},
+        {&fx.bgImage, &fx.bgMemory, &fx.bgView},
+        {&fx.fgImage, &fx.fgMemory, &fx.fgView},
+    };
+    for (const Res& r : res) {
+        if (*r.view) { vkDestroyImageView(ctx.device, *r.view, nullptr); *r.view = VK_NULL_HANDLE; }
+        if (*r.image) {
+            vmaDestroyImage(ctx.allocator, *r.image, *r.memory);
+            *r.image = VK_NULL_HANDLE;
+            *r.memory = VK_NULL_HANDLE;
+        }
+    }
+    // Descriptor sets are pool-owned; freed with the host's descriptor pool.
+    fx.tileSet = fx.neighborSet = fx.gatherSet = VK_NULL_HANDLE;
+    fx.cocSetMb = fx.cocSetLit = fx.dofGatherSet = VK_NULL_HANDLE;
+    fx.compositeSetMb = fx.compositeSetLit = VK_NULL_HANDLE;
+    fx.copybackSet = VK_NULL_HANDLE;
+    fx.width = fx.height = fx.tilesX = fx.tilesY = 0;
+}
+
+void DeferredCore::recordPostFxPass(VkCommandBuffer cmd, const PostFxTargets& fx, VkImage color,
+                                    VkImageLayout& colorLayout, const PostFxParams& params,
+                                    uint32_t frameIndex) const {
+    if ((!params.motionBlur && !params.dof) || !fx.mbOutImage || fx.width == 0 || fx.height == 0)
+        return;
+
+    auto dispatch = [&](VkPipeline pipe, VkPipelineLayout layout, VkDescriptorSet set,
+                        const void* push, uint32_t pushSize, uint32_t w, uint32_t h) {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, 0,
+                                nullptr);
+        vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, pushSize, push);
+        vkCmdDispatch(cmd, (w + 7) / 8, (h + 7) / 8, 1);
+    };
+    // GENERAL-to-GENERAL same-image barrier between chain steps (write ->
+    // read; readers sample or imageLoad, hence both access bits).
+    constexpr VkAccessFlags2 kFxRead =
+        VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+    auto chainBarrier = [&](VkImage image) {
+        imageBarrier(cmd, image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+                     sync::kCompute, sync::kStorageWrite, sync::kCompute,
+                     kFxRead, VK_IMAGE_ASPECT_COLOR_BIT);
+    };
+    // WAR against last frame's (and this pass's earlier) readers before a
+    // working target is rewritten.
+    auto warBarrier = [&](VkImage image) {
+        imageBarrier(cmd, image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+                     sync::kCompute, kFxRead, sync::kCompute, sync::kStorageWrite,
+                     VK_IMAGE_ASPECT_COLOR_BIT);
+    };
+
+    const bool mb = params.motionBlur;
+    const bool dof = params.dof;
+
+    if (mb) {
+        // WAR: last frame's post-fx readers of the working targets.
+        warBarrier(fx.tileMaxImage);
+        // 1) tile max over the motion RT (SHADER_READ_ONLY, compute in scope).
+        MotionBlurTilePush tilePush = {};
+        tilePush.srcSize[0] = static_cast<int32_t>(fx.width);
+        tilePush.srcSize[1] = static_cast<int32_t>(fx.height);
+        tilePush.tileSize = static_cast<int32_t>(kMotionBlurTileSize);
+        dispatch(mbTilePipeline_, mbTilePipelineLayout_, fx.tileSet, &tilePush, sizeof(tilePush),
+                 fx.tilesX, fx.tilesY);
+
+        // 2) 3x3 neighbourhood max (tileMax write -> sampled, neighborMax write).
+        chainBarrier(fx.tileMaxImage);
+        warBarrier(fx.neighborMaxImage);
+        dispatch(mbNeighborPipeline_, mbTilePipelineLayout_, fx.neighborSet, &tilePush,
+                 sizeof(tilePush), fx.tilesX, fx.tilesY);
+
+        // 3) full-res gather into the intermediate (lit color is
+        //    SHADER_READ_ONLY; motion + depth likewise, compute in scope).
+        chainBarrier(fx.neighborMaxImage);
+        warBarrier(fx.mbOutImage);
+        MotionBlurGatherPush gatherPush = {};
+        gatherPush.params[0] = kMotionBlurShutter;
+        gatherPush.params[1] = params.maxBlurPx;
+        gatherPush.params[2] = static_cast<float>(frameIndex);
+        gatherPush.params[3] = static_cast<float>(kMotionBlurTileSize);
+        gatherPush.params2[0] = static_cast<float>(fx.width);
+        gatherPush.params2[1] = static_cast<float>(fx.height);
+        dispatch(mbGatherPipeline_, mbGatherPipelineLayout_, fx.gatherSet, &gatherPush,
+                 sizeof(gatherPush), fx.width, fx.height);
+        chainBarrier(fx.mbOutImage); // gather writes -> coc/composite reads
+    }
+
+    if (dof) {
+        const uint32_t halfW = std::max(1u, fx.width / 2);
+        const uint32_t halfH = std::max(1u, fx.height / 2);
+        // 1) CoC setup: color (mbOut when MB ran, else the lit target) + depth
+        //    -> half-res cocColor.
+        warBarrier(fx.cocColorImage);
+        DofCocPush cocPush = {};
+        cocPush.depthParams[0] = params.depthM10;
+        cocPush.depthParams[1] = params.depthM14;
+        cocPush.depthParams[2] = params.farPlane;
+        // CoC lives in half-res pixels on both sides (coc stores coc / max,
+        // the gather re-multiplies by it).
+        cocPush.depthParams[3] = params.maxCocPx * 0.5f;
+        cocPush.params[0] = params.aperture;
+        cocPush.params[1] = kDofSkyFocus;
+        dispatch(dofCocPipeline_, dofCocPipelineLayout_, mb ? fx.cocSetMb : fx.cocSetLit,
+                 &cocPush, sizeof(cocPush), halfW, halfH);
+
+        // 2) half-res foreground/background bokeh gather.
+        chainBarrier(fx.cocColorImage);
+        warBarrier(fx.bgImage);
+        warBarrier(fx.fgImage);
+        DofGatherPush dofGatherPush = {};
+        dofGatherPush.params[0] = params.maxCocPx * 0.5f; // cocColor alpha is in half-res px
+        dofGatherPush.params[1] = static_cast<float>(frameIndex);
+        dispatch(dofGatherPipeline_, dofGatherPipelineLayout_, fx.dofGatherSet, &dofGatherPush,
+                 sizeof(dofGatherPush), halfW, halfH);
+
+        // 3) full-res composite back into the lit HDR target.  When MB is off
+        //    the sharp source IS the lit target: same-texel imageLoad/store
+        //    per invocation (race-free, same pattern as bloom composite).
+        chainBarrier(fx.bgImage);
+        chainBarrier(fx.fgImage);
+        imageBarrier(cmd, color, colorLayout, VK_IMAGE_LAYOUT_GENERAL,
+                     VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                     VK_ACCESS_2_SHADER_SAMPLED_READ_BIT, sync::kCompute,
+                     sync::kStorageReadWrite);
+        colorLayout = VK_IMAGE_LAYOUT_GENERAL;
+        DofCompositePush compPush = {};
+        compPush.params[0] = 1.f / static_cast<float>(kDofGatherTaps);
+        dispatch(dofCompositePipeline_, dofCompositePipelineLayout_,
+                 mb ? fx.compositeSetMb : fx.compositeSetLit, &compPush, sizeof(compPush),
+                 fx.width, fx.height);
+        imageBarrier(cmd, color, colorLayout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                     sync::kCompute, sync::kStorageReadWrite,
+                     VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                     sync::kSampled);
+        colorLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    } else if (mb) {
+        // DOF off: nothing else writes the MB gather result back into the lit
+        // target, so copy mbOut -> color here (the DOF composite does this
+        // when DOF runs).
+        imageBarrier(cmd, color, colorLayout, VK_IMAGE_LAYOUT_GENERAL,
+                     VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                     VK_ACCESS_2_SHADER_SAMPLED_READ_BIT, sync::kCompute,
+                     sync::kStorageWrite);
+        colorLayout = VK_IMAGE_LAYOUT_GENERAL;
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, postFxCopybackPipeline_);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                postFxCopybackPipelineLayout_, 0, 1, &fx.copybackSet, 0, nullptr);
+        vkCmdDispatch(cmd, (fx.width + 7) / 8, (fx.height + 7) / 8, 1);
+        imageBarrier(cmd, color, colorLayout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                     sync::kCompute, sync::kStorageWrite,
+                     VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                     sync::kSampled);
+        colorLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    }
+}
+
 
 // --- Auto exposure -------------------------------------------------------------
 // Resource model matches the pyramids: host-owned buffers + pool-owned set,

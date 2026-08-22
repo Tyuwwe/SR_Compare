@@ -300,6 +300,17 @@ bool Renderer::createRenderTargets() {
         return false;
     if (!deferred_.createBloomPyramid(ctx_, dw, dh, gtBloom_))
         return false;
+    // GT-path motion RT (Phase 6b): the GT GBuffer pass writes per-object
+    // motion like the LR path so GT motion blur matches.  Plus the per-path
+    // motion-blur + DOF working targets (GENERAL for life).
+    if (!createRT(gtMotion_, dw, dh, deferred::kMotionFormat,
+                  VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                  VK_IMAGE_ASPECT_COLOR_BIT))
+        return false;
+    if (!deferred_.createPostFxTargets(ctx_, renderWidth_, renderHeight_, gbPostFx_))
+        return false;
+    if (!deferred_.createPostFxTargets(ctx_, dw, dh, gtPostFx_))
+        return false;
     if (!createLensDirtTexture())
         return false;
     if (!deferred_.createDepthPyramid(ctx_, renderWidth_, renderHeight_, gbPyramid_))
@@ -481,6 +492,7 @@ bool Renderer::createSceneDescriptors() {
                                2 * 2 + 3 * 4 + 1 * 4 +     // ssao + temporal + blur samplers
                                3 * 4 +                     // ssr temporal samplers (GB/GT x2 sets)
                                20 +                        // bloom pyramid extract/down/up/comp (GB/GT)
+                               17 * 2 +                    // post-fx MB/DOF sets (Phase 6b, GB/GT)
                                1 +                         // auto-exposure HDR source
                                14 * fogPaths +             // volfog light/temporal/march/composite samplers
                                hizSets + colorSets;
@@ -495,6 +507,7 @@ bool Renderer::createSceneDescriptors() {
     // + volfog inject/light/temporal/march/composite storage (per fog path)
     // + bloom pyramid dst mips (GB/GT)
     sizes[3].descriptorCount = 10 + 8 + hizSets + colorSets + kFramesInFlight * 2 + 20 +
+                               11 * 2 + 2 * 2 + // post-fx MB/DOF storage + MB copy-back (Phase 6b, GB/GT)
                                8 * fogPaths;
     sizes[4].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     sizes[4].descriptorCount = 2 + // auto-exposure histogram + state
@@ -505,6 +518,7 @@ bool Renderer::createSceneDescriptors() {
     poolCi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     poolCi.maxSets = kFramesInFlight * 7 + 12 + 20 + hizSets + colorSets + 1 + 4 +
                      kClusterSlots * 2 + // +12 ssao/temporal/blur, +20 bloom pyramid, +1 auto-exposure, +4 ssr temporal, +cluster assign
+                     8 * 2 + 1 * 2 +      // post-fx MB/DOF sets + MB copy-back (Phase 6b, GB/GT)
                      8 * fogPaths;        // volfog inject/light/temporal/march/composite sets
     poolCi.poolSizeCount = 5;
     poolCi.pPoolSizes = sizes;
@@ -868,6 +882,13 @@ bool Renderer::createSyncResources() {
         return false;
     if (!deferred_.writeBloomPyramidSets(ctx_, descriptorPool_, finalImage_.view, gtBloom_))
         return false;
+    // Post-fx sets (Phase 6b): lit HDR target + motion + depth per path.
+    if (!deferred_.writePostFxSets(ctx_, descriptorPool_, gbColor_.view, gbMotion_.view,
+                                   gbDepth_.view, gbPostFx_))
+        return false;
+    if (!deferred_.writePostFxSets(ctx_, descriptorPool_, finalImage_.view, gtMotion_.view,
+                                   gtDepth_.view, gtPostFx_))
+        return false;
 
     // One renderFinished semaphore per swapchain image: the submit signals the
     // semaphore for the acquired image, and present waits on that same image's
@@ -1018,7 +1039,9 @@ bool Renderer::bakeProbes() {
                                     {0.f, 0.f, 1.f}, {0.f, 1.f, 0.f}, {0.f, 1.f, 0.f}};
 
     // --- bake-local targets (128^2 GBuffer + HDR + white AO stand-in) ----------
-    ImageResource albedo, normal, material, emissive, depth, hdr, ao;
+    // Phase 6b: the GT GBuffer pipeline now has five attachments, so the bake
+    // keeps a (discarded) motion target too.
+    ImageResource albedo, normal, material, emissive, depth, hdr, ao, motion;
     auto createRT = [&](ImageResource& rt, VkFormat format, VkImageUsageFlags usage,
                         VkImageAspectFlags aspect) {
         rt.width = S;
@@ -1035,6 +1058,7 @@ bool Renderer::bakeProbes() {
         createRT(normal, deferred::kNormalFormat, gbUsage, VK_IMAGE_ASPECT_COLOR_BIT) &&
         createRT(material, deferred::kMaterialFormat, gbUsage, VK_IMAGE_ASPECT_COLOR_BIT) &&
         createRT(emissive, deferred::kEmissiveFormat, gbUsage, VK_IMAGE_ASPECT_COLOR_BIT) &&
+        createRT(motion, deferred::kMotionFormat, gbUsage, VK_IMAGE_ASPECT_COLOR_BIT) &&
         createRT(depth, deferred::kDepthFormat,
                  VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
                  VK_IMAGE_ASPECT_DEPTH_BIT) &&
@@ -1179,8 +1203,11 @@ bool Renderer::bakeProbes() {
                 transition(cmd, depth, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
                            sync::kSampleStages, sync::kSampled, sync::kDepthTests,
                            sync::kDepthReadWrite, VK_IMAGE_ASPECT_DEPTH_BIT);
+                transition(cmd, motion, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                           sync::kSampleStages, sync::kSampled, sync::kColorAttach,
+                           sync::kColorWrite);
                 {
-                    VkRenderingAttachmentInfo colors[4] = {
+                    VkRenderingAttachmentInfo colors[5] = {
                         makeColorAttachment(albedo.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                                             VK_ATTACHMENT_LOAD_OP_CLEAR),
                         makeColorAttachment(normal.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
@@ -1190,17 +1217,23 @@ bool Renderer::bakeProbes() {
                                             VK_ATTACHMENT_LOAD_OP_CLEAR),
                         makeColorAttachment(emissive.view,
                                             VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                            VK_ATTACHMENT_LOAD_OP_CLEAR),
+                        makeColorAttachment(motion.view,
+                                            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                                             VK_ATTACHMENT_LOAD_OP_CLEAR)};
                     VkRenderingAttachmentInfo depthAtt = makeDepthAttachment(
                         depth.view, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
                         VK_ATTACHMENT_LOAD_OP_CLEAR);
-                    beginRendering(cmd, S, S, 4, colors, &depthAtt);
-                    // GT pipeline variant: 4 attachments, no motion/reactive.
+                    beginRendering(cmd, S, S, 5, colors, &depthAtt);
+                    // GT pipeline variant (five attachments incl. motion; the
+                    // bake discards motion — prevViewProj is identity anyway).
                     deferred_.recordGBufferDraws(cmd, scene_, /*gtPass=*/true,
                                                  frames_[0].sceneSet, textureSet_, materialStride_,
                                                  S, S, viewProj);
                     vkCmdEndRendering(cmd);
                 }
+                transition(cmd, motion, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                           sync::kColorAttach, sync::kColorWrite, sync::kFragment, sync::kSampled);
                 transition(cmd, albedo, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                            sync::kColorAttach, sync::kColorWrite, sync::kFragment, sync::kSampled);
                 transition(cmd, normal, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
@@ -1258,6 +1291,7 @@ bool Renderer::bakeProbes() {
     normal.destroy(ctx_);
     material.destroy(ctx_);
     emissive.destroy(ctx_);
+    motion.destroy(ctx_);
     depth.destroy(ctx_);
     hdr.destroy(ctx_);
     ao.destroy(ctx_);
@@ -1393,14 +1427,15 @@ void Renderer::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     transition(tgtDepth, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
                sync::kSampleStages, sync::kSampled, sync::kDepthTests, sync::kDepthReadWrite,
                VK_IMAGE_ASPECT_DEPTH_BIT);
-    if (gbuffer) {
-        transition(gbMotion_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                   sync::kSampleStages, sync::kSampled, sync::kColorAttach, sync::kColorWrite);
-    }
+    ImageResource& tgtMotion = gbuffer ? gbMotion_ : gtMotion_; // Phase 6b: both paths write motion
+    transition(tgtMotion, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+               sync::kSampleStages, sync::kSampled, sync::kColorAttach, sync::kColorWrite);
 
     timestamps_.sceneBegin(cmd, slot);
 
     // --- GBuffer pass ---------------------------------------------------------
+    // Both paths attach a motion RT (Phase 6b): the GT pass uses the GT
+    // pipeline (same five formats) so GT motion blur matches the LR path.
     {
         VkRenderingAttachmentInfo colors[5] = {
             makeColorAttachment(tgtAlbedo.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
@@ -1411,10 +1446,9 @@ void Renderer::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                                 VK_ATTACHMENT_LOAD_OP_CLEAR),
             makeColorAttachment(tgtEmissive.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                                 VK_ATTACHMENT_LOAD_OP_CLEAR),
-            makeColorAttachment(gbuffer ? gbMotion_.view : VK_NULL_HANDLE,
-                                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            makeColorAttachment(tgtMotion.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                                 VK_ATTACHMENT_LOAD_OP_CLEAR)};
-        const uint32_t colorCount = gbuffer ? 5 : 4;
+        const uint32_t colorCount = 5;
         VkRenderingAttachmentInfo depth =
             makeDepthAttachment(tgtDepth.view, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
                                 VK_ATTACHMENT_LOAD_OP_CLEAR);
@@ -1481,10 +1515,9 @@ void Renderer::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     // the pyramid then just keeps its last contents.
     if (hasTransparency_ || opts_.ssr)
         deferred_.recordDepthPyramidPass(cmd, gbuffer ? gbPyramid_ : gtPyramid_);
-    if (gbuffer) {
-        transition(gbMotion_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                   sync::kColorAttach, sync::kColorWrite, sync::kFragment, sync::kSampled);
-    }
+    // Motion RT: color writes -> post-fx compute reads (Phase 6b, both paths).
+    transition(tgtMotion, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+               sync::kColorAttach, sync::kColorWrite, sync::kSampleStages, sync::kSampled);
 
     // --- GTAO (view-Z depth chain -> main pass -> temporal EMA -> denoise) ------
     // The AO depth chain is rebuilt every frame (the main pass samples it at
@@ -1640,6 +1673,25 @@ void Renderer::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
             deferred_.recordBloomPyramidPass(cmd, gtBloom_, finalImage_.image, finalImage_.layout,
                                              opts_.displayWidth, opts_.displayHeight);
         }
+    }
+    // --- Motion blur + depth of field (Phase 6b) -------------------------------
+    // HDR domain, after bloom and before upscale/present.  Same algorithm and
+    // parameters on the LR and GT paths (the GT blurs identically, so compare
+    // metrics stay fair); the blur-radius clamps scale with path height so the
+    // display-space blur is resolution-independent.  Motion/depth are
+    // SHADER_READ_ONLY here with compute in the sampled-dst scope.
+    if (opts_.motionBlur || opts_.dof) {
+        PostFxParams fx;
+        fx.depthM10 = proj.m[10];
+        fx.depthM14 = proj.m[14];
+        fx.farPlane = camera_.farPlane;
+        const float resScale = static_cast<float>(sceneH) / 1080.f;
+        fx.maxBlurPx = std::max(8.f, kMotionBlurMaxPixels * resScale);
+        fx.maxCocPx = std::max(2.f, kDofMaxCoC * resScale);
+        fx.motionBlur = opts_.motionBlur;
+        fx.dof = opts_.dof;
+        deferred_.recordPostFxPass(cmd, gbuffer ? gbPostFx_ : gtPostFx_, litTarget.image,
+                                   litTarget.layout, fx, frameIndex);
     }
     // --- Auto exposure (lit HDR -> histogram -> smoothed EV) -------------------
     // Runs on this path's HDR source (gbColor_ for LR, finalImage_ for GT),
@@ -1934,6 +1986,7 @@ void Renderer::shutdown() {
     gbMaterial_.destroy(ctx_);
     gbEmissive_.destroy(ctx_);
     gtDepth_.destroy(ctx_);
+    gtMotion_.destroy(ctx_);
     gtAlbedo_.destroy(ctx_);
     gtNormal_.destroy(ctx_);
     gtMaterial_.destroy(ctx_);
@@ -1944,6 +1997,8 @@ void Renderer::shutdown() {
     gtAo_.destroy(ctx_);
     deferred_.destroyBloomPyramid(ctx_, gbBloom_);
     deferred_.destroyBloomPyramid(ctx_, gtBloom_);
+    deferred_.destroyPostFxTargets(ctx_, gbPostFx_);
+    deferred_.destroyPostFxTargets(ctx_, gtPostFx_);
     lensDirt_.destroy(ctx_);
     deferred_.destroyColorPyramid(ctx_, gbColorPyramid_);
     deferred_.destroyColorPyramid(ctx_, gtColorPyramid_);

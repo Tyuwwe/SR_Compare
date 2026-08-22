@@ -78,6 +78,13 @@ set(RENDERER_SHADERS
     shaders/volfog_temporal.comp
     shaders/volfog_march.comp
     shaders/volfog_composite.comp
+    shaders/motion_blur_tilemax.comp
+    shaders/motion_blur_neighborhood.comp
+    shaders/motion_blur_gather.comp
+    shaders/dof_coc.comp
+    shaders/dof_gather.comp
+    shaders/dof_composite.comp
+    shaders/postfx_copyback.comp
 )
 set(RENDERER_SPV "")
 foreach(SHADER ${RENDERER_SHADERS})

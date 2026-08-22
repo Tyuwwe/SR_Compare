@@ -1,0 +1,35 @@
+#version 450
+// Motion blur neighbourhood-max pass (Phase 6b): 3x3 max-magnitude dilation
+// of the tile-max buffer (McGuire 2012 "neighbor max").  A pixel on the
+// boundary of a fast-moving object would otherwise miss the object's
+// velocity because its own tile max only covers its own tile; the dilated
+// buffer guarantees the gather pass searches far enough.
+//
+//   binding 0 = tile max (sampler, texelFetch)
+//   binding 1 = neighbourhood max out (RG16F storage, same tile grid)
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D tileMax;
+layout(set = 0, binding = 1, rg16f) uniform writeonly image2D neighborMax;
+
+void main() {
+    const ivec2 tile = ivec2(gl_GlobalInvocationID.xy);
+    if (tile.x >= imageSize(neighborMax).x || tile.y >= imageSize(neighborMax).y) return;
+
+    const ivec2 size = textureSize(tileMax, 0);
+    vec2 best = vec2(0.0);
+    float bestLen2 = -1.0;
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            const ivec2 t = clamp(tile + ivec2(dx, dy), ivec2(0), size - 1);
+            const vec2 v = texelFetch(tileMax, t, 0).xy;
+            const float len2 = dot(v, v);
+            if (len2 > bestLen2) {
+                bestLen2 = len2;
+                best = v;
+            }
+        }
+    }
+    imageStore(neighborMax, tile, vec4(best, 0.0, 0.0));
+}

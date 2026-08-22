@@ -606,6 +606,126 @@ struct BloomPyramid {
     uint32_t height = 0;
 };
 
+// --- Motion blur + depth of field (Phase 6b) -----------------------------------
+// Reconstruction-filter motion blur (McGuire et al., "A Fast and Stable
+// Feature-Aware Motion Blur Filter", HPG 2012; same tile-max/gather structure
+// as DOOM Eternal's motion blur, SIGGRAPH 2020):
+//   1. tile max   (motion_blur_tilemax.comp): max-magnitude velocity per
+//      kMotionBlurTileSize^2 tile of the path's motion RT (pixel units);
+//   2. neighbour  (motion_blur_neighborhood.comp): 3x3 dilation of the tile
+//      grid so edge pixels search far enough for fast neighbours;
+//   3. gather     (motion_blur_gather.comp): full-res N-tap line gather along
+//      the dominant velocity (own vs tile max), coverage x depth (foreground
+//      priority) x velocity-difference weights, Poisson jitter rotated by
+//      frame index (deterministic).
+// Depth of field (UE4 scatter-as-gather CoC; Guertin, GDC 2013):
+//   1. coc        (dof_coc.comp): half-res RGBA16F, rgb = downsampled color,
+//      a = signed CoC / maxRadius (thin-lens approximation, auto-focus on the
+//      screen-centre depth texel — deterministic, no CPU readback);
+//   2. gather     (dof_gather.comp): half-res Poisson-disk gather with
+//      cylinder coverage into premultiplied foreground/background layers;
+//   3. composite  (dof_composite.comp): full-res, background layer behind the
+//      sharp image, foreground on top, written back into the lit HDR target.
+// Both run in the HDR domain after lighting+bloom and before upscale/present,
+// once per deferred path (LR at render res feeding the upscaler, GT at native
+// res, GT-SSAA at 2x before the downsample) with the same algorithm and the
+// same parameters; the blur-radius clamps scale with path height so the
+// display-space blur is resolution-independent.
+constexpr uint32_t kMotionBlurTileSize = 20;  // px per tile (McGuire 2012 tile size)
+constexpr float kMotionBlurShutter = 0.5f;    // 180-degree shutter
+// Blur-length clamp at 1080p, scaled by path height (display-space constant).
+constexpr float kMotionBlurMaxPixels = 32.f;
+constexpr uint32_t kMotionBlurGatherTaps = 12;
+constexpr float kDofMaxCoC = 12.f;   // max bokeh radius at 1080p, scaled by path height
+constexpr float kDofAperture = 1.5f; // CoC scale of the (focus - z) / z thin-lens term
+constexpr float kDofSkyFocus = 20.f; // focus fallback (m) when the screen centre is sky
+constexpr uint32_t kDofGatherTaps = 24;
+
+struct MotionBlurTilePush {
+    int32_t srcSize[2]; // full-res motion size
+    int32_t tileSize;
+    int32_t pad;
+};
+static_assert(sizeof(MotionBlurTilePush) == 16, "MotionBlurTilePush size mismatch");
+
+struct MotionBlurGatherPush {
+    float params[4];  // x = shutter, y = max blur (px), z = frame index, w = tile size
+    float params2[4]; // xy = full-res size, zw unused
+};
+static_assert(sizeof(MotionBlurGatherPush) == 32, "MotionBlurGatherPush size mismatch");
+
+struct DofCocPush {
+    float depthParams[4]; // x = proj m[10], y = proj m[14] (NDC -> view Z),
+                          // z = far, w = max CoC (half-res px)
+    float params[4];      // x = aperture scale, y = sky focus fallback (m), zw unused
+};
+static_assert(sizeof(DofCocPush) == 32, "DofCocPush size mismatch");
+
+struct DofGatherPush {
+    float params[4]; // x = max CoC (half-res px), y = frame index, zw unused
+};
+static_assert(sizeof(DofGatherPush) == 16, "DofGatherPush size mismatch");
+
+struct DofCompositePush {
+    float params[4]; // x = 1 / kDofGatherTaps (coverage normalization), yzw unused
+};
+static_assert(sizeof(DofCompositePush) == 16, "DofCompositePush size mismatch");
+
+// Host-owned post-fx working targets, one per deferred path (same
+// ownership/layout model as BloomPyramid: host holds the struct + descriptor
+// pool, all images are GENERAL for life).  cocSet/compositeSet come in two
+// flavours: reading the motion-blurred intermediate (Mb suffix) or the lit
+// HDR target directly (Lit suffix, when motion blur is off but DOF is on).
+struct PostFxTargets {
+    VkImage tileMaxImage = VK_NULL_HANDLE;       // RG16F, tile grid
+    VmaAllocation tileMaxMemory = VK_NULL_HANDLE;
+    VkImageView tileMaxView = VK_NULL_HANDLE;
+    VkImage neighborMaxImage = VK_NULL_HANDLE;   // RG16F, tile grid
+    VmaAllocation neighborMaxMemory = VK_NULL_HANDLE;
+    VkImageView neighborMaxView = VK_NULL_HANDLE;
+    VkImage mbOutImage = VK_NULL_HANDLE;         // RGBA16F, full path res
+    VmaAllocation mbOutMemory = VK_NULL_HANDLE;
+    VkImageView mbOutView = VK_NULL_HANDLE;
+    VkImage cocColorImage = VK_NULL_HANDLE;      // RGBA16F, half res (rgb + signed CoC)
+    VmaAllocation cocColorMemory = VK_NULL_HANDLE;
+    VkImageView cocColorView = VK_NULL_HANDLE;
+    VkImage bgImage = VK_NULL_HANDLE;            // RGBA16F, half res (premultiplied layer)
+    VmaAllocation bgMemory = VK_NULL_HANDLE;
+    VkImageView bgView = VK_NULL_HANDLE;
+    VkImage fgImage = VK_NULL_HANDLE;            // RGBA16F, half res (premultiplied layer)
+    VmaAllocation fgMemory = VK_NULL_HANDLE;
+    VkImageView fgView = VK_NULL_HANDLE;
+    VkDescriptorSet tileSet = VK_NULL_HANDLE;        // motion -> tileMax
+    VkDescriptorSet neighborSet = VK_NULL_HANDLE;    // tileMax -> neighborMax
+    VkDescriptorSet gatherSet = VK_NULL_HANDLE;      // color+motion+neighbor+depth -> mbOut
+    VkDescriptorSet cocSetMb = VK_NULL_HANDLE;       // mbOut+depth -> cocColor
+    VkDescriptorSet cocSetLit = VK_NULL_HANDLE;      // lit color+depth -> cocColor
+    VkDescriptorSet dofGatherSet = VK_NULL_HANDLE;   // cocColor -> bg/fg layers
+    VkDescriptorSet compositeSetMb = VK_NULL_HANDLE; // sharp=mbOut -> lit color
+    VkDescriptorSet compositeSetLit = VK_NULL_HANDLE;// sharp=lit color -> lit color
+    VkDescriptorSet copybackSet = VK_NULL_HANDLE;    // mbOut -> lit color (MB on, DOF off)
+    uint32_t width = 0;   // full path res
+    uint32_t height = 0;
+    uint32_t tilesX = 0;
+    uint32_t tilesY = 0;
+};
+
+// Per-frame post-fx parameters handed to recordPostFxPass.  depthM10/depthM14
+// are the projection entries used to unpack view Z (m14 / (ndc + m10));
+// maxBlurPx/maxCocPx are the path-resolution-scaled clamps (host scales
+// kMotionBlurMaxPixels / kDofMaxCoC by height / 1080).
+struct PostFxParams {
+    float depthM10 = 0.f;
+    float depthM14 = 0.f;
+    float farPlane = 1000.f;
+    float maxBlurPx = kMotionBlurMaxPixels;
+    float maxCocPx = kDofMaxCoC;
+    float aperture = kDofAperture;
+    bool motionBlur = true;
+    bool dof = true;
+};
+
+
 // --- Terminal lens-effects chain (Phase 6a) ------------------------------------
 // Shared by the viewer present pass (present.frag) and the compare/GUI column
 // compose (compare_compose.frag).  Defaults are deliberately weak — the
@@ -898,6 +1018,32 @@ public:
     void recordBloomPyramidPass(VkCommandBuffer cmd, const BloomPyramid& pyramid, VkImage color,
                                 VkImageLayout& colorLayout, uint32_t fullW, uint32_t fullH,
                                 float strength = kBloomStrength) const;
+
+    // --- Motion blur + depth of field (Phase 6b; see the constants above) -----
+    // Creates the per-path working targets (tile max grid, full-res MB output,
+    // half-res CoC color + fg/bg bokeh layers); GENERAL for life via a
+    // one-shot transition.  Descriptor sets are written by writePostFxSets
+    // once the host's pool exists.
+    bool createPostFxTargets(const VulkanContext& ctx, uint32_t w, uint32_t h,
+                             PostFxTargets& out) const;
+    // Allocates all sets from the caller's pool.  srcColor is the path's lit
+    // HDR target (SHADER_READ_ONLY when sampled; the DOF composite also binds
+    // it as a storage image for the write-back).  motion/depth are the path's
+    // GBuffer motion RT + depth (SHADER_READ_ONLY).  The sets are pool-owned;
+    // destroyPostFxTargets only releases images/views.
+    bool writePostFxSets(const VulkanContext& ctx, VkDescriptorPool pool, VkImageView srcColor,
+                         VkImageView motion, VkImageView depth, PostFxTargets& out) const;
+    void destroyPostFxTargets(const VulkanContext& ctx, PostFxTargets& fx) const;
+    // Records the enabled post chain on the path's lit HDR target: tile max ->
+    // neighbourhood max -> MB gather (into the full-res intermediate) -> DOF
+    // coc -> DOF gather -> DOF composite (back into the lit target; when DOF is
+    // off but MB ran, a straight copy-back of the MB intermediate instead).  color is
+    // SHADER_READ_ONLY on entry and exit (colorLayout tracked by the host);
+    // the motion RT and depth must be SHADER_READ_ONLY with compute in the
+    // dst scope.  No-op (no barriers, no writes) when both effects are off.
+    void recordPostFxPass(VkCommandBuffer cmd, const PostFxTargets& fx, VkImage color,
+                          VkImageLayout& colorLayout, const PostFxParams& params,
+                          uint32_t frameIndex) const;
 
     // --- Hi-Z depth pyramid (between the GBuffer and the lighting pass) ------
     // Full mip chain length for w x h (down to 1x1): 1 + floor(log2(max)).
@@ -1221,6 +1367,26 @@ private:
     VkPipeline bloomDownsamplePipeline_ = VK_NULL_HANDLE;
     VkPipeline bloomUpsamplePipeline_ = VK_NULL_HANDLE;
     VkPipeline bloomCompositePipeline_ = VK_NULL_HANDLE;
+    // Motion blur + DOF (Phase 6b): one set layout / pipeline per pass.
+    VkDescriptorSetLayout mbTileSetLayout_ = VK_NULL_HANDLE;      // also neighbour max
+    VkDescriptorSetLayout mbGatherSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout dofCocSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout dofGatherSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout dofCompositeSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout postFxCopybackSetLayout_ = VK_NULL_HANDLE;
+    VkPipelineLayout mbTilePipelineLayout_ = VK_NULL_HANDLE;
+    VkPipelineLayout mbGatherPipelineLayout_ = VK_NULL_HANDLE;
+    VkPipelineLayout dofCocPipelineLayout_ = VK_NULL_HANDLE;
+    VkPipelineLayout dofGatherPipelineLayout_ = VK_NULL_HANDLE;
+    VkPipelineLayout dofCompositePipelineLayout_ = VK_NULL_HANDLE;
+    VkPipelineLayout postFxCopybackPipelineLayout_ = VK_NULL_HANDLE;
+    VkPipeline mbTilePipeline_ = VK_NULL_HANDLE;
+    VkPipeline mbNeighborPipeline_ = VK_NULL_HANDLE;
+    VkPipeline mbGatherPipeline_ = VK_NULL_HANDLE;
+    VkPipeline dofCocPipeline_ = VK_NULL_HANDLE;
+    VkPipeline dofGatherPipeline_ = VK_NULL_HANDLE;
+    VkPipeline dofCompositePipeline_ = VK_NULL_HANDLE;
+    VkPipeline postFxCopybackPipeline_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout exposureSetLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout histogramPipelineLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout exposureSolvePipelineLayout_ = VK_NULL_HANDLE;
@@ -1253,6 +1419,13 @@ private:
     VkShaderModule bloomDownsampleComp_ = VK_NULL_HANDLE;
     VkShaderModule bloomUpsampleComp_ = VK_NULL_HANDLE;
     VkShaderModule bloomCompositeComp_ = VK_NULL_HANDLE;
+    VkShaderModule motionBlurTilemaxComp_ = VK_NULL_HANDLE;
+    VkShaderModule motionBlurNeighborhoodComp_ = VK_NULL_HANDLE;
+    VkShaderModule motionBlurGatherComp_ = VK_NULL_HANDLE;
+    VkShaderModule dofCocComp_ = VK_NULL_HANDLE;
+    VkShaderModule dofGatherComp_ = VK_NULL_HANDLE;
+    VkShaderModule dofCompositeComp_ = VK_NULL_HANDLE;
+    VkShaderModule postFxCopybackComp_ = VK_NULL_HANDLE;
     VkShaderModule exposureHistogramComp_ = VK_NULL_HANDLE;
     VkShaderModule exposureSolveComp_ = VK_NULL_HANDLE;
     VkShaderModule shadowDepthVert_ = VK_NULL_HANDLE;

@@ -43,6 +43,13 @@ its performance numbers are not representative of real hardware.
   supports it: TAA (history weight), FSR2/FSR3 (reactive + T&C mask), DLSS
   (bias-current-color / reactive / transparency hints), XeSS (responsive
   pixel mask). NSS and SGSR2 have no such input.
+- Motion blur (McGuire 2012 tile-max gather, 20px tiles, 12 taps, half
+  shutter) + depth of field (UE4-style scatter-as-gather, half-res CoC +
+  foreground/background bokeh layers, centre-texel autofocus), in HDR after
+  lighting, before tonemap/upscaling.  Same algorithm and parameters on the
+  LR, GT and GT-SSAA paths so the reference blurs identically; deterministic
+  (frame-index-driven noise).  CLI `--no-motion-blur` / `--no-dof`, GUI
+  checkboxes; on by default in compare/bench, DOF off in free-fly viewer.
 - Ground truth: native display resolution, optional 200% SSAA (4K→1080p)
 
 ## Modes

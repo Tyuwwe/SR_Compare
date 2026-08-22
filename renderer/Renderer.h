@@ -64,6 +64,17 @@ struct RendererOptions {
     // Froxel volumetric fog (Phase 5a, CLI: --no-volfog); the scene lighting
     // preset carries the media parameters (VolFogParams::enabled gates too).
     bool volFog = true;
+    // Motion blur (Phase 6b, McGuire 2012 tile-max gather) in the HDR domain,
+    // after bloom and before upscale/present, applied to the LR and GT paths
+    // with identical algorithm + parameters (CLI: --no-motion-blur).  On by
+    // default everywhere, including bench: the GT blurs identically, so
+    // compare/bench stay fair (every column's input pixels change by design).
+    bool motionBlur = true;
+    // Depth of field (Phase 6b, UE4 scatter-as-gather CoC; CLI: --no-dof).
+    // Default ON for bench/automation (--frames set), OFF for interactive
+    // free-fly (screen-centre autofocus gets in the way while flying);
+    // runViewer applies that rule.  The GUI has a checkbox for interactive use.
+    bool dof = true;
     // Offline reflection-probe baking (CLI: --bake-probes): renders each
     // probe's 6 cube faces and writes the .probes file, then exits without
     // entering the frame loop.  Not part of bench.
@@ -148,6 +159,7 @@ private:
     ImageResource gbMaterial_;
     ImageResource gbEmissive_;
     ImageResource gtDepth_;
+    ImageResource gtMotion_;   // GT-path motion RT (Phase 6b; RG16F, display res)
     ImageResource gtAlbedo_;
     ImageResource gtNormal_;
     ImageResource gtMaterial_;
@@ -164,6 +176,10 @@ private:
     // lens-dirt term.
     BloomPyramid gbBloom_;
     BloomPyramid gtBloom_;
+    // Motion-blur + DOF working targets (Phase 6b), one per path; same
+    // host-owned GENERAL-for-life resource model as the bloom pyramids.
+    PostFxTargets gbPostFx_;
+    PostFxTargets gtPostFx_;
     // Procedural lens-dirt mask (R8, radial blobs; generated at init — no
     // external asset).  Sampled by present.frag.
     ImageResource lensDirt_;

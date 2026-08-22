@@ -446,6 +446,13 @@ bool CompareApp::createRenderTargets() {
         return false;
     if (!createRT(gtAo_, dw, dh, VK_FORMAT_R16_SFLOAT, aoUsage, VK_IMAGE_ASPECT_COLOR_BIT))
         return false;
+    // GT motion RT (Phase 6b) + per-path post-fx working targets (LR/GT).
+    if (!createRT(gtMotion_, dw, dh, deferred::kMotionFormat, gbUsage, VK_IMAGE_ASPECT_COLOR_BIT))
+        return false;
+    if (!deferred_.createPostFxTargets(ctx_, renderWidth_, renderHeight_, gbPostFx_))
+        return false;
+    if (!deferred_.createPostFxTargets(ctx_, dw, dh, gtPostFx_))
+        return false;
 
     // 200% SSAA ground truth: render at 2x, downsample into gtColor_.
     if (opts_.gtSsaa) {
@@ -457,6 +464,11 @@ bool CompareApp::createRenderTargets() {
         if (!createRT(gtSsaaDepth_, dw * 2, dh * 2, deferred::kDepthFormat,
                       VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
                       VK_IMAGE_ASPECT_DEPTH_BIT))
+            return false;
+        if (!createRT(gtSsaaMotion_, dw * 2, dh * 2, deferred::kMotionFormat, gbUsage,
+                      VK_IMAGE_ASPECT_COLOR_BIT))
+            return false;
+        if (!deferred_.createPostFxTargets(ctx_, dw * 2, dh * 2, gtSsaaPostFx_))
             return false;
         if (!createRT(gtSsaaAlbedo_, dw * 2, dh * 2, deferred::kAlbedoFormat, gbUsage,
                       VK_IMAGE_ASPECT_COLOR_BIT))
@@ -673,6 +685,7 @@ bool CompareApp::createDescriptors() {
         gbColorPyramid_.mipCount + gtColorPyramid_.mipCount + gtSsaaColorPyramid_.mipCount;
     VkDescriptorPoolSize sizes[5] = {};
     const uint32_t fogPaths = volFogActive_ ? 3 : 0; // froxel fog sets per path (Phase 5a)
+    const uint32_t postFxPaths = opts_.gtSsaa ? 3 : 2; // MB/DOF set paths (Phase 6b: GB/GT[/SSAA])
     sizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     sizes[0].descriptorCount = deferred::kMaxTextures + numColumns * 2 + 2 + numAlgos * 2 +
                                14 * kFramesInFlight * 4 + // lighting sets (GB/GT/SSAA/spatial), shadow + atlas + 2 probe arrays
@@ -680,6 +693,7 @@ bool CompareApp::createDescriptors() {
                                11 * kFramesInFlight * 4 + // opaque-SSR trace sets (GB/GT/SSAA/spatial), +2 probe arrays
                                10 * 3 +                   // ssao + temporal + blur samplers (per path)
                                3 * 6 +                    // ssr temporal samplers (GB/GT/SSAA x2 sets)
+                               17 * postFxPaths +         // post-fx MB/DOF samplers (Phase 6b)
                                2 +                        // auto-exposure HDR sources (LR + GT)
                                14 * fogPaths +            // volfog light/temporal/march/composite samplers
                                hizSets + colorSets;
@@ -704,6 +718,8 @@ bool CompareApp::createDescriptors() {
     // SSR trace targets + SSR temporal history write / scene-color RMW (x2 sets per path)
     // + volfog inject/light/temporal/march/composite storage (per fog path)
     sizes[4].descriptorCount = 15 + hizSets + colorSets + kFramesInFlight * 4 + 2 * 6 +
+                               11 * postFxPaths + // post-fx MB/DOF storage (Phase 6b)
+                               2 * postFxPaths +  // post-fx MB copy-back storage (Phase 6b)
                                8 * fogPaths;
     VkDescriptorPoolCreateInfo poolCi = {};
     poolCi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -715,6 +731,8 @@ bool CompareApp::createDescriptors() {
                      2 +                    // auto-exposure sets (LR + GT)
                      3 * kFramesInFlight + // spatial scene + lighting + transparent
                      kClusterSlots * 3 +    // cluster assign sets (GB/GT/SSAA)
+                     8 * postFxPaths +      // post-fx MB/DOF sets (Phase 6b)
+                     1 * postFxPaths +      // post-fx MB copy-back set (Phase 6b)
                      8 * fogPaths +         // volfog sets (per fog path)
                      hizSets + colorSets;
     poolCi.poolSizeCount = 5;
@@ -751,6 +769,17 @@ bool CompareApp::createDescriptors() {
     if (opts_.gtSsaa &&
         !deferred_.writeColorPyramidSets(ctx_, descriptorPool_, gtSsaaColor_.view,
                                          gtSsaaColorPyramid_))
+        return false;
+    // Post-fx sets (Phase 6b): lit HDR target + motion + depth per path.
+    if (!deferred_.writePostFxSets(ctx_, descriptorPool_, gbColor_.view, gbMotion_.view,
+                                   gbDepth_.view, gbPostFx_))
+        return false;
+    if (!deferred_.writePostFxSets(ctx_, descriptorPool_, gtColor_.view, gtMotion_.view,
+                                   gtDepth_.view, gtPostFx_))
+        return false;
+    if (opts_.gtSsaa &&
+        !deferred_.writePostFxSets(ctx_, descriptorPool_, gtSsaaColor_.view,
+                                   gtSsaaMotion_.view, gtSsaaDepth_.view, gtSsaaPostFx_))
         return false;
 
     linearSampler_ = createSampler(ctx_, VK_FILTER_LINEAR, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
@@ -1574,6 +1603,22 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     };
     const Mat4 cullViewProj = Mat4::multiply(proj, view); // un-jittered (sub-pixel)
 
+    auto recordPostFx = [&](PostFxTargets& fxTargets, VkImage color, VkImageLayout& colorLayout,
+                            uint32_t pathH) {
+        // Phase 6b: same algorithm + parameters on every path; the blur clamps
+        // scale with path height so the display-space blur matches the GT.
+        PostFxParams fx;
+        fx.depthM10 = proj.m[10];
+        fx.depthM14 = proj.m[14];
+        fx.farPlane = camera_.farPlane;
+        const float resScale = static_cast<float>(pathH) / 1080.f;
+        fx.maxBlurPx = std::max(8.f, kMotionBlurMaxPixels * resScale);
+        fx.maxCocPx = std::max(2.f, kDofMaxCoC * resScale);
+        fx.motionBlur = opts_.motionBlur;
+        fx.dof = opts_.dof;
+        deferred_.recordPostFxPass(cmd, fxTargets, color, colorLayout, fx, frameIndex);
+    };
+
     auto recordLrGBuffer = [&](VkDescriptorSet sceneSet) {
         // GBuffer targets: sampled by the lighting fragment shader (and the
         // upscalers) during the previous use -> attachment writes.
@@ -1635,7 +1680,7 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                    sync::kColorAttach, sync::kColorWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
         transition(gbMotion_.image, gbMotionLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                   sync::kColorAttach, sync::kColorWrite, sync::kFragment, sync::kSampled,
+                   sync::kColorAttach, sync::kColorWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
         transition(gbDepth_.image, gbDepthLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                    sync::kDepthTests, sync::kDepthWrite, sync::kSampleStages, sync::kSampled,
@@ -1787,6 +1832,7 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         transition(gbColor_.image, gbColorLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                    sync::kColorAttach, sync::kColorWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
+        recordPostFx(gbPostFx_, gbColor_.image, gbColorLayout_, renderHeight_);
     };
 
     // --- 1) low-resolution deferred (spatial copy then jittered when mixed) -----
@@ -1949,12 +1995,15 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         transition(gtSsaaEmissive_.image, gtSsaaEmissiveLayout_,
                    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, sync::kSampleStages, sync::kSampled,
                    sync::kColorAttach, sync::kColorWrite, VK_IMAGE_ASPECT_COLOR_BIT);
+        transition(gtSsaaMotion_.image, gtSsaaMotionLayout_,
+                   VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, sync::kSampleStages, sync::kSampled,
+                   sync::kColorAttach, sync::kColorWrite, VK_IMAGE_ASPECT_COLOR_BIT);
         transition(gtSsaaDepth_.image, gtSsaaDepthLayout_,
                    VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, sync::kSampleStages,
                    sync::kSampled, sync::kDepthTests, sync::kDepthReadWrite,
                    VK_IMAGE_ASPECT_DEPTH_BIT);
         {
-            VkRenderingAttachmentInfo colors[4] = {
+            VkRenderingAttachmentInfo colors[5] = {
                 makeColorAttachment(gtSsaaAlbedo_.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                                     VK_ATTACHMENT_LOAD_OP_CLEAR),
                 makeColorAttachment(gtSsaaNormal_.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
@@ -1962,12 +2011,14 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                 makeColorAttachment(gtSsaaMaterial_.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                                     VK_ATTACHMENT_LOAD_OP_CLEAR),
                 makeColorAttachment(gtSsaaEmissive_.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                    VK_ATTACHMENT_LOAD_OP_CLEAR),
+                makeColorAttachment(gtSsaaMotion_.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                                     VK_ATTACHMENT_LOAD_OP_CLEAR)};
             VkRenderingAttachmentInfo depth =
                 makeDepthAttachment(gtSsaaDepth_.view,
                                     VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
                                     VK_ATTACHMENT_LOAD_OP_CLEAR);
-            beginRendering(cmd, sw, sh, 4, colors, &depth);
+            beginRendering(cmd, sw, sh, 5, colors, &depth);
             deferred_.recordGBufferDraws(cmd, scene_, true, fr.sceneSetGt, textureSet_,
                                          materialStride_, sw, sh, cullViewProj);
             vkCmdEndRendering(cmd);
@@ -1983,6 +2034,9 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kColorAttach, sync::kColorWrite,
                    sync::kSampleStages, sync::kSampled, VK_IMAGE_ASPECT_COLOR_BIT);
         transition(gtSsaaEmissive_.image, gtSsaaEmissiveLayout_,
+                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kColorAttach, sync::kColorWrite,
+                   sync::kSampleStages, sync::kSampled, VK_IMAGE_ASPECT_COLOR_BIT);
+        transition(gtSsaaMotion_.image, gtSsaaMotionLayout_,
                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kColorAttach, sync::kColorWrite,
                    sync::kSampleStages, sync::kSampled, VK_IMAGE_ASPECT_COLOR_BIT);
         transition(gtSsaaDepth_.image, gtSsaaDepthLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
@@ -2117,6 +2171,9 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                    sync::kColorAttach, sync::kColorWrite, sync::kFragment, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
 
+        // Phase 6b: MB/DOF in the 2x domain, before the box downsample.
+        recordPostFx(gtSsaaPostFx_, gtSsaaColor_.image, gtSsaaColorLayout_, sh);
+
         transition(gtColor_.image, gtColorLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                    sync::kSampleStages, sync::kSampled, sync::kColorAttach, sync::kColorWrite,
                    VK_IMAGE_ASPECT_COLOR_BIT);
@@ -2152,11 +2209,14 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         transition(gtEmissive_.image, gtEmissiveLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                    sync::kSampleStages, sync::kSampled, sync::kColorAttach, sync::kColorWrite,
                    VK_IMAGE_ASPECT_COLOR_BIT);
+        transition(gtMotion_.image, gtMotionLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                   sync::kSampleStages, sync::kSampled, sync::kColorAttach, sync::kColorWrite,
+                   VK_IMAGE_ASPECT_COLOR_BIT);
         transition(gtDepth_.image, gtDepthLayout_, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
                    sync::kSampleStages, sync::kSampled, sync::kDepthTests, sync::kDepthReadWrite,
                    VK_IMAGE_ASPECT_DEPTH_BIT);
         {
-            VkRenderingAttachmentInfo colors[4] = {
+            VkRenderingAttachmentInfo colors[5] = {
                 makeColorAttachment(gtAlbedo_.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                                     VK_ATTACHMENT_LOAD_OP_CLEAR),
                 makeColorAttachment(gtNormal_.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
@@ -2164,11 +2224,13 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                 makeColorAttachment(gtMaterial_.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                                     VK_ATTACHMENT_LOAD_OP_CLEAR),
                 makeColorAttachment(gtEmissive_.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                    VK_ATTACHMENT_LOAD_OP_CLEAR),
+                makeColorAttachment(gtMotion_.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                                     VK_ATTACHMENT_LOAD_OP_CLEAR)};
             VkRenderingAttachmentInfo depth =
                 makeDepthAttachment(gtDepth_.view, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
                                     VK_ATTACHMENT_LOAD_OP_CLEAR);
-            beginRendering(cmd, dw, dh, 4, colors, &depth);
+            beginRendering(cmd, dw, dh, 5, colors, &depth);
             deferred_.recordGBufferDraws(cmd, scene_, true, fr.sceneSetGt, textureSet_,
                                          materialStride_, dw, dh, cullViewProj);
             vkCmdEndRendering(cmd);
@@ -2184,6 +2246,9 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                    sync::kColorAttach, sync::kColorWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
         transition(gtEmissive_.image, gtEmissiveLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                   sync::kColorAttach, sync::kColorWrite, sync::kSampleStages, sync::kSampled,
+                   VK_IMAGE_ASPECT_COLOR_BIT);
+        transition(gtMotion_.image, gtMotionLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                    sync::kColorAttach, sync::kColorWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
         transition(gtDepth_.image, gtDepthLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
@@ -2311,6 +2376,8 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         transition(gtColor_.image, gtColorLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                    sync::kColorAttach, sync::kColorWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
+        // Phase 6b: MB/DOF on the 1x GT HDR.
+        recordPostFx(gtPostFx_, gtColor_.image, gtColorLayout_, dh);
     }
 
     // --- Auto exposure: GT histogram (own HDR source; gtSsaa uses its 2x HDR) --
@@ -2748,13 +2815,18 @@ void CompareApp::shutdown() {
     gtNormal_.destroy(ctx_);
     gtMaterial_.destroy(ctx_);
     gtEmissive_.destroy(ctx_);
+    gtMotion_.destroy(ctx_);
     gtDepth_.destroy(ctx_);
     gtSsaaColor_.destroy(ctx_);
     gtSsaaAlbedo_.destroy(ctx_);
     gtSsaaNormal_.destroy(ctx_);
     gtSsaaMaterial_.destroy(ctx_);
     gtSsaaEmissive_.destroy(ctx_);
+    gtSsaaMotion_.destroy(ctx_);
     gtSsaaDepth_.destroy(ctx_);
+    deferred_.destroyPostFxTargets(ctx_, gbPostFx_);
+    deferred_.destroyPostFxTargets(ctx_, gtPostFx_);
+    deferred_.destroyPostFxTargets(ctx_, gtSsaaPostFx_);
     gbAoRaw_.destroy(ctx_);
     gbAo_.destroy(ctx_);
     gtAoRaw_.destroy(ctx_);

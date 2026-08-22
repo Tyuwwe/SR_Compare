@@ -512,6 +512,11 @@ private:
     bool lensCaEnabled_ = true;
     bool lensVignetteEnabled_ = true;
     bool lensGrainEnabled_ = true;
+    // Motion blur + depth of field (Phase 6b, per-frame pass skip, no temporal
+    // state — no history reset needed).  Same algorithm + parameters on every
+    // path so the GT column blurs identically.
+    bool motionBlurEnabled_ = true;
+    bool dofEnabled_ = true;
 
     ImageResource gbColor_;
     ImageResource gbColorSpatial_; // unjittered LR HDR copy for spatial upscalers
@@ -527,12 +532,14 @@ private:
     ImageResource gtNormal_;
     ImageResource gtMaterial_;
     ImageResource gtEmissive_;
+    ImageResource gtMotion_; // GT-path motion vectors (Phase 6b MB/DOF)
     ImageResource gtDepth_;
     ImageResource gtSsaaColor_; // 2x GT render target (compare GT SSAA only)
     ImageResource gtSsaaAlbedo_;
     ImageResource gtSsaaNormal_;
     ImageResource gtSsaaMaterial_;
     ImageResource gtSsaaEmissive_;
+    ImageResource gtSsaaMotion_; // 2x GT motion RT (Phase 6b)
     ImageResource gtSsaaDepth_;
     // GTAO working target (RG16F: AO + view Z) and filtered R16F, path res.
     ImageResource gbAoRaw_;
@@ -605,6 +612,10 @@ private:
     uint32_t fogAccumFrameGb_ = ~0u;
     uint32_t fogAccumFrameGt_ = ~0u;
     uint32_t fogAccumFrameSsaa_ = ~0u;
+    // Motion blur + depth of field working sets (Phase 6b), one per path.
+    PostFxTargets gbPostFx_;
+    PostFxTargets gtPostFx_;
+    PostFxTargets gtSsaaPostFx_; // compare GT SSAA only
     ImageResource composeImage_; // RGBA8 composite; presentation + screenshot source
     ImageResource uiShotImage_;  // BGRA8 debug screenshot target incl. ImGui
     VkImageLayout uiShotLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -673,12 +684,14 @@ private:
     VkImageLayout gtNormalLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gtMaterialLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gtEmissiveLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageLayout gtMotionLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gtDepthLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gtSsaaColorLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gtSsaaAlbedoLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gtSsaaNormalLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gtSsaaMaterialLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gtSsaaEmissiveLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageLayout gtSsaaMotionLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gtSsaaDepthLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gbAoRawLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gbAoLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;

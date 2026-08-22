@@ -53,6 +53,9 @@ void printUsage() {
                  "  --no-ssr                         disable opaque screen-space reflections\n"
                  "  --no-contact-shadows             disable screen-space contact shadows (sun)\n"
                  "  --no-volfog                      disable froxel volumetric fog\n"
+                 "  --no-motion-blur                 disable HDR motion blur (McGuire 2012 tile-max gather)\n"
+                 "  --no-dof                         disable depth of field (default on for --frames runs,\n"
+                 "                                 off for interactive free-fly)\n"
                  "  --bake-probes                    bake reflection probes to the scene's .probes file, then exit\n");
 }
 
@@ -126,6 +129,10 @@ int runViewer(int argc, char** argv) {
             opts.contactShadows = false;
         } else if (a == "--no-volfog") {
             opts.volFog = false;
+        } else if (a == "--no-motion-blur") {
+            opts.motionBlur = false;
+        } else if (a == "--no-dof") {
+            opts.dof = false;
         } else if (a == "--bake-probes") {
             opts.bakeProbes = true;
         } else {
@@ -136,6 +143,9 @@ int runViewer(int argc, char** argv) {
 
     // Explicit --vsync wins; automated runs default to vsync off.
     opts.vsync = opts.vsync || (opts.frames < 0);
+    // DOF default (see RendererOptions): on for bench/automation, off for
+    // interactive free-fly.  Motion blur stays on in both.
+    if (opts.frames < 0) opts.dof = false;
 
     sr::Renderer renderer;
     if (!renderer.init(opts)) {
