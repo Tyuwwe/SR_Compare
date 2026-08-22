@@ -101,6 +101,11 @@ LightingPreset goldenHourPreset() {
     p.fog.noiseScale = 0.05f;
     p.fog.maxDistance = 200.f;
     p.fog.ambient = 0.5f;
+    // Gentle golden-hour grade (Phase 6c preset override): warm balance and a
+    // touch of contrast/saturation.  CLI grading flags win over this.
+    p.gradeTemperatureK = 5600.f;
+    p.gradeContrast = 1.06f;
+    p.gradeSaturation = 1.08f;
     return p;
 }
 

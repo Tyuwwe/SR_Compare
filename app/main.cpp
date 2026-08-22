@@ -56,7 +56,13 @@ void printUsage() {
                  "  --no-motion-blur                 disable HDR motion blur (McGuire 2012 tile-max gather)\n"
                  "  --no-dof                         disable depth of field (default on for --frames runs,\n"
                  "                                 off for interactive free-fly)\n"
-                 "  --bake-probes                    bake reflection probes to the scene's .probes file, then exit\n");
+                 "  --bake-probes                    bake reflection probes to the scene's .probes file, then exit\n"
+                 "  --hdr                            HDR swapchain output (HDR10 PQ or scRGB probe, SDR fallback)\n"
+                 "  --lut <file.cube>                3D LUT (17^3/33^3), log domain pre-ACES (default: identity)\n"
+                 "  --temperature <K>                grading white balance (default 6500, scene preset may override)\n"
+                 "  --tint <-1..1>                   grading green/magenta shift (default 0)\n"
+                 "  --contrast <f>                   grading log-domain contrast (default 1)\n"
+                 "  --saturation <f>                 grading saturation (default 1)\n");
 }
 
 int runViewer(int argc, char** argv) {
@@ -135,6 +141,22 @@ int runViewer(int argc, char** argv) {
             opts.dof = false;
         } else if (a == "--bake-probes") {
             opts.bakeProbes = true;
+        } else if (a == "--hdr") {
+            opts.hdr = true;
+        } else if (a == "--lut") {
+            opts.lutPath = sr::nextArg(i, argc, argv, "--lut");
+        } else if (a == "--temperature") {
+            opts.grading.temperatureK =
+                static_cast<float>(std::atof(sr::nextArg(i, argc, argv, "--temperature")));
+        } else if (a == "--tint") {
+            opts.grading.tint =
+                static_cast<float>(std::atof(sr::nextArg(i, argc, argv, "--tint")));
+        } else if (a == "--contrast") {
+            opts.grading.contrast =
+                static_cast<float>(std::atof(sr::nextArg(i, argc, argv, "--contrast")));
+        } else if (a == "--saturation") {
+            opts.grading.saturation =
+                static_cast<float>(std::atof(sr::nextArg(i, argc, argv, "--saturation")));
         } else {
             std::fprintf(stderr, "unknown viewer option: %s\n", a.c_str());
             return 1;

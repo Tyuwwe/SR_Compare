@@ -46,6 +46,13 @@ struct LightingPreset {
     // Froxel volumetric fog (Phase 5a); presets opt in via fog.enabled.
     // The CLI --no-volfog / GUI checkbox AND-gate this per frame.
     VolFogParams fog;
+    // Optional color-grading override (Phase 6c, log domain pre-ACES).
+    // gradeTemperatureK <= 0 = no override (neutral defaults); when set, the
+    // whole group applies.  CLI --temperature/--contrast/--saturation win.
+    float gradeTemperatureK = 0.f;
+    float gradeTint = 0.f;
+    float gradeContrast = 0.f;
+    float gradeSaturation = 0.f;
 };
 
 LightingPreset defaultLightingPreset();

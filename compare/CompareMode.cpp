@@ -33,6 +33,8 @@ void printCompareUsage() {
                  "  --no-motion-blur               disable motion blur (all paths)\n"
                  "  --no-dof                       disable depth of field (all paths)\n"
                  "  --no-lens-fx                   disable the compose lens chain (CA/vignette/grain)\n"
+                 "                                 (grading is the neutral default set; HDR output is\n"
+                 "                                 viewer/GUI-only — compare/bench stay SDR)\n"
                  "  --shadow-debug                 tint pixels per shadow cascade\n"
                  "  --env-map <hdr>                static IBL environment map (default: sky atmosphere)\n"
                  "  --exposure <f>                 manual display exposure (disables auto exposure)\n"

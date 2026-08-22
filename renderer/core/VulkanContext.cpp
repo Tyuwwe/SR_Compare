@@ -49,6 +49,22 @@ bool VulkanContext::create(Window& window) {
         instanceExt.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
     }
 
+    // HDR swapchain color spaces (HDR10 ST2084 / extended sRGB, Phase 6c)
+    // require VK_EXT_swapchain_colorspace (instance-level, near-universal on
+    // desktop; the HDR probe simply finds no HDR formats without it).
+    {
+        uint32_t extCount = 0;
+        vkEnumerateInstanceExtensionProperties(nullptr, &extCount, nullptr);
+        std::vector<VkExtensionProperties> exts(extCount);
+        vkEnumerateInstanceExtensionProperties(nullptr, &extCount, exts.data());
+        for (const auto& e : exts) {
+            if (std::strcmp(e.extensionName, VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME) == 0) {
+                instanceExt.push_back(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME);
+                break;
+            }
+        }
+    }
+
     // Plugin-declared instance requirements (registered via
     // SR_REGISTER_VULKAN_DEVICE_NEEDS): instance extensions and layers.
     // Hooks run FIRST (they may set VK_ADD_LAYER_PATH for their own layer

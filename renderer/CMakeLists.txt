@@ -19,6 +19,7 @@ add_library(renderer STATIC
     ibl/Probes.cpp
     ibl/SkyAtmosphere.cpp
     deferred/DeferredCore.cpp
+    ColorGrading.cpp
     Renderer.cpp
     Screenshot.cpp
 )
@@ -89,7 +90,7 @@ set(RENDERER_SHADERS
 set(RENDERER_SPV "")
 foreach(SHADER ${RENDERER_SHADERS})
     if(SHADER STREQUAL "shaders/present.frag")
-        sr_compile_shader(SPV ${SHADER} "${SR_TONE_MAP_GLSL}")
+        sr_compile_shader(SPV ${SHADER} "${SR_TONE_MAP_GLSL}" "${SR_SHADER_INCLUDE_DIR}/grading.glsl")
     elseif(SHADER STREQUAL "shaders/transparent.frag" OR SHADER STREQUAL "shaders/transparent_gt.frag")
         sr_compile_shader(SPV ${SHADER} "${SR_SHADER_INCLUDE_DIR}/ssr.glsl" "${SR_SHADER_INCLUDE_DIR}/brdf.glsl")
     elseif(SHADER STREQUAL "shaders/ssr_opaque.comp")

@@ -100,7 +100,8 @@ Camera lerpCamera(const Camera& a, const Camera& b, float t) {
 // the source-region window (normalized offset/size) and source dimensions,
 // plus the terminal lens-effects chain (Phase 6a; same algorithm/defaults as
 // the viewer present.frag — lens dirt excluded, the GUI paths have no bloom
-// chain).
+// chain) and the log-domain grading set (Phase 6c; identical for every
+// column, sliders in the shared controls).
 struct ComposePush {
     float colSize[2];
     float textScale;
@@ -111,8 +112,10 @@ struct ComposePush {
     float exposure;   // display-domain ACES input multiplier
     float lensA[4];   // x = chromatic aberration, y = vignette, z = film grain,
                       // w = frame index (grain hash seed)
+    float gradeA[4];  // x = contrast, y = saturation (zw unused; SDR composite)
+    float gradeB[4];  // xyz = white balance, w = LUT size
 };
-static_assert(sizeof(ComposePush) == 64, "ComposePush size mismatch");
+static_assert(sizeof(ComposePush) == 96, "ComposePush size mismatch");
 
 // Metric compute push constants (two uvec4s in the shaders).
 struct MetricPush {
@@ -293,11 +296,17 @@ bool GuiApp::init(const GuiOptions& opts) {
 
     refreshUpscalerAvailability();
 
+    // HDR surface probe (Phase 6c): gates the UI checkbox; the default stays
+    // SDR.  The checkbox handler re-creates the swapchain on toggle.
+    Swapchain::queryHdrSupport(ctx_, hdrSupportHdr10_, hdrSupportScRgb_);
     swapchainVsync_ = guiWantVsync();
     swapchainMailbox_ = guiAllowMailbox();
     if (!swapchain_.create(ctx_, active_.displayW, active_.displayH, swapchainVsync_,
-                           swapchainMailbox_))
+                           swapchainMailbox_, hdrEnabled_))
         return false;
+    // Grading LUT (Phase 6c): procedural identity, created once — it survives
+    // render-stack rebuilds (independent of scene/env/resolution).
+    if (!gradingLut_.create(ctx_, makeIdentityLut())) return false;
     if (!createUiSync()) return false;
     if (!initImGui()) return false;
     window_.setWndProcHook(&guiWndProcHook);
@@ -400,7 +409,13 @@ bool GuiApp::initImGui() {
     style.FrameRounding = 3.f;
 
     if (!ImGui_ImplWin32_Init(window_.hwnd())) return false;
+    return initImGuiVulkanBackend();
+}
 
+// Vulkan backend (device objects + pipeline) — the pipeline bakes the
+// swapchain format, so setHdrEnabled shuts it down and re-runs this after a
+// swapchain re-creation (the ImGui context and the Win32 backend persist).
+bool GuiApp::initImGuiVulkanBackend() {
     ImGui_ImplVulkan_InitInfo ii = {};
     ii.ApiVersion = VK_API_VERSION_1_3;
     ii.Instance = ctx_.instance;
@@ -451,6 +466,7 @@ void GuiApp::shutdown() {
         slRefHeld_ = false;
     }
     swapchain_.destroy(ctx_);
+    gradingLut_.destroy(ctx_);
     ctx_.destroy();
     window_.destroy();
 }
@@ -1411,8 +1427,8 @@ bool GuiApp::createShaders() {
 
 bool GuiApp::createDescriptors() {
     // Scene/texture/lighting set layouts are owned by DeferredCore.
-    VkDescriptorSetLayoutBinding composeBindings[3] = {};
-    for (uint32_t i = 0; i < 3; ++i) {
+    VkDescriptorSetLayoutBinding composeBindings[4] = {};
+    for (uint32_t i = 0; i < 4; ++i) {
         composeBindings[i].binding = i;
         composeBindings[i].descriptorCount = 1;
         composeBindings[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
@@ -1421,7 +1437,7 @@ bool GuiApp::createDescriptors() {
     }
     VkDescriptorSetLayoutCreateInfo composeLayoutCi = {};
     composeLayoutCi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    composeLayoutCi.bindingCount = 3;
+    composeLayoutCi.bindingCount = 4;
     composeLayoutCi.pBindings = composeBindings;
     if (vkCreateDescriptorSetLayout(ctx_.device, &composeLayoutCi, nullptr, &composeSetLayout_) != VK_SUCCESS)
         return false;
@@ -1483,7 +1499,7 @@ bool GuiApp::createDescriptors() {
     const uint32_t postFxPaths = active_.gtSsaa ? 3 : 2;
     sizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     sizes[0].descriptorCount =
-        deferred::kMaxTextures + numColumns * 2 + 2 + numAlgos * 6 + 14 * kFramesInFlight * 4 +
+        deferred::kMaxTextures + numColumns * 3 + 2 + numAlgos * 8 + 14 * kFramesInFlight * 4 +
         7 * kFramesInFlight * 4 + 11 * kFramesInFlight * 4 + 10 * 3 + 3 * 6 + hizSets + colorSets +
         2 + 14 * fogPaths + 17 * postFxPaths; // + ssr temporal samplers (GB/GT/SSAA x2 sets); auto-exposure HDR
                            // sources (LR + GT); volfog light/temporal/march/composite samplers;
@@ -1682,8 +1698,12 @@ void GuiApp::writeComposeSetInto(VkDescriptorSet set, VkImageView source) {
     fontInfo.sampler = fontSampler_;
     fontInfo.imageView = fontAtlas_.view;
     fontInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    VkDescriptorImageInfo lutInfo = {};
+    lutInfo.sampler = gradingLut_.sampler();
+    lutInfo.imageView = gradingLut_.view();
+    lutInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
-    VkWriteDescriptorSet writes[3] = {};
+    VkWriteDescriptorSet writes[4] = {};
     writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     writes[0].dstSet = set;
     writes[0].dstBinding = 0;
@@ -1702,7 +1722,13 @@ void GuiApp::writeComposeSetInto(VkDescriptorSet set, VkImageView source) {
     writes[2].descriptorCount = 1;
     writes[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     writes[2].pImageInfo = &fontInfo;
-    vkUpdateDescriptorSets(ctx_.device, 3, writes, 0, nullptr);
+    writes[3].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[3].dstSet = set;
+    writes[3].dstBinding = 3;
+    writes[3].descriptorCount = 1;
+    writes[3].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    writes[3].pImageInfo = &lutInfo;
+    vkUpdateDescriptorSets(ctx_.device, 4, writes, 0, nullptr);
 }
 
 bool GuiApp::createAlgoResources(AlgoColumn& algo, uint32_t index) {
@@ -1830,10 +1856,16 @@ bool GuiApp::createPipelines() {
     if (vkCreatePipelineLayout(ctx_.device, &composeLayoutCi, nullptr, &composePipelineLayout_) != VK_SUCCESS)
         return false;
 
+    VkPushConstantRange copyPushRange = {};
+    copyPushRange.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    copyPushRange.offset = 0;
+    copyPushRange.size = 16; // vec4: hdr mode + paper white (copy.frag)
     VkPipelineLayoutCreateInfo copyLayoutCi = {};
     copyLayoutCi.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     copyLayoutCi.setLayoutCount = 1;
     copyLayoutCi.pSetLayouts = &copySetLayout_;
+    copyLayoutCi.pushConstantRangeCount = 1;
+    copyLayoutCi.pPushConstantRanges = &copyPushRange;
     if (vkCreatePipelineLayout(ctx_.device, &copyLayoutCi, nullptr, &copyPipelineLayout_) != VK_SUCCESS)
         return false;
 
@@ -1923,18 +1955,11 @@ bool GuiApp::createPipelines() {
     if (createGraphicsPipeline(ctx_, fsCi, composePipeline_) != VK_SUCCESS)
         return false;
 
-    fsStages[1].module = copyFrag_;
-    VkPipelineRenderingCreateInfo copyRendering = {};
-    copyRendering.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
-    copyRendering.colorAttachmentCount = 1;
-    const VkFormat presentFormat = swapchain_.format();
-    copyRendering.pColorAttachmentFormats = &presentFormat;
-    fsCi.pNext = &copyRendering;
-    fsCi.layout = copyPipelineLayout_;
-    if (createGraphicsPipeline(ctx_, fsCi, copyPipeline_) != VK_SUCCESS)
-        return false;
+    if (!createCopyPipeline()) return false;
 
     // GT SSAA downsample: same passthrough fragment shader, HDR target.
+    fsStages[1].module = copyFrag_;
+    fsCi.layout = copyPipelineLayout_;
     VkPipelineRenderingCreateInfo downsampleRendering = {};
     downsampleRendering.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
     downsampleRendering.colorAttachmentCount = 1;
@@ -1958,6 +1983,111 @@ bool GuiApp::createPipelines() {
         return false;
 
     return true;
+}
+
+bool GuiApp::createCopyPipeline() {
+    // Swapchain copy (compare_copy.frag into the swapchain image).  Factored
+    // out of createPipelines: setHdrEnabled re-creates just this pipeline
+    // when the swapchain format changes (Phase 6c).
+    VkPipelineInputAssemblyStateCreateInfo inputAssembly = {};
+    inputAssembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineViewportStateCreateInfo viewportState = {};
+    viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    viewportState.viewportCount = 1;
+    viewportState.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo rasterizer = {};
+    rasterizer.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
+    rasterizer.cullMode = VK_CULL_MODE_NONE;
+    rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rasterizer.lineWidth = 1.f;
+    VkPipelineMultisampleStateCreateInfo multisample = {};
+    multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineColorBlendAttachmentState blend = {};
+    blend.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                           VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    VkPipelineColorBlendStateCreateInfo colorBlend = {};
+    colorBlend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    colorBlend.attachmentCount = 1;
+    colorBlend.pAttachments = &blend;
+    VkDynamicState dynamicStates[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dynamicState = {};
+    dynamicState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    dynamicState.dynamicStateCount = 2;
+    dynamicState.pDynamicStates = dynamicStates;
+    VkPipelineVertexInputStateCreateInfo emptyVertexInput = {};
+    emptyVertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    VkPipelineDepthStencilStateCreateInfo noDepth = {};
+    noDepth.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+
+    VkPipelineShaderStageCreateInfo stages[2] = {};
+    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = fullscreenVert_;
+    stages[0].pName = "main";
+    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = copyFrag_;
+    stages[1].pName = "main";
+
+    VkPipelineRenderingCreateInfo rendering = {};
+    rendering.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+    rendering.colorAttachmentCount = 1;
+    const VkFormat presentFormat = swapchain_.format();
+    rendering.pColorAttachmentFormats = &presentFormat;
+
+    VkGraphicsPipelineCreateInfo ci = {};
+    ci.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    ci.stageCount = 2;
+    ci.pStages = stages;
+    ci.pVertexInputState = &emptyVertexInput;
+    ci.pInputAssemblyState = &inputAssembly;
+    ci.pViewportState = &viewportState;
+    ci.pRasterizationState = &rasterizer;
+    ci.pMultisampleState = &multisample;
+    ci.pDepthStencilState = &noDepth;
+    ci.pColorBlendState = &colorBlend;
+    ci.pDynamicState = &dynamicState;
+    ci.pNext = &rendering;
+    ci.layout = copyPipelineLayout_;
+    return createGraphicsPipeline(ctx_, ci, copyPipeline_) == VK_SUCCESS;
+}
+
+void GuiApp::setHdrEnabled(bool enabled) {
+    if (hdrEnabled_ == enabled) return;
+    hdrEnabled_ = enabled;
+    vkDeviceWaitIdle(ctx_.device);
+    // Everything that bakes the swapchain format is re-created: the swapchain
+    // itself, the copy pipeline and the ImGui backend pipeline.
+    if (!recreateGuiSwapchain()) {
+        std::fprintf(stderr, "gui: hdr swapchain re-creation failed, reverting to SDR\n");
+        hdrEnabled_ = false;
+        recreateGuiSwapchain();
+    }
+    if (copyPipeline_) {
+        vkDestroyPipeline(ctx_.device, copyPipeline_, nullptr);
+        copyPipeline_ = VK_NULL_HANDLE;
+    }
+    if (stackOk_ && !createCopyPipeline())
+        std::fprintf(stderr, "gui: copy pipeline re-creation failed\n");
+    ImGui_ImplVulkan_Shutdown();
+    initImGuiVulkanBackend();
+    // The debug UI-shot target bakes the swapchain format too.
+    if (uiShot_ && uiShotImage_.image) {
+        uiShotImage_.destroy(ctx_);
+        uiShotLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+        uiShotImage_.width = active_.displayW;
+        uiShotImage_.height = active_.displayH;
+        uiShotImage_.format = swapchain_.format();
+        if (createImage(ctx_, uiShotImage_.width, uiShotImage_.height, uiShotImage_.format,
+                        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                        uiShotImage_.image, uiShotImage_.memory) == VK_SUCCESS) {
+            uiShotImage_.view = createImageView(ctx_, uiShotImage_.image, uiShotImage_.format,
+                                                VK_IMAGE_ASPECT_COLOR_BIT);
+        }
+    }
 }
 
 bool GuiApp::createSyncResources() {
@@ -3645,6 +3775,11 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
             vkCmdSetScissor(cmd, 0, 1, &scissor);
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, copyPipelineLayout_, 0, 1,
                                     &gtDownsampleSet_, 0, nullptr);
+            // Mode 0: passthrough — the downsample target is HDR linear, not
+            // the swapchain (copy.frag HDR branch is for presentation only).
+            const float copyPush[4] = {0.f, 0.f, 0.f, 0.f};
+            vkCmdPushConstants(cmd, copyPipelineLayout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                               sizeof(copyPush), copyPush);
             vkCmdDraw(cmd, 3, 1, 0, 0);
             vkCmdEndRendering(cmd);
         }
@@ -4034,6 +4169,16 @@ void GuiApp::recordComposePresent(VkCommandBuffer cmd, uint32_t swapchainIndex,
             push.lensA[1] = lensVignetteEnabled_ ? kLensVignetteStrength : 0.f;
             push.lensA[2] = lensGrainEnabled_ ? kLensGrainStrength : 0.f;
             push.lensA[3] = static_cast<float>(renderFrameIndex_);
+            // Grading (Phase 6c): shared sliders, identical for every column.
+            const Vec3 wb = whiteBalanceForTemperatureTint(gradeTemperatureK_, gradeTint_);
+            push.gradeA[0] = gradeContrast_;
+            push.gradeA[1] = gradeSaturation_;
+            push.gradeA[2] = 0.f;
+            push.gradeA[3] = 0.f;
+            push.gradeB[0] = wb.x;
+            push.gradeB[1] = wb.y;
+            push.gradeB[2] = wb.z;
+            push.gradeB[3] = 17.f; // makeIdentityLut() default edge length
             vkCmdPushConstants(cmd, composePipelineLayout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                                sizeof(push), &push);
             vkCmdDraw(cmd, 3, 1, 0, 0);
@@ -4062,6 +4207,11 @@ void GuiApp::recordComposePresent(VkCommandBuffer cmd, uint32_t swapchainIndex,
         vkCmdSetScissor(cmd, 0, 1, &scissor);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, copyPipelineLayout_, 0, 1,
                                 &copySet_, 0, nullptr);
+        // HDR swapchain (Phase 6c): re-linearize the SDR composite and encode
+        // (SDR content in an HDR container; paper white 203 nits, BT.2408).
+        const float copyPush[4] = {static_cast<float>(swapchain_.hdrMode()), 203.f, 0.f, 0.f};
+        vkCmdPushConstants(cmd, copyPipelineLayout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                           sizeof(copyPush), copyPush);
         vkCmdDraw(cmd, 3, 1, 0, 0);
         ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cmd);
         vkCmdEndRendering(cmd);
@@ -4101,7 +4251,7 @@ bool GuiApp::recreateGuiSwapchain() {
     swapchainVsync_ = guiWantVsync();
     swapchainMailbox_ = guiAllowMailbox();
     if (!swapchain_.create(ctx_, active_.displayW, active_.displayH, swapchainVsync_,
-                           swapchainMailbox_))
+                           swapchainMailbox_, hdrEnabled_))
         return false;
     ensurePresentSemaphores();
     return true;
@@ -4153,6 +4303,11 @@ void GuiApp::captureUiScreenshotIntoStaging(VkCommandBuffer cmd) {
         vkCmdSetScissor(cmd, 0, 1, &scissor);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, copyPipelineLayout_, 0, 1,
                                 &copySet_, 0, nullptr);
+        // Same encode as the real present (the UI-shot target uses the
+        // swapchain format).
+        const float copyPush[4] = {static_cast<float>(swapchain_.hdrMode()), 203.f, 0.f, 0.f};
+        vkCmdPushConstants(cmd, copyPipelineLayout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                           sizeof(copyPush), copyPush);
         vkCmdDraw(cmd, 3, 1, 0, 0);
         ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cmd);
         vkCmdEndRendering(cmd);
@@ -4740,6 +4895,36 @@ void GuiApp::drawSharedControls() {
         }
         ImGui::TextDisabled("%zu keyframes%s", path_.size(),
                             pathPlaying_ ? " (playing)" : " (paused)");
+    }
+
+    // Color grading (Phase 6c): log domain, pre-ACES; identical parameters on
+    // every column (GT included) so compare stays fair.  Per-frame push
+    // constants — no rebuild.
+    ImGui::Separator();
+    ImGui::Text("color grading");
+    ImGui::SliderFloat("temperature", &gradeTemperatureK_, 3000.f, 10000.f, "%.0f K");
+    ImGui::SliderFloat("tint", &gradeTint_, -1.f, 1.f, "%.2f");
+    ImGui::SliderFloat("contrast", &gradeContrast_, 0.5f, 2.f, "%.2f");
+    ImGui::SliderFloat("saturation", &gradeSaturation_, 0.f, 2.f, "%.2f");
+    if (ImGui::Button("reset grading")) {
+        gradeTemperatureK_ = 6500.f;
+        gradeTint_ = 0.f;
+        gradeContrast_ = 1.f;
+        gradeSaturation_ = 1.f;
+    }
+
+    // HDR output (Phase 6c): gated on surface support; toggling re-creates
+    // the swapchain + copy pipeline + ImGui backend.  The composite is SDR
+    // display-encoded, so this is an HDR-container compatibility mode here —
+    // true scene-HDR headroom is viewer-only (--hdr).
+    const bool hdrAny = hdrSupportHdr10_ || hdrSupportScRgb_;
+    if (!hdrAny) ImGui::BeginDisabled();
+    if (ImGui::Checkbox("hdr output", &hdrEnabled_)) setHdrEnabled(hdrEnabled_);
+    if (!hdrAny) ImGui::EndDisabled();
+    if (hdrAny) {
+        ImGui::TextDisabled("%s%s (sdr content in hdr container)",
+                            hdrSupportHdr10_ ? "hdr10" : "",
+                            hdrSupportScRgb_ ? (hdrSupportHdr10_ ? " + scrgb" : "scrgb") : "");
     }
 }
 

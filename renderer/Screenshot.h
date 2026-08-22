@@ -2,16 +2,21 @@
 // ============================================================================
 // PNG screenshot helper: converts a half-float RGBA16F buffer (read back from
 // the final HDR image) into a tonemapped 8-bit sRGB PNG via stb_image_write.
-// Tonemapping mirrors present.frag (Hill fitted ACES + gamma 2.2).
+// Tonemapping mirrors present.frag (log-domain color grading, Phase 6c, then
+// Hill fitted ACES + gamma 2.2).
 // ============================================================================
+#include "renderer/ColorGrading.h"
 #include "renderer/math/Tonemap.h"
 
 #include <cstdint>
 
 namespace sr {
 
+// grading/lut default to neutral/identity (pre-Phase-6c behavior).
 bool savePngFromHalfRgba(const char* path, const uint8_t* halfRgba, uint32_t width,
-                         uint32_t height, float exposure = kDisplayExposure);
+                         uint32_t height, float exposure = kDisplayExposure,
+                         const ColorGrading& grading = ColorGrading{},
+                         const ColorLut* lut = nullptr);
 
 // Save an already-tonemapped RGBA8 buffer (e.g. the compare-mode composite,
 // which includes the overlay text) without further processing.

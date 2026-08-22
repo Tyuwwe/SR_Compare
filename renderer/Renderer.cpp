@@ -78,7 +78,14 @@ bool Renderer::init(const RendererOptions& opts) {
                         static_cast<int>(opts.displayHeight)))
         return false;
     if (!ctx_.create(window_)) return false;
-    if (!swapchain_.create(ctx_, opts.displayWidth, opts.displayHeight, opts.vsync)) return false;
+    if (!swapchain_.create(ctx_, opts.displayWidth, opts.displayHeight, opts.vsync,
+                           /*allowMailbox=*/true, opts.hdr))
+        return false;
+    if (opts.hdr) {
+        const char* mode = swapchain_.hdrMode() == HdrMode::Hdr10 ? "HDR10 (PQ)"
+                           : swapchain_.hdrMode() == HdrMode::ScRgb ? "scRGB" : "SDR (fallback)";
+        std::fprintf(stderr, "swapchain: --hdr -> %s\n", mode);
+    }
 
     renderWidth_ = std::max(1u, static_cast<uint32_t>(static_cast<float>(opts.displayWidth) * opts.renderScale));
     renderHeight_ = std::max(1u, static_cast<uint32_t>(static_cast<float>(opts.displayHeight) * opts.renderScale));
@@ -110,6 +117,21 @@ bool Renderer::init(const RendererOptions& opts) {
             }
         }
     }
+    // Color grading (Phase 6c): CLI grading fields win, then the scene
+    // preset's optional override, then the neutral defaults.
+    grading_ = ColorGrading{};
+    if (preset.gradeTemperatureK > 0.f) {
+        grading_.temperatureK = preset.gradeTemperatureK;
+        grading_.tint = preset.gradeTint;
+        grading_.contrast = preset.gradeContrast;
+        grading_.saturation = preset.gradeSaturation;
+    }
+    if (opts_.grading.temperatureK > 0.f) grading_.temperatureK = opts_.grading.temperatureK;
+    if (opts_.grading.contrast > 0.f) grading_.contrast = opts_.grading.contrast;
+    if (opts_.grading.saturation > 0.f) grading_.saturation = opts_.grading.saturation;
+    // Tint is signed, so 0 doubles as "unset": a nonzero CLI value wins over
+    // the preset (there is no CLI way to force 0 over a preset tint).
+    if (opts_.grading.tint != 0.f) grading_.tint = opts_.grading.tint;
     // Reflection probe placements (Phase 4c-2): hand-placed per scene in the
     // registry; inert until a matching .probes bake file is loaded below.
     scene_.probes = reflectionProbesForScene(opts.scenePath);
@@ -313,6 +335,8 @@ bool Renderer::createRenderTargets() {
         return false;
     if (!createLensDirtTexture())
         return false;
+    if (!createGradingLut())
+        return false;
     if (!deferred_.createDepthPyramid(ctx_, renderWidth_, renderHeight_, gbPyramid_))
         return false;
     if (!deferred_.createDepthPyramid(ctx_, dw, dh, gtPyramid_))
@@ -436,6 +460,24 @@ bool Renderer::createLensDirtTexture() {
     return true;
 }
 
+bool Renderer::createGradingLut() {
+    // Phase 6c: --lut loads a .cube file; otherwise the procedural identity
+    // LUT (bit-neutral output with default grading).  The CPU copy mirrors
+    // the GPU one for the screenshot path (savePngFromHalfRgba).
+    if (!opts_.lutPath.empty()) {
+        if (!loadCubeLut(opts_.lutPath.c_str(), gradingLutCpu_)) {
+            std::fprintf(stderr, "lut: falling back to identity (%s)\n", opts_.lutPath.c_str());
+            gradingLutCpu_ = makeIdentityLut();
+        } else {
+            std::fprintf(stderr, "lut: loaded %s (%u^3)\n", opts_.lutPath.c_str(),
+                         gradingLutCpu_.size);
+        }
+    } else {
+        gradingLutCpu_ = makeIdentityLut();
+    }
+    return gradingLutGpu_.create(ctx_, gradingLutCpu_);
+}
+
 bool Renderer::loadShader(const char* name, VkShaderModule& out) {
     const std::string path = sr::resolveShaderPath(SR_SHADER_DIR, name);
     std::ifstream file(path, std::ios::binary | std::ios::ate);
@@ -463,9 +505,10 @@ bool Renderer::createShaders() {
 
 bool Renderer::createSceneDescriptors() {
     // Present set: 0 = final HDR image, 1 = accumulated bloom mip 0 of the
-    // presented path (lens dirt), 2 = procedural lens-dirt mask.
-    VkDescriptorSetLayoutBinding presentBindings[3] = {};
-    for (uint32_t i = 0; i < 3; ++i) {
+    // presented path (lens dirt), 2 = procedural lens-dirt mask, 3 = grading
+    // LUT (Phase 6c).
+    VkDescriptorSetLayoutBinding presentBindings[4] = {};
+    for (uint32_t i = 0; i < 4; ++i) {
         presentBindings[i].binding = i;
         presentBindings[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         presentBindings[i].descriptorCount = 1;
@@ -473,7 +516,7 @@ bool Renderer::createSceneDescriptors() {
     }
     VkDescriptorSetLayoutCreateInfo presentLayoutCi = {};
     presentLayoutCi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    presentLayoutCi.bindingCount = 3;
+    presentLayoutCi.bindingCount = 4;
     presentLayoutCi.pBindings = presentBindings;
     if (vkCreateDescriptorSetLayout(ctx_.device, &presentLayoutCi, nullptr, &presentSetLayout_) != VK_SUCCESS)
         return false;
@@ -485,7 +528,7 @@ bool Renderer::createSceneDescriptors() {
     const uint32_t colorSets = gbColorPyramid_.mipCount + gtColorPyramid_.mipCount;
     const uint32_t fogPaths = volFogActive_ ? 2 : 0; // froxel fog sets per path (Phase 5a)
     sizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    sizes[0].descriptorCount = deferred::kMaxTextures + 3 + // texture array + present (image + bloom + dirt)
+    sizes[0].descriptorCount = deferred::kMaxTextures + 4 + // texture array + present (image + bloom + dirt + lut)
                                14 * kFramesInFlight * 2 + // lighting sets (GB/GT), shadow + atlas + 2 probe arrays
                                7 * kFramesInFlight * 2 +  // transparent sets (GB/GT), +SSR+shadow
                                11 * kFramesInFlight * 2 + // opaque-SSR trace sets (GB/GT), +2 probe arrays
@@ -578,7 +621,7 @@ bool Renderer::createSceneDescriptors() {
         // is off, but the dirt strength is forced to 0 then, so the shader
         // never samples it.
         const bool useUpscaler = opts_.upscalerName != "none" && upscaler_ != nullptr;
-        VkDescriptorImageInfo info[3] = {};
+        VkDescriptorImageInfo info[4] = {};
         info[0].sampler = deferred_.textureSampler();
         info[0].imageView = finalImage_.view;
         info[0].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
@@ -588,11 +631,14 @@ bool Renderer::createSceneDescriptors() {
         info[2].sampler = deferred_.gbufferSampler();
         info[2].imageView = lensDirt_.view;
         info[2].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        info[3].sampler = gradingLutGpu_.sampler();
+        info[3].imageView = gradingLutGpu_.view();
+        info[3].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         VkWriteDescriptorSet write = {};
         write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         write.dstSet = presentSet_;
         write.dstBinding = 0;
-        write.descriptorCount = 3;
+        write.descriptorCount = 4;
         write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         write.pImageInfo = info;
         vkUpdateDescriptorSets(ctx_.device, 1, &write, 0, nullptr);
@@ -618,7 +664,7 @@ bool Renderer::createPipelines() {
     VkPushConstantRange presentPush = {};
     presentPush.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     presentPush.offset = 0;
-    presentPush.size = 48; // vec3 x vec4: exposure + lensA + lensB (present.frag)
+    presentPush.size = 80; // 5 x vec4: exposure + lensA + lensB + gradeA + gradeB (present.frag)
     VkPipelineLayoutCreateInfo presentLayoutCi = {};
     presentLayoutCi.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     presentLayoutCi.setLayoutCount = 1;
@@ -914,7 +960,8 @@ bool Renderer::recreateSwapchain(uint32_t width, uint32_t height, bool vsync) {
     }
     renderFinished_.clear();
 
-    if (!swapchain_.create(ctx_, width, height, vsync)) return false;
+    if (!swapchain_.create(ctx_, width, height, vsync, /*allowMailbox=*/true, opts_.hdr))
+        return false;
 
     // Rebuild one present semaphore per swapchain image: the new swapchain may
     // have a different image count than the previous one.
@@ -999,10 +1046,11 @@ void Renderer::captureScreenshotIntoStaging(VkCommandBuffer cmd) {
 
 void Renderer::saveScreenshot(const std::string& path) {
     if (!screenshotMapped_) return;
-    // Same exposure as the present pass of the captured frame, so the CPU
-    // tonemap matches the on-screen (GPU) result bit-for-bit.
+    // Same exposure and grading as the present pass of the captured frame, so
+    // the CPU tonemap matches the on-screen (GPU) result bit-for-bit.
     if (!savePngFromHalfRgba(path.c_str(), static_cast<const uint8_t*>(screenshotMapped_),
-                             opts_.displayWidth, opts_.displayHeight, displayExposure())) {
+                             opts_.displayWidth, opts_.displayHeight, displayExposure(), grading_,
+                             &gradingLutCpu_)) {
         std::fprintf(stderr, "failed to save screenshot %s\n", path.c_str());
     }
 }
@@ -1791,15 +1839,21 @@ void Renderer::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                             &presentSet_, 0, nullptr);
     // Present: exposure + the terminal lens-effects chain (strengths zeroed
     // when disabled; dirt also needs the bloom pyramid, so --no-bloom forces
-    // it off — the bound mip content is undefined then, see the present set).
+    // it off — the bound mip content is undefined then, see the present set)
+    // + the log-domain grading set (Phase 6c) + the HDR output mode from the
+    // swapchain (Phase 6c; 0 = SDR).
     const bool fx = opts_.lensFx;
-    const float presentPush[12] = {
+    const Vec3 wb = whiteBalanceForTemperatureTint(grading_.temperatureK, grading_.tint);
+    const float presentPush[20] = {
         displayExposure(), 0.f, 0.f, 0.f,
         fx ? kLensCaStrength : 0.f,
         fx ? kLensVignetteStrength : 0.f,
         fx ? kLensGrainStrength : 0.f,
         static_cast<float>(frameIndex),
         (fx && opts_.bloom) ? kLensDirtStrength : 0.f, 0.f, 0.f, 0.f,
+        grading_.contrast, grading_.saturation,
+        static_cast<float>(swapchain_.hdrMode()), opts_.hdrPaperWhiteNits,
+        wb.x, wb.y, wb.z, static_cast<float>(gradingLutCpu_.size),
     };
     vkCmdPushConstants(cmd, presentPipelineLayout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                        sizeof(presentPush), presentPush);
@@ -2000,6 +2054,7 @@ void Renderer::shutdown() {
     deferred_.destroyPostFxTargets(ctx_, gbPostFx_);
     deferred_.destroyPostFxTargets(ctx_, gtPostFx_);
     lensDirt_.destroy(ctx_);
+    gradingLutGpu_.destroy(ctx_);
     deferred_.destroyColorPyramid(ctx_, gbColorPyramid_);
     deferred_.destroyColorPyramid(ctx_, gtColorPyramid_);
     deferred_.destroyClusterGrid(ctx_, gbCluster_);

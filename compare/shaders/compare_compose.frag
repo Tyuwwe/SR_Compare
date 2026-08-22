@@ -1,11 +1,13 @@
 #version 450
 #extension GL_GOOGLE_include_directive : require
 #include "tonemap.glsl"
+#include "grading.glsl"
 // Compare-mode column compose: samples the column's HDR source (native GT or
 // an upscaler output) through a source-region window (aspect-preserving crop
-// + optional zoom/pan, computed on the CPU), applies the shared display
-// transform (Hill fitted ACES + gamma 2.2, same as the viewer present pass /
-// CPU screenshot path) and blits
+// + optional zoom/pan, computed on the CPU), applies the log-domain color
+// grading (Phase 6c; identical parameters for every column) and the shared
+// display transform (Hill fitted ACES + gamma 2.2, same as the viewer present
+// pass / CPU screenshot path) and blits
 // a 5x7 bitmap-font text overlay (algorithm name + FPS + live PSNR/SSIM)
 // in the top-left corner.
 //
@@ -13,7 +15,10 @@
 // normalized (offset, size) rect that fills the column and crops the
 // overflow.  When the on-screen magnification exceeds 1:1 the source is
 // sampled with nearest filtering (texelFetch) so individual source pixels
-// stay distinguishable for pixel-level algorithm comparison.
+// stay distinguishable for pixel-level algorithm comparison; grading is also
+// skipped there so magnified pixels stay unmodified (same rule as the lens
+// chain).  Compare output is SDR only — HDR presentation is viewer/GUI-only
+// (Phase 6c, see usage).
 //
 // Text comes in as packed ASCII codes in a UBO (5 slots x 96 chars); glyph
 // pixels are sampled from an R8 atlas (16x6 grid of 8x8 cells, ASCII 32..127).
@@ -23,6 +28,7 @@ layout(std140, set = 0, binding = 1) uniform TextUBO {
     uvec4 text[5][24]; // 96 chars per column slot, row-major (4 lines x 24)
 } uText;
 layout(set = 0, binding = 2) uniform sampler2D uFont;
+layout(set = 0, binding = 3) uniform sampler3D uLut; // log-domain grading LUT
 
 layout(push_constant) uniform Push {
     vec4 colSize;  // xy = column size in pixels, z = scale, w = textSlot
@@ -35,6 +41,8 @@ layout(push_constant) uniform Push {
     // (pixel-peep) mode so magnified pixels stay unmodified.  w = frame index
     // (grain hash seed).
     vec4 lensA;    // x = chromatic aberration, y = vignette, z = film grain
+    vec4 gradeA;   // x = contrast, y = saturation (zw unused; compare is SDR)
+    vec4 gradeB;   // xyz = white balance (temperature/tint), w = LUT size
 } pc;
 
 layout(location = 0) in vec2 vUV;
@@ -72,6 +80,9 @@ void main() {
     } else {
         c = texture(uSource, suv).rgb;
     }
+    // Log-domain grading, identical parameters for every column; skipped in
+    // nearest (pixel-peep) mode like the lens chain.
+    if (pc.params.z <= 0.5) c = applyColorGrading(c, pc.gradeA, pc.gradeB, uLut);
     c = tonemapToDisplay(c, pc.params.w);
     if (lensFx) {
         if (pc.lensA.y > 0.0) c *= 1.0 - pc.lensA.y * dot(d, d) * 2.0;

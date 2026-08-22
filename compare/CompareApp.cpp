@@ -3,6 +3,7 @@
 #include "app/CliUtils.h"
 
 #include "compare/Font5x7.h"
+#include "renderer/ColorGrading.h"
 #include "renderer/Screenshot.h"
 #include "renderer/core/PathUtil.h"
 #include "renderer/core/VkUtil.h"
@@ -32,7 +33,8 @@ constexpr VkFormat kComposeFormat = VK_FORMAT_R8G8B8A8_UNORM;
 // the source-region window (normalized offset/size) and source dimensions,
 // plus the terminal lens-effects chain (Phase 6a; same algorithm/defaults as
 // the viewer present.frag — lens dirt excluded, the compare paths have no
-// bloom chain).
+// bloom chain) and the log-domain grading set (Phase 6c; identical for every
+// column — compare stays SDR, HDR presentation is viewer/GUI-only).
 struct ComposePush {
     float colSize[2];
     float textScale;
@@ -43,8 +45,10 @@ struct ComposePush {
     float exposure;   // display-domain ACES input multiplier
     float lensA[4];   // x = chromatic aberration, y = vignette, z = film grain,
                       // w = frame index (grain hash seed)
+    float gradeA[4];  // x = contrast, y = saturation (zw unused; SDR only)
+    float gradeB[4];  // xyz = white balance, w = LUT size
 };
-static_assert(sizeof(ComposePush) == 64, "ComposePush size mismatch");
+static_assert(sizeof(ComposePush) == 96, "ComposePush size mismatch");
 
 // Metric compute push constants (two uvec4s in the shaders).
 struct MetricPush {
@@ -231,6 +235,9 @@ bool CompareApp::init(const CompareOptions& opts) {
     });
     if (!createRenderTargets()) return false;
     if (!createFontAtlas()) return false;
+    // Grading LUT (Phase 6c): compare uses the procedural identity LUT with
+    // the neutral grading set (same parameters for every column, SDR only).
+    if (!gradingLut_.create(ctx_, makeIdentityLut())) return false;
     if (!createMetricResources()) return false;
     if (!createShaders()) return false;
     if (!createDescriptors()) return false;
@@ -629,9 +636,9 @@ bool CompareApp::createDescriptors() {
     // Scene/texture/lighting set layouts live in DeferredCore (shared with the
     // viewer); only the compare-specific layouts are created here.
 
-    // Compose: column source + packed text UBO + font atlas.
-    VkDescriptorSetLayoutBinding composeBindings[3] = {};
-    for (uint32_t i = 0; i < 3; ++i) {
+    // Compose: column source + packed text UBO + font atlas + grading LUT.
+    VkDescriptorSetLayoutBinding composeBindings[4] = {};
+    for (uint32_t i = 0; i < 4; ++i) {
         composeBindings[i].binding = i;
         composeBindings[i].descriptorCount = 1;
         composeBindings[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
@@ -640,7 +647,7 @@ bool CompareApp::createDescriptors() {
     }
     VkDescriptorSetLayoutCreateInfo composeLayoutCi = {};
     composeLayoutCi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    composeLayoutCi.bindingCount = 3;
+    composeLayoutCi.bindingCount = 4;
     composeLayoutCi.pBindings = composeBindings;
     if (vkCreateDescriptorSetLayout(ctx_.device, &composeLayoutCi, nullptr, &composeSetLayout_) != VK_SUCCESS)
         return false;
@@ -687,7 +694,7 @@ bool CompareApp::createDescriptors() {
     const uint32_t fogPaths = volFogActive_ ? 3 : 0; // froxel fog sets per path (Phase 5a)
     const uint32_t postFxPaths = opts_.gtSsaa ? 3 : 2; // MB/DOF set paths (Phase 6b: GB/GT[/SSAA])
     sizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    sizes[0].descriptorCount = deferred::kMaxTextures + numColumns * 2 + 2 + numAlgos * 2 +
+    sizes[0].descriptorCount = deferred::kMaxTextures + numColumns * 3 + 2 + numAlgos * 2 +
                                14 * kFramesInFlight * 4 + // lighting sets (GB/GT/SSAA/spatial), shadow + atlas + 2 probe arrays
                                7 * kFramesInFlight * 4 +  // transparent sets + SSR
                                11 * kFramesInFlight * 4 + // opaque-SSR trace sets (GB/GT/SSAA/spatial), +2 probe arrays
@@ -889,8 +896,12 @@ bool CompareApp::createDescriptors() {
         fontInfo.sampler = fontSampler_;
         fontInfo.imageView = fontAtlas_.view;
         fontInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        VkDescriptorImageInfo lutInfo = {};
+        lutInfo.sampler = gradingLut_.sampler();
+        lutInfo.imageView = gradingLut_.view();
+        lutInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
-        VkWriteDescriptorSet writes[3] = {};
+        VkWriteDescriptorSet writes[4] = {};
         writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[0].dstSet = set;
         writes[0].dstBinding = 0;
@@ -909,7 +920,13 @@ bool CompareApp::createDescriptors() {
         writes[2].descriptorCount = 1;
         writes[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         writes[2].pImageInfo = &fontInfo;
-        vkUpdateDescriptorSets(ctx_.device, 3, writes, 0, nullptr);
+        writes[3].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[3].dstSet = set;
+        writes[3].dstBinding = 3;
+        writes[3].descriptorCount = 1;
+        writes[3].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[3].pImageInfo = &lutInfo;
+        vkUpdateDescriptorSets(ctx_.device, 4, writes, 0, nullptr);
     };
     writeComposeSet(gtComposeSet_, gtColor_.view);
 
@@ -1020,10 +1037,16 @@ bool CompareApp::createPipelines() {
     if (vkCreatePipelineLayout(ctx_.device, &composeLayoutCi, nullptr, &composePipelineLayout_) != VK_SUCCESS)
         return false;
 
+    VkPushConstantRange copyPushRange = {};
+    copyPushRange.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    copyPushRange.offset = 0;
+    copyPushRange.size = 16; // vec4: hdr mode + paper white (copy.frag; SDR here)
     VkPipelineLayoutCreateInfo copyLayoutCi = {};
     copyLayoutCi.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     copyLayoutCi.setLayoutCount = 1;
     copyLayoutCi.pSetLayouts = &copySetLayout_;
+    copyLayoutCi.pushConstantRangeCount = 1;
+    copyLayoutCi.pPushConstantRanges = &copyPushRange;
     if (vkCreatePipelineLayout(ctx_.device, &copyLayoutCi, nullptr, &copyPipelineLayout_) != VK_SUCCESS)
         return false;
 
@@ -2190,6 +2213,11 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
             vkCmdSetScissor(cmd, 0, 1, &scissor);
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, copyPipelineLayout_, 0, 1,
                                     &gtDownsampleSet_, 0, nullptr);
+            // Mode 0: passthrough — the downsample target is HDR linear, not
+            // the swapchain (copy.frag HDR branch is for presentation only).
+            const float copyPush[4] = {0.f, 0.f, 0.f, 0.f};
+            vkCmdPushConstants(cmd, copyPipelineLayout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                               sizeof(copyPush), copyPush);
             vkCmdDraw(cmd, 3, 1, 0, 0);
             vkCmdEndRendering(cmd);
         }
@@ -2508,6 +2536,17 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
             push.lensA[1] = opts_.lensFx ? kLensVignetteStrength : 0.f;
             push.lensA[2] = opts_.lensFx ? kLensGrainStrength : 0.f;
             push.lensA[3] = static_cast<float>(frameIndex);
+            // Grading (Phase 6c): neutral set, same for every column (compare
+            // output stays SDR; HDR presentation is viewer/GUI-only).
+            const Vec3 wb = whiteBalanceForTemperatureTint(grading_.temperatureK, grading_.tint);
+            push.gradeA[0] = grading_.contrast;
+            push.gradeA[1] = grading_.saturation;
+            push.gradeA[2] = 0.f;
+            push.gradeA[3] = 0.f;
+            push.gradeB[0] = wb.x;
+            push.gradeB[1] = wb.y;
+            push.gradeB[2] = wb.z;
+            push.gradeB[3] = 17.f; // makeIdentityLut() default edge length
             vkCmdPushConstants(cmd, composePipelineLayout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                                sizeof(push), &push);
             vkCmdDraw(cmd, 3, 1, 0, 0);
@@ -2537,6 +2576,10 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         vkCmdSetScissor(cmd, 0, 1, &scissor);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, copyPipelineLayout_, 0, 1,
                                 &copySet_, 0, nullptr);
+        // Compare presentation is SDR only (Phase 6c: HDR is viewer/GUI-only).
+        const float copyPush[4] = {0.f, 0.f, 0.f, 0.f};
+        vkCmdPushConstants(cmd, copyPipelineLayout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                           sizeof(copyPush), copyPush);
         vkCmdDraw(cmd, 3, 1, 0, 0);
         vkCmdEndRendering(cmd);
     }
@@ -2835,6 +2878,7 @@ void CompareApp::shutdown() {
     gtSsaaAo_.destroy(ctx_);
     composeImage_.destroy(ctx_);
     fontAtlas_.destroy(ctx_);
+    gradingLut_.destroy(ctx_);
 
     if (shadowsActive_) { deferred_.destroyShadowTargets(ctx_, shadow_); shadowsActive_ = false; }
     if (spotAtlasActive_) { deferred_.destroyShadowAtlas(ctx_, spotAtlas_); spotAtlasActive_ = false; }

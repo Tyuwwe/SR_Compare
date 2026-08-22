@@ -11,6 +11,7 @@
 // overlay computed on the GPU (two-pass compute reduction, read back every N
 // frames).
 // ============================================================================
+#include "renderer/ColorGrading.h"
 #include "renderer/core/Swapchain.h"
 #include "renderer/core/VulkanContext.h"
 #include "renderer/core/Window.h"
@@ -294,6 +295,10 @@ private:
     PostFxTargets gtSsaaPostFx_; // gtSsaa only
     ImageResource composeImage_; // RGBA8, tonemapped columns + overlay
     ImageResource fontAtlas_;
+    // Log-domain grading LUT (Phase 6c): procedural identity — compare columns
+    // share the neutral grading set (compare output stays SDR).
+    GradingLutGpu gradingLut_;
+    ColorGrading grading_;
 
     // Shared deferred pipeline (shaders/layouts/pipelines/samplers + IBL maps).
     DeferredCore deferred_;

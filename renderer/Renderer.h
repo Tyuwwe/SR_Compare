@@ -5,6 +5,7 @@
 // render scale (with Halton jitter), runs the IUpscaler, and presents either
 // the upscaled image or the native-resolution ground truth.
 // ============================================================================
+#include "renderer/ColorGrading.h"
 #include "renderer/core/Swapchain.h"
 #include "renderer/core/TimestampQuery.h"
 #include "renderer/core/Vk.h"
@@ -79,6 +80,19 @@ struct RendererOptions {
     // probe's 6 cube faces and writes the .probes file, then exits without
     // entering the frame loop.  Not part of bench.
     bool bakeProbes = false;
+    // Log-domain color grading (Phase 6c, ACES input; see grading.glsl).
+    // Sentinel semantics per field: <= 0 = unset, falling back to the scene
+    // lighting preset's grading override, then the neutral defaults.
+    ColorGrading grading{0.f, 0.f, 0.f, 0.f};
+    // Optional .cube 3D LUT (17^3/33^3), applied in the log domain; empty =
+    // procedural identity LUT (bit-neutral output with default grading).
+    std::string lutPath;
+    // HDR swapchain output (CLI: --hdr): probe HDR10 (PQ) then scRGB, SDR
+    // fallback with a stderr note.  Compare/bench stay SDR (viewer-only).
+    bool hdr = false;
+    // HDR10 nits calibration: scene linear 1.0 x exposure maps to this many
+    // nits before the 10000-nit PQ ceiling (BT.2408 graphics white default).
+    float hdrPaperWhiteNits = 203.f;
 };
 
 class Renderer {
@@ -183,6 +197,11 @@ private:
     // Procedural lens-dirt mask (R8, radial blobs; generated at init — no
     // external asset).  Sampled by present.frag.
     ImageResource lensDirt_;
+    // Log-domain grading LUT (Phase 6c): .cube file or procedural identity,
+    // uploaded as an RGBA16F 3D image; the CPU copy feeds the screenshot path.
+    GradingLutGpu gradingLutGpu_;
+    ColorLut gradingLutCpu_;
+    ColorGrading grading_; // resolved: CLI -> scene preset -> neutral defaults
     // HDR color mip chains (lit opaque color, box-filtered) for
     // roughness-aware glass SSR; same GENERAL-for-life resource model as the
     // depth pyramids.  Deliberately separate from the bloom pyramids (see
@@ -292,6 +311,10 @@ private:
     // Procedural 512x512 R8 lens-dirt mask (deterministic radial blobs),
     // uploaded to SHADER_READ_ONLY; sampled by present.frag.
     bool createLensDirtTexture();
+    // Grading LUT (Phase 6c): loads --lut (.cube) or generates the procedural
+    // identity LUT, uploads the GPU copy and keeps the CPU mirror for the
+    // screenshot path.
+    bool createGradingLut();
     bool createShaders();
     bool createSceneDescriptors();
     bool createPipelines();

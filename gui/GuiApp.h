@@ -32,6 +32,7 @@
 // is synchronous.
 // ============================================================================
 #include "gui/BenchRunner.h"
+#include "renderer/ColorGrading.h"
 #include "renderer/core/Swapchain.h"
 #include "renderer/core/TimestampQuery.h"
 #include "renderer/core/VulkanContext.h"
@@ -227,6 +228,9 @@ private:
     // --- core (window/context/swapchain/imgui), created once ----------------
     bool initImGui();
     void shutdownImGui();
+    // Vulkan backend half of initImGui; re-run by setHdrEnabled after the
+    // swapchain format changes (Phase 6c).
+    bool initImGuiVulkanBackend();
     bool createUiSync();
     void destroyUiSync();
     void recordUiOnlyFrame(uint32_t slot, uint32_t swapchainIndex);
@@ -312,6 +316,12 @@ private:
     bool guiAllowMailbox() const;
     bool recreateGuiSwapchain();
     void ensureGuiSwapchainMode();
+    // HDR checkbox handler (Phase 6c): re-creates the swapchain, copy pipeline
+    // and ImGui backend for the new surface format (all at device idle).
+    void setHdrEnabled(bool enabled);
+    // Swapchain-format-dependent fullscreen copy pipeline (created by
+    // createPipelines, re-created by setHdrEnabled).
+    bool createCopyPipeline();
     void waitUntil(std::chrono::steady_clock::time_point t);
     void noteDisplayPresents(int nPres, std::chrono::steady_clock::time_point frameStart);
     void captureScreenshotIntoStaging(VkCommandBuffer cmd);
@@ -517,6 +527,24 @@ private:
     // path so the GT column blurs identically.
     bool motionBlurEnabled_ = true;
     bool dofEnabled_ = true;
+    // Log-domain color grading (Phase 6c, compose push constants; identical
+    // parameters for every column — sliders in the shared controls).  The LUT
+    // is the procedural identity (no LUT file UI); the GUI is the interactive
+    // grading front end.
+    float gradeTemperatureK_ = 6500.f;
+    float gradeTint_ = 0.f;
+    float gradeContrast_ = 1.f;
+    float gradeSaturation_ = 1.f;
+    GradingLutGpu gradingLut_; // procedural identity, created once in init
+    // HDR swapchain output (Phase 6c): checkbox gated on surface support
+    // (probed once at init).  Toggling re-creates the swapchain, the copy
+    // pipeline and the ImGui backend (all bake the swapchain format).  The
+    // composite stays the SDR display-encoded image — copy.frag re-linearizes
+    // and PQ/scRGB-encodes it (SDR content in an HDR container; true scene
+    // HDR headroom is viewer-only, see present.frag).
+    bool hdrEnabled_ = false;
+    bool hdrSupportHdr10_ = false;
+    bool hdrSupportScRgb_ = false;
 
     ImageResource gbColor_;
     ImageResource gbColorSpatial_; // unjittered LR HDR copy for spatial upscalers
