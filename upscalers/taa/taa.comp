@@ -141,7 +141,11 @@ void main() {
 
     // Translucent coverage: history under translucent geometry does not
     // reproject with opaque motion, so scale the blend weight down to zero
-    // as coverage approaches 1.
+    // as coverage approaches 1.  The renderer feeds the 3x3-max dilated,
+    // MOTION-GATED copy (reactive_dilate.comp): coverage on (near-)static
+    // pixels is gated to zero — reprojection is exact there, and dropping
+    // history would pass the phase-flipping aliased current frame through
+    // unfiltered (shimmer around glass).
     if (pc.params.z > 0.5) {
         float mask = clamp(texture(uReactive, uv).r, 0.0, 1.0);
         alpha *= 1.0 - mask;

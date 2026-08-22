@@ -311,6 +311,11 @@ bool Renderer::createRenderTargets() {
                       VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                   VK_IMAGE_ASPECT_COLOR_BIT))
         return false;
+    // Dilated coverage mask (reactive_dilate.comp output; see Renderer.h).
+    if (!createRT(gbReactiveDilated_, renderWidth_, renderHeight_, deferred::kReactiveFormat,
+                  VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                  VK_IMAGE_ASPECT_COLOR_BIT))
+        return false;
     // Deferred GBuffer attachments (low-res input path / full-res GT path).
     const VkImageUsageFlags gbUsage =
         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
@@ -612,6 +617,7 @@ bool Renderer::createSceneDescriptors() {
                                20 +                        // bloom pyramid extract/down/up/comp (GB/GT)
                                17 * 2 +                    // post-fx MB/DOF sets (Phase 6b, GB/GT)
                                1 +                         // auto-exposure HDR source
+                               2 +                         // reactive mask dilate: src mask + motion samplers
                                14 * fogPaths +             // volfog light/temporal/march/composite samplers
                                2 +                         // occlusion cull sets: Hi-Z chains (GB/GT, Phase 7a)
                                hizSets + colorSets;
@@ -627,6 +633,7 @@ bool Renderer::createSceneDescriptors() {
     // + bloom pyramid dst mips (GB/GT)
     sizes[3].descriptorCount = 10 + 8 + hizSets + colorSets + kFramesInFlight * 2 + 20 +
                                11 * 2 + 2 * 2 + // post-fx MB/DOF storage + MB copy-back (Phase 6b, GB/GT)
+                               1 +              // reactive mask dilate
                                8 * fogPaths;
     sizes[4].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     sizes[4].descriptorCount = 2 + // auto-exposure histogram + state
@@ -640,6 +647,7 @@ bool Renderer::createSceneDescriptors() {
     poolCi.maxSets = kFramesInFlight * 7 + 12 + 20 + hizSets + colorSets + 1 + 4 +
                      kClusterSlots * 2 + // +12 ssao/temporal/blur, +20 bloom pyramid, +1 auto-exposure, +4 ssr temporal, +cluster assign
                      8 * 2 + 1 * 2 +      // post-fx MB/DOF sets + MB copy-back (Phase 6b, GB/GT)
+                     1 +                  // reactive mask dilate
                      2 +                  // occlusion cull sets (GB/GT, Phase 7a)
                      8 * fogPaths;        // volfog inject/light/temporal/march/composite sets
     poolCi.poolSizeCount = 5;
@@ -1037,6 +1045,12 @@ bool Renderer::createSyncResources() {
         return false;
     if (!deferred_.writePostFxSets(ctx_, descriptorPool_, finalImage_.view, gtMotion_.view,
                                    gtDepth_.view, gtPostFx_))
+        return false;
+    // Coverage mask dilate set: raw mask + motion -> dilated/gated target
+    // (pool-owned set).
+    if (!deferred_.writeReactiveDilateSet(ctx_, descriptorPool_, gbReactive_.view,
+                                          gbReactiveDilated_.view, gbMotion_.view,
+                                          reactiveDilateSet_))
         return false;
 
     // One renderFinished semaphore per swapchain image: the submit signals the
@@ -1916,6 +1930,22 @@ void Renderer::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
             vkCmdEndRendering(c);
         };
     }
+    // Coverage mask conditioning (LR only): 3x3 max dilate + motion gate.
+    // The dilated plateau absorbs the sub-pixel straddle of consumers
+    // sampling at the jittered coordinate; the motion gate keeps the mask
+    // from dropping history on static pixels (see reactive_dilate.comp).
+    if (hasTransparency_ && gbuffer) {
+        RenderGraph::Pass& p = rg_.addPass("ReactiveDilate");
+        p.access(gbReactive_.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kCompute,
+                 sync::kSampled);
+        p.access(gbMotion_.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kCompute,
+                 sync::kSampled);
+        p.access(gbReactiveDilated_.image, VK_IMAGE_LAYOUT_GENERAL, sync::kCompute,
+                 sync::kStorageWrite);
+        p.record = [&](VkCommandBuffer c) {
+            deferred_.recordReactiveDilatePass(c, reactiveDilateSet_, sceneW, sceneH);
+        };
+    }
 
     if (opts_.bloom) {
         // The helper transitions the lit target internally (GENERAL RMW
@@ -2020,7 +2050,7 @@ void Renderer::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         p.access(gbMotion_.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kSampleStages,
                  sync::kSampled);
         if (hasTransparency_)
-            p.access(gbReactive_.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            p.access(gbReactiveDilated_.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                      sync::kSampleStages, sync::kSampled);
         p.record = [&](VkCommandBuffer c) {
             UpscalerResources res;
@@ -2031,8 +2061,8 @@ void Renderer::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
             res.motion = gbMotion_.image;
             res.motionView = gbMotion_.view;
             if (hasTransparency_) {
-                res.reactive = gbReactive_.image;
-                res.reactiveView = gbReactive_.view;
+                res.reactive = gbReactiveDilated_.image;
+                res.reactiveView = gbReactiveDilated_.view;
             }
             res.output = finalImage_.image;
             res.outputView = finalImage_.view;
@@ -2315,6 +2345,7 @@ void Renderer::shutdown() {
     gbColor_.destroy(ctx_);
     gbMotion_.destroy(ctx_);
     gbReactive_.destroy(ctx_);
+    gbReactiveDilated_.destroy(ctx_);
     gbDepth_.destroy(ctx_);
     gbAlbedo_.destroy(ctx_);
     gbNormal_.destroy(ctx_);

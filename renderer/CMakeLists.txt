@@ -60,6 +60,7 @@ set(RENDERER_SHADERS
     shaders/occlusion_cull.comp
     shaders/ssao.comp
     shaders/ssao_blur.comp
+    shaders/reactive_dilate.comp
     shaders/ssao_temporal.comp
     shaders/ssr_opaque.comp
     shaders/ssr_temporal.comp

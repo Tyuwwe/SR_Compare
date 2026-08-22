@@ -1,0 +1,47 @@
+#version 450
+// Translucent coverage mask conditioning: 3x3 max dilate + motion gate of
+// the R16F reactive/TC mask written by the transparency pass.
+//
+// Dilate: the 1 px plateau absorbs the sub-pixel straddle of consumers that
+// sample the mask at the jittered coordinate (FSR2/3 sample at
+// fLrUvJittered) and of the bilinear un-jitter resample of the composite
+// colour crossing the silhouette.  Without the plateau those samplers
+// straddle the hard 0/1 mask edge phase to phase and the per-pixel history
+// weight still flickers.
+//
+// Motion gate: the mask exists to drop reprojected history where the
+// transmissive content does not follow the written (glass surface) motion.
+// At (near-)zero pixel motion the reprojection is exact, so the mask must
+// NOT fire: the current frame of sub-pixel geometry seen through/around
+// glass flips with the jitter phase, and a blanket history drop passes that
+// aliasing straight through (visible shimmer under every temporal
+// upscaler).  Gate the dilated coverage by the pixel's own motion magnitude
+// (un-jittered, render-res pixels): full protection above ~1.5 px, none
+// below 0.5 px.
+//
+// Values are dilated unclamped (multi-layer alpha can exceed 1; consumers
+// clamp).
+// Bindings: 0 = src mask (sampler), 1 = dst mask (storage), 2 = motion
+// (sampler) — dedicated reactiveDilateSetLayout, NOT the ssaoBlur shape.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D inMask;
+layout(set = 0, binding = 1, r16f) uniform writeonly image2D outMask;
+layout(set = 0, binding = 2) uniform sampler2D inMotion;
+
+void main() {
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(outMask);
+    if (pix.x >= size.x || pix.y >= size.y) return;
+
+    float m = 0.0;
+    for (int y = -1; y <= 1; ++y)
+        for (int x = -1; x <= 1; ++x)
+            m = max(m, texelFetch(inMask, clamp(pix + ivec2(x, y), ivec2(0), size - 1), 0).r);
+
+    vec2 mv = texelFetch(inMotion, pix, 0).xy;
+    m *= smoothstep(0.5, 1.5, length(mv));
+
+    imageStore(outMask, pix, vec4(m, 0.0, 0.0, 0.0));
+}

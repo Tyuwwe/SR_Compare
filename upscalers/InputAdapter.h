@@ -32,9 +32,16 @@
 // Reactive mask (UpscalerResources::reactive/reactiveView) convention:
 //   * R16_SFLOAT, render resolution, per-pixel accumulated translucent alpha
 //     coverage (0 = fully opaque / no translucency; can exceed 1, consumers
-//     clamp to [0,1]).  SHADER_READ_ONLY_OPTIMAL at dispatch; VK_NULL_HANDLE
+//     clamp to [0,1]).  The renderer feeds the 3x3-max DILATED +
+//     MOTION-GATED copy (reactive_dilate.comp): the plateau absorbs the
+//     sub-pixel straddle of consumers that sample it at the jittered
+//     coordinate (FSR2/3), and coverage on (near-)static pixels is gated to
+//     zero — reprojection is exact there, so dropping history would only
+//     pass the phase-flipping aliased current frame through unfiltered
+//     (shimmer).  SHADER_READ_ONLY_OPTIMAL at dispatch; VK_NULL_HANDLE
 //     when the scene has no translucency.
-//   * Semantics: pixels under translucency must not trust reprojected history.
+//   * Semantics: pixels under MOVING translucency must not trust reprojected
+//     history; static coverage keeps full history weight.
 //   * Consumers:
 //       TAA    : scales the history blend weight by (1 - clamp(mask,0,1))
 //                (own shader; binding 6 + useReactive push flag).

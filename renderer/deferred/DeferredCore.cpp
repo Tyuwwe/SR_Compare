@@ -218,6 +218,7 @@ bool DeferredCore::init(const VulkanContext& ctx, const char* envMapPath, const 
         !loadShader(ctx, "transparent_gt.frag.spv", transparentGtFrag_) ||
         !loadShader(ctx, "ssao.comp.spv", ssaoComp_) ||
         !loadShader(ctx, "ssao_blur.comp.spv", ssaoBlurComp_) ||
+        !loadShader(ctx, "reactive_dilate.comp.spv", reactiveDilateComp_) ||
         !loadShader(ctx, "ssao_temporal.comp.spv", ssaoTemporalComp_) ||
         !loadShader(ctx, "hiz_downsample.comp.spv", hizDownsampleComp_) ||
         !loadShader(ctx, "color_downsample.comp.spv", colorDownsampleComp_) ||
@@ -446,6 +447,29 @@ bool DeferredCore::createLayouts(const VulkanContext& ctx) {
     ssaoBlurLayoutCi.pBindings = ssaoBlurBindings;
     if (vkCreateDescriptorSetLayout(ctx.device, &ssaoBlurLayoutCi, nullptr, &ssaoBlurSetLayout_) !=
         VK_SUCCESS)
+        return false;
+
+    // Reactive mask dilate: binding 0 = src mask (sampler), 1 = dst mask
+    // (storage), 2 = motion buffer (sampler, for the motion gate).
+    VkDescriptorSetLayoutBinding reactiveDilateBindings[3] = {};
+    reactiveDilateBindings[0].binding = 0;
+    reactiveDilateBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    reactiveDilateBindings[0].descriptorCount = 1;
+    reactiveDilateBindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    reactiveDilateBindings[1].binding = 1;
+    reactiveDilateBindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    reactiveDilateBindings[1].descriptorCount = 1;
+    reactiveDilateBindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    reactiveDilateBindings[2].binding = 2;
+    reactiveDilateBindings[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    reactiveDilateBindings[2].descriptorCount = 1;
+    reactiveDilateBindings[2].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    VkDescriptorSetLayoutCreateInfo reactiveDilateSetLayoutCi = {};
+    reactiveDilateSetLayoutCi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    reactiveDilateSetLayoutCi.bindingCount = 3;
+    reactiveDilateSetLayoutCi.pBindings = reactiveDilateBindings;
+    if (vkCreateDescriptorSetLayout(ctx.device, &reactiveDilateSetLayoutCi, nullptr,
+                                    &reactiveDilateSetLayout_) != VK_SUCCESS)
         return false;
 
     // Hi-Z downsample: binding 0 = source level (sampler; mip 0 binds the D32
@@ -1191,6 +1215,16 @@ bool DeferredCore::createPipelines(const VulkanContext& ctx) {
                                &ssaoBlurPipelineLayout_) != VK_SUCCESS)
         return false;
 
+    // Coverage-mask conditioning (reactive_dilate.comp): dedicated 3-binding
+    // set layout (src mask / dst mask / motion), no push constants.
+    VkPipelineLayoutCreateInfo reactiveDilateLayoutCi = {};
+    reactiveDilateLayoutCi.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    reactiveDilateLayoutCi.setLayoutCount = 1;
+    reactiveDilateLayoutCi.pSetLayouts = &reactiveDilateSetLayout_;
+    if (vkCreatePipelineLayout(ctx.device, &reactiveDilateLayoutCi, nullptr,
+                               &reactiveDilatePipelineLayout_) != VK_SUCCESS)
+        return false;
+
     VkPushConstantRange ssaoTemporalPushRange = {};
     ssaoTemporalPushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     ssaoTemporalPushRange.offset = 0;
@@ -1217,6 +1251,10 @@ bool DeferredCore::createPipelines(const VulkanContext& ctx) {
     ssaoCi.stage.module = ssaoBlurComp_;
     ssaoCi.layout = ssaoBlurPipelineLayout_;
     if (createComputePipeline(ctx, ssaoCi, ssaoBlurPipeline_) != VK_SUCCESS)
+        return false;
+    ssaoCi.stage.module = reactiveDilateComp_;
+    ssaoCi.layout = reactiveDilatePipelineLayout_;
+    if (createComputePipeline(ctx, ssaoCi, reactiveDilatePipeline_) != VK_SUCCESS)
         return false;
     ssaoCi.stage.module = ssaoTemporalComp_;
     ssaoCi.layout = ssaoTemporalPipelineLayout_;
@@ -1655,6 +1693,7 @@ void DeferredCore::destroy(const VulkanContext& ctx) {
     if (transparentGtPipeline_) { vkDestroyPipeline(ctx.device, transparentGtPipeline_, nullptr); transparentGtPipeline_ = VK_NULL_HANDLE; }
     if (ssaoPipeline_) { vkDestroyPipeline(ctx.device, ssaoPipeline_, nullptr); ssaoPipeline_ = VK_NULL_HANDLE; }
     if (ssaoBlurPipeline_) { vkDestroyPipeline(ctx.device, ssaoBlurPipeline_, nullptr); ssaoBlurPipeline_ = VK_NULL_HANDLE; }
+    if (reactiveDilatePipeline_) { vkDestroyPipeline(ctx.device, reactiveDilatePipeline_, nullptr); reactiveDilatePipeline_ = VK_NULL_HANDLE; }
     if (ssaoTemporalPipeline_) { vkDestroyPipeline(ctx.device, ssaoTemporalPipeline_, nullptr); ssaoTemporalPipeline_ = VK_NULL_HANDLE; }
     if (hizPipeline_) { vkDestroyPipeline(ctx.device, hizPipeline_, nullptr); hizPipeline_ = VK_NULL_HANDLE; }
     if (colorDownsamplePipeline_) { vkDestroyPipeline(ctx.device, colorDownsamplePipeline_, nullptr); colorDownsamplePipeline_ = VK_NULL_HANDLE; }
@@ -1698,6 +1737,7 @@ void DeferredCore::destroy(const VulkanContext& ctx) {
     if (transparentPipelineLayout_) { vkDestroyPipelineLayout(ctx.device, transparentPipelineLayout_, nullptr); transparentPipelineLayout_ = VK_NULL_HANDLE; }
     if (ssaoPipelineLayout_) { vkDestroyPipelineLayout(ctx.device, ssaoPipelineLayout_, nullptr); ssaoPipelineLayout_ = VK_NULL_HANDLE; }
     if (ssaoBlurPipelineLayout_) { vkDestroyPipelineLayout(ctx.device, ssaoBlurPipelineLayout_, nullptr); ssaoBlurPipelineLayout_ = VK_NULL_HANDLE; }
+    if (reactiveDilatePipelineLayout_) { vkDestroyPipelineLayout(ctx.device, reactiveDilatePipelineLayout_, nullptr); reactiveDilatePipelineLayout_ = VK_NULL_HANDLE; }
     if (ssaoTemporalPipelineLayout_) { vkDestroyPipelineLayout(ctx.device, ssaoTemporalPipelineLayout_, nullptr); ssaoTemporalPipelineLayout_ = VK_NULL_HANDLE; }
     if (hizPipelineLayout_) { vkDestroyPipelineLayout(ctx.device, hizPipelineLayout_, nullptr); hizPipelineLayout_ = VK_NULL_HANDLE; }
     if (ssrPipelineLayout_) { vkDestroyPipelineLayout(ctx.device, ssrPipelineLayout_, nullptr); ssrPipelineLayout_ = VK_NULL_HANDLE; }
@@ -1724,6 +1764,7 @@ void DeferredCore::destroy(const VulkanContext& ctx) {
     if (transparentGtFrag_) { vkDestroyShaderModule(ctx.device, transparentGtFrag_, nullptr); transparentGtFrag_ = VK_NULL_HANDLE; }
     if (ssaoComp_) { vkDestroyShaderModule(ctx.device, ssaoComp_, nullptr); ssaoComp_ = VK_NULL_HANDLE; }
     if (ssaoBlurComp_) { vkDestroyShaderModule(ctx.device, ssaoBlurComp_, nullptr); ssaoBlurComp_ = VK_NULL_HANDLE; }
+    if (reactiveDilateComp_) { vkDestroyShaderModule(ctx.device, reactiveDilateComp_, nullptr); reactiveDilateComp_ = VK_NULL_HANDLE; }
     if (ssaoTemporalComp_) { vkDestroyShaderModule(ctx.device, ssaoTemporalComp_, nullptr); ssaoTemporalComp_ = VK_NULL_HANDLE; }
     if (hizDownsampleComp_) { vkDestroyShaderModule(ctx.device, hizDownsampleComp_, nullptr); hizDownsampleComp_ = VK_NULL_HANDLE; }
     if (colorDownsampleComp_) { vkDestroyShaderModule(ctx.device, colorDownsampleComp_, nullptr); colorDownsampleComp_ = VK_NULL_HANDLE; }
@@ -1758,6 +1799,7 @@ void DeferredCore::destroy(const VulkanContext& ctx) {
     if (transparentSetLayout_) { vkDestroyDescriptorSetLayout(ctx.device, transparentSetLayout_, nullptr); transparentSetLayout_ = VK_NULL_HANDLE; }
     if (ssaoSetLayout_) { vkDestroyDescriptorSetLayout(ctx.device, ssaoSetLayout_, nullptr); ssaoSetLayout_ = VK_NULL_HANDLE; }
     if (ssaoBlurSetLayout_) { vkDestroyDescriptorSetLayout(ctx.device, ssaoBlurSetLayout_, nullptr); ssaoBlurSetLayout_ = VK_NULL_HANDLE; }
+    if (reactiveDilateSetLayout_) { vkDestroyDescriptorSetLayout(ctx.device, reactiveDilateSetLayout_, nullptr); reactiveDilateSetLayout_ = VK_NULL_HANDLE; }
     if (ssaoTemporalSetLayout_) { vkDestroyDescriptorSetLayout(ctx.device, ssaoTemporalSetLayout_, nullptr); ssaoTemporalSetLayout_ = VK_NULL_HANDLE; }
     if (hizSetLayout_) { vkDestroyDescriptorSetLayout(ctx.device, hizSetLayout_, nullptr); hizSetLayout_ = VK_NULL_HANDLE; }
     if (ssrSetLayout_) { vkDestroyDescriptorSetLayout(ctx.device, ssrSetLayout_, nullptr); ssrSetLayout_ = VK_NULL_HANDLE; }
@@ -2905,6 +2947,48 @@ void DeferredCore::recordSsaoBlurPass(VkCommandBuffer cmd, VkDescriptorSet blurS
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ssaoBlurPipeline_);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ssaoBlurPipelineLayout_, 0, 1,
                             &blurSet, 0, nullptr);
+    vkCmdDispatch(cmd, (width + 7) / 8, (height + 7) / 8, 1);
+}
+
+bool DeferredCore::writeReactiveDilateSet(const VulkanContext& ctx, VkDescriptorPool pool,
+                                          VkImageView srcMask, VkImageView dstMask,
+                                          VkImageView motion, VkDescriptorSet& out) const {
+    VkDescriptorSetAllocateInfo alloc = {};
+    alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    alloc.descriptorPool = pool;
+    alloc.descriptorSetCount = 1;
+    alloc.pSetLayouts = &reactiveDilateSetLayout_;
+    if (vkAllocateDescriptorSets(ctx.device, &alloc, &out) != VK_SUCCESS) return false;
+
+    VkDescriptorImageInfo img[3] = {};
+    img[0].sampler = gbufferSampler_;
+    img[0].imageView = srcMask;
+    img[0].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    img[1].imageView = dstMask;
+    img[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    img[2].sampler = gbufferSampler_;
+    img[2].imageView = motion;
+    img[2].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+    VkWriteDescriptorSet w[3] = {};
+    for (uint32_t k = 0; k < 3; ++k) {
+        w[k].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w[k].dstSet = out;
+        w[k].dstBinding = k;
+        w[k].descriptorCount = 1;
+        w[k].descriptorType = k == 1 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
+                                     : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        w[k].pImageInfo = &img[k];
+    }
+    vkUpdateDescriptorSets(ctx.device, 3, w, 0, nullptr);
+    return true;
+}
+
+void DeferredCore::recordReactiveDilatePass(VkCommandBuffer cmd, VkDescriptorSet set,
+                                            uint32_t width, uint32_t height) const {
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, reactiveDilatePipeline_);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, reactiveDilatePipelineLayout_, 0, 1,
+                            &set, 0, nullptr);
     vkCmdDispatch(cmd, (width + 7) / 8, (height + 7) / 8, 1);
 }
 

@@ -185,6 +185,12 @@ private:
     ImageResource gbMotion_;
     ImageResource gbDepth_;
     ImageResource gbReactive_; // R16F translucent coverage mask (render res)
+    // 3x3-max dilated + motion-gated copy of gbReactive_
+    // (reactive_dilate.comp): the plateau absorbs the sub-pixel straddle of
+    // consumers sampling at the jittered coordinate; static coverage is
+    // gated to zero so it keeps its history weight.  Fed to the upscalers.
+    ImageResource gbReactiveDilated_;
+    VkDescriptorSet reactiveDilateSet_ = VK_NULL_HANDLE;
     ImageResource gbAlbedo_;
     ImageResource gbNormal_;
     ImageResource gbMaterial_;

@@ -1160,6 +1160,24 @@ public:
     // ao GENERAL storage.
     void recordSsaoBlurPass(VkCommandBuffer cmd, VkDescriptorSet blurSet, uint32_t width,
                             uint32_t height) const;
+
+    // --- Translucent coverage mask conditioning (after transparency, before upscale)
+    // 3x3 max dilate + motion gate (reactive_dilate.comp): the dilated
+    // plateau absorbs the sub-pixel straddle of consumers sampling the mask
+    // at the jittered coordinate; the motion gate keeps the mask from
+    // dropping history where the pixel does not move (reprojection is exact
+    // there, and the aliased current frame would otherwise pass through
+    // unfiltered and shimmer).  Uses its own 3-binding set layout
+    // (src mask sampler, dst storage, motion sampler); the pipeline is
+    // created in createPipelines.  The host owns the dilated R16F target.
+    // Allocates the dilate set from the caller's pool: srcMask = raw coverage
+    // mask (SHADER_READ_ONLY), dstMask = dilated target (GENERAL storage),
+    // motion = the path's RG16F motion buffer (SHADER_READ_ONLY).
+    bool writeReactiveDilateSet(const VulkanContext& ctx, VkDescriptorPool pool,
+                                VkImageView srcMask, VkImageView dstMask, VkImageView motion,
+                                VkDescriptorSet& out) const;
+    void recordReactiveDilatePass(VkCommandBuffer cmd, VkDescriptorSet set, uint32_t width,
+                                  uint32_t height) const;
     // Temporal accumulation state (host-owned; see AoHistory).  Creates the
     // two RG16F ping-pong images (GENERAL for life); descriptor sets are
     // written by writeAoHistorySets once the host's pool exists.
@@ -1504,6 +1522,8 @@ private:
     VkPipelineLayout transparentPipelineLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout ssaoPipelineLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout ssaoBlurPipelineLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout reactiveDilateSetLayout_ = VK_NULL_HANDLE; // mask + dst + motion
+    VkPipelineLayout reactiveDilatePipelineLayout_ = VK_NULL_HANDLE; // uses reactiveDilateSetLayout_
     VkPipelineLayout ssaoTemporalPipelineLayout_ = VK_NULL_HANDLE;
     VkPipeline gbufferPipeline_ = VK_NULL_HANDLE;
     VkPipeline gbufferGtPipeline_ = VK_NULL_HANDLE;
@@ -1514,6 +1534,7 @@ private:
     VkPipeline transparentGtPipeline_ = VK_NULL_HANDLE;
     VkPipeline ssaoPipeline_ = VK_NULL_HANDLE;
     VkPipeline ssaoBlurPipeline_ = VK_NULL_HANDLE;
+    VkPipeline reactiveDilatePipeline_ = VK_NULL_HANDLE;
     VkPipeline ssaoTemporalPipeline_ = VK_NULL_HANDLE;
     VkPipelineLayout hizPipelineLayout_ = VK_NULL_HANDLE;
     VkPipeline hizPipeline_ = VK_NULL_HANDLE;
@@ -1585,6 +1606,7 @@ private:
     VkShaderModule transparentGtFrag_ = VK_NULL_HANDLE;
     VkShaderModule ssaoComp_ = VK_NULL_HANDLE;
     VkShaderModule ssaoBlurComp_ = VK_NULL_HANDLE;
+    VkShaderModule reactiveDilateComp_ = VK_NULL_HANDLE;
     VkShaderModule ssaoTemporalComp_ = VK_NULL_HANDLE;
     VkShaderModule hizDownsampleComp_ = VK_NULL_HANDLE;
     VkShaderModule colorDownsampleComp_ = VK_NULL_HANDLE;

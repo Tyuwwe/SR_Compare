@@ -1142,6 +1142,11 @@ bool GuiApp::createRenderTargets() {
                       VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                   VK_IMAGE_ASPECT_COLOR_BIT))
         return false;
+    // Dilated coverage mask (reactive_dilate.comp output; see GuiApp.h).
+    if (!createRT(gbReactiveDilated_, renderWidth_, renderHeight_, deferred::kReactiveFormat,
+                  VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                  VK_IMAGE_ASPECT_COLOR_BIT))
+        return false;
     if (!createRT(gbDepth_, renderWidth_, renderHeight_, deferred::kDepthFormat,
                   VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
                       VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
@@ -1520,13 +1525,15 @@ bool GuiApp::createDescriptors() {
     sizes[0].descriptorCount =
         deferred::kMaxTextures + numColumns * 3 + 2 + numAlgos * 8 + 14 * kFramesInFlight * 4 +
         8 * kFramesInFlight * 4 + 11 * kFramesInFlight * 4 + 10 * 3 + 3 * 6 + hizSets + colorSets +
-        2 + 14 * fogPaths + 17 * postFxPaths + bloomSets + 3; // + ssr temporal samplers (GB/GT/SSAA x2 sets); auto-exposure HDR
+        2 + 14 * fogPaths + 17 * postFxPaths + bloomSets + 3 + 2;
+                           // + ssr temporal samplers (GB/GT/SSAA x2 sets); auto-exposure HDR
                            // sources (LR + GT); volfog light/temporal/march/composite samplers;
                            // lighting sets: 14 samplers each (GB/GT/SSAA/spatial), incl. shadow +
                            // spot atlas + 2 probe arrays; transparent sets: 8 each (incl. the
                            // froxel fog volume); SSR trace sets: 11 each; post-fx sets; bloom
                            // pyramid src taps (Phase 6a);
-                           // occlusion cull sets: Hi-Z chains (GB/GT/SSAA, Phase 7a)
+                           // occlusion cull sets: Hi-Z chains (GB/GT/SSAA, Phase 7a);
+                           // reactive mask dilate: src mask + motion
     sizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     sizes[1].descriptorCount = kFramesInFlight * 3 + numColumns + numAlgos + kFramesInFlight * 4 +
                                kFramesInFlight * 4 + kFramesInFlight * 4 + // + opaque-SSR UBOs
@@ -1547,7 +1554,8 @@ bool GuiApp::createDescriptors() {
     // + volfog inject/light/temporal/march/composite storage (per fog path)
     // + bloom pyramid dst mips (Phase 6a, per path)
     sizes[4].descriptorCount = 15 + hizSets + colorSets + kFramesInFlight * 4 + 2 * 6 +
-                               8 * fogPaths + 11 * postFxPaths + 2 * postFxPaths + bloomSets;
+                               8 * fogPaths + 11 * postFxPaths + 2 * postFxPaths + bloomSets +
+                               1; // reactive mask dilate dst
     VkDescriptorPoolCreateInfo poolCi = {};
     poolCi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     poolCi.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
@@ -1562,6 +1570,7 @@ bool GuiApp::createDescriptors() {
                      8 * postFxPaths +     // MB/DOF post-fx sets (Phase 6b)
                      1 * postFxPaths +     // MB copy-back set (Phase 6b)
                      bloomSets +           // bloom pyramid sets (Phase 6a)
+                     1 +                   // reactive mask dilate set
                      3 +                   // occlusion cull sets (GB/GT/SSAA, Phase 7a)
                      hizSets + colorSets;
     poolCi.poolSizeCount = 5;
@@ -1620,6 +1629,12 @@ bool GuiApp::createDescriptors() {
         return false;
     if (active_.gtSsaa &&
         !deferred_.writeBloomPyramidSets(ctx_, descriptorPool_, gtSsaaColor_.view, gtSsaaBloom_))
+        return false;
+    // Coverage mask dilate set: raw mask + motion -> dilated/gated target
+    // (pool-owned set).
+    if (!deferred_.writeReactiveDilateSet(ctx_, descriptorPool_, gbReactive_.view,
+                                          gbReactiveDilated_.view, gbMotion_.view,
+                                          reactiveDilateSet_))
         return false;
 
     if (!createAutoExposureResources()) return false;
@@ -2581,6 +2596,7 @@ void GuiApp::destroyStackResources() {
     gbEmissive_.destroy(ctx_);
     gbMotion_.destroy(ctx_);
     gbReactive_.destroy(ctx_);
+    gbReactiveDilated_.destroy(ctx_);
     gbDepth_.destroy(ctx_);
     gtColor_.destroy(ctx_);
     gtAlbedo_.destroy(ctx_);
@@ -2656,6 +2672,7 @@ void GuiApp::destroyStackResources() {
     gbEmissiveLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     gbMotionLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     gbReactiveLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+    gbReactiveDilatedLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     gbDepthLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     gtColorLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     gtAlbedoLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -3597,6 +3614,20 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         }
         recordLrDeferred(fr.sceneSetGb, fr.lightingSetGb, fr.transparentSetGb, fr.ssrSetGb,
                          Mat4::multiply(projJittered, view), projJittered);
+        // Coverage mask conditioning: upscalers consume the 3x3-max dilated,
+        // motion-gated copy — the plateau covers samplers at the jittered
+        // coordinate, and static pixels keep their history weight
+        // (see reactive_dilate.comp).  gbMotion_ is already SHADER_READ_ONLY.
+        if (hasTransparency_) {
+            transition(gbReactiveDilated_.image, gbReactiveDilatedLayout_, VK_IMAGE_LAYOUT_GENERAL,
+                       sync::kSampleStages, sync::kSampled, sync::kCompute, sync::kStorageWrite,
+                       VK_IMAGE_ASPECT_COLOR_BIT);
+            deferred_.recordReactiveDilatePass(cmd, reactiveDilateSet_, renderWidth_, renderHeight_);
+            transition(gbReactiveDilated_.image, gbReactiveDilatedLayout_,
+                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kCompute,
+                       sync::kStorageWrite, sync::kSampleStages, sync::kSampled,
+                       VK_IMAGE_ASPECT_COLOR_BIT);
+        }
     }
 
     // --- Auto exposure: LR histogram of this frame's lit HDR (gbColor_) --------
@@ -3656,8 +3687,8 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
             res.motion = gbMotion_.image;
             res.motionView = gbMotion_.view;
             if (hasTransparency_) {
-                res.reactive = gbReactive_.image;
-                res.reactiveView = gbReactive_.view;
+                res.reactive = gbReactiveDilated_.image;
+                res.reactiveView = gbReactiveDilated_.view;
             }
             res.output = algo.output.image;
             res.outputView = algo.output.view;

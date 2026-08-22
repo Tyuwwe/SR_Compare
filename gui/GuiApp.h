@@ -577,6 +577,12 @@ private:
     ImageResource gbEmissive_;
     ImageResource gbMotion_;
     ImageResource gbReactive_; // translucent coverage mask (reactive/TC input)
+    // 3x3-max dilated + motion-gated copy of gbReactive_
+    // (reactive_dilate.comp): the plateau absorbs jittered-coordinate
+    // sampling; static coverage is gated to zero so it keeps its history
+    // weight.  Fed to the upscalers.
+    ImageResource gbReactiveDilated_;
+    VkDescriptorSet reactiveDilateSet_ = VK_NULL_HANDLE;
     ImageResource gbDepth_;
     ImageResource gtColor_;
     ImageResource gtAlbedo_;
@@ -747,6 +753,7 @@ private:
     VkImageLayout gbEmissiveLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gbMotionLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gbReactiveLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageLayout gbReactiveDilatedLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gbDepthLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gtColorLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gtAlbedoLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
