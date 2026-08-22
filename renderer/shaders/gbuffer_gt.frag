@@ -15,6 +15,16 @@ layout(set = 0, binding = 1) uniform MaterialUBO {
 
 layout(set = 1, binding = 0) uniform sampler2D uTextures[1024];
 
+// Vertex-stage SceneUBO, also visible to the fragment stage (see gbuffer.frag).
+layout(set = 0, binding = 0) uniform SceneUBO {
+    mat4 viewProj;
+    mat4 viewProjNoJitter;
+    mat4 prevViewProj;
+    vec4 cameraPos;
+    vec4 ambient;
+    vec4 renderSizeJitter;
+} scene;
+
 layout(location = 0) in vec3 vWorldPos;
 layout(location = 1) in vec3 vNormal;
 layout(location = 2) in vec2 vUV;
@@ -52,6 +62,10 @@ void main() {
     }
 
     vec3 N = normalize(vNormal);
+    // Cull mode is NONE: flip the geometric normal toward the viewer before
+    // normal mapping so backfaces store viewer-facing normals (see
+    // gbuffer.frag for why this must happen here, not in lighting.frag).
+    if (dot(N, scene.cameraPos.xyz - vWorldPos) < 0.0) N = -N;
     const int normalTex = texIndex(material.tex0.y);
     if (normalTex >= 0) {
         vec3 T = normalize(vTangent.xyz - N * dot(N, vTangent.xyz));

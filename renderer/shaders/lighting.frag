@@ -315,9 +315,16 @@ void main() {
     vec3 emissive = texelFetch(gbEmissive, pix, 0).rgb;
 
     vec3 V = -viewDir;
-    // Two-sided foliage (cull is none): backfaces store inverted GBuffer
-    // normals, which zero NdV and blow up Hammon / correlated-Smith.
-    if (dot(N, V) < 0.0) N = -N;
+    // The GBuffer pass flips geometric backface normals toward the viewer
+    // (cull is NONE), so a residual dot(N, V) < 0 here is a normal-mapped
+    // normal tilted past 90 deg on a front-facing pixel.  Mirror-flipping it
+    // (the old fix for two-sided foliage) moves N to the opposite hemisphere
+    // and snaps the shading along the dot(N, V) = 0 contour — a dark band on
+    // curved surfaces at grazing angles (sponza arch rims) that swims under
+    // TAA jitter.  Rotate N the shortest way onto the NdV = epsilon hemisphere
+    // instead; that is continuous across the contour.
+    const float NdVraw = dot(N, V);
+    if (NdVraw < 1e-3) N = normalize(N - V * (NdVraw - 1e-3));
     vec3 F0 = mix(vec3(0.04), albedo, metallic);
 
     vec3 color = vec3(0.0);
