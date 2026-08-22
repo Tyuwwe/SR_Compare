@@ -967,6 +967,7 @@ bool GuiApp::buildStackTail() {
     if (!createSyncResources()) { statusLine_ = "sync resource creation failed"; return false; }
     if (!createScreenshotStaging()) { statusLine_ = "screenshot staging failed"; return false; }
     if (!timestamps_.create(ctx_, kFramesInFlight)) { statusLine_ = "timestamp query failed"; return false; }
+    if (!profiler_.create(ctx_, kFramesInFlight)) { statusLine_ = "gpu profiler query failed"; return false; }
 
     resetFrameState();
     // Launch-option zoom (--compare-zoom): the first frames can trigger
@@ -2475,6 +2476,7 @@ void GuiApp::destroyStackResources() {
     vkDeviceWaitIdle(ctx_.device);
 
     timestamps_.destroy(ctx_);
+    profiler_.destroy(ctx_);
 
     destroyAlgoResources();
 
@@ -3182,6 +3184,7 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
 
     timestamps_.resetForFrame(cmd, slot);
     timestamps_.frameBegin(cmd, slot);
+    profiler_.beginFrame(cmd, slot, frameIndex);
 
     const uint32_t dw = active_.displayW;
     const uint32_t dh = active_.displayH;
@@ -3309,6 +3312,7 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     // clamps scale with path height so the display-space blur matches the GT.
     auto recordPostFx = [&](PostFxTargets& fxTargets, VkImage color, VkImageLayout& colorLayout,
                             const Mat4& pathProj, uint32_t pathH) {
+        SR_GPU_ZONE(profiler_, cmd, "postfx");
         PostFxParams fx;
         fx.depthM10 = pathProj.m[10];
         fx.depthM14 = pathProj.m[14];
@@ -3329,6 +3333,7 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     auto recordBloom = [&](BloomPyramid& pyramid, VkImage color, VkImageLayout& colorLayout,
                            uint32_t pathW, uint32_t pathH) {
         if (!bloomEnabled_) return;
+        SR_GPU_ZONE(profiler_, cmd, "bloom");
         deferred_.recordBloomPyramidPass(cmd, pyramid, color, colorLayout, pathW, pathH);
     };
 
@@ -3340,8 +3345,11 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     // moves).  CompareApp/Renderer place this pass ahead of lighting for the
     // same reason.  It only needs scene geometry, so it runs before the GBuffer
     // pass and also covers the gbuffer-less (GT-only) configuration.
-    if (shadow && shadow->lightIndex >= 0) {
-        imageBarrier(cmd, shadow_.image, shadow_.layout,
+    {
+        SR_GPU_ZONE(profiler_, cmd, "shadows");
+        if (shadow && shadow->lightIndex >= 0) {
+            SR_GPU_ZONE(profiler_, cmd, "shadow_csm");
+            imageBarrier(cmd, shadow_.image, shadow_.layout,
                      VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, sync::kFragment,
                      sync::kSampled, sync::kDepthTests, sync::kDepthReadWrite,
                      VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, kShadowCascadeCount);
@@ -3355,8 +3363,9 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     }
     // Spot shadow atlas (Phase 4b): one 1024^2 tile per selected spot, shared
     // by all lighting paths like the CSM map.
-    if (shadow && shadow->atlasTileCount > 0) {
-        imageBarrier(cmd, spotAtlas_.image, spotAtlas_.layout,
+        if (shadow && shadow->atlasTileCount > 0) {
+            SR_GPU_ZONE(profiler_, cmd, "shadow_spot");
+            imageBarrier(cmd, spotAtlas_.image, spotAtlas_.layout,
                      VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, sync::kFragment,
                      sync::kSampled, sync::kDepthTests, sync::kDepthReadWrite,
                      VK_IMAGE_ASPECT_DEPTH_BIT);
@@ -3369,6 +3378,7 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                      sync::kDepthWrite, sync::kFragment, sync::kSampled,
                      VK_IMAGE_ASPECT_DEPTH_BIT);
         spotAtlas_.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        }
     }
 
     // --- 1) low-resolution GBuffer (jittered for temporal; extra unjittered
@@ -3376,16 +3386,22 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     timestamps_.sceneBegin(cmd, slot);
     auto recordLrDeferred = [&](VkDescriptorSet sceneSet, VkDescriptorSet lightingSet,
                                 VkDescriptorSet transparentSet, VkDescriptorSet ssrSet,
-                                const Mat4& ssaoViewProj, const Mat4& projUsed) {
+                                const Mat4& ssaoViewProj, const Mat4& projUsed,
+                                const char* tag) {
+        SR_GPU_ZONE(profiler_, cmd, tag);
         // Phase 7a: upload this frame's commands and run the occlusion cull
         // against the LR Hi-Z chain as it currently stands (previous frame's
         // pyramid — or, in mixed mode's second record, this frame's spatial
         // rebuild; gbCull_.prevViewProj always tracks the producing VP).
         const bool cullActive = occlusionEnabled_ && gbCull_.prevValid && cullCandidates_ > 0;
-        deferred_.recordCommandUpload(cmd, slot, gbCull_, cullCandidates_, cullActive);
-        if (cullActive)
-            deferred_.recordOcclusionCull(cmd, gbCull_, cullCandidates_, gbCull_.prevViewProj,
-                                          gbPyramid_.mipCount, renderWidth_, renderHeight_);
+        {
+            SR_GPU_ZONE(profiler_, cmd, "occlusion_cull");
+            deferred_.recordCommandUpload(cmd, slot, gbCull_, cullCandidates_, cullActive);
+            if (cullActive)
+                deferred_.recordOcclusionCull(cmd, gbCull_, cullCandidates_, gbCull_.prevViewProj,
+                                              gbPyramid_.mipCount, renderWidth_, renderHeight_);
+        }
+        { SR_GPU_ZONE(profiler_, cmd, "gbuffer");
         transition(gbAlbedo_.image, gbAlbedoLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                    sync::kSampleStages, sync::kSampled, sync::kColorAttach, sync::kColorWrite,
                    VK_IMAGE_ASPECT_COLOR_BIT);
@@ -3426,8 +3442,11 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                                          static_cast<uint32_t>(cullRuns_.size()));
             vkCmdEndRendering(cmd);
         }
+        } // zone "gbuffer"
         // dst scope includes compute: the opaque-SSR pass (ssr_opaque.comp)
         // samples the GBuffer after the lighting fragment shader.
+        {
+            SR_GPU_ZONE(profiler_, cmd, "hiz");
         transition(gbAlbedo_.image, gbAlbedoLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                    sync::kColorAttach, sync::kColorWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
@@ -3456,12 +3475,15 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
             gbCull_.prevViewProj = ssaoViewProj;
             gbCull_.prevValid = true;
         }
+        } // zone "hiz"
 
         // GTAO: view-Z depth chain (sampled at per-step LODs) -> main pass ->
         // temporal EMA -> denoise.  The chain is rebuilt every record.
-        deferred_.recordDepthPyramidPass(cmd, gbPyramidAo_);
         const Mat4 invAoVp = Mat4::inverse(ssaoViewProj);
+        { SR_GPU_ZONE(profiler_, cmd, "gtao");
+        deferred_.recordDepthPyramidPass(cmd, gbPyramidAo_);
         const float aoMaxLodGb = static_cast<float>(std::min(gbPyramidAo_.mipCount - 1, 4u));
+        { SR_GPU_ZONE(profiler_, cmd, "ao_main");
         transition(gbAoRaw_.image, gbAoRawLayout_, VK_IMAGE_LAYOUT_GENERAL, sync::kCompute,
                    sync::kSampled, sync::kCompute, sync::kStorageWrite, VK_IMAGE_ASPECT_COLOR_BIT);
         deferred_.recordSsaoPass(cmd, ssaoSetGb_, invAoVp, frameIndex, camera_.nearPlane,
@@ -3469,11 +3491,15 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         transition(gbAoRaw_.image, gbAoRawLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                    sync::kCompute, sync::kStorageWrite, sync::kCompute, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
+        }
         const uint32_t aoWriteGb = aoFramesGb_ & 1u;
+        { SR_GPU_ZONE(profiler_, cmd, "ao_temporal");
         deferred_.recordSsaoTemporalPass(cmd, gbAoHist_, aoWriteGb, invAoVp, prevAoViewProjGb_,
                                          renderWidth_, renderHeight_, /*reset=*/aoFramesGb_ == 0);
+        }
         prevAoViewProjGb_ = ssaoViewProj;
         ++aoFramesGb_;
+        { SR_GPU_ZONE(profiler_, cmd, "ao_blur");
         transition(gbAo_.image, gbAoLayout_, VK_IMAGE_LAYOUT_GENERAL, sync::kSampleStages,
                    sync::kSampled, sync::kCompute, sync::kStorageWrite, VK_IMAGE_ASPECT_COLOR_BIT);
         deferred_.recordSsaoBlurPass(cmd, gbAoHist_.blurSet[aoWriteGb], renderWidth_,
@@ -3481,19 +3507,25 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         transition(gbAo_.image, gbAoLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                    sync::kCompute, sync::kStorageWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
+        }
+        } // zone "gtao"
 
+        { SR_GPU_ZONE(profiler_, cmd, "lighting");
         transition(gbColor_.image, gbColorLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                    sync::kSampleStages, sync::kSampled, sync::kColorAttach, sync::kColorWrite,
                    VK_IMAGE_ASPECT_COLOR_BIT);
         deferred_.recordLightingPass(cmd, lightingSet, gbCluster_, slot, view, projUsed,
                                      gbColor_.view, renderWidth_, renderHeight_);
+        }
 
         // Froxel volumetric fog (Phase 5a): accumulate once per frame (mixed
         // mode records LR lighting twice; the first record wins the guard),
         // composite into the lit HDR target on every record.  Un-jittered
         // matrices so the volume does not swim under TAA jitter.
         if (volFogEnabled_ && fogParams_.enabled && gbFog_.injectImage != VK_NULL_HANDLE) {
+            SR_GPU_ZONE(profiler_, cmd, "volfog");
             if (fogAccumFrameGb_ != frameIndex) {
+                SR_GPU_ZONE(profiler_, cmd, "fog_accumulate");
                 deferred_.recordVolFogAccumulate(cmd, gbFog_, gbCluster_, slot, view, proj,
                                                  prevFogViewProjGb_, fogParams_, frameIndex,
                                                  fogFramesGb_ & 1u, /*reset=*/fogFramesGb_ == 0);
@@ -3501,6 +3533,7 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                 ++fogFramesGb_;
                 fogAccumFrameGb_ = frameIndex;
             }
+            { SR_GPU_ZONE(profiler_, cmd, "fog_composite");
             transition(gbColor_.image, gbColorLayout_, VK_IMAGE_LAYOUT_GENERAL,
                        sync::kColorAttach, sync::kColorWrite, sync::kCompute,
                        sync::kStorageReadWrite, VK_IMAGE_ASPECT_COLOR_BIT);
@@ -3509,20 +3542,25 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
             transition(gbColor_.image, gbColorLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                        sync::kCompute, sync::kStorageWrite, sync::kColorAttach,
                        sync::kColorReadWrite, VK_IMAGE_ASPECT_COLOR_BIT);
+            }
         }
 
         if (hasTransparency_ || ssrEnabled_) {
+            SR_GPU_ZONE(profiler_, cmd, "reflections");
             // Color mip chain: mip 0 is the opaque HDR copy glass SSR used to
             // make with a transfer; the chain stays GENERAL for life.  The
             // opaque-SSR pass consumes the same chain, so it is built whenever
             // either consumer runs.
+            { SR_GPU_ZONE(profiler_, cmd, "color_pyramid");
             transition(gbColor_.image, gbColorLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                        sync::kColorAttach, sync::kColorWrite, sync::kCompute, sync::kSampled,
                        VK_IMAGE_ASPECT_COLOR_BIT);
             deferred_.recordColorPyramidPass(cmd, gbColorPyramid_);
+            }
             if (ssrEnabled_) {
                 // Opaque SSR, Phase 2d: trace into the LR RT, then temporal
                 // EMA + fused composite (in-place RMW on gbColor_).
+                { SR_GPU_ZONE(profiler_, cmd, "ssr_trace");
                 transition(gbSsrTrace_.image, gbSsrTraceLayout_, VK_IMAGE_LAYOUT_GENERAL,
                            sync::kCompute, sync::kSampled, sync::kCompute,
                            sync::kStorageWrite, VK_IMAGE_ASPECT_COLOR_BIT);
@@ -3532,6 +3570,8 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kCompute,
                            sync::kStorageWrite, sync::kCompute, sync::kSampled,
                            VK_IMAGE_ASPECT_COLOR_BIT);
+                }
+                { SR_GPU_ZONE(profiler_, cmd, "ssr_temporal");
                 transition(gbColor_.image, gbColorLayout_, VK_IMAGE_LAYOUT_GENERAL,
                            sync::kCompute, sync::kSampled, sync::kCompute,
                            sync::kStorageReadWrite, VK_IMAGE_ASPECT_COLOR_BIT);
@@ -3544,6 +3584,7 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, sync::kCompute,
                            sync::kStorageWrite, sync::kColorAttach, sync::kColorReadWrite,
                            VK_IMAGE_ASPECT_COLOR_BIT);
+                }
             } else {
                 transition(gbColor_.image, gbColorLayout_,
                            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, sync::kCompute,
@@ -3553,6 +3594,7 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         }
 
         if (hasTransparency_) {
+            SR_GPU_ZONE(profiler_, cmd, "transparent");
             transition(gbMotion_.image, gbMotionLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                        sync::kSampleStages, sync::kSampled, sync::kColorAttach, sync::kColorReadWrite,
                        VK_IMAGE_ASPECT_COLOR_BIT);
@@ -3608,7 +3650,7 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         if (mixedSpatial) {
             recordLrDeferred(fr.sceneSetGbSpatial, fr.lightingSetGbSpatial,
                              fr.transparentSetGbSpatial, fr.ssrSetGbSpatial,
-                             Mat4::multiply(proj, view), proj);
+                             Mat4::multiply(proj, view), proj, "lr_pass_spatial");
             transition(gbColor_.image, gbColorLayout_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                        sync::kSampleStages, sync::kSampled, sync::kCopy, sync::kTransferRead,
                        VK_IMAGE_ASPECT_COLOR_BIT);
@@ -3627,12 +3669,13 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                        sync::kSampleStages, sync::kSampled, VK_IMAGE_ASPECT_COLOR_BIT);
         }
         recordLrDeferred(fr.sceneSetGb, fr.lightingSetGb, fr.transparentSetGb, fr.ssrSetGb,
-                         Mat4::multiply(projJittered, view), projJittered);
+                         Mat4::multiply(projJittered, view), projJittered, "lr_pass");
         // Coverage mask conditioning: upscalers consume the 3x3-max dilated,
         // motion-gated copy — the plateau covers samplers at the jittered
         // coordinate, and static pixels keep their history weight
         // (see reactive_dilate.comp).  gbMotion_ is already SHADER_READ_ONLY.
         if (hasTransparency_) {
+            SR_GPU_ZONE(profiler_, cmd, "reactive_dilate");
             transition(gbReactiveDilated_.image, gbReactiveDilatedLayout_, VK_IMAGE_LAYOUT_GENERAL,
                        sync::kSampleStages, sync::kSampled, sync::kCompute, sync::kStorageWrite,
                        VK_IMAGE_ASPECT_COLOR_BIT);
@@ -3650,6 +3693,7 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     // latency).  gbColor_ is SHADER_READ_ONLY here with compute in the
     // sampled-dst scope.
     if (gbuffer && autoExposureEnabled_) {
+        SR_GPU_ZONE(profiler_, cmd, "auto_exposure");
         ExposureSolvePush solve;
         solve.minEV = exposureMinEV_;
         solve.maxEV = exposureMaxEV_;
@@ -3662,6 +3706,7 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     // --- 2) per-algorithm dispatch ---------------------------------------------
     if (gbuffer) {
         timestamps_.upscaleBegin(cmd, slot);
+        { SR_GPU_ZONE(profiler_, cmd, "upscale");
 
         CameraParams cam;
         std::memcpy(cam.view, view.m, sizeof(cam.view));
@@ -3687,6 +3732,7 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         frame.resetHistory = (frameIndex == 0);
 
         for (AlgoColumn& algo : algos_) {
+            SR_GPU_ZONE(profiler_, cmd, algo.id.c_str());
             transition(algo.output.image, algo.outputLayout, VK_IMAGE_LAYOUT_GENERAL,
                        sync::kSampleStages, sync::kSampled, sync::kSampleStages,
                        sync::kStorageWrite, VK_IMAGE_ASPECT_COLOR_BIT);
@@ -3714,6 +3760,7 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
 
             algo.fgReady = false;
             if (algo.frameGen) {
+                SR_GPU_ZONE(profiler_, cmd, "frame_gen");
                 if (frame.resetHistory) algo.fgHistory = false;
                 if (algo.fgHistory) {
                     transition(algo.fgOutput.image, algo.fgOutputLayout, VK_IMAGE_LAYOUT_GENERAL,
@@ -3742,6 +3789,7 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                 algo.fgHistory = true;
             }
         }
+        } // zone "upscale"
         timestamps_.upscaleEnd(cmd, slot);
     } else {
         // No upscaler pass: emit a zero-width range so every query slot is
@@ -3752,17 +3800,21 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
 
     // --- 3) native-resolution ground truth (no jitter) ---------------------------
     if (gtActive_ && active_.gtSsaa) {
+        SR_GPU_ZONE(profiler_, cmd, "gt_ssaa");
         // 200% SSAA: deferred render at 2x into gtSsaaColor_, then
         // box-downsample to display resolution (gtColor_), which stays the
         // metric/display ref.
         const uint32_t sw = dw * 2;
         const uint32_t sh = dh * 2;
         // Phase 7a: SSAA-path occlusion cull against the 2x Hi-Z chain.
+        { SR_GPU_ZONE(profiler_, cmd, "occlusion_cull");
         const bool cullActiveSsaa = occlusionEnabled_ && gtSsaaCull_.prevValid && cullCandidates_ > 0;
         deferred_.recordCommandUpload(cmd, slot, gtSsaaCull_, cullCandidates_, cullActiveSsaa);
         if (cullActiveSsaa)
             deferred_.recordOcclusionCull(cmd, gtSsaaCull_, cullCandidates_,
                                           gtSsaaCull_.prevViewProj, gtSsaaPyramid_.mipCount, sw, sh);
+        }
+        { SR_GPU_ZONE(profiler_, cmd, "gbuffer");
         transition(gtSsaaAlbedo_.image, gtSsaaAlbedoLayout_,
                    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, sync::kSampleStages, sync::kSampled,
                    sync::kColorAttach, sync::kColorWrite, VK_IMAGE_ASPECT_COLOR_BIT);
@@ -3804,7 +3856,9 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                                          cullRuns_.data(), static_cast<uint32_t>(cullRuns_.size()));
             vkCmdEndRendering(cmd);
         }
+        } // zone "gbuffer"
         // dst scope includes compute: the opaque-SSR pass samples the GBuffer.
+        { SR_GPU_ZONE(profiler_, cmd, "hiz");
         transition(gtSsaaAlbedo_.image, gtSsaaAlbedoLayout_,
                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kColorAttach, sync::kColorWrite,
                    sync::kSampleStages, sync::kSampled, VK_IMAGE_ASPECT_COLOR_BIT);
@@ -3828,14 +3882,17 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
             gtSsaaCull_.prevViewProj = cullViewProjGt; // GT paths never jitter
             gtSsaaCull_.prevValid = true;
         }
+        } // zone "hiz"
 
         // GTAO for the 2x GT path (un-jittered view-projection): view-Z depth
         // chain -> main pass -> temporal EMA -> denoise.  The AO output is
         // also sampled by the opaque-SSR compute pass.
-        deferred_.recordDepthPyramidPass(cmd, gtSsaaPyramidAo_);
         const Mat4 invAoVpSsaa = Mat4::inverse(cullViewProjGt);
+        { SR_GPU_ZONE(profiler_, cmd, "gtao");
+        deferred_.recordDepthPyramidPass(cmd, gtSsaaPyramidAo_);
         const float aoMaxLodSsaa =
             static_cast<float>(std::min(gtSsaaPyramidAo_.mipCount - 1, 4u));
+        { SR_GPU_ZONE(profiler_, cmd, "ao_main");
         transition(gtSsaaAoRaw_.image, gtSsaaAoRawLayout_, VK_IMAGE_LAYOUT_GENERAL, sync::kCompute,
                    sync::kSampled, sync::kCompute, sync::kStorageWrite, VK_IMAGE_ASPECT_COLOR_BIT);
         deferred_.recordSsaoPass(cmd, ssaoSetSsaa_, invAoVpSsaa, frameIndex, camera_.nearPlane,
@@ -3843,27 +3900,36 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         transition(gtSsaaAoRaw_.image, gtSsaaAoRawLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                    sync::kCompute, sync::kStorageWrite, sync::kCompute, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
+        }
         const uint32_t aoWriteSsaa = aoFramesSsaa_ & 1u;
+        { SR_GPU_ZONE(profiler_, cmd, "ao_temporal");
         deferred_.recordSsaoTemporalPass(cmd, gtSsaaAoHist_, aoWriteSsaa, invAoVpSsaa,
                                          prevAoViewProjSsaa_, sw, sh,
                                          /*reset=*/aoFramesSsaa_ == 0);
+        }
         prevAoViewProjSsaa_ = cullViewProjGt;
         ++aoFramesSsaa_;
+        { SR_GPU_ZONE(profiler_, cmd, "ao_blur");
         transition(gtSsaaAo_.image, gtSsaaAoLayout_, VK_IMAGE_LAYOUT_GENERAL, sync::kSampleStages,
                    sync::kSampled, sync::kCompute, sync::kStorageWrite, VK_IMAGE_ASPECT_COLOR_BIT);
         deferred_.recordSsaoBlurPass(cmd, gtSsaaAoHist_.blurSet[aoWriteSsaa], sw, sh);
         transition(gtSsaaAo_.image, gtSsaaAoLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                    sync::kCompute, sync::kStorageWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
+        }
+        } // zone "gtao"
 
+        { SR_GPU_ZONE(profiler_, cmd, "lighting");
         transition(gtSsaaColor_.image, gtSsaaColorLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                    sync::kSampleStages, sync::kSampled, sync::kColorAttach, sync::kColorWrite,
                    VK_IMAGE_ASPECT_COLOR_BIT);
         deferred_.recordLightingPass(cmd, fr.lightingSetSsaa, gtSsaaCluster_, slot, viewGt, projGt,
                                      gtSsaaColor_.view, sw, sh);
+        }
 
         // Froxel volumetric fog (Phase 5a) on the 2x GT path.
         if (volFogEnabled_ && fogParams_.enabled && gtSsaaFog_.injectImage != VK_NULL_HANDLE) {
+            SR_GPU_ZONE(profiler_, cmd, "volfog");
             if (fogAccumFrameSsaa_ != frameIndex) {
                 deferred_.recordVolFogAccumulate(cmd, gtSsaaFog_, gtSsaaCluster_, slot, viewGt,
                                                  projGt, prevFogViewProjSsaa_, fogParams_,
@@ -3885,6 +3951,7 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         }
 
         if (hasTransparency_ || ssrEnabled_) {
+            SR_GPU_ZONE(profiler_, cmd, "reflections");
             // Same color mip chain build as the GB path (GENERAL for life);
             // the opaque-SSR pass consumes the same chain.
             transition(gtSsaaColor_.image, gtSsaaColorLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
@@ -3925,6 +3992,7 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         // Transparency pass: alpha-blended surfaces over the lit scene (GT
         // path: color only, no motion/mask outputs).
         if (hasTransparency_) {
+            SR_GPU_ZONE(profiler_, cmd, "transparent");
             transition(gtSsaaDepth_.image, gtSsaaDepthLayout_,
                        VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL, sync::kFragment,
                        sync::kSampled, sync::kDepthTests, sync::kDepthRead,
@@ -3964,6 +4032,7 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         transition(gtColor_.image, gtColorLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                    sync::kSampleStages, sync::kSampled, sync::kColorAttach, sync::kColorWrite,
                    VK_IMAGE_ASPECT_COLOR_BIT);
+        { SR_GPU_ZONE(profiler_, cmd, "ssaa_downsample");
         {
             VkRenderingAttachmentInfo color =
                 makeColorAttachment(gtColor_.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
@@ -3985,16 +4054,21 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
             vkCmdDraw(cmd, 3, 1, 0, 0);
             vkCmdEndRendering(cmd);
         }
+        } // zone "ssaa_downsample"
         transition(gtColor_.image, gtColorLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                    sync::kColorAttach, sync::kColorWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
     } else if (gtActive_) {
+        SR_GPU_ZONE(profiler_, cmd, "gt");
         // Phase 7a: GT-path occlusion cull against the 1x Hi-Z chain.
+        { SR_GPU_ZONE(profiler_, cmd, "occlusion_cull");
         const bool cullActiveGt = occlusionEnabled_ && gtCull_.prevValid && cullCandidates_ > 0;
         deferred_.recordCommandUpload(cmd, slot, gtCull_, cullCandidates_, cullActiveGt);
         if (cullActiveGt)
             deferred_.recordOcclusionCull(cmd, gtCull_, cullCandidates_, gtCull_.prevViewProj,
                                           gtPyramid_.mipCount, gtW, gtH);
+        }
+        { SR_GPU_ZONE(profiler_, cmd, "gbuffer");
         transition(gtAlbedo_.image, gtAlbedoLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                    sync::kSampleStages, sync::kSampled, sync::kColorAttach, sync::kColorWrite,
                    VK_IMAGE_ASPECT_COLOR_BIT);
@@ -4034,7 +4108,9 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                                          cullRuns_.data(), static_cast<uint32_t>(cullRuns_.size()));
             vkCmdEndRendering(cmd);
         }
+        } // zone "gbuffer"
         // dst scope includes compute: the opaque-SSR pass samples the GBuffer.
+        { SR_GPU_ZONE(profiler_, cmd, "hiz");
         transition(gtAlbedo_.image, gtAlbedoLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                    sync::kColorAttach, sync::kColorWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
@@ -4058,14 +4134,17 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
             gtCull_.prevViewProj = cullViewProjGt; // GT paths never jitter
             gtCull_.prevValid = true;
         }
+        } // zone "hiz"
 
         // GTAO for the 1x GT path (un-jittered view-projection): view-Z depth
         // chain -> main pass -> temporal EMA -> denoise.  In "GT (Apply
         // scale)" mode gtW/gtH are the low input resolution.  The AO output
         // is also sampled by the opaque-SSR compute pass.
-        deferred_.recordDepthPyramidPass(cmd, gtPyramidAo_);
         const Mat4 invAoVpGt = Mat4::inverse(cullViewProjGt);
+        { SR_GPU_ZONE(profiler_, cmd, "gtao");
+        deferred_.recordDepthPyramidPass(cmd, gtPyramidAo_);
         const float aoMaxLodGt = static_cast<float>(std::min(gtPyramidAo_.mipCount - 1, 4u));
+        { SR_GPU_ZONE(profiler_, cmd, "ao_main");
         transition(gtAoRaw_.image, gtAoRawLayout_, VK_IMAGE_LAYOUT_GENERAL, sync::kCompute,
                    sync::kSampled, sync::kCompute, sync::kStorageWrite, VK_IMAGE_ASPECT_COLOR_BIT);
         deferred_.recordSsaoPass(cmd, ssaoSetGt_, invAoVpGt, frameIndex, camera_.nearPlane,
@@ -4073,26 +4152,35 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         transition(gtAoRaw_.image, gtAoRawLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                    sync::kCompute, sync::kStorageWrite, sync::kCompute, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
+        }
         const uint32_t aoWriteGt = aoFramesGt_ & 1u;
+        { SR_GPU_ZONE(profiler_, cmd, "ao_temporal");
         deferred_.recordSsaoTemporalPass(cmd, gtAoHist_, aoWriteGt, invAoVpGt, prevAoViewProjGt_,
                                          gtW, gtH, /*reset=*/aoFramesGt_ == 0);
+        }
         prevAoViewProjGt_ = cullViewProjGt;
         ++aoFramesGt_;
+        { SR_GPU_ZONE(profiler_, cmd, "ao_blur");
         transition(gtAo_.image, gtAoLayout_, VK_IMAGE_LAYOUT_GENERAL, sync::kSampleStages,
                    sync::kSampled, sync::kCompute, sync::kStorageWrite, VK_IMAGE_ASPECT_COLOR_BIT);
         deferred_.recordSsaoBlurPass(cmd, gtAoHist_.blurSet[aoWriteGt], gtW, gtH);
         transition(gtAo_.image, gtAoLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                    sync::kCompute, sync::kStorageWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
+        }
+        } // zone "gtao"
 
+        { SR_GPU_ZONE(profiler_, cmd, "lighting");
         transition(gtColor_.image, gtColorLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                    sync::kSampleStages, sync::kSampled, sync::kColorAttach, sync::kColorWrite,
                    VK_IMAGE_ASPECT_COLOR_BIT);
         deferred_.recordLightingPass(cmd, fr.lightingSetGt, gtCluster_, slot, viewGt, projGt,
                                      gtColor_.view, gtW, gtH);
+        }
 
         // Froxel volumetric fog (Phase 5a) on the 1x GT path.
         if (volFogEnabled_ && fogParams_.enabled && gtFog_.injectImage != VK_NULL_HANDLE) {
+            SR_GPU_ZONE(profiler_, cmd, "volfog");
             if (fogAccumFrameGt_ != frameIndex) {
                 deferred_.recordVolFogAccumulate(cmd, gtFog_, gtCluster_, slot, viewGt, projGt,
                                                  prevFogViewProjGt_, fogParams_, frameIndex,
@@ -4111,6 +4199,7 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         }
 
         if (hasTransparency_ || ssrEnabled_) {
+            SR_GPU_ZONE(profiler_, cmd, "reflections");
             // Same color mip chain build as the GB path (GENERAL for life);
             // the opaque-SSR pass consumes the same chain.
             transition(gtColor_.image, gtColorLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
@@ -4151,6 +4240,7 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         // Transparency pass: alpha-blended surfaces over the lit scene (GT
         // path: color only, no motion/mask outputs).
         if (hasTransparency_) {
+            SR_GPU_ZONE(profiler_, cmd, "transparent");
             transition(gtDepth_.image, gtDepthLayout_,
                        VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL, sync::kFragment,
                        sync::kSampled, sync::kDepthTests, sync::kDepthRead,
@@ -4189,6 +4279,7 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     // The GT column solves independently of the LR path — separate pipelines,
     // so differing column exposures are the correct engine behaviour.
     if (gtActive_ && autoExposureEnabled_) {
+        SR_GPU_ZONE(profiler_, cmd, "auto_exposure_gt");
         ExposureSolvePush solve;
         solve.minEV = exposureMinEV_;
         solve.maxEV = exposureMaxEV_;
@@ -4217,6 +4308,7 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     const uint32_t regBlocksPerRow = (regW + 7) / 8;
     const uint32_t regBlockCount = regBlocksPerRow * ((regH + 7) / 8);
     if (compareMode && !algos_.empty() && frameIndex % kMetricInterval == 0) {
+        SR_GPU_ZONE(profiler_, cmd, "metrics");
         uint32_t mask = 0;
         uint32_t algoIndex = 0;
         for (AlgoColumn& algo : algos_) {
@@ -4297,6 +4389,7 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     }
 
     timestamps_.frameEnd(cmd, slot);
+    profiler_.endFrame();
     vkEndCommandBuffer(cmd);
 
     prevViewProj_ = Mat4::multiply(proj, view);
@@ -4318,6 +4411,7 @@ void GuiApp::recordComposePresent(VkCommandBuffer cmd, uint32_t swapchainIndex,
                  sync::kFragment, sync::kSampled, sync::kColorAttach, sync::kColorWrite);
     composeLayout_ = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     {
+        SR_GPU_ZONE(profiler_, cmd, "compose");
         VkRenderingAttachmentInfo color =
             makeColorAttachment(composeImage_.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                                 VK_ATTACHMENT_LOAD_OP_CLEAR);
@@ -4411,6 +4505,7 @@ void GuiApp::recordComposePresent(VkCommandBuffer cmd, uint32_t swapchainIndex,
     imageBarrier(cmd, swapImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                  sync::kColorAttach, sync::kColorWrite, sync::kColorAttach, sync::kColorWrite);
     {
+        SR_GPU_ZONE(profiler_, cmd, "present");
         VkRenderingAttachmentInfo color =
             makeColorAttachment(swapView, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                                 VK_ATTACHMENT_LOAD_OP_CLEAR);
@@ -4828,6 +4923,7 @@ void GuiApp::run() {
         // complete; harvest GPU timings + metric readback before reuse.
         if (frameIndex >= kFramesInFlight) {
             lastTimings_ = timestamps_.read(ctx_, slot);
+            profiler_.harvest(ctx_, slot); // per-pass GPU zones for the profiler panel
             frameTimesLog_.push_back(lastTimings_);
             // Cap the log but keep the most recent half, so a CSV export never
             // loses the entire history when the runaway guard fires.
@@ -4867,7 +4963,14 @@ void GuiApp::run() {
             static_cast<int>(frameIndex) == opts_.frames - 1 && !screenshotPending_)
             saveScreenshot(opts_.screenshotPath.c_str());
 
+        // The profiler panel's open flag is the profiler's enable switch: a
+        // closed panel records no timestamps (near-zero overhead).
+        profiler_.setEnabled(profilerWindow_.open);
+        const auto recordStart = std::chrono::steady_clock::now();
         recordFrame(frameIndex, swapIndex);
+        cpuRecordMs_ = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() -
+                                                                recordStart)
+                           .count();
 
         VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
         VkSubmitInfo submit = {};
@@ -5596,6 +5699,10 @@ void GuiApp::drawUi() {
     if (ImGui::IsKeyPressed(ImGuiKey_F1, false) && !io.WantTextInput)
         panelCollapsed_ = !panelCollapsed_;
 
+    // Independent floating profiler panel (default closed, anchored top-right
+    // on first open); drawn in both panel states.
+    profilerWindow_.draw(profiler_, cpuRecordMs_);
+
     if (panelCollapsed_) {
         // Slim strip with just an expand button; the render columns span the
         // full window width underneath.  Parked below the on-composite
@@ -5629,6 +5736,8 @@ void GuiApp::drawUi() {
     if (ImGui::SmallButton("<<")) panelCollapsed_ = true;
     ImGui::SameLine();
     ImGui::TextDisabled("hide panel (F1)");
+    ImGui::SameLine();
+    ImGui::Checkbox("gpu profiler", &profilerWindow_.open);
 
     // Global reference selector, shared by all three tabs.
     drawReferenceSection();

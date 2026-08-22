@@ -22,7 +22,7 @@ endif()
 
 # Interactive GUI mode (`sr_compare gui`).  Rendering is organized like
 # compare mode and reuses its shaders (compare_shaders) plus the renderer's.
-add_library(gui STATIC GuiApp.cpp BenchRunner.cpp)
+add_library(gui STATIC GuiApp.cpp BenchRunner.cpp GpuProfilerWindow.cpp)
 sr_common_setup(gui)
 target_compile_definitions(gui PRIVATE SR_SHADER_DIR="${SR_SHADER_OUT_DIR}/")
 target_link_libraries(gui PUBLIC renderer upscalers imgui)

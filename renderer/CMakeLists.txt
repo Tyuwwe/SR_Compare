@@ -6,6 +6,7 @@ add_library(renderer STATIC
     core/VkUtil.cpp
     core/Swapchain.cpp
     core/TimestampQuery.cpp
+    core/GpuProfiler.cpp
     core/MemoryBudget.cpp
     core/RenderGraph.cpp
     scene/Scene.cpp

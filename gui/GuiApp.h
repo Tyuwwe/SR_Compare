@@ -32,7 +32,9 @@
 // is synchronous.
 // ============================================================================
 #include "gui/BenchRunner.h"
+#include "gui/GpuProfilerWindow.h"
 #include "renderer/ColorGrading.h"
+#include "renderer/core/GpuProfiler.h"
 #include "renderer/core/Swapchain.h"
 #include "renderer/core/TimestampQuery.h"
 #include "renderer/core/VulkanContext.h"
@@ -804,6 +806,12 @@ private:
     void* screenshotMapped_ = nullptr;
 
     TimestampQuery timestamps_;
+    // Per-pass GPU timestamp zones + the ImGui profiler panel.  The window's
+    // `open` flag drives profiler_.setEnabled in the run loop, so a closed
+    // panel records no timestamps at all.
+    GpuProfiler profiler_;
+    GpuProfilerWindow profilerWindow_;
+    float cpuRecordMs_ = 0.f; // CPU duration of the last recordFrame
 
     // --- runtime/UI state ----------------------------------------------------------
     UiState ui_;
