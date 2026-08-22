@@ -6,6 +6,7 @@
 // the upscaled image or the native-resolution ground truth.
 // ============================================================================
 #include "renderer/ColorGrading.h"
+#include "renderer/core/RenderGraph.h"
 #include "renderer/core/Swapchain.h"
 #include "renderer/core/TimestampQuery.h"
 #include "renderer/core/Vk.h"
@@ -116,6 +117,9 @@ private:
         uint32_t width = 0;
         uint32_t height = 0;
         VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        // Non-null when the image is backed by a TransientImageArena block
+        // (aliased with the arena's other images) instead of a VMA allocation.
+        TransientImageArena* arena = nullptr;
         void destroy(const VulkanContext& ctx);
     };
 
@@ -180,10 +184,16 @@ private:
     ImageResource gtEmissive_;
     ImageResource finalImage_;
     // GTAO working target (RG16F: AO + view Z) and filtered R16F, GBuffer res.
+    // The raw target and the path's SSR trace target share one aliased memory
+    // block each (TransientImageArena): the raw AO dies with the temporal pass
+    // before lighting, the trace target is born after the color pyramid — the
+    // lifetimes never overlap.
     ImageResource gbAoRaw_;
     ImageResource gbAo_;
     ImageResource gtAoRaw_;
     ImageResource gtAo_;
+    TransientImageArena gbAoSsrArena_;
+    TransientImageArena gtAoSsrArena_;
     // HDR bloom pyramids (thresholded 5-level chains; Phase 6a), one per path.
     // GENERAL-for-life, host-owned — same resource model as the color
     // pyramids below.  The accumulated mip 0 also feeds the present pass's
@@ -347,6 +357,10 @@ private:
         return opts_.autoExposure ? exposureChannel_.value : opts_.exposure;
     }
     bool recreateSwapchain(uint32_t width, uint32_t height, bool vsync);
+    // Frame graph: per-frame pass registration + automatic barrier derivation
+    // (renderer/core/RenderGraph.h).  The image state tracker persists across
+    // frames; recordFrame clears and rebuilds the pass list every frame.
+    RenderGraph rg_;
     void updateSceneUBO(uint32_t frameIndex, bool jitter, uint32_t renderW, uint32_t renderH,
                         const Mat4& view, const Mat4& proj, const Mat4& projJittered,
                         const Mat4& prevViewProj);

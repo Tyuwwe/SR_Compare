@@ -68,7 +68,8 @@ void beginRendering(VkCommandBuffer cmd, uint32_t width, uint32_t height, uint32
 
 void Renderer::ImageResource::destroy(const VulkanContext& ctx) {
     if (view) { vkDestroyImageView(ctx.device, view, nullptr); view = VK_NULL_HANDLE; }
-    if (image) { vmaDestroyImage(ctx.allocator, image, memory); image = VK_NULL_HANDLE; memory = VK_NULL_HANDLE; }
+    if (image && arena) { arena->destroyImage(ctx, image); image = VK_NULL_HANDLE; arena = nullptr; }
+    else if (image) { vmaDestroyImage(ctx.allocator, image, memory); image = VK_NULL_HANDLE; memory = VK_NULL_HANDLE; }
 }
 
 bool Renderer::init(const RendererOptions& opts) {
@@ -219,6 +220,14 @@ bool Renderer::init(const RendererOptions& opts) {
             spotAtlas_.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         }
     });
+    // Seed the graph's cross-frame tracker with the states the one-shot above
+    // left behind; every other tracked target is still UNDEFINED.
+    if (shadowsActive_)
+        rg_.adopt(shadow_.image, {VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kFragment,
+                                  sync::kSampled});
+    if (spotAtlasActive_)
+        rg_.adopt(spotAtlas_.image, {VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kFragment,
+                                     sync::kSampled});
     if (!createShaders()) return false;
     if (!createSceneDescriptors()) return false;
     if (!createAutoExposureResources()) return false;
@@ -317,13 +326,54 @@ bool Renderer::createRenderTargets() {
         return false;
     // GTAO targets (working RG16F + filtered R16F) for both GBuffer paths.
     const VkImageUsageFlags aoUsage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-    if (!createRT(gbAoRaw_, renderWidth_, renderHeight_, kAoRawFormat, aoUsage,
-                  VK_IMAGE_ASPECT_COLOR_BIT))
+    // The AO raw target and the SSR trace target of a path never overlap in
+    // time (the raw AO is consumed by the temporal pass before lighting; the
+    // trace target is written after the color pyramid), so each pair shares
+    // one aliased memory block.  Falls back to plain VMA images on failure.
+    auto createAliasedPair = [&](TransientImageArena& arena, ImageResource& raw,
+                                 ImageResource& trace, uint32_t w, uint32_t h) -> bool {
+        const VkImageUsageFlags usage = aoUsage;
+        VkDeviceSize rawBytes = 0, traceBytes = 0, rawAlign = 0, traceAlign = 0;
+        uint32_t rawBits = 0, traceBits = 0;
+        bool ok = TransientImageArena::queryImageRequirements(ctx_, w, h, kAoRawFormat, usage,
+                                                              rawBytes, rawAlign, rawBits) &&
+                  TransientImageArena::queryImageRequirements(ctx_, w, h, kSsrTraceFormat, usage,
+                                                              traceBytes, traceAlign, traceBits) &&
+                  arena.init(ctx_, rawBits & traceBits, std::max(rawBytes, traceBytes),
+                             std::max(rawAlign, traceAlign));
+        if (ok) {
+            raw.image = arena.createAliasedImage(ctx_, w, h, kAoRawFormat, usage);
+            trace.image = arena.createAliasedImage(ctx_, w, h, kSsrTraceFormat, usage);
+            ok = raw.image != VK_NULL_HANDLE && trace.image != VK_NULL_HANDLE;
+        }
+        if (ok) {
+            raw.view = createImageView(ctx_, raw.image, kAoRawFormat, VK_IMAGE_ASPECT_COLOR_BIT);
+            trace.view =
+                createImageView(ctx_, trace.image, kSsrTraceFormat, VK_IMAGE_ASPECT_COLOR_BIT);
+            ok = raw.view != VK_NULL_HANDLE && trace.view != VK_NULL_HANDLE;
+        }
+        if (!ok) {
+            // Fallback: independent VMA allocations (pre-aliasing behavior).
+            if (raw.image) { arena.destroyImage(ctx_, raw.image); raw.image = VK_NULL_HANDLE; }
+            if (trace.image) { arena.destroyImage(ctx_, trace.image); trace.image = VK_NULL_HANDLE; }
+            arena.destroy(ctx_);
+            return createRT(raw, w, h, kAoRawFormat, usage, VK_IMAGE_ASPECT_COLOR_BIT) &&
+                   createRT(trace, w, h, kSsrTraceFormat, usage, VK_IMAGE_ASPECT_COLOR_BIT);
+        }
+        raw.width = trace.width = w;
+        raw.height = trace.height = h;
+        raw.format = kAoRawFormat;
+        trace.format = kSsrTraceFormat;
+        raw.arena = &arena;
+        trace.arena = &arena;
+        return true;
+    };
+    if (!createAliasedPair(gbAoSsrArena_, gbAoRaw_, gbSsrTrace_, renderWidth_, renderHeight_))
         return false;
     if (!createRT(gbAo_, renderWidth_, renderHeight_, VK_FORMAT_R16_SFLOAT, aoUsage,
                   VK_IMAGE_ASPECT_COLOR_BIT))
         return false;
-    if (!createRT(gtAoRaw_, dw, dh, kAoRawFormat, aoUsage, VK_IMAGE_ASPECT_COLOR_BIT))
+    if (!createAliasedPair(gtAoSsrArena_, gtAoRaw_, gtSsrTrace_, dw, dh))
         return false;
     if (!createRT(gtAo_, dw, dh, VK_FORMAT_R16_SFLOAT, aoUsage, VK_IMAGE_ASPECT_COLOR_BIT))
         return false;
@@ -364,12 +414,8 @@ bool Renderer::createRenderTargets() {
     if (!deferred_.createAoHistory(ctx_, dw, dh, gtAoHist_))
         return false;
     // Opaque SSR trace targets + temporal history (Phase 2d), one per path.
-    const VkImageUsageFlags ssrUsage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-    if (!createRT(gbSsrTrace_, renderWidth_, renderHeight_, kSsrTraceFormat, ssrUsage,
-                  VK_IMAGE_ASPECT_COLOR_BIT))
-        return false;
-    if (!createRT(gtSsrTrace_, dw, dh, kSsrTraceFormat, ssrUsage, VK_IMAGE_ASPECT_COLOR_BIT))
-        return false;
+    // The trace targets themselves were created above, aliased with the AO
+    // raw targets (non-overlapping lifetimes).
     if (!deferred_.createSsrHistory(ctx_, renderWidth_, renderHeight_, gbSsrHist_))
         return false;
     if (!deferred_.createSsrHistory(ctx_, dw, dh, gtSsrHist_))
@@ -1067,21 +1113,13 @@ void Renderer::updateCamera(uint32_t frameIndex, float dt) {
 }
 
 void Renderer::captureScreenshotIntoStaging(VkCommandBuffer cmd) {
-    // finalImage_ is SHADER_READ_ONLY here (sampled by the present pass).
-    imageBarrier(cmd, finalImage_.image, finalImage_.layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                 VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
-                 VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+    // finalImage_ is TRANSFER_SRC here (the enclosing graph pass declared it).
     VkBufferImageCopy region = {};
     region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     region.imageSubresource.layerCount = 1;
     region.imageExtent = {opts_.displayWidth, opts_.displayHeight, 1};
     vkCmdCopyImageToBuffer(cmd, finalImage_.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                            screenshotStaging_, 1, &region);
-    imageBarrier(cmd, finalImage_.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                 VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
-                 VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
-    finalImage_.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 }
 
 void Renderer::saveScreenshot(const std::string& path) {
@@ -1526,166 +1564,203 @@ void Renderer::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     Mat4& prevAoVp = gbuffer ? prevAoViewProjGb_ : prevAoViewProjGt_;
     uint32_t& aoFrames = gbuffer ? aoFramesGb_ : aoFramesGt_;
 
-    auto transition = [&](ImageResource& rt, VkImageLayout target,
-                          VkPipelineStageFlags2 srcStage, VkAccessFlags2 srcAccess,
-                          VkPipelineStageFlags2 dstStage, VkAccessFlags2 dstAccess,
-                          VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT) {
-        imageBarrier(cmd, rt.image, rt.layout, target, srcStage, srcAccess, dstStage, dstAccess,
-                     aspect);
-        rt.layout = target;
-    };
-
-    // GBuffer targets: last frame they were sampled by the lighting fragment
-    // shader (or the upscaler, which may run compute) -> attachment writes.
-    transition(tgtAlbedo, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-               sync::kSampleStages, sync::kSampled, sync::kColorAttach, sync::kColorWrite);
-    transition(tgtNormal, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-               sync::kSampleStages, sync::kSampled, sync::kColorAttach, sync::kColorWrite);
-    transition(tgtMaterial, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-               sync::kSampleStages, sync::kSampled, sync::kColorAttach, sync::kColorWrite);
-    transition(tgtEmissive, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-               sync::kSampleStages, sync::kSampled, sync::kColorAttach, sync::kColorWrite);
-    transition(tgtDepth, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-               sync::kSampleStages, sync::kSampled, sync::kDepthTests, sync::kDepthReadWrite,
-               VK_IMAGE_ASPECT_DEPTH_BIT);
     ImageResource& tgtMotion = gbuffer ? gbMotion_ : gtMotion_; // Phase 6b: both paths write motion
-    transition(tgtMotion, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-               sync::kSampleStages, sync::kSampled, sync::kColorAttach, sync::kColorWrite);
 
-    timestamps_.sceneBegin(cmd, slot);
+    // --- Frame graph -------------------------------------------------------------
+    // The frame records as a linear pass list: each pass declares its image
+    // accesses and the graph derives the sync2 barriers from its cross-frame
+    // state tracker (replacing the old hand-written transition() calls and the
+    // per-resource layout members).  GENERAL-for-life resources (Hi-Z/color
+    // pyramids, temporal histories, fog volumes, bloom/post-fx working
+    // targets) keep their DeferredCore-internal barriers and stay untracked.
+    rg_.clear();
 
     // Phase 7a uploads + the occlusion cull pass are scene work: keep them
     // inside the scene timestamp range.  The cull reprojects candidates
     // against LAST frame's pyramid of this path (1-frame latency; skipped on
     // the path's first frame or after a resize -> everything visible).
     const bool cullActive = occlusion_ && cull.prevValid && cullCandidates_ > 0;
-    deferred_.recordInstanceUpload(cmd, slot, instances_, cullCandidates_);
-    deferred_.recordCommandUpload(cmd, slot, cull, cullCandidates_, cullActive);
-    if (cullActive)
-        deferred_.recordOcclusionCull(cmd, cull, cullCandidates_, cull.prevViewProj,
-                                      (gbuffer ? gbPyramid_ : gtPyramid_).mipCount, sceneW, sceneH);
 
     // --- GBuffer pass ---------------------------------------------------------
     // Both paths attach a motion RT (Phase 6b): the GT pass uses the GT
     // pipeline (same five formats) so GT motion blur matches the LR path.
     {
-        VkRenderingAttachmentInfo colors[5] = {
-            makeColorAttachment(tgtAlbedo.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                                VK_ATTACHMENT_LOAD_OP_CLEAR),
-            makeColorAttachment(tgtNormal.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                                VK_ATTACHMENT_LOAD_OP_CLEAR, 0.f, 0.f, 1.f),
-            makeColorAttachment(tgtMaterial.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                                VK_ATTACHMENT_LOAD_OP_CLEAR),
-            makeColorAttachment(tgtEmissive.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                                VK_ATTACHMENT_LOAD_OP_CLEAR),
-            makeColorAttachment(tgtMotion.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                                VK_ATTACHMENT_LOAD_OP_CLEAR)};
-        const uint32_t colorCount = 5;
-        VkRenderingAttachmentInfo depth =
-            makeDepthAttachment(tgtDepth.view, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-                                VK_ATTACHMENT_LOAD_OP_CLEAR);
-        beginRendering(cmd, sceneW, sceneH, colorCount, colors, &depth);
-        deferred_.recordGBufferDraws(cmd, scene_, !gbuffer, fr.sceneSet, textureSet_,
-                                     materialStride_, sceneW, sceneH, cullViewProj, cull,
-                                     cullRuns_.data(), static_cast<uint32_t>(cullRuns_.size()));
-        vkCmdEndRendering(cmd);
+        RenderGraph::Pass& p = rg_.addPass("GBuffer");
+        p.access(tgtAlbedo.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, sync::kColorAttach,
+                 sync::kColorWrite);
+        p.access(tgtNormal.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, sync::kColorAttach,
+                 sync::kColorWrite);
+        p.access(tgtMaterial.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, sync::kColorAttach,
+                 sync::kColorWrite);
+        p.access(tgtEmissive.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, sync::kColorAttach,
+                 sync::kColorWrite);
+        p.access(tgtMotion.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, sync::kColorAttach,
+                 sync::kColorWrite);
+        p.access(tgtDepth.image, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                 sync::kDepthTests, sync::kDepthReadWrite, VK_IMAGE_ASPECT_DEPTH_BIT);
+        p.record = [&](VkCommandBuffer c) {
+            timestamps_.sceneBegin(c, slot);
+            deferred_.recordInstanceUpload(c, slot, instances_, cullCandidates_);
+            deferred_.recordCommandUpload(c, slot, cull, cullCandidates_, cullActive);
+            if (cullActive)
+                deferred_.recordOcclusionCull(c, cull, cullCandidates_, cull.prevViewProj,
+                                              (gbuffer ? gbPyramid_ : gtPyramid_).mipCount, sceneW,
+                                              sceneH);
+            VkRenderingAttachmentInfo colors[5] = {
+                makeColorAttachment(tgtAlbedo.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                    VK_ATTACHMENT_LOAD_OP_CLEAR),
+                makeColorAttachment(tgtNormal.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                    VK_ATTACHMENT_LOAD_OP_CLEAR, 0.f, 0.f, 1.f),
+                makeColorAttachment(tgtMaterial.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                    VK_ATTACHMENT_LOAD_OP_CLEAR),
+                makeColorAttachment(tgtEmissive.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                    VK_ATTACHMENT_LOAD_OP_CLEAR),
+                makeColorAttachment(tgtMotion.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                    VK_ATTACHMENT_LOAD_OP_CLEAR)};
+            const uint32_t colorCount = 5;
+            VkRenderingAttachmentInfo depth =
+                makeDepthAttachment(tgtDepth.view, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                                    VK_ATTACHMENT_LOAD_OP_CLEAR);
+            beginRendering(c, sceneW, sceneH, colorCount, colors, &depth);
+            deferred_.recordGBufferDraws(c, scene_, !gbuffer, fr.sceneSet, textureSet_,
+                                         materialStride_, sceneW, sceneH, cullViewProj, cull,
+                                         cullRuns_.data(), static_cast<uint32_t>(cullRuns_.size()));
+            vkCmdEndRendering(c);
+        };
     }
 
     // --- Shadow pass (sun CSM, one 2048^2 layer per cascade) -----------------
     // Runs once per frame and feeds both the LR and the GT lighting paths.
     if (shadow && shadow->lightIndex >= 0) {
-        // Sampled by the lighting fragment shaders last frame -> depth attach.
-        imageBarrier(cmd, shadow_.image, shadow_.layout,
-                     VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-                     sync::kFragment, sync::kSampled, sync::kDepthTests, sync::kDepthReadWrite,
-                     VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, kShadowCascadeCount);
-        shadow_.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-        deferred_.recordShadowPass(cmd, shadow_, scene_, shadow->cascadeVp, fr.sceneSet,
-                                   textureSet_, materialStride_);
-        // Depth writes -> shadow-comparison samples in the lighting shaders.
-        imageBarrier(cmd, shadow_.image, shadow_.layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                     VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT, sync::kDepthWrite,
-                     sync::kFragment, sync::kSampled,
-                     VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, kShadowCascadeCount);
-        shadow_.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        RenderGraph::Pass& p = rg_.addPass("ShadowCSM");
+        p.access(shadow_.image, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                 sync::kDepthTests, sync::kDepthReadWrite, VK_IMAGE_ASPECT_DEPTH_BIT, 0,
+                 kShadowCascadeCount);
+        p.record = [&](VkCommandBuffer c) {
+            deferred_.recordShadowPass(c, shadow_, scene_, shadow->cascadeVp, fr.sceneSet,
+                                       textureSet_, materialStride_);
+        };
+        // Depth writes -> shadow-comparison samples in the lighting shaders
+        // (barrier-only pass; the lighting pass re-declares the read).
+        rg_.addPass("ShadowCSMResolve")
+            .access(shadow_.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kFragment,
+                    sync::kSampled, VK_IMAGE_ASPECT_DEPTH_BIT, 0, kShadowCascadeCount);
     }
 
     // --- Spot shadow atlas (Phase 4b, one 1024^2 tile per selected spot) -----
     // Same once-per-frame sharing between the LR and GT paths as the CSM pass.
     if (shadow && shadow->atlasTileCount > 0) {
-        imageBarrier(cmd, spotAtlas_.image, spotAtlas_.layout,
-                     VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-                     sync::kFragment, sync::kSampled, sync::kDepthTests, sync::kDepthReadWrite,
-                     VK_IMAGE_ASPECT_DEPTH_BIT);
-        spotAtlas_.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-        deferred_.recordSpotShadowPass(cmd, spotAtlas_, scene_, shadow->atlasVp,
-                                       shadow->atlasTileCount, fr.sceneSet, textureSet_,
-                                       materialStride_);
-        imageBarrier(cmd, spotAtlas_.image, spotAtlas_.layout,
-                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                     VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT, sync::kDepthWrite,
-                     sync::kFragment, sync::kSampled, VK_IMAGE_ASPECT_DEPTH_BIT);
-        spotAtlas_.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        RenderGraph::Pass& p = rg_.addPass("SpotAtlas");
+        p.access(spotAtlas_.image, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                 sync::kDepthTests, sync::kDepthReadWrite, VK_IMAGE_ASPECT_DEPTH_BIT);
+        p.record = [&](VkCommandBuffer c) {
+            deferred_.recordSpotShadowPass(c, spotAtlas_, scene_, shadow->atlasVp,
+                                           shadow->atlasTileCount, fr.sceneSet, textureSet_,
+                                           materialStride_);
+        };
+        rg_.addPass("SpotAtlasResolve")
+            .access(spotAtlas_.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kFragment,
+                    sync::kSampled, VK_IMAGE_ASPECT_DEPTH_BIT);
     }
 
-    // --- Lighting pass (deferred PBR + IBL, skybox on far-plane pixels) --------
-    // dst scope includes compute: the opaque-SSR pass (ssr_opaque.comp) samples
-    // the GBuffer after the lighting fragment shader.
-    transition(tgtAlbedo, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-               sync::kColorAttach, sync::kColorWrite, sync::kSampleStages, sync::kSampled);
-    transition(tgtNormal, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-               sync::kColorAttach, sync::kColorWrite, sync::kSampleStages, sync::kSampled);
-    transition(tgtMaterial, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-               sync::kColorAttach, sync::kColorWrite, sync::kSampleStages, sync::kSampled);
-    transition(tgtEmissive, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-               sync::kColorAttach, sync::kColorWrite, sync::kSampleStages, sync::kSampled);
-    transition(tgtDepth, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-               sync::kDepthTests, sync::kDepthWrite, sync::kSampleStages, sync::kSampled,
-               VK_IMAGE_ASPECT_DEPTH_BIT);
+    // --- Hi-Z + GTAO (between the GBuffer and the lighting pass) ---------------
     // Hi-Z pyramid for the SSR marchers (glass in the transparency pass and
     // the opaque-SSR compute pass) and next frame's occlusion cull (Phase 7a).
     // Skipped only when no consumer runs; the pyramid then just keeps its last
     // contents.
-    if (hasTransparency_ || opts_.ssr || occlusion_)
-        deferred_.recordDepthPyramidPass(cmd, gbuffer ? gbPyramid_ : gtPyramid_);
-    // Motion RT: color writes -> post-fx compute reads (Phase 6b, both paths).
-    transition(tgtMotion, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-               sync::kColorAttach, sync::kColorWrite, sync::kSampleStages, sync::kSampled);
+    if (hasTransparency_ || opts_.ssr || occlusion_) {
+        RenderGraph::Pass& p = rg_.addPass("HiZ");
+        p.access(tgtDepth.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kCompute,
+                 sync::kSampled, VK_IMAGE_ASPECT_DEPTH_BIT);
+        p.record = [&](VkCommandBuffer c) {
+            deferred_.recordDepthPyramidPass(c, gbuffer ? gbPyramid_ : gtPyramid_);
+        };
+    }
 
     // --- GTAO (view-Z depth chain -> main pass -> temporal EMA -> denoise) ------
     // The AO depth chain is rebuilt every frame (the main pass samples it at
     // per-step LODs).  AoRaw ping-pongs between ssao main (storage write) and
     // the temporal pass (sampled); the accumulated history feeds the blur.
-    deferred_.recordDepthPyramidPass(cmd, aoChain);
-    transition(tgtAoRaw, VK_IMAGE_LAYOUT_GENERAL,
-               sync::kCompute, sync::kSampled, sync::kCompute, sync::kStorageWrite);
+    {
+        RenderGraph::Pass& p = rg_.addPass("AoChain");
+        p.access(tgtDepth.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kCompute,
+                 sync::kSampled, VK_IMAGE_ASPECT_DEPTH_BIT);
+        p.record = [&](VkCommandBuffer c) { deferred_.recordDepthPyramidPass(c, aoChain); };
+    }
     // XeGTAO's working depth has 5 levels: cap the step LOD at 4.
     const float aoMaxLod = static_cast<float>(std::min(aoChain.mipCount - 1, 4u));
-    deferred_.recordSsaoPass(cmd, gbuffer ? ssaoSetGb_ : ssaoSetGt_, invViewProjUsed, frameIndex,
-                             camera_.nearPlane, camera_.farPlane, aoMaxLod, sceneW, sceneH);
-    transition(tgtAoRaw, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-               sync::kCompute, sync::kStorageWrite, sync::kCompute, sync::kSampled);
+    {
+        RenderGraph::Pass& p = rg_.addPass("GTAO");
+        p.access(tgtNormal.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kCompute,
+                 sync::kSampled);
+        p.access(tgtAoRaw.image, VK_IMAGE_LAYOUT_GENERAL, sync::kCompute, sync::kStorageWrite);
+        p.record = [&](VkCommandBuffer c) {
+            deferred_.recordSsaoPass(c, gbuffer ? ssaoSetGb_ : ssaoSetGt_, invViewProjUsed,
+                                     frameIndex, camera_.nearPlane, camera_.farPlane, aoMaxLod,
+                                     sceneW, sceneH);
+        };
+    }
     const uint32_t aoWrite = aoFrames & 1u;
-    deferred_.recordSsaoTemporalPass(cmd, aoHist, aoWrite, invViewProjUsed, prevAoVp, sceneW,
-                                     sceneH, /*reset=*/aoFrames == 0);
+    {
+        RenderGraph::Pass& p = rg_.addPass("GTAOTemporal");
+        p.access(tgtAoRaw.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kCompute,
+                 sync::kSampled);
+        p.access(tgtDepth.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kCompute,
+                 sync::kSampled, VK_IMAGE_ASPECT_DEPTH_BIT);
+        // Value captures: the lambda runs at execute() time, after the
+        // bookkeeping below already advanced the temporal state.
+        const Mat4 aoPrevVp = prevAoVp;
+        const bool aoReset = aoFrames == 0;
+        p.record = [&, aoPrevVp, aoReset](VkCommandBuffer c) {
+            deferred_.recordSsaoTemporalPass(c, aoHist, aoWrite, invViewProjUsed, aoPrevVp, sceneW,
+                                             sceneH, aoReset);
+        };
+    }
     prevAoVp = viewProjUsed;
     ++aoFrames;
     // Ao: sampled by the lighting fragment + opaque-SSR compute shaders,
     // rewritten by the blur pass.
-    transition(tgtAo, VK_IMAGE_LAYOUT_GENERAL,
-               sync::kSampleStages, sync::kSampled, sync::kCompute, sync::kStorageWrite);
-    deferred_.recordSsaoBlurPass(cmd, aoHist.blurSet[aoWrite], sceneW, sceneH);
-    transition(tgtAo, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-               sync::kCompute, sync::kStorageWrite, sync::kSampleStages, sync::kSampled);
+    {
+        RenderGraph::Pass& p = rg_.addPass("GTAOBlur");
+        p.access(tgtAo.image, VK_IMAGE_LAYOUT_GENERAL, sync::kCompute, sync::kStorageWrite);
+        p.record = [&](VkCommandBuffer c) {
+            deferred_.recordSsaoBlurPass(c, aoHist.blurSet[aoWrite], sceneW, sceneH);
+        };
+    }
 
-    // litTarget was sampled by last frame's upscaler (GB) or present pass (GT).
-    transition(litTarget, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-               sync::kSampleStages, sync::kSampled, sync::kColorAttach, sync::kColorWrite);
-
-    deferred_.recordLightingPass(cmd, gbuffer ? fr.lightingSetGb : fr.lightingSetGt,
-                                 gbuffer ? gbCluster_ : gtCluster_, slot,
-                                 view, gbuffer ? projJittered : proj,
-                                 litTarget.view, sceneW, sceneH);
+    // --- Lighting pass (deferred PBR + IBL, skybox on far-plane pixels) --------
+    // The GBuffer reads are declared here (fragment scope); the opaque-SSR
+    // compute pass re-declares them with compute scope later — read-after-read
+    // in one layout needs no barrier, so the graph emits nothing extra.
+    {
+        RenderGraph::Pass& p = rg_.addPass("Lighting");
+        p.access(tgtAlbedo.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kFragment,
+                 sync::kSampled);
+        p.access(tgtNormal.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kFragment,
+                 sync::kSampled);
+        p.access(tgtMaterial.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kFragment,
+                 sync::kSampled);
+        p.access(tgtEmissive.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kFragment,
+                 sync::kSampled);
+        p.access(tgtDepth.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kFragment,
+                 sync::kSampled, VK_IMAGE_ASPECT_DEPTH_BIT);
+        p.access(tgtAo.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kFragment,
+                 sync::kSampled);
+        if (shadow && shadow->lightIndex >= 0)
+            p.access(shadow_.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kFragment,
+                     sync::kSampled, VK_IMAGE_ASPECT_DEPTH_BIT, 0, kShadowCascadeCount);
+        if (shadow && shadow->atlasTileCount > 0)
+            p.access(spotAtlas_.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kFragment,
+                     sync::kSampled, VK_IMAGE_ASPECT_DEPTH_BIT);
+        p.access(litTarget.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, sync::kColorAttach,
+                 sync::kColorWrite);
+        p.record = [&](VkCommandBuffer c) {
+            deferred_.recordLightingPass(c, gbuffer ? fr.lightingSetGb : fr.lightingSetGt,
+                                         gbuffer ? gbCluster_ : gtCluster_, slot, view,
+                                         gbuffer ? projJittered : proj, litTarget.view, sceneW,
+                                         sceneH);
+        };
+    }
 
     // --- Froxel volumetric fog (Phase 5a): inject -> light -> temporal ->
     //     march, then composite over the lit HDR target (before tonemap) -----
@@ -1695,124 +1770,155 @@ void Renderer::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     // under TAA jitter; the GT path is the same algorithm and parameters at
     // native resolution.
     if (volFogActive_) {
-        VolFogVolume& fog = gbuffer ? gbFog_ : gtFog_;
-        ClusterGrid& fogCluster = gbuffer ? gbCluster_ : gtCluster_;
+        // NOTE: record lambdas run at rg_.execute() time, AFTER this block has
+        // closed — anything block-scope they use must be captured by value or
+        // rebound from members inside the lambda (references would dangle).
         Mat4& prevFogVp = gbuffer ? prevFogViewProjGb_ : prevFogViewProjGt_;
         uint32_t& fogFrames = gbuffer ? fogFramesGb_ : fogFramesGt_;
         const Mat4 fogViewProj = Mat4::multiply(proj, view); // un-jittered
-        deferred_.recordVolFogAccumulate(cmd, fog, fogCluster, slot, view, proj, prevFogVp,
-                                         fogParams_, frameIndex, fogFrames & 1u,
-                                         /*reset=*/fogFrames == 0);
+        const Mat4 fogPrevVp = prevFogVp;
+        const uint32_t fogWrite = fogFrames & 1u;
+        const bool fogReset = fogFrames == 0;
+        rg_.addPass("VolFogAccumulate").record = [&, fogPrevVp, fogWrite, fogReset](VkCommandBuffer c) {
+            VolFogVolume& fog = gbuffer ? gbFog_ : gtFog_;
+            ClusterGrid& fogCluster = gbuffer ? gbCluster_ : gtCluster_;
+            deferred_.recordVolFogAccumulate(c, fog, fogCluster, slot, view, proj, fogPrevVp,
+                                             fogParams_, frameIndex, fogWrite, fogReset);
+        };
         prevFogVp = fogViewProj;
         ++fogFrames;
-        transition(litTarget, VK_IMAGE_LAYOUT_GENERAL, sync::kColorAttach, sync::kColorWrite,
-                   sync::kCompute, sync::kStorageReadWrite);
-        deferred_.recordVolFogComposite(cmd, fog, proj, fogParams_.maxDistance, sceneW, sceneH);
-        transition(litTarget, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, sync::kCompute,
-                   sync::kStorageWrite, sync::kColorAttach, sync::kColorReadWrite);
+        RenderGraph::Pass& p = rg_.addPass("VolFogComposite");
+        p.access(litTarget.image, VK_IMAGE_LAYOUT_GENERAL, sync::kCompute, sync::kStorageReadWrite);
+        p.access(tgtDepth.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kCompute,
+                 sync::kSampled, VK_IMAGE_ASPECT_DEPTH_BIT);
+        p.record = [&](VkCommandBuffer c) {
+            const VolFogVolume& fog = gbuffer ? gbFog_ : gtFog_;
+            deferred_.recordVolFogComposite(c, fog, proj, fogParams_.maxDistance, sceneW, sceneH);
+        };
     }
 
     // --- Opaque SSR + transparency pass (over the lit scene) ------------------
     // Build the color mip chain from the lit target: mip 0 IS the opaque HDR
     // copy glass SSR used to make with a transfer; the chain is GENERAL for
-    // life, so only litTarget transitions here (color attach -> compute read
-    // -> color attach).  The opaque-SSR compute pass consumes the same chain,
-    // so it is built whenever either consumer runs.
+    // life (untracked — the pass barriers internally).  The opaque-SSR compute
+    // pass consumes the same chain, so it is built whenever either consumer
+    // runs.
     if (hasTransparency_ || opts_.ssr) {
-        transition(litTarget, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                   sync::kColorAttach, sync::kColorWrite, sync::kCompute, sync::kSampled);
-        deferred_.recordColorPyramidPass(cmd, gbuffer ? gbColorPyramid_ : gtColorPyramid_);
+        RenderGraph::Pass& cp = rg_.addPass("ColorPyramid");
+        cp.access(litTarget.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kCompute,
+                  sync::kSampled);
+        cp.record = [&](VkCommandBuffer c) {
+            deferred_.recordColorPyramidPass(c, gbuffer ? gbColorPyramid_ : gtColorPyramid_);
+        };
         if (opts_.ssr) {
             // Opaque SSR, Phase 2d: trace into the path's full-res RT (rgb =
             // composite delta, a = view |z|), then the temporal pass EMA-
             // accumulates the delta and fuses the composite (in-place RMW add
             // on the lit target) — first frame equals the old in-place pass.
             ImageResource& ssrTrace = gbuffer ? gbSsrTrace_ : gtSsrTrace_;
-            SsrHistory& ssrHist = gbuffer ? gbSsrHist_ : gtSsrHist_;
             Mat4& prevSsrVp = gbuffer ? prevSsrViewProjGb_ : prevSsrViewProjGt_;
             uint32_t& ssrFrames = gbuffer ? ssrFramesGb_ : ssrFramesGt_;
-            transition(ssrTrace, VK_IMAGE_LAYOUT_GENERAL,
-                       sync::kCompute, sync::kSampled, sync::kCompute, sync::kStorageWrite);
-            deferred_.recordSsrPass(cmd, gbuffer ? fr.ssrSetGb : fr.ssrSetGt, viewProjUsed,
-                                    sceneW, sceneH);
-            transition(ssrTrace, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                       sync::kCompute, sync::kStorageWrite, sync::kCompute, sync::kSampled);
-            transition(litTarget, VK_IMAGE_LAYOUT_GENERAL,
-                       sync::kCompute, sync::kSampled, sync::kCompute, sync::kStorageReadWrite);
+            {
+                RenderGraph::Pass& p = rg_.addPass("SsrTrace");
+                p.access(tgtAlbedo.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                         sync::kCompute, sync::kSampled);
+                p.access(tgtNormal.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                         sync::kCompute, sync::kSampled);
+                p.access(tgtMaterial.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                         sync::kCompute, sync::kSampled);
+                p.access(tgtDepth.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                         sync::kCompute, sync::kSampled, VK_IMAGE_ASPECT_DEPTH_BIT);
+                p.access(tgtAo.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kCompute,
+                         sync::kSampled);
+                p.access(ssrTrace.image, VK_IMAGE_LAYOUT_GENERAL, sync::kCompute,
+                         sync::kStorageWrite);
+                p.record = [&](VkCommandBuffer c) {
+                    deferred_.recordSsrPass(c, gbuffer ? fr.ssrSetGb : fr.ssrSetGt, viewProjUsed,
+                                            sceneW, sceneH);
+                };
+            }
+            // Value captures: the lambda runs at execute() time, after the
+            // bookkeeping below already advanced the ping-pong state.
             const uint32_t ssrWrite = ssrFrames & 1u;
-            deferred_.recordSsrTemporalPass(cmd, ssrHist, ssrWrite, invViewProjUsed, prevSsrVp,
-                                            sceneW, sceneH, /*reset=*/ssrFrames == 0);
+            const Mat4 ssrPrevVp = prevSsrVp;
+            const bool ssrReset = ssrFrames == 0;
+            {
+                RenderGraph::Pass& p = rg_.addPass("SsrTemporal");
+                p.access(ssrTrace.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                         sync::kCompute, sync::kSampled);
+                p.access(tgtDepth.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                         sync::kCompute, sync::kSampled, VK_IMAGE_ASPECT_DEPTH_BIT);
+                p.access(litTarget.image, VK_IMAGE_LAYOUT_GENERAL, sync::kCompute,
+                         sync::kStorageReadWrite);
+                p.record = [&, ssrWrite, ssrPrevVp, ssrReset](VkCommandBuffer c) {
+                    SsrHistory& ssrHist = gbuffer ? gbSsrHist_ : gtSsrHist_;
+                    deferred_.recordSsrTemporalPass(c, ssrHist, ssrWrite, invViewProjUsed,
+                                                    ssrPrevVp, sceneW, sceneH, ssrReset);
+                };
+            }
             prevSsrVp = viewProjUsed;
             ++ssrFrames;
-            transition(litTarget, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                       sync::kCompute, sync::kStorageWrite, sync::kColorAttach,
-                       sync::kColorReadWrite);
-        } else {
-            transition(litTarget, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                       sync::kCompute, sync::kSampled, sync::kColorAttach, sync::kColorReadWrite);
         }
     }
     if (hasTransparency_) {
+        RenderGraph::Pass& p = rg_.addPass("Transparency");
+        // LOAD_OP_LOAD + alpha blending: the lit target is read AND written.
+        p.access(litTarget.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, sync::kColorAttach,
+                 sync::kColorReadWrite);
         if (gbuffer) {
-            transition(gbMotion_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                       sync::kFragment, sync::kSampled, sync::kColorAttach, sync::kColorReadWrite);
-            transition(gbReactive_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                       sync::kSampleStages, sync::kSampled, sync::kColorAttach, sync::kColorWrite);
+            p.access(gbMotion_.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                     sync::kColorAttach, sync::kColorReadWrite);
+            p.access(gbReactive_.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                     sync::kColorAttach, sync::kColorWrite);
         }
-        transition(tgtDepth, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
-                   sync::kFragment, sync::kSampled, sync::kDepthTests, sync::kDepthRead,
-                   VK_IMAGE_ASPECT_DEPTH_BIT);
-
-        VkRenderingAttachmentInfo tColors[3] = {};
-        tColors[0] =
-            makeColorAttachment(litTarget.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                                VK_ATTACHMENT_LOAD_OP_LOAD);
-        if (gbuffer) {
-            tColors[1] =
-                makeColorAttachment(gbMotion_.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        p.access(tgtDepth.image, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+                 sync::kDepthTests, sync::kDepthRead, VK_IMAGE_ASPECT_DEPTH_BIT);
+        p.record = [&](VkCommandBuffer c) {
+            VkRenderingAttachmentInfo tColors[3] = {};
+            tColors[0] =
+                makeColorAttachment(litTarget.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                                     VK_ATTACHMENT_LOAD_OP_LOAD);
-            tColors[2] =
-                makeColorAttachment(gbReactive_.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                                    VK_ATTACHMENT_LOAD_OP_CLEAR);
-        }
-        VkRenderingAttachmentInfo tDepth =
-            makeDepthAttachment(tgtDepth.view, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
-                                VK_ATTACHMENT_LOAD_OP_LOAD);
-        beginRendering(cmd, sceneW, sceneH, gbuffer ? 3 : 1, tColors, &tDepth);
-        deferred_.recordTransparentDraws(cmd, scene_, !gbuffer, fr.sceneSet, textureSet_,
-                                         gbuffer ? fr.transparentSetGb : fr.transparentSetGt,
-                                         materialStride_, sceneW, sceneH,
-                                         Mat4::multiply(proj, view), camera_.position);
-        vkCmdEndRendering(cmd);
-
-        if (gbuffer) {
-            transition(gbMotion_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                       sync::kColorAttach, sync::kColorWrite, sync::kSampleStages, sync::kSampled);
-            transition(gbReactive_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                       sync::kColorAttach, sync::kColorWrite, sync::kSampleStages, sync::kSampled);
-        }
-        transition(tgtDepth, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                   sync::kDepthTests, sync::kDepthRead, sync::kSampleStages, sync::kSampled,
-                   VK_IMAGE_ASPECT_DEPTH_BIT);
+            if (gbuffer) {
+                tColors[1] =
+                    makeColorAttachment(gbMotion_.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                        VK_ATTACHMENT_LOAD_OP_LOAD);
+                tColors[2] =
+                    makeColorAttachment(gbReactive_.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                        VK_ATTACHMENT_LOAD_OP_CLEAR);
+            }
+            VkRenderingAttachmentInfo tDepth =
+                makeDepthAttachment(tgtDepth.view, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+                                    VK_ATTACHMENT_LOAD_OP_LOAD);
+            beginRendering(c, sceneW, sceneH, gbuffer ? 3 : 1, tColors, &tDepth);
+            deferred_.recordTransparentDraws(c, scene_, !gbuffer, fr.sceneSet, textureSet_,
+                                             gbuffer ? fr.transparentSetGb : fr.transparentSetGt,
+                                             materialStride_, sceneW, sceneH,
+                                             Mat4::multiply(proj, view), camera_.position);
+            vkCmdEndRendering(c);
+        };
     }
 
-    transition(litTarget, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-               sync::kColorAttach, sync::kColorWrite, sync::kSampleStages, sync::kSampled);
     if (opts_.bloom) {
-        if (gbuffer) {
-            deferred_.recordBloomPyramidPass(cmd, gbBloom_, gbColor_.image, gbColor_.layout,
-                                             renderWidth_, renderHeight_);
-        } else {
-            deferred_.recordBloomPyramidPass(cmd, gtBloom_, finalImage_.image, finalImage_.layout,
-                                             opts_.displayWidth, opts_.displayHeight);
-        }
+        // The helper transitions the lit target internally (GENERAL RMW
+        // composite) and hands it back SHADER_READ_ONLY: entry via the
+        // declaration, the in/out layout through the tracker's layoutRef, the
+        // exit stage/access via leaves().
+        RenderGraph::Pass& p = rg_.addPass("Bloom");
+        p.access(litTarget.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kCompute,
+                 sync::kSampled);
+        p.leaves(litTarget.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                 sync::kFragment | sync::kCompute, sync::kSampled);
+        p.record = [&](VkCommandBuffer c) {
+            const BloomPyramid& bloom = gbuffer ? gbBloom_ : gtBloom_;
+            deferred_.recordBloomPyramidPass(c, bloom, litTarget.image,
+                                             rg_.layoutRef(litTarget.image), sceneW, sceneH);
+        };
     }
     // --- Motion blur + depth of field (Phase 6b) -------------------------------
     // HDR domain, after bloom and before upscale/present.  Same algorithm and
     // parameters on the LR and GT paths (the GT blurs identically, so compare
     // metrics stay fair); the blur-radius clamps scale with path height so the
-    // display-space blur is resolution-independent.  Motion/depth are
-    // SHADER_READ_ONLY here with compute in the sampled-dst scope.
+    // display-space blur is resolution-independent.
     if (opts_.motionBlur || opts_.dof) {
         PostFxParams fx;
         fx.depthM10 = proj.m[10];
@@ -1823,8 +1929,20 @@ void Renderer::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         fx.maxCocPx = std::max(2.f, kDofMaxCoC * resScale);
         fx.motionBlur = opts_.motionBlur;
         fx.dof = opts_.dof;
-        deferred_.recordPostFxPass(cmd, gbuffer ? gbPostFx_ : gtPostFx_, litTarget.image,
-                                   litTarget.layout, fx, frameIndex);
+        RenderGraph::Pass& p = rg_.addPass("PostFx");
+        // Same internal-transition convention as the bloom pass above.
+        p.access(litTarget.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                 sync::kFragment | sync::kCompute, sync::kSampled);
+        p.access(tgtMotion.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kCompute,
+                 sync::kSampled);
+        p.access(tgtDepth.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kCompute,
+                 sync::kSampled, VK_IMAGE_ASPECT_DEPTH_BIT);
+        p.leaves(litTarget.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                 sync::kFragment | sync::kCompute, sync::kSampled);
+        p.record = [&, fx](VkCommandBuffer c) { // fx by value: runs at execute() time
+            deferred_.recordPostFxPass(c, gbuffer ? gbPostFx_ : gtPostFx_, litTarget.image,
+                                       rg_.layoutRef(litTarget.image), fx, frameIndex);
+        };
     }
     // --- Auto exposure (lit HDR -> histogram -> smoothed EV) -------------------
     // Runs on this path's HDR source (gbColor_ for LR, finalImage_ for GT),
@@ -1841,11 +1959,16 @@ void Renderer::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         solve.minEV = opts_.exposureMinEV;
         solve.maxEV = opts_.exposureMaxEV;
         solve.resetState = (frameIndex == 0) ? 1.f : 0.f; // snap on the first frame
-        deferred_.recordAutoExposurePass(cmd, exposureChannel_.gpu, solve,
-                                         exposureChannel_.staging[slot]);
+        RenderGraph::Pass& p = rg_.addPass("AutoExposure");
+        p.access(litTarget.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kCompute,
+                 sync::kSampled);
+        p.record = [&, solve](VkCommandBuffer c) { // solve by value: runs at execute() time
+            deferred_.recordAutoExposurePass(c, exposureChannel_.gpu, solve,
+                                             exposureChannel_.staging[slot]);
+        };
         exposureChannel_.pending[slot] = true;
     }
-    timestamps_.sceneEnd(cmd, slot);
+    rg_.addPass("SceneEnd").record = [&](VkCommandBuffer c) { timestamps_.sceneEnd(c, slot); };
 
     // Phase 7a: from the next frame on, this path's cull pass reprojects
     // against the pyramid just built with this frame's exact view-projection.
@@ -1855,111 +1978,139 @@ void Renderer::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     if (!gbuffer) {
         // GT has no upscaler pass; emit a zero-width range so every query slot
         // is written (readback with WAIT_BIT otherwise blocks forever).
-        timestamps_.upscaleBegin(cmd, slot);
-        timestamps_.upscaleEnd(cmd, slot);
+        rg_.addPass("Upscale").record = [&](VkCommandBuffer c) {
+            timestamps_.upscaleBegin(c, slot);
+            timestamps_.upscaleEnd(c, slot);
+        };
     }
 
     if (gbuffer) {
         // gbColor_/gbMotion_/gbDepth_ are already SHADER_READ_ONLY (lighting
-        // wrote gbColor_ and sampled depth; motion was resolved right after
-        // the GBuffer pass).  finalImage_ was sampled by the present pass;
-        // the upscaler writes it as a storage image (fragment or compute).
-        transition(finalImage_, VK_IMAGE_LAYOUT_GENERAL,
-                   sync::kFragment, sync::kSampled, sync::kSampleStages, sync::kStorageWrite);
+        // wrote gbColor_ and sampled depth; the graph tracks the states).
+        // finalImage_ was sampled by the present pass; the upscaler writes it
+        // as a storage image (fragment or compute).
+        RenderGraph::Pass& p = rg_.addPass("Upscale");
+        p.access(finalImage_.image, VK_IMAGE_LAYOUT_GENERAL, sync::kSampleStages,
+                 sync::kStorageWrite);
+        p.access(gbColor_.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kSampleStages,
+                 sync::kSampled);
+        p.access(gbDepth_.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kSampleStages,
+                 sync::kSampled, VK_IMAGE_ASPECT_DEPTH_BIT);
+        p.access(gbMotion_.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kSampleStages,
+                 sync::kSampled);
+        if (hasTransparency_)
+            p.access(gbReactive_.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                     sync::kSampleStages, sync::kSampled);
+        p.record = [&](VkCommandBuffer c) {
+            UpscalerResources res;
+            res.color = gbColor_.image;
+            res.colorView = gbColor_.view;
+            res.depth = gbDepth_.image;
+            res.depthView = gbDepth_.view;
+            res.motion = gbMotion_.image;
+            res.motionView = gbMotion_.view;
+            if (hasTransparency_) {
+                res.reactive = gbReactive_.image;
+                res.reactiveView = gbReactive_.view;
+            }
+            res.output = finalImage_.image;
+            res.outputView = finalImage_.view;
 
-        UpscalerResources res;
-        res.color = gbColor_.image;
-        res.colorView = gbColor_.view;
-        res.depth = gbDepth_.image;
-        res.depthView = gbDepth_.view;
-        res.motion = gbMotion_.image;
-        res.motionView = gbMotion_.view;
-        if (hasTransparency_) {
-            res.reactive = gbReactive_.image;
-            res.reactiveView = gbReactive_.view;
-        }
-        res.output = finalImage_.image;
-        res.outputView = finalImage_.view;
+            CameraParams cam;
+            std::memcpy(cam.view, view.m, sizeof(cam.view));
+            std::memcpy(cam.proj, proj.m, sizeof(cam.proj));
+            std::memcpy(cam.prevViewProj, prevViewProj_.m, sizeof(cam.prevViewProj));
+            cam.jitterX = jitterX_;
+            cam.jitterY = jitterY_;
+            cam.prevJitterX = prevJitterX_;
+            cam.prevJitterY = prevJitterY_;
+            cam.cameraNear = camera_.nearPlane;
+            cam.cameraFar = camera_.farPlane;
+            cam.fovY = camera_.fovY;
 
-        CameraParams cam;
-        std::memcpy(cam.view, view.m, sizeof(cam.view));
-        std::memcpy(cam.proj, proj.m, sizeof(cam.proj));
-        std::memcpy(cam.prevViewProj, prevViewProj_.m, sizeof(cam.prevViewProj));
-        cam.jitterX = jitterX_;
-        cam.jitterY = jitterY_;
-        cam.prevJitterX = prevJitterX_;
-        cam.prevJitterY = prevJitterY_;
-        cam.cameraNear = camera_.nearPlane;
-        cam.cameraFar = camera_.farPlane;
-        cam.fovY = camera_.fovY;
+            FrameParams frame;
+            frame.frameIndex = static_cast<int>(frameIndex);
+            frame.deltaTime = deltaTime_;
+            // Real exposure input (was hardcoded 1): the display exposure applied
+            // to this frame — see InputAdapter.h for the preExposure convention.
+            frame.preExposure = displayExposure();
+            frame.resetHistory = (frameIndex == 0);
 
-        FrameParams frame;
-        frame.frameIndex = static_cast<int>(frameIndex);
-        frame.deltaTime = deltaTime_;
-        // Real exposure input (was hardcoded 1): the display exposure applied
-        // to this frame — see InputAdapter.h for the preExposure convention.
-        frame.preExposure = displayExposure();
-        frame.resetHistory = (frameIndex == 0);
-
-        timestamps_.upscaleBegin(cmd, slot);
-        upscaler_->dispatch(cmd, res, cam, frame);
-        timestamps_.upscaleEnd(cmd, slot);
-
-        transition(finalImage_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                   sync::kSampleStages, sync::kStorageWrite, sync::kFragment, sync::kSampled);
+            timestamps_.upscaleBegin(c, slot);
+            upscaler_->dispatch(c, res, cam, frame);
+            timestamps_.upscaleEnd(c, slot);
+        };
+        rg_.addPass("PostUpscale")
+            .access(finalImage_.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kFragment,
+                    sync::kSampled);
     }
     // GT path: finalImage_ is already SHADER_READ_ONLY (post-lighting).
 
+    // Acquired swapchain contents are undefined; the graph starts the image
+    // from UNDEFINED (no source synchronization) like the old code did.
     const VkImage swapImage = swapchain_.image(swapchainIndex);
     const VkImageView swapView = swapchain_.view(swapchainIndex);
-    imageBarrier(cmd, swapImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                 VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
-                 sync::kColorAttach, sync::kColorWrite);
-
-    VkRenderingAttachmentInfo presentColor =
-        makeColorAttachment(swapView, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_ATTACHMENT_LOAD_OP_CLEAR);
-    beginRendering(cmd, swapchain_.extent().width, swapchain_.extent().height, 1, &presentColor, nullptr);
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, presentPipeline_);
-    VkViewport pvp = {0.f, 0.f, static_cast<float>(swapchain_.extent().width),
-                      static_cast<float>(swapchain_.extent().height), 0.f, 1.f};
-    vkCmdSetViewport(cmd, 0, 1, &pvp);
-    VkRect2D psc = {{0, 0}, {swapchain_.extent().width, swapchain_.extent().height}};
-    vkCmdSetScissor(cmd, 0, 1, &psc);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, presentPipelineLayout_, 0, 1,
-                            &presentSet_, 0, nullptr);
-    // Present: exposure + the terminal lens-effects chain (strengths zeroed
-    // when disabled; dirt also needs the bloom pyramid, so --no-bloom forces
-    // it off — the bound mip content is undefined then, see the present set)
-    // + the log-domain grading set (Phase 6c) + the HDR output mode from the
-    // swapchain (Phase 6c; 0 = SDR).
-    const bool fx = opts_.lensFx;
-    const Vec3 wb = whiteBalanceForTemperatureTint(grading_.temperatureK, grading_.tint);
-    const float presentPush[20] = {
-        displayExposure(), 0.f, 0.f, 0.f,
-        fx ? kLensCaStrength : 0.f,
-        fx ? kLensVignetteStrength : 0.f,
-        fx ? kLensGrainStrength : 0.f,
-        static_cast<float>(frameIndex),
-        (fx && opts_.bloom) ? kLensDirtStrength : 0.f, 0.f, 0.f, 0.f,
-        grading_.contrast, grading_.saturation,
-        static_cast<float>(swapchain_.hdrMode()), opts_.hdrPaperWhiteNits,
-        wb.x, wb.y, wb.z, static_cast<float>(gradingLutCpu_.size),
-    };
-    vkCmdPushConstants(cmd, presentPipelineLayout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
-                       sizeof(presentPush), presentPush);
-    vkCmdDraw(cmd, 3, 1, 0, 0);
-    vkCmdEndRendering(cmd);
-
-    imageBarrier(cmd, swapImage, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                 VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-                 sync::kColorAttach, sync::kColorWrite, VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE);
+    rg_.discard(swapImage);
+    {
+        RenderGraph::Pass& p = rg_.addPass("Present");
+        p.access(finalImage_.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kFragment,
+                 sync::kSampled);
+        p.access(swapImage, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, sync::kColorAttach,
+                 sync::kColorWrite);
+        p.record = [&](VkCommandBuffer c) {
+            VkRenderingAttachmentInfo presentColor =
+                makeColorAttachment(swapView, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_ATTACHMENT_LOAD_OP_CLEAR);
+            beginRendering(c, swapchain_.extent().width, swapchain_.extent().height, 1, &presentColor, nullptr);
+            vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, presentPipeline_);
+            VkViewport pvp = {0.f, 0.f, static_cast<float>(swapchain_.extent().width),
+                              static_cast<float>(swapchain_.extent().height), 0.f, 1.f};
+            vkCmdSetViewport(c, 0, 1, &pvp);
+            VkRect2D psc = {{0, 0}, {swapchain_.extent().width, swapchain_.extent().height}};
+            vkCmdSetScissor(c, 0, 1, &psc);
+            vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, presentPipelineLayout_, 0, 1,
+                                    &presentSet_, 0, nullptr);
+            // Present: exposure + the terminal lens-effects chain (strengths zeroed
+            // when disabled; dirt also needs the bloom pyramid, so --no-bloom forces
+            // it off — the bound mip content is undefined then, see the present set)
+            // + the log-domain grading set (Phase 6c) + the HDR output mode from the
+            // swapchain (Phase 6c; 0 = SDR).
+            const bool fx = opts_.lensFx;
+            const Vec3 wb = whiteBalanceForTemperatureTint(grading_.temperatureK, grading_.tint);
+            const float presentPush[20] = {
+                displayExposure(), 0.f, 0.f, 0.f,
+                fx ? kLensCaStrength : 0.f,
+                fx ? kLensVignetteStrength : 0.f,
+                fx ? kLensGrainStrength : 0.f,
+                static_cast<float>(frameIndex),
+                (fx && opts_.bloom) ? kLensDirtStrength : 0.f, 0.f, 0.f, 0.f,
+                grading_.contrast, grading_.saturation,
+                static_cast<float>(swapchain_.hdrMode()), opts_.hdrPaperWhiteNits,
+                wb.x, wb.y, wb.z, static_cast<float>(gradingLutCpu_.size),
+            };
+            vkCmdPushConstants(c, presentPipelineLayout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                               sizeof(presentPush), presentPush);
+            vkCmdDraw(c, 3, 1, 0, 0);
+            vkCmdEndRendering(c);
+        };
+    }
+    rg_.addPass("PresentOut")
+        .access(swapImage, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_PIPELINE_STAGE_2_NONE,
+                VK_ACCESS_2_NONE);
 
     const bool capturing = !opts_.screenshotPath.empty() && static_cast<int>(frameIndex) == opts_.frames - 1;
     if (capturing) {
-        captureScreenshotIntoStaging(cmd);
+        RenderGraph::Pass& p = rg_.addPass("Screenshot");
+        p.access(finalImage_.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, sync::kCopy,
+                 sync::kTransferRead);
+        p.record = [&](VkCommandBuffer c) { captureScreenshotIntoStaging(c); };
+        rg_.addPass("ScreenshotBack")
+            .access(finalImage_.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kFragment,
+                    sync::kSampled);
     }
 
-    timestamps_.frameEnd(cmd, slot);
+    rg_.addPass("FrameEnd").record = [&](VkCommandBuffer c) { timestamps_.frameEnd(c, slot); };
+
+    rg_.execute(cmd);
     vkEndCommandBuffer(cmd);
 
     prevViewProj_ = Mat4::multiply(proj, view);
@@ -2173,6 +2324,10 @@ void Renderer::shutdown() {
     deferred_.destroySsrHistory(ctx_, gtSsrHist_);
     gbSsrTrace_.destroy(ctx_);
     gtSsrTrace_.destroy(ctx_);
+    // Backing blocks of the aliased AO-raw/SSR-trace pairs (images already
+    // destroyed above via ImageResource::arena).
+    gbAoSsrArena_.destroy(ctx_);
+    gtAoSsrArena_.destroy(ctx_);
     finalImage_.destroy(ctx_);
 
     if (shadowsActive_) { deferred_.destroyShadowTargets(ctx_, shadow_); shadowsActive_ = false; }
