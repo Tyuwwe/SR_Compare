@@ -389,6 +389,95 @@ struct DepthPyramid {
     float falloff[2] = {0.f, 0.f};
 };
 
+// --- GPU occlusion culling + indirect GBuffer draws (Phase 7a) -----------------
+// 2020-standard GPU-driven visibility for the static opaque instances:
+// per-instance transform/material data lives in a device-local SSBO (scene
+// set binding 3, read by gbuffer.vert via gl_InstanceIndex) instead of
+// per-draw push constants, and the GBuffer pass issues one
+// vkCmdDrawIndexedIndirect per material run over a CPU-filled command buffer.
+// A compute pass (occlusion_cull.comp) then tests each candidate's world AABB
+// against the PREVIOUS frame's Hi-Z pyramid (the path's max-reduced NDC depth
+// chain, reprojected with the previous frame's exact view-projection —
+// jittered for the LR path) and zeroes the instanceCount of fully occluded
+// commands (1-frame latency; first frame / resize / path switch => cull
+// skipped, everything visible).
+// CPU frustum culling + LOD selection (Phase 3b) stay on the CPU: they are
+// path-independent and already pay for themselves; the GPU pass only re-tests
+// the CPU-visible set (lower implementation risk than moving frustum/LOD into
+// compute, and the candidate list doubles as the command buffer content).
+// Commands stay in place (no compaction): zero-instance indirect draws are
+// nearly free, the output keeps the CPU's sorted (material, mesh) order and
+// the result is bit-deterministic (no atomics, no prefix sums).  Because the
+// CPU always knows the run lengths, plain vkCmdDrawIndexedIndirect is used
+// instead of the count variant (core since Vulkan 1.2 — nothing extra to
+// enable either way).  Skinned and BLEND instances keep the direct-draw
+// paths (few; transparency is order-dependent).
+constexpr uint32_t kCullSlots = 2; // per-slot staging, matches every host's kFramesInFlight
+
+// std430, matches gbuffer.vert / occlusion_cull.comp.
+struct GpuInstance {
+    float model[16];
+    float prevModel[16];
+    float normalModel[16];
+    float aabbMin[4]; // xyz = world AABB min
+    float aabbMax[4];
+    uint32_t materialIndex = 0;
+    uint32_t flags = 0; // bit0: occlusion-exempt (transform changed this frame)
+    uint32_t pad[2] = {};
+};
+static_assert(sizeof(GpuInstance) == 240, "GpuInstance std430 size mismatch");
+
+// Contiguous candidate range sharing one material (one indirect draw call).
+struct CullDrawRun {
+    uint32_t materialIndex = 0;
+    uint32_t firstCommand = 0;
+    uint32_t commandCount = 0;
+};
+
+// Host-owned per-frame instance data: the CPU fills the slot's mapped staging
+// (buildInstanceList), recordInstanceUpload copies it into the device-local
+// SSBO the GBuffer vertex shaders and the cull pass read.  One per host; all
+// paths share it (the candidate list is resolution-independent).
+struct InstanceBuffer {
+    VkBuffer staging[kCullSlots] = {};
+    VmaAllocation stagingMemory[kCullSlots] = {};
+    void* stagingMapped[kCullSlots] = {};
+    VkBuffer buffer = VK_NULL_HANDLE; // device-local SSBO (scene set binding 3)
+    VmaAllocation memory = VK_NULL_HANDLE;
+    uint32_t capacity = 0;
+};
+
+// Host-owned per-path indirect/cull state (same ownership model as
+// DepthPyramid): one per deferred render path because the cull set binds that
+// path's Hi-Z chain and prevViewProj tracks that path's last rendered frame.
+// The command buffer contents are CPU-identical across paths; each path gets
+// its own buffer because its cull pass zeroes different instanceCounts
+// (resolution-dependent Hi-Z; the culled sets agree up to edge texels).
+struct CullChannel {
+    VkBuffer cmdStaging[kCullSlots] = {};
+    VmaAllocation cmdStagingMemory[kCullSlots] = {};
+    void* cmdStagingMapped[kCullSlots] = {};
+    VkBuffer indirect = VK_NULL_HANDLE; // device-local INDIRECT | STORAGE
+    VmaAllocation indirectMemory = VK_NULL_HANDLE;
+    VkDescriptorSet cullSet = VK_NULL_HANDLE; // pool-owned (cullSetLayout)
+    // Exact view-projection that produced the bound Hi-Z chain (jittered for
+    // the LR path); prevValid = false skips the cull pass (first frame of the
+    // path / pyramid recreated / camera cut), leaving every command visible.
+    Mat4 prevViewProj = Mat4::identity();
+    bool prevValid = false;
+    uint32_t capacity = 0;
+};
+
+// Push constants of occlusion_cull.comp.
+struct OcclusionCullPush {
+    float prevViewProj[16];
+    uint32_t candidateCount = 0;
+    uint32_t mipCount = 0;
+    int32_t screenW = 0;
+    int32_t screenH = 0;
+};
+static_assert(sizeof(OcclusionCullPush) == 80, "OcclusionCullPush size mismatch");
+
 // --- Temporal AO accumulation (GTAO visibility EMA) ----------------------------
 // Host-owned ping-pong state (same ownership/layout model as DepthPyramid):
 // two RG16F buffers (R = accumulated visibility, G = CURRENT-frame view |z| —
@@ -900,13 +989,67 @@ public:
                           VkBuffer clusterLights, VkBuffer clusterGrid) const;
 
     // --- pass recording (the caller owns all layout transitions) ---------------
-    // Draws the scene into the already-begun GBuffer rendering block (merged
-    // scene-wide buffers, frustum culled with the un-jittered view-projection,
-    // descriptor rebinds collapsed per material run).
+    // Draws the scene into the already-begun GBuffer rendering block: static
+    // opaque instances as one vkCmdDrawIndexedIndirect per material run over
+    // the channel's command buffer (transforms from the scene-set instance
+    // SSBO via gl_InstanceIndex), then the skinned instances on the direct
+    // push-constant path (CPU frustum-culled with the un-jittered cullViewProj,
+    // as before — skinned casts stay off the indirect path this phase).
+    // runs/runCount come from this frame's
+    // buildInstanceList; the channel's upload (and optional cull pass) must
+    // already be recorded.  Descriptor rebinds collapse to one per run.
     void recordGBufferDraws(VkCommandBuffer cmd, const Scene& scene, bool gtPass,
                             VkDescriptorSet sceneSet, VkDescriptorSet textureSet,
                             uint32_t materialStride, uint32_t width, uint32_t height,
-                            const Mat4& cullViewProj) const;
+                            const Mat4& cullViewProj, const CullChannel& channel,
+                            const CullDrawRun* runs, uint32_t runCount) const;
+
+    // --- GPU occlusion culling (Phase 7a; see the CullChannel comment) ---------
+    // capacity = upper bound of static opaque instances (scene.instances.size()).
+    bool createInstanceBuffer(const VulkanContext& ctx, uint32_t capacity, InstanceBuffer& out) const;
+    void destroyInstanceBuffer(const VulkanContext& ctx, InstanceBuffer& buf) const;
+    bool createCullChannel(const VulkanContext& ctx, uint32_t capacity, CullChannel& out) const;
+    void destroyCullChannel(const VulkanContext& ctx, CullChannel& ch) const;
+    // Allocates the channel's cull set from the caller's pool: binding 0 = the
+    // shared instance SSBO, 1 = the channel's indirect command buffer, 2 = this
+    // path's Hi-Z chain (all mips, GENERAL).  Re-run when the pyramid is
+    // recreated (resize) and reset prevValid afterwards.
+    bool writeCullSet(const VulkanContext& ctx, VkDescriptorPool pool, const InstanceBuffer& inst,
+                      VkImageView hizChain, CullChannel& out) const;
+    // Scene set binding 3: the device-local instance SSBO (gbuffer.vert fetches
+    // gInstances[gl_InstanceIndex]).  Call once per scene set after the
+    // instance buffer exists (same convention as writeSceneSkinBinding).
+    void writeSceneInstanceBinding(const VulkanContext& ctx, VkDescriptorSet set,
+                                   VkBuffer instances) const;
+    // Fills this frame's static-opaque candidate list: CPU frustum cull with
+    // the un-jittered cullViewProj plus the LOD state of updateLodSelection
+    // (Phase 3b rules, unchanged), grouped into material runs in the scene's
+    // (material, mesh) sort order.  Writes up to `capacity` entries into
+    // instOut (GpuInstance) and cmdOut (VkDrawIndexedIndirectCommand,
+    // instanceCount = 1, firstInstance = candidate index) and returns the
+    // candidate count.  Instances whose transform changed this frame
+    // (model != prevModel) are flagged occlusion-exempt in GpuInstance::flags.
+    uint32_t buildInstanceList(const Scene& scene, const Mat4& cullViewProj, uint32_t capacity,
+                               GpuInstance* instOut, VkDrawIndexedIndirectCommand* cmdOut,
+                               std::vector<CullDrawRun>& runs) const;
+    // Records the slot's staging -> device copy of the instance SSBO plus the
+    // barrier making it visible to the cull pass (compute) and the GBuffer
+    // vertex stage.  Once per frame, before any path's cull pass or draws.
+    void recordInstanceUpload(VkCommandBuffer cmd, uint32_t slot, const InstanceBuffer& buf,
+                              uint32_t count) const;
+    // Records the slot's staging -> device copy of the channel's indirect
+    // command buffer.  culled=true leaves the buffer compute-writable for
+    // recordOcclusionCull (which carries the final -> indirect-read barrier);
+    // culled=false barriers straight to the indirect-draw stage.
+    void recordCommandUpload(VkCommandBuffer cmd, uint32_t slot, const CullChannel& ch,
+                             uint32_t count, bool culled) const;
+    // Dispatches occlusion_cull.comp on the channel: reprojects each
+    // candidate's world AABB with prevViewProj (the exact VP that produced the
+    // bound Hi-Z chain) and zeroes the instanceCount of fully occluded
+    // commands.  Ends with a compute-write -> indirect-read barrier.
+    void recordOcclusionCull(VkCommandBuffer cmd, const CullChannel& ch, uint32_t candidateCount,
+                             const Mat4& prevViewProj, uint32_t mipCount, uint32_t width,
+                             uint32_t height) const;
     // Fullscreen deferred lighting: GBuffer + IBL -> HDR target.  First runs
     // the cluster light-assignment compute pass (cluster_assign.comp on
     // grid.assignSet[slot], view-space AABB tests) with a
@@ -1388,6 +1531,10 @@ private:
     VkPipeline dofCompositePipeline_ = VK_NULL_HANDLE;
     VkPipeline postFxCopybackPipeline_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout exposureSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout cullSetLayout_ = VK_NULL_HANDLE;
+    VkPipelineLayout cullPipelineLayout_ = VK_NULL_HANDLE;
+    VkPipeline cullPipeline_ = VK_NULL_HANDLE;
+    uint32_t maxDrawIndirectCount_ = 0xFFFFu; // capped from device limits in init()
     VkPipelineLayout histogramPipelineLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout exposureSolvePipelineLayout_ = VK_NULL_HANDLE;
     VkPipeline histogramPipeline_ = VK_NULL_HANDLE;
@@ -1432,6 +1579,7 @@ private:
     VkShaderModule shadowDepthSkinnedVert_ = VK_NULL_HANDLE;
     VkShaderModule shadowDepthFrag_ = VK_NULL_HANDLE;
     VkShaderModule clusterAssignComp_ = VK_NULL_HANDLE;
+    VkShaderModule occlusionCullComp_ = VK_NULL_HANDLE;
     VkSampler textureSampler_ = VK_NULL_HANDLE;
     VkSampler gbufferSampler_ = VK_NULL_HANDLE;
     VkSampler shadowSampler_ = VK_NULL_HANDLE;

@@ -146,8 +146,12 @@ bool DeferredCore::init(const VulkanContext& ctx, const char* envMapPath, const 
     gbufferSampler_ = createSampler(ctx, VK_FILTER_LINEAR, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
     // Hi-Z pyramid reads are texelFetch with an explicit lod; nearest + clamp
     // keeps the untouched sampler state out of the way (and D32 mip-0 sources
-    // are not guaranteed to support linear filtering).
-    hizSampler_ = createSampler(ctx, VK_FILTER_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
+    // are not guaranteed to support linear filtering).  maxLod spans the full
+    // chain: the Phase 7a occlusion cull texelFetches the chain view at a
+    // computed mip, and some drivers clamp even explicit-lod fetches by the
+    // sampler's maxLod.
+    hizSampler_ = createSampler(ctx, VK_FILTER_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                                0.f, 32.f);
     // SSR hit-colour reads pick a mip by roughness (textureLod), so the
     // colour pyramid chain view needs trilinear filtering with the full LOD
     // range; clamp keeps edge texels from wrapping into the opposite border.
@@ -198,6 +202,7 @@ bool DeferredCore::init(const VulkanContext& ctx, const char* envMapPath, const 
         !loadShader(ctx, "shadow_depth_skinned.vert.spv", shadowDepthSkinnedVert_) ||
         !loadShader(ctx, "shadow_depth.frag.spv", shadowDepthFrag_) ||
         !loadShader(ctx, "cluster_assign.comp.spv", clusterAssignComp_) ||
+        !loadShader(ctx, "occlusion_cull.comp.spv", occlusionCullComp_) ||
         !loadShader(ctx, "volfog_inject.comp.spv", volfogInjectComp_) ||
         !loadShader(ctx, "volfog_light.comp.spv", volfogLightComp_) ||
         !loadShader(ctx, "volfog_temporal.comp.spv", volfogTemporalComp_) ||
@@ -211,6 +216,9 @@ bool DeferredCore::init(const VulkanContext& ctx, const char* envMapPath, const 
         !loadShader(ctx, "dof_composite.comp.spv", dofCompositeComp_) ||
         !loadShader(ctx, "postfx_copyback.comp.spv", postFxCopybackComp_))
         return false;
+
+    // Indirect GBuffer draws (Phase 7a): chunk run lengths at the device cap.
+    maxDrawIndirectCount_ = ctx.properties.limits.maxDrawIndirectCount;
 
     if (!createLayouts(ctx)) return false;
     if (!createPipelines(ctx)) return false;
@@ -238,7 +246,7 @@ bool DeferredCore::loadShader(const VulkanContext& ctx, const char* name, VkShad
 }
 
 bool DeferredCore::createLayouts(const VulkanContext& ctx) {
-    VkDescriptorSetLayoutBinding sceneBindings[3] = {};
+    VkDescriptorSetLayoutBinding sceneBindings[4] = {};
     sceneBindings[0].binding = 0;
     sceneBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     sceneBindings[0].descriptorCount = 1;
@@ -254,10 +262,18 @@ bool DeferredCore::createLayouts(const VulkanContext& ctx) {
     sceneBindings[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     sceneBindings[2].descriptorCount = 1;
     sceneBindings[2].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    // Per-instance data SSBO (Phase 7a), read by the static GBuffer vertex
+    // shader (gbuffer.vert) at gl_InstanceIndex.  The skinned/shadow/transparent
+    // shaders never statically use binding 3, but hosts bind the instance
+    // buffer to every scene set anyway (one writeSceneInstanceBinding call).
+    sceneBindings[3].binding = 3;
+    sceneBindings[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    sceneBindings[3].descriptorCount = 1;
+    sceneBindings[3].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
 
     VkDescriptorSetLayoutCreateInfo sceneLayoutCi = {};
     sceneLayoutCi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    sceneLayoutCi.bindingCount = 3;
+    sceneLayoutCi.bindingCount = 4;
     sceneLayoutCi.pBindings = sceneBindings;
     if (vkCreateDescriptorSetLayout(ctx.device, &sceneLayoutCi, nullptr, &sceneSetLayout_) !=
         VK_SUCCESS)
@@ -416,6 +432,30 @@ bool DeferredCore::createLayouts(const VulkanContext& ctx) {
     hizLayoutCi.bindingCount = 2;
     hizLayoutCi.pBindings = hizBindings;
     if (vkCreateDescriptorSetLayout(ctx.device, &hizLayoutCi, nullptr, &hizSetLayout_) !=
+        VK_SUCCESS)
+        return false;
+
+    // Occlusion cull (Phase 7a): binding 0 = candidate GpuInstance SSBO
+    // (read), 1 = the path's indirect command buffer (instanceCount writes),
+    // 2 = the path's previous-frame Hi-Z chain (all mips, GENERAL).
+    VkDescriptorSetLayoutBinding cullBindings[3] = {};
+    cullBindings[0].binding = 0;
+    cullBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    cullBindings[0].descriptorCount = 1;
+    cullBindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    cullBindings[1].binding = 1;
+    cullBindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    cullBindings[1].descriptorCount = 1;
+    cullBindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    cullBindings[2].binding = 2;
+    cullBindings[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    cullBindings[2].descriptorCount = 1;
+    cullBindings[2].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    VkDescriptorSetLayoutCreateInfo cullLayoutCi = {};
+    cullLayoutCi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    cullLayoutCi.bindingCount = 3;
+    cullLayoutCi.pBindings = cullBindings;
+    if (vkCreateDescriptorSetLayout(ctx.device, &cullLayoutCi, nullptr, &cullSetLayout_) !=
         VK_SUCCESS)
         return false;
 
@@ -1432,6 +1472,30 @@ bool DeferredCore::createPipelines(const VulkanContext& ctx) {
     if (createComputePipeline(ctx, clusterCi, clusterPipeline_) != VK_SUCCESS)
         return false;
 
+    // --- Occlusion cull (Phase 7a) --------------------------------------------
+    VkPushConstantRange cullPushRange = {};
+    cullPushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    cullPushRange.offset = 0;
+    cullPushRange.size = sizeof(OcclusionCullPush);
+    VkPipelineLayoutCreateInfo cullLayoutCi = {};
+    cullLayoutCi.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    cullLayoutCi.setLayoutCount = 1;
+    cullLayoutCi.pSetLayouts = &cullSetLayout_;
+    cullLayoutCi.pushConstantRangeCount = 1;
+    cullLayoutCi.pPushConstantRanges = &cullPushRange;
+    if (vkCreatePipelineLayout(ctx.device, &cullLayoutCi, nullptr, &cullPipelineLayout_) !=
+        VK_SUCCESS)
+        return false;
+    VkComputePipelineCreateInfo cullCi = {};
+    cullCi.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    cullCi.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    cullCi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    cullCi.stage.module = occlusionCullComp_;
+    cullCi.stage.pName = "main";
+    cullCi.layout = cullPipelineLayout_;
+    if (createComputePipeline(ctx, cullCi, cullPipeline_) != VK_SUCCESS)
+        return false;
+
     // --- Froxel volumetric fog (Phase 5a): one compute pipeline per pass ------
     // A small helper builds each set-layout + push-range pipeline layout pair;
     // the push sizes differ per pass (VolFog*Push).
@@ -1600,6 +1664,8 @@ void DeferredCore::destroy(const VulkanContext& ctx) {
     if (histogramPipelineLayout_) { vkDestroyPipelineLayout(ctx.device, histogramPipelineLayout_, nullptr); histogramPipelineLayout_ = VK_NULL_HANDLE; }
     if (exposureSolvePipelineLayout_) { vkDestroyPipelineLayout(ctx.device, exposureSolvePipelineLayout_, nullptr); exposureSolvePipelineLayout_ = VK_NULL_HANDLE; }
     if (clusterPipelineLayout_) { vkDestroyPipelineLayout(ctx.device, clusterPipelineLayout_, nullptr); clusterPipelineLayout_ = VK_NULL_HANDLE; }
+    if (cullPipeline_) { vkDestroyPipeline(ctx.device, cullPipeline_, nullptr); cullPipeline_ = VK_NULL_HANDLE; }
+    if (cullPipelineLayout_) { vkDestroyPipelineLayout(ctx.device, cullPipelineLayout_, nullptr); cullPipelineLayout_ = VK_NULL_HANDLE; }
     if (volfogInjectPipelineLayout_) { vkDestroyPipelineLayout(ctx.device, volfogInjectPipelineLayout_, nullptr); volfogInjectPipelineLayout_ = VK_NULL_HANDLE; }
     if (volfogLightPipelineLayout_) { vkDestroyPipelineLayout(ctx.device, volfogLightPipelineLayout_, nullptr); volfogLightPipelineLayout_ = VK_NULL_HANDLE; }
     if (volfogTemporalPipelineLayout_) { vkDestroyPipelineLayout(ctx.device, volfogTemporalPipelineLayout_, nullptr); volfogTemporalPipelineLayout_ = VK_NULL_HANDLE; }
@@ -1631,6 +1697,7 @@ void DeferredCore::destroy(const VulkanContext& ctx) {
     if (shadowDepthSkinnedVert_) { vkDestroyShaderModule(ctx.device, shadowDepthSkinnedVert_, nullptr); shadowDepthSkinnedVert_ = VK_NULL_HANDLE; }
     if (shadowDepthFrag_) { vkDestroyShaderModule(ctx.device, shadowDepthFrag_, nullptr); shadowDepthFrag_ = VK_NULL_HANDLE; }
     if (clusterAssignComp_) { vkDestroyShaderModule(ctx.device, clusterAssignComp_, nullptr); clusterAssignComp_ = VK_NULL_HANDLE; }
+    if (occlusionCullComp_) { vkDestroyShaderModule(ctx.device, occlusionCullComp_, nullptr); occlusionCullComp_ = VK_NULL_HANDLE; }
     if (volfogInjectComp_) { vkDestroyShaderModule(ctx.device, volfogInjectComp_, nullptr); volfogInjectComp_ = VK_NULL_HANDLE; }
     if (volfogLightComp_) { vkDestroyShaderModule(ctx.device, volfogLightComp_, nullptr); volfogLightComp_ = VK_NULL_HANDLE; }
     if (volfogTemporalComp_) { vkDestroyShaderModule(ctx.device, volfogTemporalComp_, nullptr); volfogTemporalComp_ = VK_NULL_HANDLE; }
@@ -1655,6 +1722,7 @@ void DeferredCore::destroy(const VulkanContext& ctx) {
     if (ssrTemporalSetLayout_) { vkDestroyDescriptorSetLayout(ctx.device, ssrTemporalSetLayout_, nullptr); ssrTemporalSetLayout_ = VK_NULL_HANDLE; }
     if (exposureSetLayout_) { vkDestroyDescriptorSetLayout(ctx.device, exposureSetLayout_, nullptr); exposureSetLayout_ = VK_NULL_HANDLE; }
     if (clusterSetLayout_) { vkDestroyDescriptorSetLayout(ctx.device, clusterSetLayout_, nullptr); clusterSetLayout_ = VK_NULL_HANDLE; }
+    if (cullSetLayout_) { vkDestroyDescriptorSetLayout(ctx.device, cullSetLayout_, nullptr); cullSetLayout_ = VK_NULL_HANDLE; }
     if (volfogInjectSetLayout_) { vkDestroyDescriptorSetLayout(ctx.device, volfogInjectSetLayout_, nullptr); volfogInjectSetLayout_ = VK_NULL_HANDLE; }
     if (volfogLightSetLayout_) { vkDestroyDescriptorSetLayout(ctx.device, volfogLightSetLayout_, nullptr); volfogLightSetLayout_ = VK_NULL_HANDLE; }
     if (volfogTemporalSetLayout_) { vkDestroyDescriptorSetLayout(ctx.device, volfogTemporalSetLayout_, nullptr); volfogTemporalSetLayout_ = VK_NULL_HANDLE; }
@@ -2176,7 +2244,8 @@ void DeferredCore::writeLightingSet(const VulkanContext& ctx, VkDescriptorSet se
 void DeferredCore::recordGBufferDraws(VkCommandBuffer cmd, const Scene& scene, bool gtPass,
                                       VkDescriptorSet sceneSet, VkDescriptorSet textureSet,
                                       uint32_t materialStride, uint32_t width, uint32_t height,
-                                      const Mat4& cullViewProj) const {
+                                      const Mat4& cullViewProj, const CullChannel& channel,
+                                      const CullDrawRun* runs, uint32_t runCount) const {
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
                       gtPass ? gbufferGtPipeline_ : gbufferPipeline_);
     VkViewport viewport = {0.f, 0.f, static_cast<float>(width), static_cast<float>(height), 0.f, 1.f};
@@ -2187,74 +2256,64 @@ void DeferredCore::recordGBufferDraws(VkCommandBuffer cmd, const Scene& scene, b
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, scenePipelineLayout_, 1, 1,
                             &textureSet, 0, nullptr);
 
-    // Frustum for CPU culling (un-jittered; jitter is sub-pixel).
-    const Frustum frustum = extractFrustum(cullViewProj);
-
-    // Bind the scene-wide merged buffers once; draws address into them with
-    // per-mesh firstIndex/vertexOffset.  (Null in fully-skinned scenes, which
-    // only ever take the skinned branch below.)
+    // Bind the scene-wide merged buffers once; indirect commands address into
+    // them with per-mesh firstIndex/vertexOffset.  (Null in fully-skinned
+    // scenes, which only ever take the skinned branch below.)
     const VkDeviceSize zeroOffset = 0;
     if (scene.mergedVertexBuffer) {
         vkCmdBindVertexBuffers(cmd, 0, 1, &scene.mergedVertexBuffer, &zeroOffset);
         vkCmdBindIndexBuffer(cmd, scene.mergedIndexBuffer, 0, VK_INDEX_TYPE_UINT32);
     }
 
-    // Instances are sorted by (material, mesh) at load time, so state changes
-    // collapse to one descriptor bind per material run.
+    // Static opaque instances: one indirect draw per material run (candidates
+    // are sorted by (material, mesh), so runs keep descriptor rebinds at one
+    // per material).  Occluded commands carry instanceCount = 0 (nearly free);
+    // the order stays the CPU's sorted order, so results are deterministic.
     uint32_t lastMaterial = UINT32_MAX;
+    for (uint32_t r = 0; r < runCount; ++r) {
+        const CullDrawRun& run = runs[r];
+        if (run.commandCount == 0) continue;
+        if (run.materialIndex != lastMaterial) {
+            lastMaterial = run.materialIndex;
+            const uint32_t dynOffset = run.materialIndex * materialStride;
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, scenePipelineLayout_, 0, 1,
+                                    &sceneSet, 1, &dynOffset);
+        }
+        // Chunk at maxDrawIndirectCount (Bistro-scale scenes stay far below
+        // the usual 65535, but the limit is not required to be that large).
+        uint32_t done = 0;
+        while (done < run.commandCount) {
+            const uint32_t chunk = std::min(run.commandCount - done, maxDrawIndirectCount_);
+            vkCmdDrawIndexedIndirect(cmd, channel.indirect,
+                                     (run.firstCommand + done) * sizeof(VkDrawIndexedIndirectCommand),
+                                     chunk, sizeof(VkDrawIndexedIndirectCommand));
+            done += chunk;
+        }
+    }
+
+    // Skinned instances: direct draws with the palette-offset push block
+    // (few; the palette SSBO already carries the node transforms).  They keep
+    // the CPU frustum + LOD cull and never enter the indirect path.
+    const Frustum frustum = extractFrustum(cullViewProj);
     bool skinnedBound = false;
     for (const auto& inst : scene.instances) {
+        if (inst.skinIndex < 0) continue; // static draws are the indirect runs above
         if (scene.materials[inst.materialIndex].blend) continue; // transparency pass draws these
         if (!aabbIntersectsFrustum(frustum, inst.aabbMin, inst.aabbMax)) continue;
         if (inst.lodCulled) continue; // LOD screen-size cull (updateLodSelection)
 
-        if (inst.skinIndex >= 0) {
-            // Skinned draw: own vertex buffers + palette offsets; the push
-            // matrices are unused (the palette carries the node transform).
-            if (!skinnedBound) {
-                skinnedBound = true;
-                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                  gtPass ? gbufferSkinnedGtPipeline_ : gbufferSkinnedPipeline_);
-                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                        scenePipelineLayout_, 1, 1, &textureSet, 0, nullptr);
-                lastMaterial = UINT32_MAX; // descriptor offsets were bound for the static pipeline
-            }
-            const Skin& skin = scene.skins[static_cast<size_t>(inst.skinIndex)];
-            SkinnedScenePush push;
-            push.paletteCur = skin.paletteCur;
-            push.palettePrev = skin.palettePrev;
-            vkCmdPushConstants(cmd, scenePipelineLayout_, VK_SHADER_STAGE_VERTEX_BIT, 0,
-                               sizeof(push), &push);
-
-            if (inst.materialIndex != lastMaterial) {
-                lastMaterial = inst.materialIndex;
-                const uint32_t dynOffset = inst.materialIndex * materialStride;
-                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, scenePipelineLayout_,
-                                        0, 1, &sceneSet, 1, &dynOffset);
-            }
-
-            const Mesh& mesh = scene.skinnedMeshes[inst.meshIndex];
-            vkCmdBindVertexBuffers(cmd, 0, 1, &mesh.vertexBuffer, &zeroOffset);
-            vkCmdBindIndexBuffer(cmd, mesh.indexBuffer, 0, VK_INDEX_TYPE_UINT32);
-            vkCmdDrawIndexed(cmd, mesh.indexCount, 1, 0, 0, 0);
-            continue;
-        }
-
-        if (skinnedBound) {
-            skinnedBound = false;
+        if (!skinnedBound) {
+            skinnedBound = true;
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                              gtPass ? gbufferGtPipeline_ : gbufferPipeline_);
+                              gtPass ? gbufferSkinnedGtPipeline_ : gbufferSkinnedPipeline_);
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, scenePipelineLayout_, 1,
                                     1, &textureSet, 0, nullptr);
-            vkCmdBindVertexBuffers(cmd, 0, 1, &scene.mergedVertexBuffer, &zeroOffset);
-            vkCmdBindIndexBuffer(cmd, scene.mergedIndexBuffer, 0, VK_INDEX_TYPE_UINT32);
-            lastMaterial = UINT32_MAX;
+            lastMaterial = UINT32_MAX; // descriptor offsets were bound for the static pipeline
         }
-
-        ScenePush push;
-        std::memcpy(push.model, inst.model.m, sizeof(push.model));
-        std::memcpy(push.prevModel, inst.prevModel.m, sizeof(push.prevModel));
-        std::memcpy(push.normalModel, inst.normalModel.m, sizeof(push.normalModel));
+        const Skin& skin = scene.skins[static_cast<size_t>(inst.skinIndex)];
+        SkinnedScenePush push;
+        push.paletteCur = skin.paletteCur;
+        push.palettePrev = skin.palettePrev;
         vkCmdPushConstants(cmd, scenePipelineLayout_, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(push),
                            &push);
 
@@ -2265,10 +2324,292 @@ void DeferredCore::recordGBufferDraws(VkCommandBuffer cmd, const Scene& scene, b
                                     &sceneSet, 1, &dynOffset);
         }
 
+        const Mesh& mesh = scene.skinnedMeshes[inst.meshIndex];
+        vkCmdBindVertexBuffers(cmd, 0, 1, &mesh.vertexBuffer, &zeroOffset);
+        vkCmdBindIndexBuffer(cmd, mesh.indexBuffer, 0, VK_INDEX_TYPE_UINT32);
+        vkCmdDrawIndexed(cmd, mesh.indexCount, 1, 0, 0, 0);
+    }
+}
+
+// --- GPU occlusion culling + indirect draws (Phase 7a) -------------------------
+
+bool DeferredCore::createInstanceBuffer(const VulkanContext& ctx, uint32_t capacity,
+                                        InstanceBuffer& out) const {
+    out.capacity = capacity;
+    if (capacity == 0) return true; // empty scene: draws no-op on capacity-0 lists
+    const VkDeviceSize size = static_cast<VkDeviceSize>(capacity) * sizeof(GpuInstance);
+    for (uint32_t slot = 0; slot < kCullSlots; ++slot) {
+        if (createBuffer(ctx, size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                         out.staging[slot], out.stagingMemory[slot]) != VK_SUCCESS)
+            return false;
+        vmaMapMemory(ctx.allocator, out.stagingMemory[slot], &out.stagingMapped[slot]);
+    }
+    return createBuffer(ctx, size,
+                        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, out.buffer, out.memory) == VK_SUCCESS;
+}
+
+void DeferredCore::destroyInstanceBuffer(const VulkanContext& ctx, InstanceBuffer& buf) const {
+    for (uint32_t slot = 0; slot < kCullSlots; ++slot) {
+        if (buf.staging[slot]) {
+            vmaUnmapMemory(ctx.allocator, buf.stagingMemory[slot]);
+            vmaDestroyBuffer(ctx.allocator, buf.staging[slot], buf.stagingMemory[slot]);
+            buf.staging[slot] = VK_NULL_HANDLE;
+            buf.stagingMemory[slot] = VK_NULL_HANDLE;
+            buf.stagingMapped[slot] = nullptr;
+        }
+    }
+    if (buf.buffer) {
+        vmaDestroyBuffer(ctx.allocator, buf.buffer, buf.memory);
+        buf.buffer = VK_NULL_HANDLE;
+        buf.memory = VK_NULL_HANDLE;
+    }
+    buf.capacity = 0;
+}
+
+bool DeferredCore::createCullChannel(const VulkanContext& ctx, uint32_t capacity,
+                                     CullChannel& out) const {
+    out.capacity = capacity;
+    out.prevValid = false;
+    if (capacity == 0) return true;
+    const VkDeviceSize size =
+        static_cast<VkDeviceSize>(capacity) * sizeof(VkDrawIndexedIndirectCommand);
+    for (uint32_t slot = 0; slot < kCullSlots; ++slot) {
+        if (createBuffer(ctx, size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                         out.cmdStaging[slot], out.cmdStagingMemory[slot]) != VK_SUCCESS)
+            return false;
+        vmaMapMemory(ctx.allocator, out.cmdStagingMemory[slot], &out.cmdStagingMapped[slot]);
+    }
+    return createBuffer(ctx, size,
+                        VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                            VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, out.indirect,
+                        out.indirectMemory) == VK_SUCCESS;
+}
+
+void DeferredCore::destroyCullChannel(const VulkanContext& ctx, CullChannel& ch) const {
+    for (uint32_t slot = 0; slot < kCullSlots; ++slot) {
+        if (ch.cmdStaging[slot]) {
+            vmaUnmapMemory(ctx.allocator, ch.cmdStagingMemory[slot]);
+            vmaDestroyBuffer(ctx.allocator, ch.cmdStaging[slot], ch.cmdStagingMemory[slot]);
+            ch.cmdStaging[slot] = VK_NULL_HANDLE;
+            ch.cmdStagingMemory[slot] = VK_NULL_HANDLE;
+            ch.cmdStagingMapped[slot] = nullptr;
+        }
+    }
+    if (ch.indirect) {
+        vmaDestroyBuffer(ctx.allocator, ch.indirect, ch.indirectMemory);
+        ch.indirect = VK_NULL_HANDLE;
+        ch.indirectMemory = VK_NULL_HANDLE;
+    }
+    ch.cullSet = VK_NULL_HANDLE; // pool-owned
+    ch.prevValid = false;
+    ch.capacity = 0;
+}
+
+bool DeferredCore::writeCullSet(const VulkanContext& ctx, VkDescriptorPool pool,
+                                const InstanceBuffer& inst, VkImageView hizChain,
+                                CullChannel& out) const {
+    out.prevValid = false; // the bound chain was (re)created: its contents are undefined
+    if (out.capacity == 0) return true;
+    if (out.cullSet == VK_NULL_HANDLE) {
+        VkDescriptorSetAllocateInfo alloc = {};
+        alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        alloc.descriptorPool = pool;
+        alloc.descriptorSetCount = 1;
+        alloc.pSetLayouts = &cullSetLayout_;
+        if (vkAllocateDescriptorSets(ctx.device, &alloc, &out.cullSet) != VK_SUCCESS) return false;
+    }
+    VkDescriptorBufferInfo instBuf = {};
+    instBuf.buffer = inst.buffer;
+    instBuf.range = VK_WHOLE_SIZE;
+    VkDescriptorBufferInfo cmdBuf = {};
+    cmdBuf.buffer = out.indirect;
+    cmdBuf.range = VK_WHOLE_SIZE;
+    VkDescriptorImageInfo hiz = {};
+    hiz.sampler = hizSampler_; // texelFetch with explicit lod; filter state is irrelevant
+    hiz.imageView = hizChain;
+    hiz.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    VkWriteDescriptorSet w[3] = {};
+    for (auto& x : w) x.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    w[0].dstSet = out.cullSet;
+    w[0].dstBinding = 0;
+    w[0].descriptorCount = 1;
+    w[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    w[0].pBufferInfo = &instBuf;
+    w[1].dstSet = out.cullSet;
+    w[1].dstBinding = 1;
+    w[1].descriptorCount = 1;
+    w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    w[1].pBufferInfo = &cmdBuf;
+    w[2].dstSet = out.cullSet;
+    w[2].dstBinding = 2;
+    w[2].descriptorCount = 1;
+    w[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    w[2].pImageInfo = &hiz;
+    vkUpdateDescriptorSets(ctx.device, 3, w, 0, nullptr);
+    return true;
+}
+
+void DeferredCore::writeSceneInstanceBinding(const VulkanContext& ctx, VkDescriptorSet set,
+                                             VkBuffer instances) const {
+    VkDescriptorBufferInfo buf = {};
+    buf.buffer = instances;
+    buf.offset = 0;
+    buf.range = VK_WHOLE_SIZE;
+    VkWriteDescriptorSet w = {};
+    w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    w.dstSet = set;
+    w.dstBinding = 3;
+    w.descriptorCount = 1;
+    w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    w.pBufferInfo = &buf;
+    vkUpdateDescriptorSets(ctx.device, 1, &w, 0, nullptr);
+}
+
+uint32_t DeferredCore::buildInstanceList(const Scene& scene, const Mat4& cullViewProj,
+                                         uint32_t capacity, GpuInstance* instOut,
+                                         VkDrawIndexedIndirectCommand* cmdOut,
+                                         std::vector<CullDrawRun>& runs) const {
+    runs.clear();
+    if (capacity == 0) return 0;
+    // Frustum for CPU culling (un-jittered; jitter is sub-pixel).
+    const Frustum frustum = extractFrustum(cullViewProj);
+    uint32_t count = 0;
+    for (const auto& inst : scene.instances) {
+        if (scene.materials[inst.materialIndex].blend) continue; // transparency pass draws these
+        if (inst.skinIndex >= 0) continue; // direct push-constant path (see recordGBufferDraws)
+        if (!aabbIntersectsFrustum(frustum, inst.aabbMin, inst.aabbMax)) continue;
+        if (inst.lodCulled) continue; // LOD screen-size cull (updateLodSelection)
+        if (count >= capacity) break; // capacity = instances.size(), so this never triggers
+
+        GpuInstance& gi = instOut[count];
+        std::memcpy(gi.model, inst.model.m, sizeof(gi.model));
+        std::memcpy(gi.prevModel, inst.prevModel.m, sizeof(gi.prevModel));
+        std::memcpy(gi.normalModel, inst.normalModel.m, sizeof(gi.normalModel));
+        gi.aabbMin[0] = inst.aabbMin.x;
+        gi.aabbMin[1] = inst.aabbMin.y;
+        gi.aabbMin[2] = inst.aabbMin.z;
+        gi.aabbMin[3] = 0.f;
+        gi.aabbMax[0] = inst.aabbMax.x;
+        gi.aabbMax[1] = inst.aabbMax.y;
+        gi.aabbMax[2] = inst.aabbMax.z;
+        gi.aabbMax[3] = 0.f;
+        gi.materialIndex = inst.materialIndex;
+        // Instances whose transform changed this frame (dynamic drivers /
+        // animated nodes) are exempt from the occlusion test: the previous
+        // frame's Hi-Z still holds their OLD silhouette, which could mis-cull
+        // the new position.  Exact float compare — deterministic.
+        gi.flags = std::memcmp(inst.model.m, inst.prevModel.m, sizeof(inst.model.m)) != 0 ? 1u : 0u;
+        gi.pad[0] = gi.pad[1] = 0;
+
         // LOD level chosen by Scene::updateLodSelection (lodDraws[0] = full mesh).
         const LodDraw& draw = inst.lodDraws[inst.lodLevel];
-        vkCmdDrawIndexed(cmd, draw.indexCount, 1, draw.firstIndex, draw.vertexOffset, 0);
+        VkDrawIndexedIndirectCommand& dc = cmdOut[count];
+        dc.indexCount = draw.indexCount;
+        dc.instanceCount = 1; // the cull pass zeroes occluded commands
+        dc.firstIndex = draw.firstIndex;
+        dc.vertexOffset = draw.vertexOffset;
+        dc.firstInstance = count; // gbuffer.vert reads gInstances[gl_InstanceIndex]
+
+        // Instances are sorted by (material, mesh) at load time, so runs are
+        // maximal same-material ranges of the surviving candidates.
+        if (runs.empty() || runs.back().materialIndex != inst.materialIndex) {
+            CullDrawRun run;
+            run.materialIndex = inst.materialIndex;
+            run.firstCommand = count;
+            run.commandCount = 0;
+            runs.push_back(run);
+        }
+        ++runs.back().commandCount;
+        ++count;
     }
+    return count;
+}
+
+void DeferredCore::recordInstanceUpload(VkCommandBuffer cmd, uint32_t slot,
+                                        const InstanceBuffer& buf, uint32_t count) const {
+    if (count == 0) return;
+    VkBufferCopy region = {};
+    region.size = static_cast<VkDeviceSize>(count) * sizeof(GpuInstance);
+    vkCmdCopyBuffer(cmd, buf.staging[slot % kCullSlots], buf.buffer, 1, &region);
+    // Transfer write -> cull-pass reads (compute) + GBuffer vertex reads.
+    VkBufferMemoryBarrier2 bar = {};
+    bar.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2;
+    bar.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+    bar.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    bar.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT;
+    bar.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+    bar.buffer = buf.buffer;
+    bar.size = VK_WHOLE_SIZE;
+    VkDependencyInfo dep = {};
+    dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dep.bufferMemoryBarrierCount = 1;
+    dep.pBufferMemoryBarriers = &bar;
+    vkCmdPipelineBarrier2(cmd, &dep);
+}
+
+void DeferredCore::recordCommandUpload(VkCommandBuffer cmd, uint32_t slot, const CullChannel& ch,
+                                       uint32_t count, bool culled) const {
+    if (count == 0) return;
+    VkBufferCopy region = {};
+    region.size = static_cast<VkDeviceSize>(count) * sizeof(VkDrawIndexedIndirectCommand);
+    vkCmdCopyBuffer(cmd, ch.cmdStaging[slot % kCullSlots], ch.indirect, 1, &region);
+    VkBufferMemoryBarrier2 bar = {};
+    bar.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2;
+    bar.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+    bar.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    if (culled) {
+        // The cull pass rewrites instanceCount next; it barriers to the
+        // indirect-draw stage itself when done.
+        bar.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        bar.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+    } else {
+        bar.dstStageMask = VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT;
+        bar.dstAccessMask = VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT;
+    }
+    bar.buffer = ch.indirect;
+    bar.size = VK_WHOLE_SIZE;
+    VkDependencyInfo dep = {};
+    dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dep.bufferMemoryBarrierCount = 1;
+    dep.pBufferMemoryBarriers = &bar;
+    vkCmdPipelineBarrier2(cmd, &dep);
+}
+
+void DeferredCore::recordOcclusionCull(VkCommandBuffer cmd, const CullChannel& ch,
+                                       uint32_t candidateCount, const Mat4& prevViewProj,
+                                       uint32_t mipCount, uint32_t width, uint32_t height) const {
+    if (candidateCount == 0 || !ch.cullSet) return;
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cullPipeline_);
+    OcclusionCullPush push;
+    std::memcpy(push.prevViewProj, prevViewProj.m, sizeof(push.prevViewProj));
+    push.candidateCount = candidateCount;
+    push.mipCount = mipCount;
+    push.screenW = static_cast<int32_t>(width);
+    push.screenH = static_cast<int32_t>(height);
+    vkCmdPushConstants(cmd, cullPipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push),
+                       &push);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cullPipelineLayout_, 0, 1,
+                            &ch.cullSet, 0, nullptr);
+    vkCmdDispatch(cmd, (candidateCount + 63) / 64, 1, 1);
+
+    // Cull writes (zeroing instanceCount) -> indirect command reads below.
+    VkBufferMemoryBarrier2 bar = {};
+    bar.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2;
+    bar.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    bar.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+    bar.dstStageMask = VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT;
+    bar.dstAccessMask = VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT;
+    bar.buffer = ch.indirect;
+    bar.size = VK_WHOLE_SIZE;
+    VkDependencyInfo dep = {};
+    dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dep.bufferMemoryBarrierCount = 1;
+    dep.pBufferMemoryBarriers = &bar;
+    vkCmdPipelineBarrier2(cmd, &dep);
 }
 
 void DeferredCore::recordLightingPass(VkCommandBuffer cmd, VkDescriptorSet lightingSet,

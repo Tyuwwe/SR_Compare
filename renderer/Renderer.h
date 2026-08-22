@@ -243,6 +243,21 @@ private:
     ClusterGrid gbCluster_;
     ClusterGrid gtCluster_;
 
+    // GPU occlusion culling + indirect GBuffer draws (Phase 7a): the shared
+    // per-frame instance SSBO plus one cull channel per path (each channel
+    // binds its path's Hi-Z chain and tracks that path's previous
+    // view-projection; see DeferredCore's CullChannel).  occlusion_ is the
+    // SR_OCCLUSION opt-out: when false the cull pass is skipped but the
+    // indirect draw path stays live (every command visible).
+    InstanceBuffer instances_;
+    CullChannel gbCull_;
+    CullChannel gtCull_;
+    std::vector<CullDrawRun> cullRuns_;
+    std::vector<GpuInstance> cullInstCpu_;               // build scratch (capacity-sized)
+    std::vector<VkDrawIndexedIndirectCommand> cullCmdCpu_;
+    uint32_t cullCandidates_ = 0;
+    bool occlusion_ = true;
+
     // Froxel volumetric fog (Phase 5a), one volume set per path: the grid
     // scales with the path resolution like the cluster grid.  The temporal
     // filter uses the UN-JITTERED previous view-projection per path; a zero
@@ -317,6 +332,9 @@ private:
     bool createGradingLut();
     bool createShaders();
     bool createSceneDescriptors();
+    // Phase 7a: instance SSBO + per-path cull channels (needs the descriptor
+    // pool and the Hi-Z pyramids, so runs after createSceneDescriptors).
+    bool createCullResources();
     bool createPipelines();
     bool createSyncResources();
     bool createScreenshotStaging();

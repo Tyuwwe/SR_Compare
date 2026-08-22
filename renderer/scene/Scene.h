@@ -46,6 +46,21 @@ inline bool lodEnabledByDefault() {
     return !v || v[0] != '0';
 }
 
+// Hosts default GPU occlusion culling (Phase 7a, Hi-Z reproject + indirect
+// draws) to on; SR_OCCLUSION=0 disables the cull pass (the GBuffer stays on
+// the indirect path with every command visible, so A/B runs share shaders).
+inline bool occlusionEnabledByDefault() {
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4996) // std::getenv is portable; _dupenv_s is MSVC-only
+#endif
+    const char* v = std::getenv("SR_OCCLUSION");
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
+    return !v || v[0] != '0';
+}
+
 // One draw range into the merged scene buffers (index span + vertex offset).
 struct LodDraw {
     uint32_t firstIndex = 0;

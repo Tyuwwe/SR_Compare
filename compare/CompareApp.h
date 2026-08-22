@@ -228,6 +228,20 @@ private:
     ClusterGrid gbCluster_;
     ClusterGrid gtCluster_;
     ClusterGrid gtSsaaCluster_; // gtSsaa only
+
+    // GPU occlusion culling + indirect GBuffer draws (Phase 7a): shared
+    // instance SSBO + one cull channel per path (LR / GT / GT-SSAA), each
+    // bound to that path's Hi-Z chain.  occlusion_ = SR_OCCLUSION opt-out;
+    // when false the cull pass is skipped (indirect path stays live).
+    InstanceBuffer instances_;
+    CullChannel gbCull_;
+    CullChannel gtCull_;
+    CullChannel gtSsaaCull_; // gtSsaa only
+    std::vector<CullDrawRun> cullRuns_;
+    std::vector<GpuInstance> cullInstCpu_; // build scratch (capacity-sized)
+    std::vector<VkDrawIndexedIndirectCommand> cullCmdCpu_;
+    uint32_t cullCandidates_ = 0;
+    bool occlusion_ = true;
     // Hi-Z depth pyramids for the SSR march (LR / GT / GT-SSAA paths); general
     // DeferredCore resource, later reused by GTAO/contact shadows/culling.
     DepthPyramid gbPyramid_;
@@ -419,6 +433,9 @@ private:
     // Auto-exposure channels + sets (needs the descriptor pool; called from
     // createDescriptors once the pool exists).
     bool createAutoExposureResources();
+    // Phase 7a: instance SSBO + per-path cull channels (needs the descriptor
+    // pool + allocated scene sets, so runs after createDescriptors).
+    bool createCullResources();
     // Per-path display exposure: harvested auto value, or the manual
     // --exposure override when auto exposure is off.
     float lrExposure() const {

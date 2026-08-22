@@ -73,6 +73,8 @@ void Renderer::ImageResource::destroy(const VulkanContext& ctx) {
 bool Renderer::init(const RendererOptions& opts) {
     opts_ = opts;
     diagNoJitter_ = sr::envFlag("SR_NO_JITTER");
+    // GPU occlusion culling (Phase 7a) defaults on; SR_OCCLUSION=0 opts out.
+    occlusion_ = occlusionEnabledByDefault();
 
     if (!window_.create("sr_compare", static_cast<int>(opts.displayWidth),
                         static_cast<int>(opts.displayHeight)))
@@ -212,6 +214,7 @@ bool Renderer::init(const RendererOptions& opts) {
     if (!createShaders()) return false;
     if (!createSceneDescriptors()) return false;
     if (!createAutoExposureResources()) return false;
+    if (!createCullResources()) return false;
     if (!createPipelines()) return false;
     if (!createSyncResources()) return false;
     if (!createScreenshotStaging()) return false;
@@ -538,6 +541,7 @@ bool Renderer::createSceneDescriptors() {
                                17 * 2 +                    // post-fx MB/DOF sets (Phase 6b, GB/GT)
                                1 +                         // auto-exposure HDR source
                                14 * fogPaths +             // volfog light/temporal/march/composite samplers
+                               2 +                         // occlusion cull sets: Hi-Z chains (GB/GT, Phase 7a)
                                hizSets + colorSets;
     sizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     sizes[1].descriptorCount = kFramesInFlight * 10 + // scene + lighting(+probe) + 2 transparent + 2 SSR(+probe) UBOs
@@ -556,12 +560,15 @@ bool Renderer::createSceneDescriptors() {
     sizes[4].descriptorCount = 2 + // auto-exposure histogram + state
                                2 * kFramesInFlight * 2 + // lighting sets: cluster lights + grid SSBOs
                                2 * kClusterSlots * 2 +    // cluster assign sets (GB/GT paths)
+                               kFramesInFlight +          // scene sets: instance SSBO (Phase 7a)
+                               2 * 2 +                    // occlusion cull sets (GB/GT, Phase 7a)
                                2 * kClusterSlots * fogPaths; // volfog light sets: lights + grid SSBOs
     VkDescriptorPoolCreateInfo poolCi = {};
     poolCi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     poolCi.maxSets = kFramesInFlight * 7 + 12 + 20 + hizSets + colorSets + 1 + 4 +
                      kClusterSlots * 2 + // +12 ssao/temporal/blur, +20 bloom pyramid, +1 auto-exposure, +4 ssr temporal, +cluster assign
                      8 * 2 + 1 * 2 +      // post-fx MB/DOF sets + MB copy-back (Phase 6b, GB/GT)
+                     2 +                  // occlusion cull sets (GB/GT, Phase 7a)
                      8 * fogPaths;        // volfog inject/light/temporal/march/composite sets
     poolCi.poolSizeCount = 5;
     poolCi.pPoolSizes = sizes;
@@ -644,6 +651,28 @@ bool Renderer::createSceneDescriptors() {
         vkUpdateDescriptorSets(ctx_.device, 1, &write, 0, nullptr);
     }
 
+    return true;
+}
+
+bool Renderer::createCullResources() {
+    // Phase 7a: the instance SSBO upper bound is the full instance list (the
+    // candidate build skips blend/skinned/frustum-culled entries); one cull
+    // channel per path, bound to that path's Hi-Z chain.
+    const uint32_t capacity = static_cast<uint32_t>(scene_.instances.size());
+    if (!deferred_.createInstanceBuffer(ctx_, capacity, instances_)) return false;
+    if (!deferred_.createCullChannel(ctx_, capacity, gbCull_)) return false;
+    if (!deferred_.createCullChannel(ctx_, capacity, gtCull_)) return false;
+    if (!deferred_.writeCullSet(ctx_, descriptorPool_, instances_, gbPyramid_.chainView, gbCull_))
+        return false;
+    if (!deferred_.writeCullSet(ctx_, descriptorPool_, instances_, gtPyramid_.chainView, gtCull_))
+        return false;
+    // Scene set binding 3 (instance SSBO) for both frame slots.
+    for (uint32_t i = 0; i < kFramesInFlight; ++i) {
+        if (instances_.buffer)
+            deferred_.writeSceneInstanceBinding(ctx_, frames_[i].sceneSet, instances_.buffer);
+    }
+    cullInstCpu_.resize(capacity);
+    cullCmdCpu_.resize(capacity);
     return true;
 }
 
@@ -1255,6 +1284,21 @@ bool Renderer::bakeProbes() {
                            sync::kSampleStages, sync::kSampled, sync::kColorAttach,
                            sync::kColorWrite);
                 {
+                    // The bake shares the indirect GBuffer path (no cull pass;
+                    // every candidate visible).  Slot 0 staging is safe here:
+                    // each face renders in its own one-shot submit.
+                    const uint32_t candidates = deferred_.buildInstanceList(
+                        scene_, viewProj, instances_.capacity, cullInstCpu_.data(),
+                        cullCmdCpu_.data(), cullRuns_);
+                    if (candidates > 0) {
+                        std::memcpy(instances_.stagingMapped[0], cullInstCpu_.data(),
+                                    static_cast<size_t>(candidates) * sizeof(GpuInstance));
+                        std::memcpy(gtCull_.cmdStagingMapped[0], cullCmdCpu_.data(),
+                                    static_cast<size_t>(candidates) *
+                                        sizeof(VkDrawIndexedIndirectCommand));
+                    }
+                    deferred_.recordInstanceUpload(cmd, 0, instances_, candidates);
+                    deferred_.recordCommandUpload(cmd, 0, gtCull_, candidates, /*culled=*/false);
                     VkRenderingAttachmentInfo colors[5] = {
                         makeColorAttachment(albedo.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                                             VK_ATTACHMENT_LOAD_OP_CLEAR),
@@ -1277,7 +1321,8 @@ bool Renderer::bakeProbes() {
                     // bake discards motion — prevViewProj is identity anyway).
                     deferred_.recordGBufferDraws(cmd, scene_, /*gtPass=*/true,
                                                  frames_[0].sceneSet, textureSet_, materialStride_,
-                                                 S, S, viewProj);
+                                                 S, S, viewProj, gtCull_, cullRuns_.data(),
+                                                 static_cast<uint32_t>(cullRuns_.size()));
                     vkCmdEndRendering(cmd);
                 }
                 transition(cmd, motion, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
@@ -1397,6 +1442,23 @@ void Renderer::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     // view-projection used for this pass (jittered for the low-res path).
     const Mat4 viewProjUsed = Mat4::multiply(gbuffer ? projJittered : proj, view);
 
+    // --- Phase 7a: candidate build + staged upload -----------------------------
+    // CPU frustum cull + LOD state (path-independent) -> the slot's staging;
+    // the GPU upload/cull/draw consume it below.  The active path's channel
+    // gets this frame's commands; the idle path keeps its stale (valid)
+    // pyramid + prevViewProj pair.
+    CullChannel& cull = gbuffer ? gbCull_ : gtCull_;
+    const Mat4 cullViewProj = Mat4::multiply(proj, view); // un-jittered (sub-pixel)
+    cullCandidates_ =
+        deferred_.buildInstanceList(scene_, cullViewProj, instances_.capacity,
+                                    cullInstCpu_.data(), cullCmdCpu_.data(), cullRuns_);
+    if (cullCandidates_ > 0) {
+        std::memcpy(instances_.stagingMapped[slot], cullInstCpu_.data(),
+                    static_cast<size_t>(cullCandidates_) * sizeof(GpuInstance));
+        std::memcpy(cull.cmdStagingMapped[slot], cullCmdCpu_.data(),
+                    static_cast<size_t>(cullCandidates_) * sizeof(VkDrawIndexedIndirectCommand));
+    }
+
     // Shadows (Phase 4b): CSM sun cascades (first shadow-casting directional,
     // same selection rule as fillLightingUBO) plus the spot shadow atlas —
     // shadow-casting spots are scored by intensity/distance^2 and the top
@@ -1481,6 +1543,17 @@ void Renderer::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
 
     timestamps_.sceneBegin(cmd, slot);
 
+    // Phase 7a uploads + the occlusion cull pass are scene work: keep them
+    // inside the scene timestamp range.  The cull reprojects candidates
+    // against LAST frame's pyramid of this path (1-frame latency; skipped on
+    // the path's first frame or after a resize -> everything visible).
+    const bool cullActive = occlusion_ && cull.prevValid && cullCandidates_ > 0;
+    deferred_.recordInstanceUpload(cmd, slot, instances_, cullCandidates_);
+    deferred_.recordCommandUpload(cmd, slot, cull, cullCandidates_, cullActive);
+    if (cullActive)
+        deferred_.recordOcclusionCull(cmd, cull, cullCandidates_, cull.prevViewProj,
+                                      (gbuffer ? gbPyramid_ : gtPyramid_).mipCount, sceneW, sceneH);
+
     // --- GBuffer pass ---------------------------------------------------------
     // Both paths attach a motion RT (Phase 6b): the GT pass uses the GT
     // pipeline (same five formats) so GT motion blur matches the LR path.
@@ -1502,8 +1575,8 @@ void Renderer::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                                 VK_ATTACHMENT_LOAD_OP_CLEAR);
         beginRendering(cmd, sceneW, sceneH, colorCount, colors, &depth);
         deferred_.recordGBufferDraws(cmd, scene_, !gbuffer, fr.sceneSet, textureSet_,
-                                     materialStride_, sceneW, sceneH,
-                                     Mat4::multiply(proj, view));
+                                     materialStride_, sceneW, sceneH, cullViewProj, cull,
+                                     cullRuns_.data(), static_cast<uint32_t>(cullRuns_.size()));
         vkCmdEndRendering(cmd);
     }
 
@@ -1559,9 +1632,10 @@ void Renderer::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                sync::kDepthTests, sync::kDepthWrite, sync::kSampleStages, sync::kSampled,
                VK_IMAGE_ASPECT_DEPTH_BIT);
     // Hi-Z pyramid for the SSR marchers (glass in the transparency pass and
-    // the opaque-SSR compute pass).  Skipped only when neither consumer runs;
-    // the pyramid then just keeps its last contents.
-    if (hasTransparency_ || opts_.ssr)
+    // the opaque-SSR compute pass) and next frame's occlusion cull (Phase 7a).
+    // Skipped only when no consumer runs; the pyramid then just keeps its last
+    // contents.
+    if (hasTransparency_ || opts_.ssr || occlusion_)
         deferred_.recordDepthPyramidPass(cmd, gbuffer ? gbPyramid_ : gtPyramid_);
     // Motion RT: color writes -> post-fx compute reads (Phase 6b, both paths).
     transition(tgtMotion, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
@@ -1761,6 +1835,11 @@ void Renderer::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         exposureChannel_.pending[slot] = true;
     }
     timestamps_.sceneEnd(cmd, slot);
+
+    // Phase 7a: from the next frame on, this path's cull pass reprojects
+    // against the pyramid just built with this frame's exact view-projection.
+    cull.prevViewProj = viewProjUsed;
+    cull.prevValid = true;
 
     if (!gbuffer) {
         // GT has no upscaler pass; emit a zero-width range so every query slot
@@ -2065,6 +2144,9 @@ void Renderer::shutdown() {
     deferred_.destroyDepthPyramid(ctx_, gtPyramid_);
     deferred_.destroyDepthPyramid(ctx_, gbPyramidAo_);
     deferred_.destroyDepthPyramid(ctx_, gtPyramidAo_);
+    deferred_.destroyCullChannel(ctx_, gbCull_);
+    deferred_.destroyCullChannel(ctx_, gtCull_);
+    deferred_.destroyInstanceBuffer(ctx_, instances_);
     deferred_.destroyAoHistory(ctx_, gbAoHist_);
     deferred_.destroyAoHistory(ctx_, gtAoHist_);
     deferred_.destroySsrHistory(ctx_, gbSsrHist_);

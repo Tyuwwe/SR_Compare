@@ -1,0 +1,107 @@
+#version 450
+// Hi-Z occlusion cull (Phase 7a): one thread per candidate instance.  The
+// candidate's world AABB is reprojected with the PREVIOUS frame's exact
+// view-projection (jittered for the LR path — the matrix that produced the
+// bound depth pyramid) and tested against that pyramid (max-reduced NDC
+// depth, non-reversed: 0 = near, 1 = far).  A candidate is occluded when its
+// nearest possible depth is still behind the farthest surface recorded in
+// its screen rect last frame; its indirect command's instanceCount is then
+// zeroed.  1-frame latency: disocclusions pop in next frame (the GBuffer
+// always draws the full candidate set first), newly occluded instances just
+// overdraw for one frame.
+//
+// Conservative outs (command stays visible): any corner behind the previous
+// camera (w <= 0), the rect fully outside the previous frame, the instance
+// flagged occlusion-exempt (transform changed this frame — the pyramid still
+// holds its old silhouette).
+//
+// Deterministic: pure function of the candidate list + previous pyramid; one
+// thread per command, no atomics, writes only its own slot.
+
+layout(local_size_x = 64) in;
+
+struct GpuInstance {
+    mat4 model;
+    mat4 prevModel;
+    mat4 normalModel;
+    vec4 aabbMin; // xyz = world AABB min
+    vec4 aabbMax;
+    uint materialIndex;
+    uint flags;   // bit0: occlusion-exempt (dynamic transform)
+    uint pad0;
+    uint pad1;
+};
+layout(set = 0, binding = 0) readonly buffer Instances {
+    GpuInstance gInstances[];
+};
+
+struct DrawCmd {
+    uint indexCount;
+    uint instanceCount;
+    uint firstIndex;
+    int vertexOffset;
+    uint firstInstance;
+};
+layout(set = 0, binding = 1) buffer Commands {
+    DrawCmd gCommands[];
+};
+
+// Previous frame's max-reduce NDC depth chain (R32F, mip 0 = full res).
+layout(set = 0, binding = 2) uniform sampler2D uHiZ;
+
+layout(push_constant) uniform Push {
+    mat4 prevViewProj;
+    uint candidateCount;
+    uint mipCount;
+    int screenW;
+    int screenH;
+} pc;
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.candidateCount) return;
+    const GpuInstance inst = gInstances[i];
+    if ((inst.flags & 1u) != 0u) return; // occlusion-exempt (dynamic)
+
+    // Project the 8 AABB corners into the previous frame's clip space.
+    vec2 rectMin = vec2(1.0, 1.0);
+    vec2 rectMax = vec2(0.0, 0.0);
+    float nearestZ = 1.0;
+    for (int c = 0; c < 8; ++c) {
+        const vec3 corner = vec3((c & 1) != 0 ? inst.aabbMax.x : inst.aabbMin.x,
+                                 (c & 2) != 0 ? inst.aabbMax.y : inst.aabbMin.y,
+                                 (c & 4) != 0 ? inst.aabbMax.z : inst.aabbMin.z);
+        const vec4 clip = pc.prevViewProj * vec4(corner, 1.0);
+        if (clip.w <= 0.0) return; // crosses/behind the near plane: no safe test
+        const vec3 ndc = clip.xyz / clip.w;
+        const vec2 uv = ndc.xy * 0.5 + 0.5; // y-flip is baked into the projection
+        rectMin = min(rectMin, uv);
+        rectMax = max(rectMax, uv);
+        nearestZ = min(nearestZ, clamp(ndc.z, 0.0, 1.0));
+    }
+    // Fully outside the previous frame: nothing is known, stay visible.
+    if (rectMax.x < 0.0 || rectMax.y < 0.0 || rectMin.x > 1.0 || rectMin.y > 1.0) return;
+    rectMin = clamp(rectMin, vec2(0.0), vec2(1.0));
+    rectMax = clamp(rectMax, vec2(0.0), vec2(1.0));
+
+    // Pick the mip where the rect is about one texel, then take the farthest
+    // depth over the rect's four corner texels there (max-reduce chain: the
+    // texel holds the farthest surface of its footprint).
+    const vec2 sizePx = (rectMax - rectMin) * vec2(pc.screenW, pc.screenH);
+    const float maxDim = max(max(sizePx.x, sizePx.y), 1.0);
+    const uint mip = min(uint(ceil(log2(maxDim))), pc.mipCount - 1u);
+    const ivec2 mipSize = max(ivec2(pc.screenW, pc.screenH) >> int(mip), ivec2(1, 1));
+    const ivec2 t00 = clamp(ivec2(rectMin * vec2(pc.screenW, pc.screenH)) >> int(mip),
+                            ivec2(0), mipSize - 1);
+    const ivec2 t11 = clamp(ivec2(ceil(rectMax * vec2(pc.screenW, pc.screenH)) - 1.0) >> int(mip),
+                            ivec2(0), mipSize - 1);
+    float farthest = 0.0;
+    farthest = max(farthest, texelFetch(uHiZ, ivec2(t00.x, t00.y), int(mip)).r);
+    farthest = max(farthest, texelFetch(uHiZ, ivec2(t11.x, t00.y), int(mip)).r);
+    farthest = max(farthest, texelFetch(uHiZ, ivec2(t00.x, t11.y), int(mip)).r);
+    farthest = max(farthest, texelFetch(uHiZ, ivec2(t11.x, t11.y), int(mip)).r);
+
+    // Strictly behind the farthest recorded surface => fully occluded.
+    // (Equality stays visible: the recorded surface may be the box itself.)
+    if (nearestZ > farthest) gCommands[i].instanceCount = 0;
+}

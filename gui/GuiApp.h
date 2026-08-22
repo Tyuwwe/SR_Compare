@@ -277,6 +277,10 @@ private:
     // Auto-exposure channels + sets (needs the descriptor pool; called from
     // createDescriptors once it exists).
     bool createAutoExposureResources();
+    // Phase 7a cull resources (instance SSBO + per-path cull channels; needs
+    // the pool, the depth pyramids and the allocated scene sets).
+    bool createCullResources();
+    void destroyCullResources();
     // Per-path display exposure: harvested auto value, or the manual slider
     // value when auto exposure is off.
     float lrExposureNow() const {
@@ -516,6 +520,10 @@ private:
     VolFogParams fogParams_;
     // Screen-size LOD switching + distance cull (per-frame CPU selection).
     bool lodEnabled_ = lodEnabledByDefault();
+    // GPU Hi-Z occlusion culling (Phase 7a, per-frame pass skip; SR_OCCLUSION=0
+    // default-off, checkbox overrides interactively).  Indirect draws stay live
+    // either way — off means "all candidates visible".
+    bool occlusionEnabled_ = occlusionEnabledByDefault();
     // Terminal lens-effects chain (Phase 6a, compose push constants; lens
     // dirt is viewer-only — it needs the HDR bloom pyramid).  Strengths are
     // the shared DeferredCore defaults (kLens*Strength).
@@ -592,6 +600,18 @@ private:
     DepthPyramid gbPyramid_;
     DepthPyramid gtPyramid_;
     DepthPyramid gtSsaaPyramid_; // compare GT SSAA only
+    // GPU occlusion culling + indirect GBuffer draws (Phase 7a): shared
+    // instance SSBO + one cull channel per path (LR / GT / GT-SSAA), each
+    // bound to that path's Hi-Z chain.  occlusionEnabled_ = opt-out; when
+    // false the cull pass is skipped (the indirect path stays live).
+    InstanceBuffer instances_;
+    CullChannel gbCull_;
+    CullChannel gtCull_;
+    CullChannel gtSsaaCull_; // compare GT SSAA only
+    std::vector<CullDrawRun> cullRuns_;
+    std::vector<GpuInstance> cullInstCpu_; // build scratch (capacity-sized)
+    std::vector<VkDrawIndexedIndirectCommand> cullCmdCpu_;
+    uint32_t cullCandidates_ = 0;
     // GTAO view-Z depth chains (XeGTAO DepthMIPFilter) + temporal accumulation
     // ping-pong state, one per path.  Per-path previous-frame view-projection
     // (jittered for LR) and frame counters drive the temporal pass; a zero

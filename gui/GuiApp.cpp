@@ -1501,10 +1501,11 @@ bool GuiApp::createDescriptors() {
     sizes[0].descriptorCount =
         deferred::kMaxTextures + numColumns * 3 + 2 + numAlgos * 8 + 14 * kFramesInFlight * 4 +
         7 * kFramesInFlight * 4 + 11 * kFramesInFlight * 4 + 10 * 3 + 3 * 6 + hizSets + colorSets +
-        2 + 14 * fogPaths + 17 * postFxPaths; // + ssr temporal samplers (GB/GT/SSAA x2 sets); auto-exposure HDR
+        2 + 14 * fogPaths + 17 * postFxPaths + 3; // + ssr temporal samplers (GB/GT/SSAA x2 sets); auto-exposure HDR
                            // sources (LR + GT); volfog light/temporal/march/composite samplers;
                            // lighting sets: 14 samplers each (GB/GT/SSAA/spatial), incl. shadow +
-                           // spot atlas + 2 probe arrays; SSR trace sets: 11 each; post-fx sets
+                           // spot atlas + 2 probe arrays; SSR trace sets: 11 each; post-fx sets;
+                           // occlusion cull sets: Hi-Z chains (GB/GT/SSAA, Phase 7a)
     sizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     sizes[1].descriptorCount = kFramesInFlight * 3 + numColumns + numAlgos + kFramesInFlight * 4 +
                                kFramesInFlight * 4 + kFramesInFlight * 4 + // + opaque-SSR UBOs
@@ -1516,6 +1517,8 @@ bool GuiApp::createDescriptors() {
     sizes[3].descriptorCount = numAlgos * 2 + 4 + // metric blocks/result + auto-exposure (LR + GT)
                                2 * kFramesInFlight * 4 + // lighting sets: cluster lights + grid SSBOs
                                2 * kClusterSlots * 3 +    // cluster assign sets (GB/GT/SSAA paths)
+                               kFramesInFlight * 3 +      // scene sets: instance SSBO (Phase 7a)
+                               2 * 3 +                    // occlusion cull sets (GB/GT/SSAA, Phase 7a)
                                2 * kClusterSlots * fogPaths; // volfog light sets
     sizes[4].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     // ssao raw + temporal history + blur outputs (GB/GT/SSAA) + pyramid mips +
@@ -1536,6 +1539,7 @@ bool GuiApp::createDescriptors() {
                      8 * fogPaths +        // volfog sets (per fog path)
                      8 * postFxPaths +     // MB/DOF post-fx sets (Phase 6b)
                      1 * postFxPaths +     // MB copy-back set (Phase 6b)
+                     3 +                   // occlusion cull sets (GB/GT/SSAA, Phase 7a)
                      hizSets + colorSets;
     poolCi.poolSizeCount = 5;
     poolCi.pPoolSizes = sizes;
@@ -1681,6 +1685,11 @@ bool GuiApp::createDescriptors() {
         write.pImageInfo = &info;
         vkUpdateDescriptorSets(ctx_.device, 1, &write, 0, nullptr);
     }
+
+    // Phase 7a cull resources: instance SSBO + per-path cull channels bound to
+    // the depth pyramids (created by createRenderTargets above); scene sets
+    // are already allocated, so binding 3 can be written here.
+    if (!createCullResources()) return false;
 
     return true;
 }
@@ -1840,6 +1849,45 @@ bool GuiApp::createAutoExposureResources() {
     const ImageResource& gtSrc = active_.gtSsaa ? gtSsaaColor_ : gtColor_;
     return deferred_.createExposureChannel(ctx_, descriptorPool_, gtSrc.view, gtSrc.width,
                                            gtSrc.height, initialEV, gtExposure_);
+}
+
+bool GuiApp::createCullResources() {
+    // Phase 7a: shared instance SSBO + one cull channel per path (LR / GT /
+    // GT-SSAA), each bound to that path's Hi-Z chain.  Capacity covers the
+    // full instance list (the candidate build skips blend/skinned/culled).
+    const uint32_t capacity = static_cast<uint32_t>(scene_.instances.size());
+    if (!deferred_.createInstanceBuffer(ctx_, capacity, instances_)) return false;
+    if (!deferred_.createCullChannel(ctx_, capacity, gbCull_)) return false;
+    if (!deferred_.createCullChannel(ctx_, capacity, gtCull_)) return false;
+    if (!deferred_.writeCullSet(ctx_, descriptorPool_, instances_, gbPyramid_.chainView, gbCull_))
+        return false;
+    if (!deferred_.writeCullSet(ctx_, descriptorPool_, instances_, gtPyramid_.chainView, gtCull_))
+        return false;
+    if (active_.gtSsaa) {
+        if (!deferred_.createCullChannel(ctx_, capacity, gtSsaaCull_)) return false;
+        if (!deferred_.writeCullSet(ctx_, descriptorPool_, instances_, gtSsaaPyramid_.chainView,
+                                    gtSsaaCull_))
+            return false;
+    }
+    // Scene set binding 3 (instance SSBO) for every slot's GB/spatial/GT set.
+    if (instances_.buffer) {
+        for (uint32_t i = 0; i < kFramesInFlight; ++i) {
+            deferred_.writeSceneInstanceBinding(ctx_, frames_[i].sceneSetGb, instances_.buffer);
+            deferred_.writeSceneInstanceBinding(ctx_, frames_[i].sceneSetGbSpatial,
+                                                instances_.buffer);
+            deferred_.writeSceneInstanceBinding(ctx_, frames_[i].sceneSetGt, instances_.buffer);
+        }
+    }
+    cullInstCpu_.resize(capacity);
+    cullCmdCpu_.resize(capacity);
+    return true;
+}
+
+void GuiApp::destroyCullResources() {
+    deferred_.destroyCullChannel(ctx_, gbCull_);
+    deferred_.destroyCullChannel(ctx_, gtCull_);
+    deferred_.destroyCullChannel(ctx_, gtSsaaCull_);
+    deferred_.destroyInstanceBuffer(ctx_, instances_);
 }
 
 bool GuiApp::createPipelines() {
@@ -2530,6 +2578,8 @@ void GuiApp::destroyStackResources() {
     deferred_.destroyDepthPyramid(ctx_, gbPyramid_);
     deferred_.destroyDepthPyramid(ctx_, gtPyramid_);
     deferred_.destroyDepthPyramid(ctx_, gtSsaaPyramid_);
+    // Phase 7a cull channels + shared instance SSBO (sets die with the pool).
+    destroyCullResources();
     deferred_.destroyDepthPyramid(ctx_, gbPyramidAo_);
     deferred_.destroyDepthPyramid(ctx_, gtPyramidAo_);
     deferred_.destroyDepthPyramid(ctx_, gtSsaaPyramidAo_);
@@ -3165,6 +3215,25 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     const Mat4 cullViewProj = Mat4::multiply(proj, view); // un-jittered (sub-pixel)
     const Mat4 cullViewProjGt = Mat4::multiply(projGt, viewGt);
 
+    // --- Phase 7a: candidate build + staged instance/command data -------------
+    // One CPU build (frustum + LOD, path-independent); each path's channel
+    // gets a copy of the same command list and zeroes its own occluded
+    // instanceCounts against its own Hi-Z chain.
+    cullCandidates_ =
+        deferred_.buildInstanceList(scene_, cullViewProj, instances_.capacity,
+                                    cullInstCpu_.data(), cullCmdCpu_.data(), cullRuns_);
+    if (cullCandidates_ > 0) {
+        std::memcpy(instances_.stagingMapped[slot], cullInstCpu_.data(),
+                    static_cast<size_t>(cullCandidates_) * sizeof(GpuInstance));
+        const size_t cmdBytes =
+            static_cast<size_t>(cullCandidates_) * sizeof(VkDrawIndexedIndirectCommand);
+        std::memcpy(gbCull_.cmdStagingMapped[slot], cullCmdCpu_.data(), cmdBytes);
+        std::memcpy(gtCull_.cmdStagingMapped[slot], cullCmdCpu_.data(), cmdBytes);
+        if (active_.gtSsaa)
+            std::memcpy(gtSsaaCull_.cmdStagingMapped[slot], cullCmdCpu_.data(), cmdBytes);
+    }
+    deferred_.recordInstanceUpload(cmd, slot, instances_, cullCandidates_);
+
     // Phase 6b: same MB/DOF algorithm + parameters on every path; the blur
     // clamps scale with path height so the display-space blur matches the GT.
     auto recordPostFx = [&](PostFxTargets& fxTargets, VkImage color, VkImageLayout& colorLayout,
@@ -3226,6 +3295,15 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     auto recordLrDeferred = [&](VkDescriptorSet sceneSet, VkDescriptorSet lightingSet,
                                 VkDescriptorSet transparentSet, VkDescriptorSet ssrSet,
                                 const Mat4& ssaoViewProj, const Mat4& projUsed) {
+        // Phase 7a: upload this frame's commands and run the occlusion cull
+        // against the LR Hi-Z chain as it currently stands (previous frame's
+        // pyramid — or, in mixed mode's second record, this frame's spatial
+        // rebuild; gbCull_.prevViewProj always tracks the producing VP).
+        const bool cullActive = occlusionEnabled_ && gbCull_.prevValid && cullCandidates_ > 0;
+        deferred_.recordCommandUpload(cmd, slot, gbCull_, cullCandidates_, cullActive);
+        if (cullActive)
+            deferred_.recordOcclusionCull(cmd, gbCull_, cullCandidates_, gbCull_.prevViewProj,
+                                          gbPyramid_.mipCount, renderWidth_, renderHeight_);
         transition(gbAlbedo_.image, gbAlbedoLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                    sync::kSampleStages, sync::kSampled, sync::kColorAttach, sync::kColorWrite,
                    VK_IMAGE_ASPECT_COLOR_BIT);
@@ -3262,7 +3340,8 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
             beginRendering(cmd, renderWidth_, renderHeight_, 5, colors, &depth);
             deferred_.recordGBufferDraws(cmd, scene_, false, sceneSet, textureSet_,
                                          materialStride_, renderWidth_, renderHeight_,
-                                         cullViewProj);
+                                         cullViewProj, gbCull_, cullRuns_.data(),
+                                         static_cast<uint32_t>(cullRuns_.size()));
             vkCmdEndRendering(cmd);
         }
         // dst scope includes compute: the opaque-SSR pass (ssr_opaque.comp)
@@ -3286,9 +3365,15 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                    sync::kDepthTests, sync::kDepthWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_DEPTH_BIT);
         // Hi-Z pyramid for the SSR marchers (glass transparency + opaque-SSR
-        // compute; both LR lighting variants share the same GBuffer depth).
-        if (hasTransparency_ || ssrEnabled_)
+        // compute; both LR lighting variants share the same GBuffer depth) and
+        // the occlusion cull (Phase 7a).  ssaoViewProj is the exact
+        // view-projection of the GBuffer record that fed this depth — the cull
+        // channel reprojects with it from the next record on.
+        if (hasTransparency_ || ssrEnabled_ || occlusionEnabled_) {
             deferred_.recordDepthPyramidPass(cmd, gbPyramid_);
+            gbCull_.prevViewProj = ssaoViewProj;
+            gbCull_.prevValid = true;
+        }
 
         // GTAO: view-Z depth chain (sampled at per-step LODs) -> main pass ->
         // temporal EMA -> denoise.  The chain is rebuilt every record.
@@ -3571,6 +3656,12 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         // metric/display ref.
         const uint32_t sw = dw * 2;
         const uint32_t sh = dh * 2;
+        // Phase 7a: SSAA-path occlusion cull against the 2x Hi-Z chain.
+        const bool cullActiveSsaa = occlusionEnabled_ && gtSsaaCull_.prevValid && cullCandidates_ > 0;
+        deferred_.recordCommandUpload(cmd, slot, gtSsaaCull_, cullCandidates_, cullActiveSsaa);
+        if (cullActiveSsaa)
+            deferred_.recordOcclusionCull(cmd, gtSsaaCull_, cullCandidates_,
+                                          gtSsaaCull_.prevViewProj, gtSsaaPyramid_.mipCount, sw, sh);
         transition(gtSsaaAlbedo_.image, gtSsaaAlbedoLayout_,
                    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, sync::kSampleStages, sync::kSampled,
                    sync::kColorAttach, sync::kColorWrite, VK_IMAGE_ASPECT_COLOR_BIT);
@@ -3608,7 +3699,8 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                                     VK_ATTACHMENT_LOAD_OP_CLEAR);
             beginRendering(cmd, sw, sh, 5, colors, &depth);
             deferred_.recordGBufferDraws(cmd, scene_, true, fr.sceneSetGt, textureSet_,
-                                         materialStride_, sw, sh, cullViewProjGt);
+                                         materialStride_, sw, sh, cullViewProjGt, gtSsaaCull_,
+                                         cullRuns_.data(), static_cast<uint32_t>(cullRuns_.size()));
             vkCmdEndRendering(cmd);
         }
         // dst scope includes compute: the opaque-SSR pass samples the GBuffer.
@@ -3630,8 +3722,11 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         transition(gtSsaaDepth_.image, gtSsaaDepthLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                    sync::kDepthTests, sync::kDepthWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_DEPTH_BIT);
-        if (hasTransparency_ || ssrEnabled_)
+        if (hasTransparency_ || ssrEnabled_ || occlusionEnabled_) {
             deferred_.recordDepthPyramidPass(cmd, gtSsaaPyramid_);
+            gtSsaaCull_.prevViewProj = cullViewProjGt; // GT paths never jitter
+            gtSsaaCull_.prevValid = true;
+        }
 
         // GTAO for the 2x GT path (un-jittered view-projection): view-Z depth
         // chain -> main pass -> temporal EMA -> denoise.  The AO output is
@@ -3787,6 +3882,12 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                    sync::kColorAttach, sync::kColorWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
     } else if (gtActive_) {
+        // Phase 7a: GT-path occlusion cull against the 1x Hi-Z chain.
+        const bool cullActiveGt = occlusionEnabled_ && gtCull_.prevValid && cullCandidates_ > 0;
+        deferred_.recordCommandUpload(cmd, slot, gtCull_, cullCandidates_, cullActiveGt);
+        if (cullActiveGt)
+            deferred_.recordOcclusionCull(cmd, gtCull_, cullCandidates_, gtCull_.prevViewProj,
+                                          gtPyramid_.mipCount, gtW, gtH);
         transition(gtAlbedo_.image, gtAlbedoLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                    sync::kSampleStages, sync::kSampled, sync::kColorAttach, sync::kColorWrite,
                    VK_IMAGE_ASPECT_COLOR_BIT);
@@ -3822,7 +3923,8 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                                     VK_ATTACHMENT_LOAD_OP_CLEAR);
             beginRendering(cmd, gtW, gtH, 5, colors, &depth);
             deferred_.recordGBufferDraws(cmd, scene_, true, fr.sceneSetGt, textureSet_,
-                                         materialStride_, gtW, gtH, cullViewProjGt);
+                                         materialStride_, gtW, gtH, cullViewProjGt, gtCull_,
+                                         cullRuns_.data(), static_cast<uint32_t>(cullRuns_.size()));
             vkCmdEndRendering(cmd);
         }
         // dst scope includes compute: the opaque-SSR pass samples the GBuffer.
@@ -3844,8 +3946,11 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         transition(gtDepth_.image, gtDepthLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                    sync::kDepthTests, sync::kDepthWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_DEPTH_BIT);
-        if (hasTransparency_ || ssrEnabled_)
+        if (hasTransparency_ || ssrEnabled_ || occlusionEnabled_) {
             deferred_.recordDepthPyramidPass(cmd, gtPyramid_);
+            gtCull_.prevViewProj = cullViewProjGt; // GT paths never jitter
+            gtCull_.prevValid = true;
+        }
 
         // GTAO for the 1x GT path (un-jittered view-projection): view-Z depth
         // chain -> main pass -> temporal EMA -> denoise.  In "GT (Apply
@@ -5017,6 +5122,8 @@ void GuiApp::drawViewerTab() {
     if (!fogParams_.enabled || gbFog_.injectImage == VK_NULL_HANDLE) ImGui::EndDisabled();
     // Screen-size LOD + small-object cull: per-frame CPU selection, no rebuild.
     ImGui::Checkbox("lod", &lodEnabled_);
+    // GPU Hi-Z occlusion culling (Phase 7a): per-frame pass skip, no rebuild.
+    ImGui::Checkbox("occlusion cull", &occlusionEnabled_);
     // Motion blur + DOF (Phase 6b): per-frame pass skip, no temporal state.
     ImGui::Checkbox("motion blur", &motionBlurEnabled_);
     ImGui::Checkbox("depth of field", &dofEnabled_);

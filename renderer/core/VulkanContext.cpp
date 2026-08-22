@@ -248,6 +248,10 @@ bool VulkanContext::create(Window& window) {
     // Reflection-probe cube arrays (Phase 4c-2); core since Vulkan 1.1 and
     // universally supported on desktop GPUs targeted by this tool.
     features2.features.imageCubeArray = VK_TRUE;
+    // Phase 7a indirect GBuffer draws: batched vkCmdDrawIndexedIndirect.  Core
+    // since 1.0 and near-universal; when absent, maxDrawIndirectCount is 1 and
+    // the recorder emits single-draw calls, which are legal without it.
+    features2.features.multiDrawIndirect = features.multiDrawIndirect;
 
     // Vulkan 1.2 features shared by plugins (each sType may appear only once
     // in the chain, so plugins must not add their own v12/v13 nodes).

@@ -3,9 +3,10 @@
 //
 // Two flavors, selected by push.aoFilter:
 //
-//   SSR chains (aoFilter=0): mip 0 max-reduces the opaque GBuffer depth (D32,
-//   bound as a sampler) into R32F; each further mip max-reduces the previous
-//   one 2x2.  The projection is standard (non-reversed) Vulkan depth:
+//   SSR chains (aoFilter=0): mip 0 is a per-texel copy of the opaque GBuffer
+//   depth (D32, bound as a sampler) into R32F; each further mip max-reduces
+//   the previous one 2x2.  The projection is standard (non-reversed) Vulkan
+//   depth:
 //   0 = near, 1 = far, so a ray marcher testing "ray behind the cell" needs
 //   the FARTHEST surface per cell -> max-reduce.  Sky pixels (cleared depth
 //   1.0) dominate any mixed cell; the marcher treats the far value as
@@ -46,13 +47,16 @@ void main() {
     ivec2 dstSize = imageSize(dstMip);
     if (dst.x >= dstSize.x || dst.y >= dstSize.y) return;
 
-    // AO chain level 0: true per-texel copy with NDC -> view-Z conversion
-    // (the SSR flavor keeps its historical 2x2 max at level 0; the marcher
-    // only needs a conservative farthest-depth cell).
-    if (push.aoFilter == 1 && push.level == 0) {
+    // Level 0 is a true per-texel copy of the source depth for BOTH flavors
+    // (AO converts NDC -> view-Z here; the SSR chain keeps NDC depth).  Every
+    // consumer — the SSR marchers (ssr.glsl: mipSize = size0 >> level) and the
+    // Phase 7a occlusion cull — assumes mip L has resolution size0 >> L, so a
+    // 2x2 max at level 0 would silently halve the chain's effective resolution.
+    if (push.level == 0) {
         float d = texelFetch(srcTex, min(dst, push.srcSize - 1), 0).r;
-        float viewZ = push.depthUnpack.x / max(push.depthUnpack.y - d, 1e-6);
-        imageStore(dstMip, dst, vec4(viewZ));
+        if (push.aoFilter == 1)
+            d = push.depthUnpack.x / max(push.depthUnpack.y - d, 1e-6);
+        imageStore(dstMip, dst, vec4(d));
         return;
     }
 
