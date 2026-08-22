@@ -5,7 +5,8 @@
 // One invocation per pixel of the lit HDR target: locates the pixel's view
 // depth in the froxel volume, samples the ray-integrated inscatter /
 // transmittance trilinearly, and applies
-//     out = color * transmittance + inscatter
+//     out.rgb = color.rgb * transmittance + inscatter
+//     out.a   = transmittance   (consumed by ssr_temporal.comp; see there)
 // in place (same per-texel RMW contract as ssr_temporal.comp — no feedback
 // hazard).  Runs after the deferred lighting pass, before tonemapping.
 //
@@ -51,5 +52,13 @@ void main() {
     const vec4 fog = texture(integratedVolume, vec3(uv, w));
 
     const vec4 color = imageLoad(sceneColor, pix);
-    imageStore(sceneColor, pix, vec4(color.rgb * fog.a + fog.rgb, color.a));
+    // Transmittance goes into the alpha channel: the opaque-SSR temporal pass
+    // (ssr_temporal.comp) composites its trace delta AFTER this pass, and the
+    // delta replaces the PRE-fog specIbl term — without the scale it would
+    // subtract conf*specIbl that fog already attenuated to t*specIbl, going
+    // negative whenever conf > t (distant fogged ground turned black).  Alpha
+    // is unused downstream (present / bloom / TAA read .rgb only), so it is a
+    // free per-pixel carrier; lighting.frag writes 1.0, which is exactly the
+    // no-fog scale.
+    imageStore(sceneColor, pix, vec4(color.rgb * fog.a + fog.rgb, fog.a));
 }

@@ -45,9 +45,26 @@
 // accumulation of the jittered sharp mip IS the mirror anti-aliasing).
 //
 // The composite is fused into this pass: each invocation read-modify-writes
-// only its own texel of the lit HDR target (out = old + delta), so a third
-// pass / descriptor set is unnecessary and there is no feedback hazard — the
-// same argument the pre-Phase-2d in-place pass relied on.
+// only its own texel of the lit HDR target (out = old + delta * fogT), so a
+// third pass / descriptor set is unnecessary and there is no feedback hazard —
+// the same argument the pre-Phase-2d in-place pass relied on.
+//
+// fogT: the lit target's alpha carries the volumetric-fog transmittance
+// (written by volfog_composite.comp, which runs BEFORE this pass; lighting
+// cleared alpha to 1, so alpha == 1 when fog is off).  The trace delta
+// replaces the PRE-fog specIbl term (conf*(ssrColor*envBRDF - specIbl)), but
+// by the time this pass runs, fog has already attenuated that term to
+// t*specIbl.  Compositing the raw delta subtracts conf*specIbl in full —
+// negative overshoot whenever conf > t, which read as black distant ground in
+// fog (Bistro street).  Scaling the whole delta by t reproduces exactly the
+// result of compositing SSR before the fog pass:
+//   (direct + specIbl)*t + inscatter + t*conf*(hit - specIbl)
+//     == (direct + (1-conf)*specIbl + conf*hit)*t + inscatter
+// so fogged pixels smoothly keep their IBL/fog colour instead of going black,
+// while near / fog-free pixels (t ≈ 1) are unchanged.  (The hit colour itself
+// is sampled from the post-fog colour pyramid, i.e. it carries the fog of the
+// hit location and is then attenuated by the pixel's t as well — a benign
+// approximation, far smaller than the specIbl overshoot this fixes.)
 //
 // bindings: 0 = trace target (rgb = delta, a = view |z|; SHADER_READ_ONLY)
 //           1 = history read  (the OTHER ping-pong buffer, GENERAL)
@@ -90,7 +107,7 @@ void main() {
         imageStore(outHistory, pix, cur);
         if (depth < 1.0) {
             vec4 old = imageLoad(sceneColor, pix);
-            imageStore(sceneColor, pix, vec4(old.rgb + cur.rgb, old.a));
+            imageStore(sceneColor, pix, vec4(old.rgb + cur.rgb * old.a, old.a));
         }
         return;
     }
@@ -159,8 +176,9 @@ void main() {
     }
     imageStore(outHistory, pix, vec4(delta, cur.a));
 
-    // Fused composite: adding the filtered delta reproduces the old in-place
-    // mix(iblSpec, ssrColor*envBRDF, conf) on the specular term.
+    // Fused composite: adding the filtered delta (scaled by the fog
+    // transmittance in scene alpha, see the header) reproduces the old
+    // in-place mix(iblSpec, ssrColor*envBRDF, conf) on the specular term.
     vec4 old = imageLoad(sceneColor, pix);
-    imageStore(sceneColor, pix, vec4(old.rgb + delta, old.a));
+    imageStore(sceneColor, pix, vec4(old.rgb + delta * old.a, old.a));
 }
