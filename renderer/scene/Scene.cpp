@@ -33,9 +33,9 @@ bool createStagedBuffer(const VulkanContext& ctx, const void* data, VkDeviceSize
 
     VkBufferCopy region = {};
     region.size = size;
-    submitOneShot(ctx, [&](VkCommandBuffer cmd) {
+    submitUploadOneShot(ctx, [&](VkCommandBuffer cmd) {
         vkCmdCopyBuffer(cmd, staging, buffer, 1, &region);
-    }, pool);
+    }, {}, pool);
 
     vmaDestroyBuffer(ctx.allocator, staging, stagingMemory);
     return true;
@@ -196,6 +196,9 @@ bool Scene::uploadTexture(const VulkanContext& ctx, uint32_t width, uint32_t hei
     std::memcpy(mapped, rgba8, static_cast<size_t>(size));
     vmaUnmapMemory(ctx.allocator, stagingMemory);
 
+    // Mip blits are not legal on transfer-only queues, so uncompressed
+    // uploads stay on the graphics queue (the KTX2 path needs no blits and
+    // does use the transfer queue via uploadKtx2Levels).
     submitOneShot(ctx, [&](VkCommandBuffer cmd) {
         // Level 0: UNDEFINED -> TRANSFER_DST, upload, -> TRANSFER_SRC.
         imageBarrier(cmd, out.image, VK_IMAGE_LAYOUT_UNDEFINED,

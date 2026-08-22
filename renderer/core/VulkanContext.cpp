@@ -181,6 +181,7 @@ bool VulkanContext::create(Window& window) {
 
     int chosen = -1;
     VkPhysicalDeviceProperties chosenProps{};
+    uint32_t chosenTransfer = 0xFFFFFFFFu;
     for (uint32_t i = 0; i < deviceCount; ++i) {
         VkPhysicalDeviceProperties props;
         vkGetPhysicalDeviceProperties(devices[i], &props);
@@ -200,17 +201,31 @@ bool VulkanContext::create(Window& window) {
         }
         if (gfx == 0xFFFFFFFFu || present == 0xFFFFFFFFu) continue;
 
+        // Dedicated transfer engine: TRANSFER without GRAPHICS (so the family
+        // always differs from gfx), preferring one also without COMPUTE (the
+        // pure DMA engine on discrete GPUs).  Absent on some iGPUs — uploads
+        // then stay on the graphics queue.
+        uint32_t transfer = 0xFFFFFFFFu;
+        for (uint32_t q = 0; q < qfCount; ++q) {
+            const VkQueueFlags f = qfs[q].queueFlags;
+            if (!(f & VK_QUEUE_TRANSFER_BIT) || (f & VK_QUEUE_GRAPHICS_BIT)) continue;
+            if (transfer == 0xFFFFFFFFu || !(f & VK_QUEUE_COMPUTE_BIT)) transfer = q;
+            if (!(f & VK_QUEUE_COMPUTE_BIT)) break;
+        }
+
         // Prefer discrete GPUs, fall back to any suitable one.
         if (chosen == -1 || (isDiscrete(props.deviceType) && !isDiscrete(chosenProps.deviceType))) {
             chosen = static_cast<int>(i);
             chosenProps = props;
             graphicsQueueFamily = gfx;
             presentQueueFamily = present;
+            chosenTransfer = transfer;
         }
         if (isDiscrete(props.deviceType)) break;
     }
     if (chosen < 0) { destroy(); return false; }
     physicalDevice = devices[static_cast<uint32_t>(chosen)];
+    transferQueueFamily = chosenTransfer;
 
     vkGetPhysicalDeviceProperties(physicalDevice, &properties);
     vkGetPhysicalDeviceFeatures(physicalDevice, &features);
@@ -308,10 +323,11 @@ bool VulkanContext::create(Window& window) {
     }
 
     float queuePriority = 1.f;
-    const bool sameFamily = graphicsQueueFamily == presentQueueFamily;
+    const bool hasTransferFamily = transferQueueFamily != 0xFFFFFFFFu;
     std::vector<VkDeviceQueueCreateInfo> qcis;
     std::vector<uint32_t> uniqueFamilies = {graphicsQueueFamily};
-    if (!sameFamily) uniqueFamilies.push_back(presentQueueFamily);
+    if (presentQueueFamily != graphicsQueueFamily) uniqueFamilies.push_back(presentQueueFamily);
+    if (hasTransferFamily) uniqueFamilies.push_back(transferQueueFamily);
     for (uint32_t f : uniqueFamilies) {
         VkDeviceQueueCreateInfo q = {};
         q.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
@@ -336,6 +352,8 @@ bool VulkanContext::create(Window& window) {
 
     vkGetDeviceQueue(device, graphicsQueueFamily, 0, &graphicsQueue);
     vkGetDeviceQueue(device, presentQueueFamily, 0, &presentQueue);
+    if (hasTransferFamily)
+        vkGetDeviceQueue(device, transferQueueFamily, 0, &transferQueue);
 
     VkCommandPoolCreateInfo pool = {};
     pool.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
@@ -343,6 +361,11 @@ bool VulkanContext::create(Window& window) {
     pool.queueFamilyIndex = graphicsQueueFamily;
     vkCreateCommandPool(device, &pool, nullptr, &oneShotPool);
     vkCreateCommandPool(device, &pool, nullptr, &framePool);
+    if (hasTransferFamily) {
+        pool.queueFamilyIndex = transferQueueFamily;
+        vkCreateCommandPool(device, &pool, nullptr, &transferPool);
+        pool.queueFamilyIndex = graphicsQueueFamily;
+    }
 
     VmaAllocatorCreateInfo allocatorInfo = {};
     allocatorInfo.physicalDevice = physicalDevice;
@@ -378,6 +401,12 @@ bool VulkanContext::create(Window& window) {
             std::fprintf(stderr, "warning: vkCreatePipelineCache failed, caching disabled\n");
     }
 
+    std::fprintf(stderr, "queues: graphics=%u present=%u%s\n", graphicsQueueFamily,
+                 presentQueueFamily,
+                 transferQueue != VK_NULL_HANDLE
+                     ? " transfer=dedicated"
+                     : " transfer=none (uploads on graphics queue)");
+
     return true;
 }
 
@@ -396,6 +425,7 @@ void VulkanContext::destroy() {
     }
     if (oneShotPool) { vkDestroyCommandPool(device, oneShotPool, nullptr); oneShotPool = VK_NULL_HANDLE; }
     if (framePool) { vkDestroyCommandPool(device, framePool, nullptr); framePool = VK_NULL_HANDLE; }
+    if (transferPool) { vkDestroyCommandPool(device, transferPool, nullptr); transferPool = VK_NULL_HANDLE; }
     if (pipelineCache) {
         // Persist the merged cache next to the exe for the next run.
         std::lock_guard<std::mutex> lk(pipelineMutex);

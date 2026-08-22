@@ -561,10 +561,13 @@ bool CompareApp::createFontAtlas() {
     fontAtlas_.height = kFontAtlasH;
     fontAtlas_.format = VK_FORMAT_R8_UNORM;
 
-    submitOneShot(ctx_, [&](VkCommandBuffer cmd) {
-        copyBufferToImage(cmd, staging, fontAtlas_.image, kFontAtlasW, kFontAtlasH,
-                          VK_FORMAT_R8_UNORM);
-    });
+    submitUploadOneShot(
+        ctx_,
+        [&](VkCommandBuffer cmd) {
+            copyBufferToImageTransferStage(cmd, staging, fontAtlas_.image, kFontAtlasW,
+                                           kFontAtlasH);
+        },
+        [&](VkCommandBuffer cmd) { transitionImageToShaderRead(cmd, fontAtlas_.image); });
     vmaDestroyBuffer(ctx_.allocator, staging, stagingMemory);
 
     fontAtlas_.view = createImageView(ctx_, fontAtlas_.image, VK_FORMAT_R8_UNORM,

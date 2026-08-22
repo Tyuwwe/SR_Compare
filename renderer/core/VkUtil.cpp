@@ -6,6 +6,27 @@
 
 namespace sr {
 
+namespace {
+
+// Upload targets (TRANSFER_DST) are written on the dedicated transfer queue
+// and consumed on the graphics queue.  CONCURRENT sharing across the two
+// families avoids queue-family ownership transfers at every upload; the
+// cross-queue memory/layout handoff is done with a semaphore instead
+// (submitUploadOneShot).  Staging sources and render targets keep EXCLUSIVE
+// sharing so driver fast paths (e.g. color compression) stay enabled.
+void applyUploadSharing(const VulkanContext& ctx, bool isUploadDst, VkSharingMode& sharingMode,
+                        uint32_t& familyCount, const uint32_t*& families,
+                        uint32_t (&familyStorage)[2]) {
+    if (ctx.transferQueue == VK_NULL_HANDLE || !isUploadDst) return;
+    familyStorage[0] = ctx.graphicsQueueFamily;
+    familyStorage[1] = ctx.transferQueueFamily;
+    sharingMode = VK_SHARING_MODE_CONCURRENT;
+    familyCount = 2;
+    families = familyStorage;
+}
+
+} // namespace
+
 VkResult createBuffer(const VulkanContext& ctx, VkDeviceSize size, VkBufferUsageFlags usage,
                       VkMemoryPropertyFlags props, VkBuffer& buffer, VmaAllocation& allocation) {
     VkBufferCreateInfo info = {};
@@ -13,6 +34,9 @@ VkResult createBuffer(const VulkanContext& ctx, VkDeviceSize size, VkBufferUsage
     info.size = size;
     info.usage = usage;
     info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    uint32_t families[2];
+    applyUploadSharing(ctx, (usage & VK_BUFFER_USAGE_TRANSFER_DST_BIT) != 0, info.sharingMode,
+                       info.queueFamilyIndexCount, info.pQueueFamilyIndices, families);
 
     VmaAllocationCreateInfo alloc = {};
     alloc.usage = VMA_MEMORY_USAGE_AUTO;
@@ -39,6 +63,9 @@ VkResult createImage(const VulkanContext& ctx, uint32_t width, uint32_t height, 
     info.usage = usage;
     info.samples = VK_SAMPLE_COUNT_1_BIT;
     info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    uint32_t families[2];
+    applyUploadSharing(ctx, (usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT) != 0, info.sharingMode,
+                       info.queueFamilyIndexCount, info.pQueueFamilyIndices, families);
 
     VmaAllocationCreateInfo alloc = {};
     alloc.usage = VMA_MEMORY_USAGE_AUTO;
@@ -62,6 +89,9 @@ VkResult createImage3D(const VulkanContext& ctx, uint32_t width, uint32_t height
     info.usage = usage;
     info.samples = VK_SAMPLE_COUNT_1_BIT;
     info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    uint32_t families[2];
+    applyUploadSharing(ctx, (usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT) != 0, info.sharingMode,
+                       info.queueFamilyIndexCount, info.pQueueFamilyIndices, families);
 
     VmaAllocationCreateInfo alloc = {};
     alloc.usage = VMA_MEMORY_USAGE_AUTO;
@@ -155,9 +185,8 @@ void imageBarrier(VkCommandBuffer cmd, VkImage image, VkImageLayout oldLayout,
     vkCmdPipelineBarrier2(cmd, &dependency);
 }
 
-void copyBufferToImage(VkCommandBuffer cmd, VkBuffer src, VkImage dst, uint32_t width,
-                       uint32_t height, VkFormat format) {
-    (void)format; // format is implicit in the source data; kept for API clarity
+void copyBufferToImageTransferStage(VkCommandBuffer cmd, VkBuffer src, VkImage dst, uint32_t width,
+                                    uint32_t height) {
     imageBarrier(cmd, dst, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                  VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
                  VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
@@ -173,13 +202,22 @@ void copyBufferToImage(VkCommandBuffer cmd, VkBuffer src, VkImage dst, uint32_t 
     region.imageOffset = {0, 0, 0};
     region.imageExtent = {width, height, 1};
     vkCmdCopyBufferToImage(cmd, src, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+}
 
+void transitionImageToShaderRead(VkCommandBuffer cmd, VkImage image) {
     // Consumers: fragment (font atlas) and compute (IBL equirect) sampling.
-    imageBarrier(cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+    imageBarrier(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                  VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
                  VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                  VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+}
+
+void copyBufferToImage(VkCommandBuffer cmd, VkBuffer src, VkImage dst, uint32_t width,
+                       uint32_t height, VkFormat format) {
+    (void)format; // format is implicit in the source data; kept for API clarity
+    copyBufferToImageTransferStage(cmd, src, dst, width, height);
+    transitionImageToShaderRead(cmd, dst);
 }
 
 void submitOneShot(const VulkanContext& ctx, const std::function<void(VkCommandBuffer)>& fn,
@@ -243,6 +281,135 @@ void submitOneShot(const VulkanContext& ctx, const std::function<void(VkCommandB
     }
     vkDestroyFence(ctx.device, fence, nullptr);
     vkFreeCommandBuffers(ctx.device, cmdPool, 1, &cmd);
+}
+
+void submitUploadOneShot(const VulkanContext& ctx,
+                         const std::function<void(VkCommandBuffer)>& fnCopy,
+                         const std::function<void(VkCommandBuffer)>& fnPost,
+                         VkCommandPool pool) {
+    // No dedicated transfer engine: record both parts into one graphics
+    // command buffer, exactly like submitOneShot.
+    if (ctx.transferQueue == VK_NULL_HANDLE) {
+        submitOneShot(
+            ctx,
+            [&](VkCommandBuffer cmd) {
+                fnCopy(cmd);
+                if (fnPost) fnPost(cmd);
+            },
+            pool);
+        return;
+    }
+
+    const VkCommandPool gfxPool = pool ? pool : ctx.oneShotPool;
+    VkCommandBuffer tcmd = VK_NULL_HANDLE; // transfer-family, shared pool
+    VkCommandBuffer gcmd = VK_NULL_HANDLE; // graphics-family, caller pool
+    VkSemaphore semaphore = VK_NULL_HANDLE;
+    VkFence fence = VK_NULL_HANDLE;
+    bool submittedT = false;
+    bool submittedG = false;
+
+    // The shared transfer pool may be used from several threads (main,
+    // texture streamer, GUI load worker); every pool access is serialized.
+    {
+        std::lock_guard<std::mutex> lk(ctx.transferPoolMutex);
+        VkCommandBufferAllocateInfo alloc = {};
+        alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        alloc.commandPool = ctx.transferPool;
+        alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        alloc.commandBufferCount = 1;
+        VkCommandBufferBeginInfo begin = {};
+        begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        bool ok = vkAllocateCommandBuffers(ctx.device, &alloc, &tcmd) == VK_SUCCESS && tcmd;
+        if (ok) ok = vkBeginCommandBuffer(tcmd, &begin) == VK_SUCCESS;
+        if (ok) {
+            fnCopy(tcmd);
+            ok = vkEndCommandBuffer(tcmd) == VK_SUCCESS;
+        }
+        if (!ok) {
+            std::fprintf(stderr, "submitUploadOneShot: transfer cmd record failed\n");
+            if (tcmd) vkFreeCommandBuffers(ctx.device, ctx.transferPool, 1, &tcmd);
+            tcmd = VK_NULL_HANDLE;
+        }
+    }
+    if (!tcmd) return;
+
+    if (fnPost) {
+        VkCommandBufferAllocateInfo alloc = {};
+        alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        alloc.commandPool = gfxPool;
+        alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        alloc.commandBufferCount = 1;
+        VkCommandBufferBeginInfo begin = {};
+        begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        bool ok = vkAllocateCommandBuffers(ctx.device, &alloc, &gcmd) == VK_SUCCESS && gcmd;
+        if (ok) ok = vkBeginCommandBuffer(gcmd, &begin) == VK_SUCCESS;
+        if (ok) {
+            fnPost(gcmd);
+            ok = vkEndCommandBuffer(gcmd) == VK_SUCCESS;
+        }
+        if (!ok) {
+            std::fprintf(stderr, "submitUploadOneShot: graphics cmd record failed\n");
+            if (gcmd) vkFreeCommandBuffers(ctx.device, gfxPool, 1, &gcmd);
+            gcmd = VK_NULL_HANDLE;
+            std::lock_guard<std::mutex> lk(ctx.transferPoolMutex);
+            vkFreeCommandBuffers(ctx.device, ctx.transferPool, 1, &tcmd);
+            return;
+        }
+    }
+
+    VkSemaphoreCreateInfo semaInfo = {};
+    semaInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+    VkFenceCreateInfo fenceInfo = {};
+    fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    if (vkCreateSemaphore(ctx.device, &semaInfo, nullptr, &semaphore) != VK_SUCCESS ||
+        vkCreateFence(ctx.device, &fenceInfo, nullptr, &fence) != VK_SUCCESS) {
+        std::fprintf(stderr, "submitUploadOneShot: sync object creation failed\n");
+    }
+
+    // Copy on the transfer queue; the graphics-queue batch (the consumer
+    // transition, or empty) waits on its semaphore, so same-queue ordering
+    // makes the upload visible to every subsequent graphics submission.
+    if (semaphore && fence) {
+        VkSubmitInfo tsubmit = {};
+        tsubmit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        tsubmit.commandBufferCount = 1;
+        tsubmit.pCommandBuffers = &tcmd;
+        tsubmit.signalSemaphoreCount = 1;
+        tsubmit.pSignalSemaphores = &semaphore;
+        std::lock_guard<std::mutex> lk(ctx.transferQueueMutex);
+        submittedT = vkQueueSubmit(ctx.transferQueue, 1, &tsubmit, VK_NULL_HANDLE) == VK_SUCCESS;
+        if (!submittedT)
+            std::fprintf(stderr, "submitUploadOneShot: transfer vkQueueSubmit failed\n");
+    }
+    if (submittedT) {
+        const VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+        VkSubmitInfo gsubmit = {};
+        gsubmit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        gsubmit.waitSemaphoreCount = 1;
+        gsubmit.pWaitSemaphores = &semaphore;
+        gsubmit.pWaitDstStageMask = &waitStage;
+        gsubmit.commandBufferCount = gcmd ? 1u : 0u;
+        gsubmit.pCommandBuffers = gcmd ? &gcmd : nullptr;
+        std::lock_guard<std::mutex> lk(ctx.queueMutex);
+        submittedG = vkQueueSubmit(ctx.graphicsQueue, 1, &gsubmit, fence) == VK_SUCCESS;
+        if (!submittedG)
+            std::fprintf(stderr, "submitUploadOneShot: graphics vkQueueSubmit failed\n");
+    }
+    if (submittedG &&
+        vkWaitForFences(ctx.device, 1, &fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) {
+        // Log and fall through; a failed wait is fatal and leaves the device
+        // unusable, matching submitOneShot.
+        std::fprintf(stderr, "submitUploadOneShot: vkWaitForFences failed\n");
+    }
+    // On the failure paths the batches are orphaned-but-harmless; never wait
+    // on a fence that cannot signal.
+    if (semaphore) vkDestroySemaphore(ctx.device, semaphore, nullptr);
+    if (fence) vkDestroyFence(ctx.device, fence, nullptr);
+    if (gcmd) vkFreeCommandBuffers(ctx.device, gfxPool, 1, &gcmd);
+    std::lock_guard<std::mutex> lk(ctx.transferPoolMutex);
+    vkFreeCommandBuffers(ctx.device, ctx.transferPool, 1, &tcmd);
 }
 
 } // namespace sr

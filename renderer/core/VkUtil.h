@@ -102,11 +102,39 @@ inline void copyColorImage(VkCommandBuffer cmd, VkImage src, VkImageLayout srcLa
 void copyBufferToImage(VkCommandBuffer cmd, VkBuffer src, VkImage dst, uint32_t width,
                        uint32_t height, VkFormat format);
 
+// copyBufferToImage split across the queue handoff for submitUploadOneShot:
+// the first stage uses only transfer-legal stages (valid in a transfer-queue
+// command buffer); the second transitions TRANSFER_DST -> SHADER_READ_ONLY
+// and must run on the graphics queue (shader stages are not legal in
+// transfer-family barriers).
+void copyBufferToImageTransferStage(VkCommandBuffer cmd, VkBuffer src, VkImage dst, uint32_t width,
+                                    uint32_t height);
+void transitionImageToShaderRead(VkCommandBuffer cmd, VkImage image);
+
 // Allocate a one-time command buffer, record fn, submit to the graphics queue,
 // wait for completion and free the buffer.  pool != VK_NULL_HANDLE selects the
 // command pool (must be owned by the calling thread); the queue submit itself
 // is serialized through VulkanContext::queueMutex.
 void submitOneShot(const VulkanContext& ctx, const std::function<void(VkCommandBuffer)>& fn,
                    VkCommandPool pool = VK_NULL_HANDLE);
+
+// Upload variant for pure transfer work (buffer/image copies).  fnCopy may use
+// only transfer-queue-legal commands and barrier stages (no blits/clears, no
+// shader stages in barrier masks); fnPost, if non-empty, records the consumer
+// transition (e.g. TRANSFER_DST -> SHADER_READ_ONLY) and runs on the graphics
+// queue.  When the context has a dedicated transfer queue the copy runs there
+// (on the DMA engine, overlapping in-flight rendering instead of queueing
+// behind it) using the shared VulkanContext::transferPool; the transfer submit
+// signals a binary semaphore that the graphics-queue submit (fnPost) waits on,
+// so every later graphics submission sees the uploaded data and final layouts
+// without queue-family ownership transfers (upload targets are created with
+// CONCURRENT sharing across the two families; see createBuffer/createImage).
+// Without a transfer queue both parts record into one graphics command buffer,
+// exactly like submitOneShot; pool then selects the command pool as there, and
+// on the transfer path it also provides the graphics-family pool for fnPost.
+void submitUploadOneShot(const VulkanContext& ctx,
+                         const std::function<void(VkCommandBuffer)>& fnCopy,
+                         const std::function<void(VkCommandBuffer)>& fnPost = {},
+                         VkCommandPool pool = VK_NULL_HANDLE);
 
 } // namespace sr

@@ -463,9 +463,12 @@ bool Renderer::createLensDirtTexture() {
     std::memcpy(mapped, pixels.data(), pixels.size());
     vmaUnmapMemory(ctx_.allocator, stagingMemory);
     // copyBufferToImage transitions UNDEFINED -> TRANSFER_DST -> SHADER_READ_ONLY.
-    submitOneShot(ctx_, [&](VkCommandBuffer cmd) {
-        copyBufferToImage(cmd, staging, lensDirt_.image, kSize, kSize, lensDirt_.format);
-    });
+    submitUploadOneShot(
+        ctx_,
+        [&](VkCommandBuffer cmd) {
+            copyBufferToImageTransferStage(cmd, staging, lensDirt_.image, kSize, kSize);
+        },
+        [&](VkCommandBuffer cmd) { transitionImageToShaderRead(cmd, lensDirt_.image); });
     vmaDestroyBuffer(ctx_.allocator, staging, stagingMemory);
     lensDirt_.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     return true;

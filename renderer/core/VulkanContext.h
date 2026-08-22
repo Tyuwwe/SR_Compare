@@ -22,10 +22,19 @@ struct VulkanContext {
     uint32_t graphicsQueueFamily = 0;
     VkQueue presentQueue = VK_NULL_HANDLE;
     uint32_t presentQueueFamily = 0;
+    // Dedicated transfer queue (family without GRAPHICS, prefer without
+    // COMPUTE — the DMA engine).  VK_NULL_HANDLE when the device has no such
+    // family; upload helpers then fall back to the graphics queue.
+    VkQueue transferQueue = VK_NULL_HANDLE;
+    uint32_t transferQueueFamily = 0;
     VkSurfaceKHR surface = VK_NULL_HANDLE;
 
     VkCommandPool oneShotPool = VK_NULL_HANDLE;  // one-time submits (upscalers)
     VkCommandPool framePool = VK_NULL_HANDLE;    // per-frame recording
+    // Transfer-family pool shared by submitUploadOneShot across threads;
+    // all pool access (alloc/record/free) is serialized through
+    // transferPoolMutex, queue submits through transferQueueMutex.
+    VkCommandPool transferPool = VK_NULL_HANDLE;
 
     // VMA allocator — all device memory owned by VkUtil helpers goes through
     // this instead of per-resource vkAllocateMemory (Bistro's texture count
@@ -44,6 +53,12 @@ struct VulkanContext {
     // thread while the main thread keeps rendering, so queue access needs
     // external synchronization; command pools stay per-thread instead.
     mutable std::mutex queueMutex;
+
+    // Same for the dedicated transfer queue and its shared command pool
+    // (submitUploadOneShot may run on the main thread, the texture streamer
+    // and the GUI load worker concurrently).
+    mutable std::mutex transferQueueMutex;
+    mutable std::mutex transferPoolMutex;
 
     VkPhysicalDeviceProperties properties{};
     VkPhysicalDeviceFeatures features{};

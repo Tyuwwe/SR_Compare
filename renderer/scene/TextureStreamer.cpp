@@ -62,7 +62,7 @@ bool uploadKtx2Levels(const VulkanContext& ctx, const Ktx2Image& img, VkImage im
     }
     vmaUnmapMemory(ctx.allocator, stagingMemory);
 
-    submitOneShot(
+    submitUploadOneShot(
         ctx,
         [&](VkCommandBuffer cmd) {
             imageBarrier(cmd, image, VK_IMAGE_LAYOUT_UNDEFINED,
@@ -72,6 +72,8 @@ bool uploadKtx2Levels(const VulkanContext& ctx, const Ktx2Image& img, VkImage im
                          static_cast<uint32_t>(regions.size()));
             vkCmdCopyBufferToImage(cmd, staging, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                                    static_cast<uint32_t>(regions.size()), regions.data());
+        },
+        [&](VkCommandBuffer cmd) {
             imageBarrier(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT,
                          VK_ACCESS_2_TRANSFER_WRITE_BIT, sync::kSampleStages,
@@ -198,6 +200,11 @@ void Scene::TextureStreamer::run() {
                 vmaMapMemory(ctx->allocator, stagingMemory, &mapped);
                 std::memcpy(mapped, bytes.data(), bytes.size());
                 vmaUnmapMemory(ctx->allocator, stagingMemory);
+                // Stays on the graphics queue: the SHADER_READ_ONLY ->
+                // TRANSFER_DST transition needs a shader-stage source scope
+                // (not legal in transfer-family barriers) and same-queue
+                // ordering against frames that may still sample the
+                // placeholder level.
                 submitOneShot(
                     *ctx,
                     [&](VkCommandBuffer cmd) {

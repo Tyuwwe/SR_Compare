@@ -76,9 +76,10 @@ bool uploadHdrImage(const VulkanContext& ctx, uint32_t w, uint32_t h, const uint
     vmaMapMemory(ctx.allocator, stagingMemory, &mapped);
     std::memcpy(mapped, data, static_cast<size_t>(size));
     vmaUnmapMemory(ctx.allocator, stagingMemory);
-    submitOneShot(ctx, [&](VkCommandBuffer cmd) {
-        copyBufferToImage(cmd, staging, image, w, h, kHdrFormat);
-    });
+    submitUploadOneShot(
+        ctx,
+        [&](VkCommandBuffer cmd) { copyBufferToImageTransferStage(cmd, staging, image, w, h); },
+        [&](VkCommandBuffer cmd) { transitionImageToShaderRead(cmd, image); });
     vmaDestroyBuffer(ctx.allocator, staging, stagingMemory);
     view = createImageView(ctx, image, kHdrFormat, VK_IMAGE_ASPECT_COLOR_BIT);
     return view != VK_NULL_HANDLE;

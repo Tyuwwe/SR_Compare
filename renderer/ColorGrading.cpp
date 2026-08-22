@@ -230,19 +230,24 @@ bool GradingLutGpu::create(const VulkanContext& ctx, const ColorLut& lut) {
     std::memcpy(mapped, pixels.data(), pixels.size() * sizeof(uint16_t));
     vmaUnmapMemory(ctx.allocator, stagingMemory);
 
-    submitOneShot(ctx, [&](VkCommandBuffer cmd) {
-        imageBarrier(cmd, image_, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                     VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE, sync::kCopy, sync::kTransferWrite);
-        VkBufferImageCopy region = {};
-        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        region.imageSubresource.layerCount = 1;
-        region.imageExtent = {n, n, n};
-        vkCmdCopyBufferToImage(cmd, staging, image_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
-                               &region);
-        imageBarrier(cmd, image_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kCopy, sync::kTransferWrite,
-                     sync::kSampleStages, sync::kSampled);
-    });
+    submitUploadOneShot(
+        ctx,
+        [&](VkCommandBuffer cmd) {
+            imageBarrier(cmd, image_, VK_IMAGE_LAYOUT_UNDEFINED,
+                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_NONE,
+                         VK_ACCESS_2_NONE, sync::kCopy, sync::kTransferWrite);
+            VkBufferImageCopy region = {};
+            region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            region.imageSubresource.layerCount = 1;
+            region.imageExtent = {n, n, n};
+            vkCmdCopyBufferToImage(cmd, staging, image_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+                                   &region);
+        },
+        [&](VkCommandBuffer cmd) {
+            imageBarrier(cmd, image_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kCopy,
+                         sync::kTransferWrite, sync::kSampleStages, sync::kSampled);
+        });
     vmaDestroyBuffer(ctx.allocator, staging, stagingMemory);
     return true;
 }
