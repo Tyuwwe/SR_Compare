@@ -2,6 +2,7 @@
 #extension GL_GOOGLE_include_directive : require
 #include "brdf.glsl"
 #include "ssr.glsl"
+#include "volfog.glsl"
 // GT-path transparency fragment shader: identical shading to transparent.frag
 // but only the blended color output (the GT path has no motion/mask targets).
 // Keep the bodies in sync.
@@ -63,6 +64,16 @@ layout(set = 2, binding = 4) uniform sampler2D ssaoTex;
 layout(set = 2, binding = 5) uniform sampler2DArrayShadow shadowMap; // CSM, comparison sampler
 layout(set = 2, binding = 6) uniform sampler2D ssrColor; // opaque HDR color mip chain (RGBA16F)
 layout(set = 2, binding = 7) uniform sampler2D ssrHiZ; // opaque depth pyramid (Hi-Z, R32F)
+// Ray-integrated froxel volume (same as transparent.frag — keep in sync).
+layout(set = 2, binding = 8) uniform sampler3D fogVolume;
+
+// Fragment-stage push block.  Member offsets in SPIR-V are ABSOLUTE within
+// the pipeline's push-constant memory, so params sits explicitly at byte 208,
+// right after the vertex-stage SkinnedScenePush range
+// (sizeof(SkinnedScenePush), see DeferredCore::createPipelines).
+layout(push_constant) uniform TransparentFogPush {
+    layout(offset = 208) vec4 params; // x = near, y = fog far, z = enabled (1/0), w unused
+} fogPc;
 
 layout(location = 0) in vec3 vWorldPos;
 layout(location = 1) in vec3 vNormal;
@@ -250,6 +261,16 @@ void main() {
 
     vec3 glassColor = (lightDiffuse + emissive + kd * diffuseIbl * ambientScale) * transmit +
                       lightSpecular + specSsr;
+
+    // Volumetric fog on translucency (same as transparent.frag — keep in
+    // sync): fog the glass contribution with the ray-integrated volume at the
+    // fragment's view depth; the background was fogged by volfog_composite.
+    if (fogPc.params.z > 0.5 && viewDepth > fogPc.params.x) {
+        const vec2 fuv = gl_FragCoord.xy / ubo.renderSizeJitter.xy;
+        const vec4 fog = texture(fogVolume, vec3(fuv, froxelW(viewDepth, fogPc.params.x,
+                                                              fogPc.params.y)));
+        glassColor = glassColor * fog.a + fog.rgb;
+    }
 
     outColor = vec4(glassColor, alpha);
 }

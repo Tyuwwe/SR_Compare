@@ -10,9 +10,9 @@
 // hazard).  Runs after the deferred lighting pass, before tonemapping.
 //
 // Only OPAQUE depth participates (the composite runs before the
-// transparency pass): alpha-blended surfaces are not fogged this phase —
-// documented Phase 5a limitation, matching the era's default of fogging
-// translucency in a separate path.
+// transparency pass): alpha-blended surfaces are fogged separately — the
+// transparency fragment shaders sample this same integrated volume at the
+// fragment's view depth (volumetric fog on translucency, matching UE4.16).
 //
 // Sky pixels (depth == 1) clamp to the fog far range, i.e. the fully
 // integrated column: the sky behind the fog is attenuated and tinted.

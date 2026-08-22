@@ -2,6 +2,7 @@
 #extension GL_GOOGLE_include_directive : require
 #include "brdf.glsl"
 #include "ssr.glsl"
+#include "volfog.glsl"
 // Forward transparency pass (upscaler input path).  Shades alpha-blended
 // surfaces (glass, bottles) with the same Cook-Torrance GGX + point lights +
 // IBL split-sum as the deferred lighting pass, combined through an
@@ -76,6 +77,19 @@ layout(set = 2, binding = 5) uniform sampler2DArrayShadow shadowMap; // CSM, com
 // captured before this pass writes color (SSR).
 layout(set = 2, binding = 6) uniform sampler2D ssrColor;
 layout(set = 2, binding = 7) uniform sampler2D ssrHiZ;
+// Ray-integrated froxel volume (rgba16f: rgb = inscatter, a = transmittance),
+// written by volfog_march this frame; when volumetric fog is off the host
+// binds a 1x1x1 identity volume (T=1, I=0) and fogPc.params.z gates the
+// sample.
+layout(set = 2, binding = 8) uniform sampler3D fogVolume;
+
+// Fragment-stage push block.  Member offsets in SPIR-V are ABSOLUTE within
+// the pipeline's push-constant memory, so params sits explicitly at byte 208,
+// right after the vertex-stage SkinnedScenePush range
+// (sizeof(SkinnedScenePush), see DeferredCore::createPipelines).
+layout(push_constant) uniform TransparentFogPush {
+    layout(offset = 208) vec4 params; // x = near, y = fog far, z = enabled (1/0), w unused
+} fogPc;
 
 layout(location = 0) in vec3 vWorldPos;
 layout(location = 1) in vec3 vNormal;
@@ -295,6 +309,20 @@ void main() {
     // (blend uses ONE, ONE_MINUS_SRC_ALPHA).
     vec3 glassColor = (lightDiffuse + emissive + kd * diffuseIbl * ambientScale) * transmit +
                       lightSpecular + specSsr;
+
+    // Volumetric fog on translucency (UE4.16 applies the same ray-integrated
+    // volume to translucent shading): the opaque background under this pixel
+    // was already fogged by volfog_composite (color * T + I at opaque depth),
+    // so fog the glass contribution itself at the fragment's view depth —
+    // otherwise unfogged panes read as dark/black cutouts floating on top of
+    // the fogged scene.  The background's near-segment inscatter ends up
+    // scaled by (1 - alpha); the era-standard approximation.
+    if (fogPc.params.z > 0.5 && viewDepth > fogPc.params.x) {
+        const vec2 fuv = gl_FragCoord.xy / ubo.renderSizeJitter.xy;
+        const vec4 fog = texture(fogVolume, vec3(fuv, froxelW(viewDepth, fogPc.params.x,
+                                                              fogPc.params.y)));
+        glassColor = glassColor * fog.a + fog.rgb;
+    }
 
     outColor = vec4(glassColor, alpha);
     outMotion = vMotion;

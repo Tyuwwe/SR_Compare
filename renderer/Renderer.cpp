@@ -590,7 +590,7 @@ bool Renderer::createSceneDescriptors() {
     sizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     sizes[0].descriptorCount = deferred::kMaxTextures + 4 + // texture array + present (image + bloom + dirt + lut)
                                14 * kFramesInFlight * 2 + // lighting sets (GB/GT), shadow + atlas + 2 probe arrays
-                               7 * kFramesInFlight * 2 +  // transparent sets (GB/GT), +SSR+shadow
+                               8 * kFramesInFlight * 2 +  // transparent sets (GB/GT), +SSR+shadow+fog volume
                                11 * kFramesInFlight * 2 + // opaque-SSR trace sets (GB/GT), +2 probe arrays
                                2 * 2 + 3 * 4 + 1 * 4 +     // ssao + temporal + blur samplers
                                3 * 4 +                     // ssr temporal samplers (GB/GT x2 sets)
@@ -941,10 +941,12 @@ bool Renderer::createSyncResources() {
             return false;
         deferred_.writeTransparentSet(ctx_, frames_[i].transparentSetGb, frames_[i].lightingUbo,
                                       gbAo_.view, shadowView, gbColorPyramid_.chainView,
-                                      gbPyramid_.chainView);
+                                      gbPyramid_.chainView,
+                                      volFogActive_ ? gbFog_.intView : VK_NULL_HANDLE);
         deferred_.writeTransparentSet(ctx_, frames_[i].transparentSetGt, frames_[i].lightingUbo,
                                       gtAo_.view, shadowView, gtColorPyramid_.chainView,
-                                      gtPyramid_.chainView);
+                                      gtPyramid_.chainView,
+                                      volFogActive_ ? gtFog_.intView : VK_NULL_HANDLE);
 
         // Per-path opaque-SSR sets (binding 0 reuses this frame's lighting UBO).
         const VkDescriptorSetLayout ssrLayout = deferred_.ssrSetLayout();
@@ -1893,7 +1895,9 @@ void Renderer::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
             deferred_.recordTransparentDraws(c, scene_, !gbuffer, fr.sceneSet, textureSet_,
                                              gbuffer ? fr.transparentSetGb : fr.transparentSetGt,
                                              materialStride_, sceneW, sceneH,
-                                             Mat4::multiply(proj, view), camera_.position);
+                                             Mat4::multiply(proj, view), camera_.position,
+                                             proj.m[14] / proj.m[10], fogParams_.maxDistance,
+                                             volFogActive_);
             vkCmdEndRendering(c);
         };
     }

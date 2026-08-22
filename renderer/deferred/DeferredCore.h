@@ -627,6 +627,17 @@ struct VolFogCompositePush {
 };
 static_assert(sizeof(VolFogCompositePush) == 16, "VolFogCompositePush size mismatch");
 
+// Fragment-stage push block of the transparency pipelines
+// (transparent.frag / transparent_gt.frag), appended AFTER the vertex-stage
+// SkinnedScenePush range (offset = sizeof(SkinnedScenePush)).  Carries the
+// froxel volume depth range so the shader can sample the ray-integrated
+// inscatter/transmittance at the fragment's view depth (volumetric fog on
+// translucency, Phase 5a fix).
+struct TransparentFogPush {
+    float params[4]; // x = near, y = fog far, z = enabled (1/0), w unused
+};
+static_assert(sizeof(TransparentFogPush) == 16, "TransparentFogPush size mismatch");
+
 // Host-owned froxel volume set, one per deferred render path (grid resolution
 // scales with the path resolution — same rule as ClusterGrid).  Five volumes:
 // the inject target (per-frame media properties), the raw lit volume (light
@@ -1069,19 +1080,27 @@ public:
     // (binding 5 left unwritten).  ssrColor is the chain view (all mips) of
     // this path's ColorPyramid and depthPyramid the chain view of its
     // DepthPyramid; ssr.glsl marches the latter and samples the former at a
-    // roughness-driven LOD.
+    // roughness-driven LOD.  fogVolume is the ray-integrated froxel volume of
+    // this path (binding 8); pass VK_NULL_HANDLE when volumetric fog is off —
+    // an internal identity volume (T=1, I=0) is bound instead so the
+    // descriptor is always valid, and the push-constant enable flag gates the
+    // sample.
     void writeTransparentSet(const VulkanContext& ctx, VkDescriptorSet set,
                              VkBuffer lightingUbo, VkImageView ssao, VkImageView shadow,
-                             VkImageView ssrColor, VkImageView depthPyramid) const;
+                             VkImageView ssrColor, VkImageView depthPyramid,
+                             VkImageView fogVolume) const;
     // Draws all BLEND-material instances back-to-front over the lit scene.
     // LR path (gtPass=false): 3 attachments = color (alpha blend) + motion
     // (overwrite) + reactive mask (additive).  GT path: color only.  The
     // caller begins/ends the rendering block and owns all layout transitions.
+    // fogNear/fogFar/fogOn feed the fragment-stage TransparentFogPush block
+    // (volumetric fog on translucency; ignored when fogOn is false).
     void recordTransparentDraws(VkCommandBuffer cmd, const Scene& scene, bool gtPass,
                                 VkDescriptorSet sceneSet, VkDescriptorSet textureSet,
                                 VkDescriptorSet transparentSet, uint32_t materialStride,
                                 uint32_t width, uint32_t height, const Mat4& cullViewProj,
-                                const Vec3& cameraPos) const;
+                                const Vec3& cameraPos, float fogNear, float fogFar,
+                                bool fogOn) const;
 
     const IblMaps& ibl() const { return ibl_; }
 
@@ -1585,6 +1604,12 @@ private:
     VkSampler shadowSampler_ = VK_NULL_HANDLE;
     VkSampler hizSampler_ = VK_NULL_HANDLE; // nearest + clamp (texelFetch pyramid reads)
     VkSampler colorPyramidSampler_ = VK_NULL_HANDLE; // trilinear + clamp (SSR roughness LOD reads)
+    // 1x1x1 identity froxel volume (T=1, I=0), GENERAL for life: fallback for
+    // the transparency set's binding 8 when volumetric fog is off, so the
+    // statically-used sampler always has a valid descriptor.
+    VkImage fogFallbackImage_ = VK_NULL_HANDLE;
+    VmaAllocation fogFallbackMemory_ = VK_NULL_HANDLE;
+    VkImageView fogFallbackView_ = VK_NULL_HANDLE;
 };
 
 } // namespace sr

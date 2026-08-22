@@ -159,6 +159,37 @@ bool DeferredCore::init(const VulkanContext& ctx, const char* envMapPath, const 
                                          VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, 0.f, 32.f);
     if (!textureSampler_ || !gbufferSampler_ || !hizSampler_ || !colorPyramidSampler_) return false;
 
+    // Identity froxel volume fallback (see the member comment in the header).
+    {
+        if (createImage3D(ctx, 1, 1, 1, kFroxelFormat,
+                          VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                          fogFallbackImage_, fogFallbackMemory_) != VK_SUCCESS)
+            return false;
+        fogFallbackView_ = createImageView(ctx, fogFallbackImage_, kFroxelFormat,
+                                           VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, VK_IMAGE_VIEW_TYPE_3D);
+        if (!fogFallbackView_) return false;
+        VkBuffer staging = VK_NULL_HANDLE;
+        VmaAllocation stagingMemory = VK_NULL_HANDLE;
+        if (createBuffer(ctx, 8, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                             VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                         staging, stagingMemory) != VK_SUCCESS)
+            return false;
+        void* mapped = nullptr;
+        if (vmaMapMemory(ctx.allocator, stagingMemory, &mapped) != VK_SUCCESS) return false;
+        const uint16_t identity[4] = {0, 0, 0, 0x3C00}; // half (0,0,0,1): I=0, T=1
+        std::memcpy(mapped, identity, sizeof(identity));
+        vmaUnmapMemory(ctx.allocator, stagingMemory);
+        submitOneShot(ctx, [&](VkCommandBuffer cmd) {
+            copyBufferToImageTransferStage(cmd, staging, fogFallbackImage_, 1, 1);
+            imageBarrier(cmd, fogFallbackImage_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                         VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_COPY_BIT,
+                         VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                         VK_ACCESS_2_SHADER_SAMPLED_READ_BIT, VK_IMAGE_ASPECT_COLOR_BIT, 0, 1);
+        });
+        vmaDestroyBuffer(ctx.allocator, staging, stagingMemory);
+    }
+
     // Depth comparison sampler for the CSM shadow map.  CLAMP_TO_BORDER with
     // an opaque-white border makes off-map reads compare as "lit" (beyond the
     // last cascade the sun is unshadowed).
@@ -341,13 +372,14 @@ bool DeferredCore::createLayouts(const VulkanContext& ctx) {
 
     // Transparency pass: binding 0 = LightingUBO; 1-3 = IBL; 4 = SSAO;
     // 5 = CSM shadow map; 6 = opaque HDR copy (SSR); 7 = opaque depth pyramid
-    // (Hi-Z, R32F, SSR hierarchical march).
-    VkDescriptorSetLayoutBinding transparentBindings[8] = {};
+    // (Hi-Z, R32F, SSR hierarchical march); 8 = ray-integrated froxel volume
+    // (volumetric fog on translucency; unwritten when fog is off).
+    VkDescriptorSetLayoutBinding transparentBindings[9] = {};
     transparentBindings[0].binding = 0;
     transparentBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     transparentBindings[0].descriptorCount = 1;
     transparentBindings[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-    for (uint32_t i = 1; i < 8; ++i) {
+    for (uint32_t i = 1; i < 9; ++i) {
         transparentBindings[i].binding = i;
         transparentBindings[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         transparentBindings[i].descriptorCount = 1;
@@ -355,7 +387,7 @@ bool DeferredCore::createLayouts(const VulkanContext& ctx) {
     }
     VkDescriptorSetLayoutCreateInfo transparentLayoutCi = {};
     transparentLayoutCi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    transparentLayoutCi.bindingCount = 8;
+    transparentLayoutCi.bindingCount = 9;
     transparentLayoutCi.pBindings = transparentBindings;
     if (vkCreateDescriptorSetLayout(ctx.device, &transparentLayoutCi, nullptr,
                                     &transparentSetLayout_) != VK_SUCCESS)
@@ -789,10 +821,13 @@ bool DeferredCore::createLayouts(const VulkanContext& ctx) {
 
 bool DeferredCore::createPipelines(const VulkanContext& ctx) {
     // The scene push range must cover the largest block: SkinnedScenePush
-    // (208 B).  Static draws push fewer bytes, which is always legal.
-    if (ctx.properties.limits.maxPushConstantsSize < sizeof(SkinnedScenePush)) {
+    // (208 B).  Static draws push fewer bytes, which is always legal.  The
+    // transparency pipelines append a 16 B fragment-stage block
+    // (TransparentFogPush) after it, hence the + sizeof(TransparentFogPush).
+    constexpr size_t kMaxPushBytes = sizeof(SkinnedScenePush) + sizeof(TransparentFogPush);
+    if (ctx.properties.limits.maxPushConstantsSize < kMaxPushBytes) {
         std::fprintf(stderr, "device maxPushConstantsSize=%u < %zu\n",
-                     ctx.properties.limits.maxPushConstantsSize, sizeof(SkinnedScenePush));
+                     ctx.properties.limits.maxPushConstantsSize, kMaxPushBytes);
         return false;
     }
 
@@ -1033,12 +1068,19 @@ bool DeferredCore::createPipelines(const VulkanContext& ctx) {
     // --- Transparency pass ---------------------------------------------------
     VkDescriptorSetLayout transparentLayouts[3] = {sceneSetLayout_, textureSetLayout_,
                                                    transparentSetLayout_};
+    // Second range: fragment-stage TransparentFogPush (volumetric fog on
+    // translucency), appended after the vertex-stage SkinnedScenePush range.
+    VkPushConstantRange transparentPushRanges[2] = {};
+    transparentPushRanges[0] = pushRange;
+    transparentPushRanges[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    transparentPushRanges[1].offset = sizeof(SkinnedScenePush);
+    transparentPushRanges[1].size = sizeof(TransparentFogPush);
     VkPipelineLayoutCreateInfo transparentLayoutCi = {};
     transparentLayoutCi.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     transparentLayoutCi.setLayoutCount = 3;
     transparentLayoutCi.pSetLayouts = transparentLayouts;
-    transparentLayoutCi.pushConstantRangeCount = 1;
-    transparentLayoutCi.pPushConstantRanges = &pushRange;
+    transparentLayoutCi.pushConstantRangeCount = 2;
+    transparentLayoutCi.pPushConstantRanges = transparentPushRanges;
     if (vkCreatePipelineLayout(ctx.device, &transparentLayoutCi, nullptr,
                                &transparentPipelineLayout_) != VK_SUCCESS)
         return false;
@@ -1733,6 +1775,8 @@ void DeferredCore::destroy(const VulkanContext& ctx) {
     if (shadowSampler_) { vkDestroySampler(ctx.device, shadowSampler_, nullptr); shadowSampler_ = VK_NULL_HANDLE; }
     if (hizSampler_) { vkDestroySampler(ctx.device, hizSampler_, nullptr); hizSampler_ = VK_NULL_HANDLE; }
     if (colorPyramidSampler_) { vkDestroySampler(ctx.device, colorPyramidSampler_, nullptr); colorPyramidSampler_ = VK_NULL_HANDLE; }
+    if (fogFallbackView_) { vkDestroyImageView(ctx.device, fogFallbackView_, nullptr); fogFallbackView_ = VK_NULL_HANDLE; }
+    if (fogFallbackImage_) { vmaDestroyImage(ctx.allocator, fogFallbackImage_, fogFallbackMemory_); fogFallbackImage_ = VK_NULL_HANDLE; fogFallbackMemory_ = VK_NULL_HANDLE; }
     ibl_.destroy(ctx);
     sky_.destroy(ctx);
     probes_.destroy(ctx);
@@ -2693,7 +2737,7 @@ bool DeferredCore::sceneHasTransparency(const Scene& scene) const {
 void DeferredCore::writeTransparentSet(const VulkanContext& ctx, VkDescriptorSet set,
                                        VkBuffer lightingUbo, VkImageView ssao,
                                        VkImageView shadow, VkImageView ssrColor,
-                                       VkImageView depthPyramid) const {
+                                       VkImageView depthPyramid, VkImageView fogVolume) const {
     VkDescriptorBufferInfo lightBuf = {};
     lightBuf.buffer = lightingUbo;
     lightBuf.offset = 0;
@@ -2721,15 +2765,22 @@ void DeferredCore::writeTransparentSet(const VulkanContext& ctx, VkDescriptorSet
     img[6].sampler = hizSampler_;
     img[6].imageView = depthPyramid;
     img[6].imageLayout = VK_IMAGE_LAYOUT_GENERAL; // pyramid lives in GENERAL
+    VkDescriptorImageInfo fogImg = {};
+    fogImg.sampler = gbufferSampler_; // trilinear, same as the fog composite
+    // Always a valid view (validation treats the sampler as statically used
+    // even behind the runtime enable gate): identity volume when fog is off.
+    fogImg.imageView = fogVolume ? fogVolume : fogFallbackView_;
+    fogImg.imageLayout = VK_IMAGE_LAYOUT_GENERAL; // froxel volumes are GENERAL for life
 
-    VkWriteDescriptorSet w[8] = {};
+    VkWriteDescriptorSet w[9] = {};
     w[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     w[0].dstSet = set;
     w[0].dstBinding = 0;
     w[0].descriptorCount = 1;
     w[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     w[0].pBufferInfo = &lightBuf;
-    // Bindings 1-4 always; 5 (shadow) skipped if no map; 6-7 SSR always.
+    // Bindings 1-4 always; 5 (shadow) skipped if no map; 6-7 SSR always;
+    // 8 (froxel fog volume / identity fallback) always.
     uint32_t n = 1;
     for (uint32_t k = 0; k < 4; ++k) {
         w[n].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -2758,6 +2809,13 @@ void DeferredCore::writeTransparentSet(const VulkanContext& ctx, VkDescriptorSet
         w[n].pImageInfo = &img[5 + k];
         ++n;
     }
+    w[n].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    w[n].dstSet = set;
+    w[n].dstBinding = 8;
+    w[n].descriptorCount = 1;
+    w[n].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    w[n].pImageInfo = &fogImg;
+    ++n;
     vkUpdateDescriptorSets(ctx.device, n, w, 0, nullptr);
 }
 
@@ -3834,6 +3892,11 @@ void DeferredCore::recordVolFogComposite(VkCommandBuffer cmd, const VolFogVolume
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, volfogCompositePipelineLayout_,
                             0, 1, &fog.compositeSet, 0, nullptr);
     vkCmdDispatch(cmd, (width + 7) / 8, (height + 7) / 8, 1);
+    // The transparency pass (fragment stage) samples the same integrated
+    // volume later this frame; order this pass's reads before those.
+    imageBarrier(cmd, fog.intImage, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+                 sync::kCompute, sync::kSampled, sync::kFragment, sync::kSampled,
+                 VK_IMAGE_ASPECT_COLOR_BIT, 0, 1);
 }
 
 // --- Bloom pyramid (Phase 6a) --------------------------------------------------
@@ -4532,7 +4595,8 @@ void DeferredCore::recordTransparentDraws(VkCommandBuffer cmd, const Scene& scen
                                           VkDescriptorSet sceneSet, VkDescriptorSet textureSet,
                                           VkDescriptorSet transparentSet, uint32_t materialStride,
                                           uint32_t width, uint32_t height,
-                                          const Mat4& cullViewProj, const Vec3& cameraPos) const {
+                                          const Mat4& cullViewProj, const Vec3& cameraPos,
+                                          float fogNear, float fogFar, bool fogOn) const {
     // Collect visible BLEND instances, sorted back-to-front by AABB center.
     const Frustum frustum = extractFrustum(cullViewProj);
     std::vector<uint32_t> order;
@@ -4557,6 +4621,15 @@ void DeferredCore::recordTransparentDraws(VkCommandBuffer cmd, const Scene& scen
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
                       gtPass ? transparentGtPipeline_ : transparentPipeline_);
+    // Volumetric fog on translucency: fragment-stage range appended after the
+    // vertex-stage SkinnedScenePush range.  When fog is off the shader never
+    // samples the (unwritten) volume binding.
+    TransparentFogPush fogPush = {};
+    fogPush.params[0] = fogNear;
+    fogPush.params[1] = fogFar;
+    fogPush.params[2] = fogOn ? 1.f : 0.f;
+    vkCmdPushConstants(cmd, transparentPipelineLayout_, VK_SHADER_STAGE_FRAGMENT_BIT,
+                       sizeof(SkinnedScenePush), sizeof(fogPush), &fogPush);
     VkViewport viewport = {0.f, 0.f, static_cast<float>(width), static_cast<float>(height), 0.f, 1.f};
     vkCmdSetViewport(cmd, 0, 1, &viewport);
     VkRect2D scissor = {{0, 0}, {width, height}};
