@@ -74,9 +74,11 @@ layout(set = 0, binding = 9) uniform sampler2D ssrHiZ;   // max-reduced depth py
 layout(set = 0, binding = 10, rgba16f) uniform writeonly image2D ssrOut; // trace target
 
 // The path's view-projection (jittered for the LR path), matching the GBuffer
-// pass; the inverse ships in the lighting UBO.
+// pass; the inverse ships in the lighting UBO.  params.x is the global SSR
+// weight scale (CLI --ssr-strength / GUI slider).
 layout(push_constant) uniform SsrPush {
     mat4 viewProj;
+    vec4 params;
 } push;
 
 void main() {
@@ -135,7 +137,19 @@ void main() {
     const vec4 ssr = traceSsr(ssrColor, textureQueryLevels(ssrColor), ssrHiZ,
                               textureQueryLevels(ssrHiZ), push.viewProj, u.invViewProj,
                               u.cameraPos.xyz, wp.xyz, N, R, roughness, renderSize);
-    const float conf = clamp(ssr.a, 0.0, 1.0);
+    // Weight shaping, both applied to the hit confidence (so the temporal EMA
+    // filters the scaled value and the miss path stays exactly 0):
+    //  - params.x: global strength scale (default 0.6).  A single
+    //    deterministic ray + box-mip lookup over-covers the true GGX lobe
+    //    integral, which reads as a greasy / wet-film sheen once it replaces
+    //    the IBL term at full weight; scaling down leans on the fallback.
+    //  - roughness fade: past ~0.5 perceptual roughness the lobe is wide
+    //    enough that the prefiltered probe/env chain is the better
+    //    approximation, so the SSR weight rolls off and reaches 0 at 0.85
+    //    (2020 engines cap SSR roughness the same way).  Rough ground then
+    //    belongs to IBL instead of showing the marched colour film.
+    const float roughFade = 1.0 - smoothstep(0.5, 0.85, roughness);
+    const float conf = clamp(ssr.a, 0.0, 1.0) * push.params.x * roughFade;
     if (conf <= 0.0) {
         // Miss: zero delta keeps the IBL specular term; the valid view |z|
         // lets the temporal pass fade a stale hit out over the EMA window.

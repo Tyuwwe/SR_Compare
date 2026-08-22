@@ -68,6 +68,15 @@ inline bool parseRenderScale(const char* s, float& out) {
     return true;
 }
 
+// Unit-interval scalar (global effect weight, e.g. --ssr-strength).  NaN is
+// rejected via !(v >= 0).
+inline bool parseUnitInterval(const char* s, float& out) {
+    const float v = static_cast<float>(std::atof(s));
+    if (!(v >= 0.0f) || v > 1.0f) return false;
+    out = v;
+    return true;
+}
+
 // DOF tuning (Phase 6b).  Focus distance in metres, >= 0 (0 = auto-focus on
 // the screen-centre texel); f-stop in [0.5, 64]; max bokeh radius in [1, 64]
 // display px at 1080p.  NaN is rejected via !(v >= ...).

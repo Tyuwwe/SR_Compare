@@ -48,7 +48,12 @@ struct CompareOptions {
     // present pass).  CLI: --no-lens-fx.  Lens dirt is viewer-only (the
     // compare paths have no HDR bloom chain for it to modulate).
     bool lensFx = true;
-    bool ssr = true;                    // opaque screen-space reflections (CLI: --no-ssr)
+    // Opaque screen-space reflections; off by default (probes/env fallback),
+    // CLI: --ssr opts in, --no-ssr accepted for compatibility.
+    bool ssr = false;
+    // Global SSR weight scale applied to the hit confidence (CLI:
+    // --ssr-strength 0..1); below 1 the composite leans on the IBL fallback.
+    float ssrStrength = 0.6f;
     // Screen-space contact shadows for the CSM sun (CLI: --no-contact-shadows);
     // needs shadows on (rides the CSM sun selection).
     bool contactShadows = true;

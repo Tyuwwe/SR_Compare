@@ -27,7 +27,9 @@ void printCompareUsage() {
                  "  --metric-interval <N>          frames between metric readbacks (default 15)\n"
                  "  --gt-ssaa                      GT rendered at 2x, downsampled to output res\n"
                  "  --no-shadows                   disable CSM sun shadows\n"
-                 "  --no-ssr                       disable opaque screen-space reflections\n"
+                 "  --ssr                          enable opaque screen-space reflections (default off;\n"
+                 "                               --no-ssr accepted for compatibility)\n"
+                 "  --ssr-strength <0..1>          global SSR weight scale (default 0.6)\n"
                  "  --no-contact-shadows           disable screen-space contact shadows (sun)\n"
                  "  --no-volfog                    disable froxel volumetric fog\n"
                  "  --motion-blur                  enable motion blur (default off, all paths;\n"
@@ -88,8 +90,15 @@ int runCompareMode(int argc, char** argv) {
             opts.gtSsaa = true;
         } else if (a == "--no-shadows") {
             opts.shadows = false;
+        } else if (a == "--ssr") {
+            opts.ssr = true;
         } else if (a == "--no-ssr") {
             opts.ssr = false;
+        } else if (a == "--ssr-strength") {
+            if (!parseUnitInterval(nextArg(i, argc, argv, "--ssr-strength"), opts.ssrStrength)) {
+                std::fprintf(stderr, "invalid --ssr-strength value\n");
+                return 1;
+            }
         } else if (a == "--no-contact-shadows") {
             opts.contactShadows = false;
         } else if (a == "--no-volfog") {

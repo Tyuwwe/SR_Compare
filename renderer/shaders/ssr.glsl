@@ -230,23 +230,28 @@ vec4 traceSsr(sampler2D colorTex, int colorMipCount, sampler2D hizTex, int hizMi
 
     // Roughness → mip LOD: each chain level doubles the footprint of the 2x2
     // box average, approximating a reflection cone whose aperture grows with
-    // the GGX lobe.  A linear mapping in perceptual roughness (the material
-    // parameter IS perceptual roughness; GGX alpha = r²) matches how the
-    // split-sum IBL path picks its prefilter LOD, and trilinear sampling
-    // between levels keeps the blur free of banding.  This is the standard
-    // "colour mip chain" half of stochastic-free SSR (UE samples its blurred
-    // scene-colour pyramid the same way once denoising is skipped).
+    // the GGX lobe.  The mapping is NONLINEAR (perceptual roughness squared,
+    // i.e. linear in GGX alpha) and capped two levels short of the chain tail:
+    // the last box-filter levels are only a handful of texels (the tail ends
+    // near 1x1), and sampling them overlays the reflection with stacked
+    // square blobs — the "blocky reflection" artifact on mid/high-roughness
+    // and grazing pixels.  Trilinear sampling between levels keeps the blur
+    // free of banding.  This remains the standard "colour mip chain" half of
+    // stochastic-free SSR (UE samples its blurred scene-colour pyramid the
+    // same way once denoising is skipped).
     //
     // Grazing term: at |R·N| → 0 the ray runs nearly parallel to the surface,
     // so a one-texel hit-position step spans metres of surface and the marched
     // hit point (hence the sampled colour) is far less stable frame to frame
     // than the roughness footprint alone implies — the dominant SSR flicker
-    // source on ground planes.  Widening the cone by (1-|R·N|)² (up to +1.25
-    // LOD at exact grazing, 0 head-on) pulls those samples from a coarser,
+    // source on ground planes.  Widening the cone by (1-|R·N|)² (up to +1 LOD
+    // at exact grazing, 0 head-on) pulls those samples from a coarser,
     // temporally stable average; head-on mirror reflections are untouched.
-    const float lod = min(roughness * float(colorMipCount - 1) +
-                              (1.0 - grazing) * (1.0 - grazing) * 1.25,
-                          float(colorMipCount - 1));
+    // The cap applies to the SUM, so grazing rough pixels can no longer reach
+    // the blocky chain tail either.
+    const float maxLod = float(max(colorMipCount - 3, 1));
+    const float graze = 1.0 - grazing;
+    const float lod = min(roughness * roughness * maxLod + graze * graze, maxLod);
     vec3 col = textureLod(colorTex, hitUv, lod).rgb;
     // UE tames fireflies with rcp(1+lum) because SSSR is stochastic; this
     // path is a single ray and the mip chain already averages out the hot

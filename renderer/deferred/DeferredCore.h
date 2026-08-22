@@ -554,13 +554,16 @@ struct ColorPyramid {
 };
 
 // Push constants of the opaque SSR pass (ssr_opaque.comp): the path's
-// view-projection (jittered for the LR path).  Everything else the marcher
-// needs (invViewProj, cameraPos, iblParams) comes from the bound LightingUBO
-// prefix, so no second UBO per path is required.
+// view-projection (jittered for the LR path) plus params (x = global SSR
+// weight scale, multiplied into the hit confidence before the delta is
+// written).  Everything else the marcher needs (invViewProj, cameraPos,
+// iblParams) comes from the bound LightingUBO prefix, so no second UBO per
+// path is required.
 struct SsrPush {
     float viewProj[16];
+    float params[4]; // x = strength (0..1); y/z/w unused
 };
-static_assert(sizeof(SsrPush) == 64, "SsrPush size mismatch");
+static_assert(sizeof(SsrPush) == 80, "SsrPush size mismatch");
 
 // --- Froxel volumetric fog (Phase 5a) ----------------------------------------
 // Frostbite 2015 unified participating media (Hillaire, "Physically Based
@@ -1308,12 +1311,13 @@ public:
                      VkImageView depth, VkImageView ssao, VkImageView ssrColor,
                      VkImageView depthPyramid, VkImageView ssrTraceOut) const;
     // Dispatches ssr_opaque.comp (trace stage).  viewProj must be the exact
-    // view-projection of this path's GBuffer pass (jittered for LR).  The
-    // caller owns all layout transitions: the trace target in GENERAL on
+    // view-projection of this path's GBuffer pass (jittered for LR).
+    // strength is the global SSR weight scale (0..1) pushed into params.x.
+    // The caller owns all layout transitions: the trace target in GENERAL on
     // entry, the GBuffer + SSAO textures shader-readable by compute, both
     // pyramids already rebuilt.
     void recordSsrPass(VkCommandBuffer cmd, VkDescriptorSet ssrSet, const Mat4& viewProj,
-                       uint32_t width, uint32_t height) const;
+                       uint32_t width, uint32_t height, float strength) const;
     // Temporal accumulation state (host-owned; see SsrHistory).  Creates the
     // two RGBA16F ping-pong images (GENERAL for life); descriptor sets are
     // written by writeSsrHistorySets once the host's pool exists.

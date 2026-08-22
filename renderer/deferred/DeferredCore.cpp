@@ -3479,12 +3479,15 @@ void DeferredCore::writeSsrSet(const VulkanContext& ctx, VkDescriptorSet set,
 }
 
 void DeferredCore::recordSsrPass(VkCommandBuffer cmd, VkDescriptorSet ssrSet,
-                                 const Mat4& viewProj, uint32_t width, uint32_t height) const {
+                                 const Mat4& viewProj, uint32_t width, uint32_t height,
+                                 float strength) const {
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ssrPipeline_);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ssrPipelineLayout_, 0, 1,
                             &ssrSet, 0, nullptr);
     SsrPush push;
     std::memcpy(push.viewProj, viewProj.m, sizeof(push.viewProj));
+    push.params[0] = strength;
+    push.params[1] = push.params[2] = push.params[3] = 0.0f;
     vkCmdPushConstants(cmd, ssrPipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push),
                        &push);
     vkCmdDispatch(cmd, (width + 7) / 8, (height + 7) / 8, 1);

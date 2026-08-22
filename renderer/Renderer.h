@@ -59,7 +59,14 @@ struct RendererOptions {
     // in HDR, vignette + film grain in display domain; CLI: --no-lens-fx).
     // Strengths are the shared DeferredCore defaults (kLens*Strength).
     bool lensFx = true;
-    bool ssr = true;          // opaque screen-space reflections (CLI: --no-ssr)
+    // Opaque screen-space reflections.  Off by default in every mode (the
+    // reflection fallback chain — baked probes → global env — carries the
+    // specular term); CLI: --ssr opts in, --no-ssr accepted for compatibility.
+    bool ssr = false;
+    // Global SSR weight scale, multiplied into the hit confidence at the
+    // trace stage (CLI: --ssr-strength 0..1).  Below 1 the composite leans on
+    // the IBL fallback, taming the greasy full-strength look on rough ground.
+    float ssrStrength = 0.6f;
     // Screen-space contact shadows for the CSM sun (CLI: --no-contact-shadows);
     // needs shadows on (rides the CSM sun selection).
     bool contactShadows = true;

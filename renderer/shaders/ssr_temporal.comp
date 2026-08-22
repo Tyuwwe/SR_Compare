@@ -170,7 +170,19 @@ void main() {
                 const vec3 dev = abs(hist - histClip);
                 const vec3 staleV = clamp(dev / (sigma + 1e-4), 0.0, 1.0);
                 const float stale = max(staleV.r, max(staleV.g, staleV.b));
-                delta = mix(histClip, cur.rgb, max(pc.params.x, stale));
+                // Miss hold: when the current trace misses outright
+                // (cur == 0, e.g. a large occluder crossing the ray for one
+                // frame) halve the EMA weight so the accumulated reflection
+                // decays over ~2 windows instead of dropping 8% on the spot —
+                // hit/miss alternation otherwise reads as luminance flicker
+                // on moving objects.  Genuinely stale content still trips the
+                // staleness override (the neighbourhood collapses to ~0 and
+                // the history lands far outside the clip box), so this only
+                // slows the fade where the pixel's surroundings still
+                // reflect.
+                const bool miss = dot(cur.rgb, cur.rgb) < 1e-12;
+                const float blend = miss ? pc.params.x * 0.5 : pc.params.x;
+                delta = mix(histClip, cur.rgb, max(blend, stale));
             }
         }
     }

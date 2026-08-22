@@ -38,7 +38,8 @@ its performance numbers are not representative of real hardware.
   (`--no-contact-shadows`)
 - SSR: full-screen opaque Hi-Z cone march sampling the color mip by roughness,
   energy-conserving replacement of the IBL specular term, temporal EMA
-  accumulation (`--no-ssr`).  Reflection fallback chain: SSR → baked local
+  accumulation (off by default; `--ssr` enables, `--ssr-strength <0..1>`
+  scales the weight, default 0.6).  Reflection fallback chain: SSR → baked local
   probes (box projection, two-probe blending; bake with `--bake-probes`) → env
 - GTAO (XeGTAO-style depth-mip sampling + temporal accumulation; Jimenez 2016
   3 slices × 3 steps/side + 5×5 depth-aware denoise)
@@ -122,7 +123,10 @@ full text):
 --sun-elev / --sun-az <deg>   override the preset sun direction
 --exposure <f>       manual display exposure (disables auto exposure)
 --no-shadows / --shadow-debug / --no-contact-shadows
---no-ssr             disable opaque screen-space reflections
+--ssr / --ssr-strength <0..1>
+                     enable opaque screen-space reflections (default off in every
+                     mode; --no-ssr accepted for compatibility) and scale their
+                     weight (default 0.6)
 --no-volfog          disable froxel volumetric fog
 --no-bloom / --no-lens-fx
 --motion-blur / --dof

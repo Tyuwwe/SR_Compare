@@ -1869,7 +1869,8 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                 transition(gbSsrTrace_.image, gbSsrTraceLayout_, VK_IMAGE_LAYOUT_GENERAL,
                            sync::kCompute, sync::kSampled, sync::kCompute, sync::kStorageWrite,
                            VK_IMAGE_ASPECT_COLOR_BIT);
-                deferred_.recordSsrPass(cmd, ssrSet, ssaoViewProj, renderWidth_, renderHeight_);
+                deferred_.recordSsrPass(cmd, ssrSet, ssaoViewProj, renderWidth_, renderHeight_,
+                                      opts_.ssrStrength);
                 transition(gbSsrTrace_.image, gbSsrTraceLayout_,
                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kCompute,
                            sync::kStorageWrite, sync::kCompute, sync::kSampled,
@@ -2238,7 +2239,8 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                 transition(gtSsaaSsrTrace_.image, gtSsaaSsrTraceLayout_, VK_IMAGE_LAYOUT_GENERAL,
                            sync::kCompute, sync::kSampled, sync::kCompute,
                            sync::kStorageWrite, VK_IMAGE_ASPECT_COLOR_BIT);
-                deferred_.recordSsrPass(cmd, fr.ssrSetSsaa, cullViewProj, sw, sh);
+                deferred_.recordSsrPass(cmd, fr.ssrSetSsaa, cullViewProj, sw, sh,
+                                      opts_.ssrStrength);
                 transition(gtSsaaSsrTrace_.image, gtSsaaSsrTraceLayout_,
                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kCompute,
                            sync::kStorageWrite, sync::kCompute, sync::kSampled,
@@ -2462,7 +2464,8 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                 transition(gtSsrTrace_.image, gtSsrTraceLayout_, VK_IMAGE_LAYOUT_GENERAL,
                            sync::kCompute, sync::kSampled, sync::kCompute,
                            sync::kStorageWrite, VK_IMAGE_ASPECT_COLOR_BIT);
-                deferred_.recordSsrPass(cmd, fr.ssrSetGt, cullViewProj, dw, dh);
+                deferred_.recordSsrPass(cmd, fr.ssrSetGt, cullViewProj, dw, dh,
+                                      opts_.ssrStrength);
                 transition(gtSsrTrace_.image, gtSsrTraceLayout_,
                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kCompute,
                            sync::kStorageWrite, sync::kCompute, sync::kSampled,

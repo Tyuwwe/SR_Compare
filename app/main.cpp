@@ -50,7 +50,9 @@ void printUsage() {
                  "  --exposure <f>                   manual display exposure (disables auto exposure)\n"
                  "  --no-bloom                       disable HDR bloom\n"
                  "  --no-lens-fx                     disable the present lens chain (CA/dirt/vignette/grain)\n"
-                 "  --no-ssr                         disable opaque screen-space reflections\n"
+                 "  --ssr                            enable opaque screen-space reflections (default off;\n"
+                 "                                 --no-ssr accepted for compatibility)\n"
+                 "  --ssr-strength <0..1>            global SSR weight scale (default 0.6)\n"
                  "  --no-contact-shadows             disable screen-space contact shadows (sun)\n"
                  "  --no-volfog                      disable froxel volumetric fog\n"
                  "  --motion-blur                    enable HDR motion blur (McGuire 2012 tile-max gather;\n"
@@ -135,8 +137,16 @@ int runViewer(int argc, char** argv) {
             opts.bloom = false;
         } else if (a == "--no-lens-fx") {
             opts.lensFx = false;
+        } else if (a == "--ssr") {
+            opts.ssr = true;
         } else if (a == "--no-ssr") {
             opts.ssr = false;
+        } else if (a == "--ssr-strength") {
+            if (!sr::parseUnitInterval(sr::nextArg(i, argc, argv, "--ssr-strength"),
+                                       opts.ssrStrength)) {
+                std::fprintf(stderr, "invalid --ssr-strength value\n");
+                return 1;
+            }
         } else if (a == "--no-contact-shadows") {
             opts.contactShadows = false;
         } else if (a == "--no-volfog") {

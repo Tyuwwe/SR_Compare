@@ -1865,7 +1865,7 @@ void Renderer::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                          sync::kStorageWrite);
                 p.record = [&](VkCommandBuffer c) {
                     deferred_.recordSsrPass(c, gbuffer ? fr.ssrSetGb : fr.ssrSetGt, viewProjUsed,
-                                            sceneW, sceneH);
+                                            sceneW, sceneH, opts_.ssrStrength);
                 };
             }
             // Value captures: the lambda runs at execute() time, after the

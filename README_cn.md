@@ -30,7 +30,8 @@ Arm NSS 在 PC 上经 Vulkan ML Emulation Layer 软件模拟推理，性能数�
   阴影 atlas（4096²，16 × 1024² tile，逐帧按重要性选灯）、太阳屏幕空间接触阴影
   （`--no-contact-shadows`）
 - SSR：全屏不透明 Hi-Z 锥体步进，按 roughness 采颜色 mip，能量守恒地替换 IBL
-  specular 项，temporal EMA 累积（`--no-ssr`）。反射回退链：SSR → 烘焙局部反射
+  specular 项，temporal EMA 累积（默认关；`--ssr` 开启，`--ssr-strength <0..1>`
+  缩放强度，默认 0.6）。反射回退链：SSR → 烘焙局部反射
   探针（box projection、双探针混合；`--bake-probes` 离线烘焙）→ env
 - GTAO（XeGTAO 风格深度 mip 采样 + temporal 累积；Jimenez 2016 3 切片 ×
   每侧 3 步 + 5×5 深度双边滤波）
@@ -98,7 +99,9 @@ sr_compare viewer --list-upscalers
 --sun-elev / --sun-az <deg>   覆盖预设太阳方向
 --exposure <f>       手动显示曝光（关闭自动曝光）
 --no-shadows / --shadow-debug / --no-contact-shadows
---no-ssr             关闭不透明 SSR
+--ssr / --ssr-strength <0..1>
+                     打开不透明 SSR（所有模式默认关；--no-ssr 保留兼容旧脚本）
+                     并缩放其强度（默认 0.6）
 --no-volfog          关闭 froxel 体积雾
 --no-bloom / --no-lens-fx
 --motion-blur / --dof

@@ -513,7 +513,10 @@ private:
     // shadows on — rides the CSM sun selection).
     bool contactShadowsEnabled_ = true;
     // Opaque screen-space reflections (per-frame pass skip, no rebuild).
-    bool ssrEnabled_ = true;
+    // Off by default — the probe/env fallback carries the specular term.
+    bool ssrEnabled_ = false;
+    // Global SSR weight scale (trace-stage confidence multiplier, 0..1).
+    float ssrStrength_ = 0.6f;
     // Froxel volumetric fog (per-frame pass skip; params from the scene
     // lighting preset, toggling resets the temporal history).
     bool volFogEnabled_ = true;

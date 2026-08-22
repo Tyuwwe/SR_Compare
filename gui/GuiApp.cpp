@@ -3513,7 +3513,8 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                 transition(gbSsrTrace_.image, gbSsrTraceLayout_, VK_IMAGE_LAYOUT_GENERAL,
                            sync::kCompute, sync::kSampled, sync::kCompute,
                            sync::kStorageWrite, VK_IMAGE_ASPECT_COLOR_BIT);
-                deferred_.recordSsrPass(cmd, ssrSet, ssaoViewProj, renderWidth_, renderHeight_);
+                deferred_.recordSsrPass(cmd, ssrSet, ssaoViewProj, renderWidth_, renderHeight_,
+                                      ssrStrength_);
                 transition(gbSsrTrace_.image, gbSsrTraceLayout_,
                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kCompute,
                            sync::kStorageWrite, sync::kCompute, sync::kSampled,
@@ -3883,7 +3884,7 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                 transition(gtSsaaSsrTrace_.image, gtSsaaSsrTraceLayout_, VK_IMAGE_LAYOUT_GENERAL,
                            sync::kCompute, sync::kSampled, sync::kCompute,
                            sync::kStorageWrite, VK_IMAGE_ASPECT_COLOR_BIT);
-                deferred_.recordSsrPass(cmd, fr.ssrSetSsaa, cullViewProjGt, sw, sh);
+                deferred_.recordSsrPass(cmd, fr.ssrSetSsaa, cullViewProjGt, sw, sh, ssrStrength_);
                 transition(gtSsaaSsrTrace_.image, gtSsaaSsrTraceLayout_,
                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kCompute,
                            sync::kStorageWrite, sync::kCompute, sync::kSampled,
@@ -4109,7 +4110,7 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                 transition(gtSsrTrace_.image, gtSsrTraceLayout_, VK_IMAGE_LAYOUT_GENERAL,
                            sync::kCompute, sync::kSampled, sync::kCompute,
                            sync::kStorageWrite, VK_IMAGE_ASPECT_COLOR_BIT);
-                deferred_.recordSsrPass(cmd, fr.ssrSetGt, cullViewProjGt, gtW, gtH);
+                deferred_.recordSsrPass(cmd, fr.ssrSetGt, cullViewProjGt, gtW, gtH, ssrStrength_);
                 transition(gtSsrTrace_.image, gtSsrTraceLayout_,
                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kCompute,
                            sync::kStorageWrite, sync::kCompute, sync::kSampled,
@@ -5210,6 +5211,11 @@ void GuiApp::drawViewerTab() {
     if (!shadowsActive_) ImGui::EndDisabled();
     // Opaque SSR: per-frame pass skip (no rebuild), all deferred paths.
     ImGui::Checkbox("ssr (opaque)", &ssrEnabled_);
+    if (!ssrEnabled_) ImGui::BeginDisabled();
+    // Global SSR weight: scales the trace-stage hit confidence; below 1 the
+    // composite leans on the IBL fallback (rough ground reads less greasy).
+    ImGui::SliderFloat("ssr strength", &ssrStrength_, 0.f, 1.f, "%.2f");
+    if (!ssrEnabled_) ImGui::EndDisabled();
     // Froxel volumetric fog: per-frame pass skip; re-enabling restarts the
     // temporal history so stale frames do not bleed in.
     if (!fogParams_.enabled || gbFog_.injectImage == VK_NULL_HANDLE) ImGui::BeginDisabled();
