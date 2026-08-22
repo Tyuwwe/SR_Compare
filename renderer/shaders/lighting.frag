@@ -228,12 +228,22 @@ float spotShadow(int tile, vec3 worldPos) {
 // is small, so the Hi-Z cell-skip machinery costs more setup than it saves;
 // fixed world-space steps with a per-sample view-Z compare stay deterministic
 // (no frame jitter) and cheap.  The occlusion test mirrors SSR's acceptance
-// model: a step counts when the ray point sits behind the visible surface by
-// more than a distance-scaled thickness; the darkening fades out at the ray
-// end so the length cutoff does not pop.
+// model: a step counts when the ray point sits behind the visible surface
+// inside a distance-scaled thickness window; the darkening is strongest at
+// the contact and fades to fully lit at the ray end so the length cutoff
+// does not pop.
 const float kContactMaxLen = 2.0; // world metres (UE ContactShadowLength)
 const float kContactBias = 0.03;  // origin offset along N, self-hit guard
 const int kContactSteps = 12;
+// Upper half of the acceptance window (view Z, metres).  The depth buffer
+// only stores the front-most surface, so "ray point behind it" is ambiguous:
+// the point may sit inside the occluder volume (a real shadow) or metres
+// behind a foreground object that merely crosses the ray's screen path.  The
+// latter used to score full-strength hits and projected object-shaped ghost
+// shadows onto anything behind them, swimming with the camera.  Capping the
+// depth gap limits hits to volumes the ray actually enters; CSM covers the
+// large occluders this rejects.
+const float kContactThickness = 0.5; // +2% of ray distance, below
 
 float contactShadow(vec3 worldPos, vec3 N, vec3 L) {
     const vec2 renderSize = vec2(textureSize(gbDepth, 0));
@@ -253,8 +263,20 @@ float contactShadow(vec3 worldPos, vec3 N, vec3 L) {
         const vec2 cuv = (vec2(spix) + 0.5) / renderSize;
         const float bufZ = ssrViewZ(u.viewProj, u.invViewProj, cuv, bufDepth);
         const float rayZ = abs(clip.w);
-        if (rayZ > bufZ + 0.02 + 0.01 * bufZ)
-            shadow = min(shadow, 1.0 - smoothstep(0.75, 1.0, t));
+        const float over = rayZ - bufZ; // >0: ray point behind the visible surface
+        if (over <= 0.02 + 0.01 * bufZ || over >= kContactThickness + 0.02 * rayZ)
+            continue;
+        // Attenuation grows with hit distance along the ray: strongest at the
+        // contact, fully lit at the length cutoff, so the cutoff does not pop.
+        // (The phase-4c-1 code had this inverted — 1 - smoothstep(0.75,1,t) —
+        // which zeroed every hit closer than 1.5 m, i.e. all real contacts,
+        // and gave full weight to far hits, i.e. the screen-space ghosts.)
+        // The 5%-of-screen edge fade softens the clip when the march crosses
+        // the screen border (off-screen samples count as unoccluded).
+        const float edge = smoothstep(0.0, 0.05, suv.x) * smoothstep(0.0, 0.05, suv.y) *
+                           smoothstep(0.0, 0.05, 1.0 - suv.x) *
+                           smoothstep(0.0, 0.05, 1.0 - suv.y);
+        shadow = min(shadow, mix(1.0, smoothstep(0.0, 1.0, t), edge));
     }
     return shadow;
 }
