@@ -22,12 +22,27 @@
 //
 // Rejection: camera-only reprojection (the current pixel's world position,
 // rebuilt from the GBuffer depth, projected with the PREVIOUS frame's
-// view-projection); history is dropped on screen exit, on a relative view-Z
-// mismatch (disocclusion / different surface; normal rejection is subsumed —
-// a different surface at this pixel must differ in depth along the ray), and
-// on the first frame of the path (reset).  Valid history is neighbourhood-
-// clamped to the 3x3 RGB min/max of the current trace (anti-ghosting; the
-// delta can be negative, which plain min/max handles) before the EMA blend.
+// view-projection; both matrices carry the path's jitter, so the LR path
+// reprojects in its own jittered render domain — no half-pixel drift).  The
+// history colour is fetched as a depth-validated bilinear: each of the four
+// taps contributes its bilinear weight only when its stored view |z| matches
+// the reprojection (a truncating single-texel fetch snaps the sub-pixel
+// reprojection to the wrong texel under jitter/rotation and read as edge
+// flicker; an unvalidated bilinear bleeds the foreground surface across depth
+// edges).  History is dropped when no tap validates (disocclusion / screen
+// exit) and on the first frame of the path (reset).
+//
+// Anti-ghosting: valid history is variance-clipped to the current trace's
+// 3x3 neighbourhood (mean +- gamma * sigma per channel; the delta can be
+// negative, which the clip handles).  A plain min/max box is as wide as the
+// worst neighbour — on sharp (low-roughness) reflections the reflected image
+// slides across the surface under camera motion while the depth test still
+// passes, and the wide box let stale content decay over the whole EMA window
+// (the "layered" ghost trails).  The clip distance doubles as a staleness
+// signal: the blend weight rises toward 1 in proportion to how far outside
+// the box the history lay, so moved reflection content is dropped within a
+// frame or two while stationary pixels keep the full EMA accumulation (the
+// accumulation of the jittered sharp mip IS the mirror anti-aliasing).
 //
 // The composite is fused into this pass: each invocation read-modify-writes
 // only its own texel of the lit HDR target (out = old + delta), so a third
@@ -58,6 +73,7 @@ layout(push_constant) uniform Push {
 } pc;
 
 const float kDepthReject = 0.04; // relative view-Z tolerance (mirror of the host constant)
+const float kClipGamma = 1.25;   // variance-clip width in neighbourhood sigmas
 
 void main() {
     ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
@@ -88,27 +104,56 @@ void main() {
     if (prevClip.w > 0.0) {
         vec2 prevUv = prevClip.xy / prevClip.w * 0.5 + 0.5;
         if (all(greaterThan(prevUv, vec2(0.0))) && all(lessThan(prevUv, vec2(1.0)))) {
-            float prevViewZ = abs(prevClip.w);
-            ivec2 hp = clamp(ivec2(prevUv * vec2(size)), ivec2(0), size - 1);
-            vec4 hist = texelFetch(history, hp, 0);
-            // Depth rejection: the reprojected history texel must be the same
-            // surface; otherwise restart the EMA from the current frame.
-            float tol = max(prevViewZ * kDepthReject, 0.01);
-            if (abs(hist.a - prevViewZ) <= tol) {
-                // Neighbourhood clamp to the current trace's 3x3 RGB min/max:
-                // bounds stale history (disocclusion ghosting) to what the
-                // current frame can still explain.
-                vec3 bmin = cur.rgb;
-                vec3 bmax = cur.rgb;
-                for (int dy = -1; dy <= 1; ++dy) {
-                    for (int dx = -1; dx <= 1; ++dx) {
-                        ivec2 np = clamp(pix + ivec2(dx, dy), ivec2(0), size - 1);
-                        vec3 n = texelFetch(traceTex, np, 0).rgb;
-                        bmin = min(bmin, n);
-                        bmax = max(bmax, n);
+            const float prevViewZ = abs(prevClip.w);
+            const float tol = max(prevViewZ * kDepthReject, 0.01);
+            // Depth-validated bilinear history fetch: a tap counts only when
+            // its stored view |z| matches the reprojected surface, so depth
+            // edges neither snap (truncation) nor bleed (plain bilinear).
+            const vec2 hPos = prevUv * vec2(size) - 0.5;
+            const ivec2 hBase = ivec2(floor(hPos));
+            const vec2 hFrac = hPos - vec2(hBase);
+            vec3 histSum = vec3(0.0);
+            float histW = 0.0;
+            for (int ty = 0; ty <= 1; ++ty) {
+                for (int tx = 0; tx <= 1; ++tx) {
+                    const float w = (tx == 0 ? 1.0 - hFrac.x : hFrac.x) *
+                                    (ty == 0 ? 1.0 - hFrac.y : hFrac.y);
+                    if (w <= 0.0) continue;
+                    const ivec2 tp = clamp(hBase + ivec2(tx, ty), ivec2(0), size - 1);
+                    const vec4 tap = texelFetch(history, tp, 0);
+                    if (abs(tap.a - prevViewZ) <= tol) {
+                        histSum += tap.rgb * w;
+                        histW += w;
                     }
                 }
-                delta = mix(clamp(hist.rgb, bmin, bmax), cur.rgb, pc.params.x);
+            }
+            if (histW > 0.0) {
+                const vec3 hist = histSum / histW;
+                // Variance clip to the current trace's 3x3 neighbourhood:
+                // mean +- kClipGamma * sigma per channel — tighter than the
+                // min/max box, so sliding reflection content cannot hide
+                // behind a single extreme neighbour.
+                vec3 m1 = vec3(0.0);
+                vec3 m2 = vec3(0.0);
+                for (int dy = -1; dy <= 1; ++dy) {
+                    for (int dx = -1; dx <= 1; ++dx) {
+                        const ivec2 np = clamp(pix + ivec2(dx, dy), ivec2(0), size - 1);
+                        const vec3 n = texelFetch(traceTex, np, 0).rgb;
+                        m1 += n;
+                        m2 += n * n;
+                    }
+                }
+                const vec3 mean = m1 * (1.0 / 9.0);
+                const vec3 sigma = sqrt(max(m2 * (1.0 / 9.0) - mean * mean, vec3(0.0)));
+                const vec3 histClip = clamp(hist, mean - kClipGamma * sigma,
+                                            mean + kClipGamma * sigma);
+                // Staleness-driven blend: history far outside the clip box is
+                // moved/stale reflection content — drop it within a frame or
+                // two instead of letting it decay over the whole EMA window.
+                const vec3 dev = abs(hist - histClip);
+                const vec3 staleV = clamp(dev / (sigma + 1e-4), 0.0, 1.0);
+                const float stale = max(staleV.r, max(staleV.g, staleV.b));
+                delta = mix(histClip, cur.rgb, max(pc.params.x, stale));
             }
         }
     }
