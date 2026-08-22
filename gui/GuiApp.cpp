@@ -1508,11 +1508,12 @@ bool GuiApp::createDescriptors() {
     sizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     sizes[0].descriptorCount =
         deferred::kMaxTextures + numColumns * 3 + 2 + numAlgos * 8 + 14 * kFramesInFlight * 4 +
-        7 * kFramesInFlight * 4 + 11 * kFramesInFlight * 4 + 10 * 3 + 3 * 6 + hizSets + colorSets +
+        8 * kFramesInFlight * 4 + 11 * kFramesInFlight * 4 + 10 * 3 + 3 * 6 + hizSets + colorSets +
         2 + 14 * fogPaths + 17 * postFxPaths + 3; // + ssr temporal samplers (GB/GT/SSAA x2 sets); auto-exposure HDR
                            // sources (LR + GT); volfog light/temporal/march/composite samplers;
                            // lighting sets: 14 samplers each (GB/GT/SSAA/spatial), incl. shadow +
-                           // spot atlas + 2 probe arrays; SSR trace sets: 11 each; post-fx sets;
+                           // spot atlas + 2 probe arrays; transparent sets: 8 each (incl. the
+                           // froxel fog volume); SSR trace sets: 11 each; post-fx sets;
                            // occlusion cull sets: Hi-Z chains (GB/GT/SSAA, Phase 7a)
     sizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     sizes[1].descriptorCount = kFramesInFlight * 3 + numColumns + numAlgos + kFramesInFlight * 4 +
@@ -2263,21 +2264,25 @@ bool GuiApp::createSyncResources() {
         }
 
         // The transparency shader reads iblParams (identical in both lighting
-        // UBOs) plus the path's own SSAO texture: one set per path.
+        // UBOs) plus the path's own SSAO texture: one set per path.  Binding 8
+        // is the path's ray-integrated froxel volume (volumetric fog on
+        // translucency); the spatial LR variant shares gbFog_ (same rule as
+        // the fog light sets).  Written whenever the volume exists — the
+        // per-frame checkbox gate lives in the record-side push constant.
         deferred_.writeTransparentSet(ctx_, fr.transparentSetGb, fr.lightingUboGb, gbAo_.view,
                                       shadowView, gbColorPyramid_.chainView,
-                                      gbPyramid_.chainView);
+                                      gbPyramid_.chainView, gbFog_.intView);
         deferred_.writeTransparentSet(ctx_, fr.transparentSetGbSpatial, fr.lightingUboGbSpatial,
                                       gbAo_.view, shadowView, gbColorPyramid_.chainView,
-                                      gbPyramid_.chainView);
+                                      gbPyramid_.chainView, gbFog_.intView);
         deferred_.writeTransparentSet(ctx_, fr.transparentSetGt, fr.lightingUboGt, gtAo_.view,
                                       shadowView, gtColorPyramid_.chainView,
-                                      gtPyramid_.chainView);
+                                      gtPyramid_.chainView, gtFog_.intView);
         if (active_.gtSsaa) {
             deferred_.writeTransparentSet(ctx_, fr.transparentSetSsaa, fr.lightingUboGt,
                                           gtSsaaAo_.view, shadowView,
                                           gtSsaaColorPyramid_.chainView,
-                                          gtSsaaPyramid_.chainView);
+                                          gtSsaaPyramid_.chainView, gtSsaaFog_.intView);
         }
 
         // Opaque-SSR trace sets: binding 0 reuses the path's lighting UBO; the
@@ -3506,7 +3511,10 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                 beginRendering(cmd, renderWidth_, renderHeight_, 3, tColors, &tDepth);
                 deferred_.recordTransparentDraws(cmd, scene_, false, sceneSet, textureSet_,
                                                  transparentSet, materialStride_, renderWidth_,
-                                                 renderHeight_, cullViewProj, camera_.position);
+                                                 renderHeight_, cullViewProj, camera_.position,
+                                                 proj.m[14] / proj.m[10], fogParams_.maxDistance,
+                                                 volFogEnabled_ && fogParams_.enabled &&
+                                                     gbFog_.injectImage != VK_NULL_HANDLE);
                 vkCmdEndRendering(cmd);
             }
             transition(gbMotion_.image, gbMotionLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
@@ -3849,7 +3857,11 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                 beginRendering(cmd, sw, sh, 1, &tColor, &tDepth);
                 deferred_.recordTransparentDraws(cmd, scene_, true, fr.sceneSetGt, textureSet_,
                                                  fr.transparentSetSsaa, materialStride_, sw, sh,
-                                                 cullViewProjGt, gtCam.position);
+                                                 cullViewProjGt, gtCam.position,
+                                                 projGt.m[14] / projGt.m[10],
+                                                 fogParams_.maxDistance,
+                                                 volFogEnabled_ && fogParams_.enabled &&
+                                                     gtSsaaFog_.injectImage != VK_NULL_HANDLE);
                 vkCmdEndRendering(cmd);
             }
             transition(gtSsaaDepth_.image, gtSsaaDepthLayout_,
@@ -4069,7 +4081,11 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                 beginRendering(cmd, gtW, gtH, 1, &tColor, &tDepth);
                 deferred_.recordTransparentDraws(cmd, scene_, true, fr.sceneSetGt, textureSet_,
                                                  fr.transparentSetGt, materialStride_, gtW, gtH,
-                                                 cullViewProjGt, gtCam.position);
+                                                 cullViewProjGt, gtCam.position,
+                                                 projGt.m[14] / projGt.m[10],
+                                                 fogParams_.maxDistance,
+                                                 volFogEnabled_ && fogParams_.enabled &&
+                                                     gtFog_.injectImage != VK_NULL_HANDLE);
                 vkCmdEndRendering(cmd);
             }
             transition(gtDepth_.image, gtDepthLayout_,

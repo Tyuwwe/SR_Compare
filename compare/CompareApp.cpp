@@ -702,7 +702,7 @@ bool CompareApp::createDescriptors() {
     sizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     sizes[0].descriptorCount = deferred::kMaxTextures + numColumns * 3 + 2 + numAlgos * 2 +
                                14 * kFramesInFlight * 4 + // lighting sets (GB/GT/SSAA/spatial), shadow + atlas + 2 probe arrays
-                               7 * kFramesInFlight * 4 +  // transparent sets + SSR
+                               8 * kFramesInFlight * 4 +  // transparent sets + SSR + fog volume
                                11 * kFramesInFlight * 4 + // opaque-SSR trace sets (GB/GT/SSAA/spatial), +2 probe arrays
                                10 * 3 +                   // ssao + temporal + blur samplers (per path)
                                3 * 6 +                    // ssr temporal samplers (GB/GT/SSAA x2 sets)
@@ -1334,21 +1334,28 @@ bool CompareApp::createSyncResources() {
         }
 
         // The transparency shader reads iblParams (identical in both lighting
-        // UBOs) plus the path's own SSAO texture: one set per path.
+        // UBOs) plus the path's own SSAO texture: one set per path.  Binding 8
+        // is the path's ray-integrated froxel volume (volumetric fog on
+        // translucency); the spatial LR variant shares gbFog_ (same rule as
+        // the fog light sets below).
         deferred_.writeTransparentSet(ctx_, fr.transparentSetGb, fr.lightingUboGb, gbAo_.view,
                                       shadowView, gbColorPyramid_.chainView,
-                                      gbPyramid_.chainView);
+                                      gbPyramid_.chainView,
+                                      volFogActive_ ? gbFog_.intView : VK_NULL_HANDLE);
         deferred_.writeTransparentSet(ctx_, fr.transparentSetGbSpatial, fr.lightingUboGbSpatial,
                                       gbAo_.view, shadowView, gbColorPyramid_.chainView,
-                                      gbPyramid_.chainView);
+                                      gbPyramid_.chainView,
+                                      volFogActive_ ? gbFog_.intView : VK_NULL_HANDLE);
         deferred_.writeTransparentSet(ctx_, fr.transparentSetGt, fr.lightingUboGt, gtAo_.view,
                                       shadowView, gtColorPyramid_.chainView,
-                                      gtPyramid_.chainView);
+                                      gtPyramid_.chainView,
+                                      volFogActive_ ? gtFog_.intView : VK_NULL_HANDLE);
         if (opts_.gtSsaa) {
             deferred_.writeTransparentSet(ctx_, fr.transparentSetSsaa, fr.lightingUboGt,
                                           gtSsaaAo_.view, shadowView,
                                           gtSsaaColorPyramid_.chainView,
-                                          gtSsaaPyramid_.chainView);
+                                          gtSsaaPyramid_.chainView,
+                                          volFogActive_ ? gtSsaaFog_.intView : VK_NULL_HANDLE);
         }
 
         // Opaque-SSR trace sets: binding 0 reuses the path's lighting UBO; the
@@ -1914,7 +1921,9 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                 beginRendering(cmd, renderWidth_, renderHeight_, 3, tColors, &tDepth);
                 deferred_.recordTransparentDraws(cmd, scene_, false, sceneSet, textureSet_,
                                                  transparentSet, materialStride_, renderWidth_,
-                                                 renderHeight_, cullViewProj, camera_.position);
+                                                 renderHeight_, cullViewProj, camera_.position,
+                                                 proj.m[14] / proj.m[10], fogParams_.maxDistance,
+                                                 volFogActive_);
                 vkCmdEndRendering(cmd);
             }
             transition(gbMotion_.image, gbMotionLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
@@ -2270,7 +2279,10 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                 beginRendering(cmd, sw, sh, 1, &tColor, &tDepth);
                 deferred_.recordTransparentDraws(cmd, scene_, true, fr.sceneSetGt, textureSet_,
                                                  fr.transparentSetSsaa, materialStride_, sw, sh,
-                                                 cullViewProj, camera_.position);
+                                                 cullViewProj, camera_.position,
+                                                 proj.m[14] / proj.m[10], fogParams_.maxDistance,
+                                                 volFogActive_ &&
+                                                     gtSsaaFog_.injectImage != VK_NULL_HANDLE);
                 vkCmdEndRendering(cmd);
             }
             transition(gtSsaaDepth_.image, gtSsaaDepthLayout_,
@@ -2491,7 +2503,9 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                 beginRendering(cmd, dw, dh, 1, &tColor, &tDepth);
                 deferred_.recordTransparentDraws(cmd, scene_, true, fr.sceneSetGt, textureSet_,
                                                  fr.transparentSetGt, materialStride_, dw, dh,
-                                                 cullViewProj, camera_.position);
+                                                 cullViewProj, camera_.position,
+                                                 proj.m[14] / proj.m[10], fogParams_.maxDistance,
+                                                 volFogActive_);
                 vkCmdEndRendering(cmd);
             }
             transition(gtDepth_.image, gtDepthLayout_,
