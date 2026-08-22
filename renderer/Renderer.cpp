@@ -75,6 +75,21 @@ void Renderer::ImageResource::destroy(const VulkanContext& ctx) {
 bool Renderer::init(const RendererOptions& opts) {
     opts_ = opts;
     diagNoJitter_ = sr::envFlag("SR_NO_JITTER");
+    // Diagnostics: dump every frame as <dir>/frame_%04d.png (synchronous
+    // readback per frame; used for offline temporal-stability metrics).
+    // _dupenv_s: plain getenv trips C4996 (this project builds /W4).
+#ifdef _MSC_VER
+    {
+        char* d = nullptr;
+        size_t dLen = 0;
+        if (_dupenv_s(&d, &dLen, "SR_FRAME_DUMP_DIR") == 0 && d != nullptr) {
+            frameDumpDir_ = d;
+            std::free(d);
+        }
+    }
+#else
+    if (const char* d = std::getenv("SR_FRAME_DUMP_DIR")) frameDumpDir_ = d;
+#endif
     // GPU occlusion culling (Phase 7a) defaults on; SR_OCCLUSION=0 opts out.
     occlusion_ = occlusionEnabledByDefault();
 
@@ -2103,7 +2118,9 @@ void Renderer::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         .access(swapImage, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_PIPELINE_STAGE_2_NONE,
                 VK_ACCESS_2_NONE);
 
-    const bool capturing = !opts_.screenshotPath.empty() && static_cast<int>(frameIndex) == opts_.frames - 1;
+    const bool capturing = (!opts_.screenshotPath.empty() &&
+                            static_cast<int>(frameIndex) == opts_.frames - 1) ||
+                           !frameDumpDir_.empty();
     if (capturing) {
         RenderGraph::Pass& p = rg_.addPass("Screenshot");
         p.access(finalImage_.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, sync::kCopy,
@@ -2216,6 +2233,14 @@ void Renderer::run() {
         if (!opts_.screenshotPath.empty() && static_cast<int>(frameIndex) == opts_.frames - 1) {
             vkWaitForFences(ctx_.device, 1, &frames_[slot].fence, VK_TRUE, UINT64_MAX);
             saveScreenshot(opts_.screenshotPath);
+        }
+        // Per-frame dump (SR_FRAME_DUMP_DIR): the fence wait serialises the
+        // pipeline — diagnostics only, never enabled by default.
+        if (!frameDumpDir_.empty()) {
+            vkWaitForFences(ctx_.device, 1, &frames_[slot].fence, VK_TRUE, UINT64_MAX);
+            char name[32];
+            std::snprintf(name, sizeof(name), "frame_%04u.png", frameIndex);
+            saveScreenshot(frameDumpDir_ + "/" + name);
         }
 
         ++frameIndex;
