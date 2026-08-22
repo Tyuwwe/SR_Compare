@@ -8,14 +8,14 @@ add_library(imgui STATIC
     ${IMGUI_DIR}/imgui_tables.cpp
     ${IMGUI_DIR}/imgui_widgets.cpp
     ${IMGUI_DIR}/imgui_demo.cpp
-    ${IMGUI_DIR}/backends/imgui_impl_win32.cpp
+    ${IMGUI_DIR}/backends/imgui_impl_sdl3.cpp
     ${IMGUI_DIR}/backends/imgui_impl_vulkan.cpp
 )
 target_include_directories(imgui SYSTEM PUBLIC ${IMGUI_DIR} ${IMGUI_DIR}/backends)
 if(Vulkan_INCLUDE_DIRS)
     target_include_directories(imgui SYSTEM PUBLIC ${Vulkan_INCLUDE_DIRS})
 endif()
-target_link_libraries(imgui PUBLIC Vulkan::Vulkan)
+target_link_libraries(imgui PUBLIC Vulkan::Vulkan SDL3::SDL3)
 if(MSVC)
     target_compile_options(imgui PRIVATE /W0 /utf-8)
 endif()

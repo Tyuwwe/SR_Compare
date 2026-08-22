@@ -1,18 +1,21 @@
 #pragma once
 // ============================================================================
-// Minimal Win32 window + input.  No third-party windowing library: we create a
-// native HWND, expose a surface-compatible handle, and accumulate a tiny input
-// state (keyboard + relative mouse) for the free-fly camera.
+// Minimal SDL3 window + input.  SDL owns the native window, the event pump
+// and the Vulkan surface (SDL_Vulkan_CreateSurface); we accumulate a tiny
+// input state (keyboard + relative mouse) for the free-fly camera.
 // ============================================================================
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#define UNICODE
-#define _UNICODE
-#include <windows.h>
-
 #include <cstdint>
 
+union SDL_Event;
+struct SDL_Window;
+
 namespace sr {
+
+// Virtual-key-style indices into Window::Input::keys (same values as the
+// Win32 VK_* codes they replace: ASCII for letters/digits).
+constexpr int kKeyShift = 0x10;
+constexpr int kKeyControl = 0x11;
+constexpr int kKeySpace = 0x20;
 
 class Window {
 public:
@@ -27,11 +30,10 @@ public:
     bool create(const char* title, int width, int height);
     void destroy();
 
-    // Pump pending messages and refresh input deltas.  Returns false on quit.
+    // Pump pending events and refresh input deltas.  Returns false on quit.
     bool poll();
 
-    HWND hwnd() const { return hwnd_; }
-    HINSTANCE hinstance() const { return hinstance_; }
+    SDL_Window* sdlWindow() const { return window_; }
     int width() const { return width_; }
     int height() const { return height_; }
     bool shouldClose() const { return shouldClose_; }
@@ -39,28 +41,25 @@ public:
     const Input& input() const { return input_; }
     void clearMouseDelta() { input_.mouseDX = 0.f; input_.mouseDY = 0.f; input_.resized = false; }
 
-    // GUI integration: optional hook (e.g. ImGui_ImplWin32_WndProcHandler)
-    // invoked at the top of wndProc; a non-zero return short-circuits the
-    // default handling.  clickToCapture=false disables the viewer's
+    // GUI integration: optional hook (e.g. ImGui_ImplSDL3_ProcessEvent)
+    // invoked for every event before the default handling; returning true
+    // consumes the event.  clickToCapture=false disables the viewer's
     // left-click mouse capture so UI clicks keep the cursor free.
-    using WndProcHook = LRESULT (*)(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
-    void setWndProcHook(WndProcHook hook) { wndProcHook_ = hook; }
+    using EventHook = bool (*)(const SDL_Event& event);
+    void setEventHook(EventHook hook) { eventHook_ = hook; }
     void setClickToCaptureEnabled(bool enabled) { clickToCapture_ = enabled; }
 
     // Resize the client area (keeps the window position/top-left corner).
     void setClientSize(int width, int height);
 
 private:
-    static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
-
     void setCaptured(bool captured);
 
-    HWND hwnd_ = nullptr;
-    HINSTANCE hinstance_ = nullptr;
+    SDL_Window* window_ = nullptr;
     int width_ = 0, height_ = 0;
     bool shouldClose_ = false;
     Input input_;
-    WndProcHook wndProcHook_ = nullptr;
+    EventHook eventHook_ = nullptr;
     bool clickToCapture_ = true;
 };
 

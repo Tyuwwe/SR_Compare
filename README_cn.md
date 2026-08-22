@@ -213,7 +213,9 @@ build_all.bat          :: 一键 configure + Release 构建
 
 依赖：Windows 11、Visual Studio（C++ 工作负载，vswhere 自动发现）、CMake ≥ 3.24
 （PATH 或 VS 自带均可）、Vulkan SDK 1.4+（`VULKAN_SDK` 提供 glslangValidator）、
-Python 3.10+（仅 `scripts/fetch_sdks.py` 与 `metrics/` 用）。
+Python 3.10+（仅 `scripts/fetch_sdks.py` 与 `metrics/` 用）。窗口/输入库 SDL3 由
+`python scripts/fetch_sdks.py --only sdl3` 获取（预编译 VC x64 包，落到
+`third_party/sdl3/`；构建时自动把 `SDL3.dll` 拷到 exe 旁）。
 
 DLSS 需要 NVIDIA Developer 账号申请 applicationId（免费），环境变量 `SR_DLSS_APP_ID`。
 
@@ -230,7 +232,7 @@ Python 3）。缺失时主工程照常编译，NSS 插件自动禁用。
 
 `build/app/Release/` 构建后即为自包含目录，整体复制即可运行（无需源码与构建环境）：
 
-- `sr_compare.exe` + 全部运行时 DLL（XeSS/Streamline/DLSS/NSS、CRT）
+- `sr_compare.exe` + 全部运行时 DLL（SDL3、XeSS/Streamline/DLSS/NSS、CRT）
 - `sr_run_gui.bat`（一键启动 GUI）
 - `shaders/`、`assets/`（Bistro 全 PBR 约 1.3GB 可裁剪）、`nss-emu/`
 

@@ -24,7 +24,7 @@
 //
 // Settings that change resolution/scale/scene/algorithm set/env map require
 // an "Apply" rebuild: the whole render stack is destroyed and recreated (the
-// Win32 window, Vulkan device and ImGui backend persist).  Apply is
+// SDL window, Vulkan device and ImGui backend persist).  Apply is
 // asynchronous: a worker thread loads the new scene and initializes the
 // upscalers while the old stack keeps rendering under a progress overlay, and
 // the new stack is swapped in at a device-idle safe point (see the
@@ -353,7 +353,7 @@ private:
     // bypassing OS focus/cursor state (deterministic on attended machines).
     // Commands: "pos x y", "wheel f", "down n" / "up n" (0=left, 2=middle),
     // "key F1" / "keyup F1", "shot path.png", "graph" (toggle the Render
-    // Graph editor window), "pass <name> <0|1>" (toggle a runtime pass
+    // Graph editor window), "profiler" (toggle the GPU profiler window), "pass <name> <0|1>" (toggle a runtime pass
     // switch: shadows/contact/ssr/volfog/occlusion/bloom/mb/dof/autoexp),
     // "wait" (one frame gap).
     void pumpInputFile();

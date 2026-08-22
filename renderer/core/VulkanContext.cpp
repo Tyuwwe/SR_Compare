@@ -5,6 +5,8 @@
 #include "renderer/core/Window.h"
 #include "upscalers/UpscalerFactory.h"
 
+#include <SDL3/SDL_vulkan.h>
+
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -25,8 +27,18 @@ bool isDiscrete(VkPhysicalDeviceType type) {
 } // namespace
 
 bool VulkanContext::create(Window& window) {
-    std::vector<const char*> instanceExt = {VK_KHR_SURFACE_EXTENSION_NAME,
-                                            VK_KHR_WIN32_SURFACE_EXTENSION_NAME};
+    // Surface extensions come from SDL (VK_KHR_surface + the platform one).
+    std::vector<const char*> instanceExt;
+    {
+        uint32_t count = 0;
+        const char* const* sdlExts = SDL_Vulkan_GetInstanceExtensions(&count);
+        if (sdlExts == nullptr || count == 0) {
+            std::fprintf(stderr, "vulkan: SDL_Vulkan_GetInstanceExtensions failed: %s\n",
+                         SDL_GetError());
+            return false;
+        }
+        instanceExt.assign(sdlExts, sdlExts + count);
+    }
 
     // Optional validation layer (only if the loader actually provides it).
     const char* validationLayer = "VK_LAYER_KHRONOS_validation";
@@ -163,11 +175,8 @@ bool VulkanContext::create(Window& window) {
         }
     }
 
-    VkWin32SurfaceCreateInfoKHR sci = {};
-    sci.sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR;
-    sci.hwnd = window.hwnd();
-    sci.hinstance = window.hinstance();
-    if (vkCreateWin32SurfaceKHR(instance, &sci, nullptr, &surface) != VK_SUCCESS) {
+    if (!SDL_Vulkan_CreateSurface(window.sdlWindow(), instance, nullptr, &surface)) {
+        std::fprintf(stderr, "vulkan: SDL_Vulkan_CreateSurface failed: %s\n", SDL_GetError());
         destroy();
         return false;
     }

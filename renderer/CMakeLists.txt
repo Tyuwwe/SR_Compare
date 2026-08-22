@@ -39,7 +39,7 @@ add_library(meshoptimizer STATIC
 target_include_directories(meshoptimizer SYSTEM PUBLIC ${SR_THIRD_PARTY_DIR}/meshoptimizer)
 
 sr_common_setup(renderer)
-target_link_libraries(renderer PUBLIC meshoptimizer)
+target_link_libraries(renderer PUBLIC meshoptimizer SDL3::SDL3)
 target_compile_definitions(renderer PRIVATE SR_SHADER_DIR="${SR_SHADER_OUT_DIR}/")
 
 # Compile the renderer's GLSL to SPIR-V at build time.  The deferred

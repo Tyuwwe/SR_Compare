@@ -15,9 +15,11 @@
 #include "upscalers/dlss/SlContext.h"
 
 #include <imgui.h>
+#include <imgui_impl_sdl3.h>
 #include <imgui_impl_vulkan.h>
-#include <imgui_impl_win32.h>
 #include <imgui_internal.h> // GImGui->InputEventsQueue (input-path debug)
+
+#include <SDL3/SDL.h> // SDL_Event/SDL_EVENT_* for the automation debug hook
 
 #include <algorithm>
 #include <cctype>
@@ -31,26 +33,23 @@
 #include <sstream>
 #include <vector>
 
-// The Win32 backend header intentionally leaves this declaration inside an
-// #if 0 block (to avoid dragging <windows.h> into the header); declare it here.
-extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg,
-                                                             WPARAM wParam, LPARAM lParam);
-
 namespace {
 // Debug hook (SR_GUI_DEBUG_INPUT=1): verify the backend actually queues a
-// wheel event when the message arrives.
+// wheel event when the event arrives.
 bool dbgInputEnabled() {
     static const bool enabled = sr::envFlag("SR_GUI_DEBUG_INPUT");
     return enabled;
 }
 
-LRESULT guiWndProcHook(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+bool guiSdlEventHook(const SDL_Event& event) {
     const int queueBefore = GImGui ? GImGui->InputEventsQueue.Size : -1;
-    const LRESULT r = ImGui_ImplWin32_WndProcHandler(hwnd, msg, wp, lp);
-    if (dbgInputEnabled() && (msg == WM_MOUSEWHEEL || msg == WM_MBUTTONDOWN)) {
+    const bool r = ImGui_ImplSDL3_ProcessEvent(&event);
+    if (dbgInputEnabled() &&
+        (event.type == SDL_EVENT_MOUSE_WHEEL ||
+         event.type == SDL_EVENT_MOUSE_BUTTON_DOWN)) {
         const ImGuiIO& io = ImGui::GetIO();
-        std::fprintf(stderr, "[hook] msg=0x%04x ret=%lld queue=%d->%d wheelNow=%.3f capture=%d\n",
-                     msg, static_cast<long long>(r), queueBefore,
+        std::fprintf(stderr, "[hook] type=0x%04x consumed=%d queue=%d->%d wheelNow=%.3f capture=%d\n",
+                     event.type, r ? 1 : 0, queueBefore,
                      GImGui->InputEventsQueue.Size, static_cast<double>(io.MouseWheel),
                      io.WantCaptureMouse ? 1 : 0);
     }
@@ -330,7 +329,7 @@ bool GuiApp::init(const GuiOptions& opts) {
     if (!gradingLut_.create(ctx_, makeIdentityLut())) return false;
     if (!createUiSync()) return false;
     if (!initImGui()) return false;
-    window_.setWndProcHook(&guiWndProcHook);
+    window_.setEventHook(&guiSdlEventHook);
 
     // Default selection: taa for the viewer, taa+fsr2 for compare (launch
     // options may have preset these already).
@@ -439,13 +438,13 @@ bool GuiApp::initImGui() {
     style.WindowRounding = 4.f;
     style.FrameRounding = 3.f;
 
-    if (!ImGui_ImplWin32_Init(window_.hwnd())) return false;
+    if (!ImGui_ImplSDL3_InitForVulkan(window_.sdlWindow())) return false;
     return initImGuiVulkanBackend();
 }
 
 // Vulkan backend (device objects + pipeline) — the pipeline bakes the
 // swapchain format, so setHdrEnabled shuts it down and re-runs this after a
-// swapchain re-creation (the ImGui context and the Win32 backend persist).
+// swapchain re-creation (the ImGui context and the SDL3 backend persist).
 bool GuiApp::initImGuiVulkanBackend() {
     ImGui_ImplVulkan_InitInfo ii = {};
     ii.ApiVersion = VK_API_VERSION_1_3;
@@ -468,9 +467,9 @@ bool GuiApp::initImGuiVulkanBackend() {
 
 void GuiApp::shutdownImGui() {
     graphWindow_.destroy(); // ImNodes context (independent of the ImGui one)
-    window_.setWndProcHook(nullptr);
+    window_.setEventHook(nullptr);
     ImGui_ImplVulkan_Shutdown();
-    ImGui_ImplWin32_Shutdown();
+    ImGui_ImplSDL3_Shutdown();
     ImGui::DestroyContext();
 }
 
@@ -3121,9 +3120,9 @@ void GuiApp::updateCamera(float dt) {
         in.keys['D'] = ImGui::IsKeyDown(ImGuiKey_D);
         in.keys['Q'] = ImGui::IsKeyDown(ImGuiKey_Q);
         in.keys['E'] = ImGui::IsKeyDown(ImGuiKey_E);
-        in.keys[VK_SHIFT] = ImGui::IsKeyDown(ImGuiKey_LeftShift) || ImGui::IsKeyDown(ImGuiKey_RightShift);
-        in.keys[VK_SPACE] = ImGui::IsKeyDown(ImGuiKey_Space);
-        in.keys[VK_CONTROL] = ImGui::IsKeyDown(ImGuiKey_LeftCtrl) || ImGui::IsKeyDown(ImGuiKey_RightCtrl);
+        in.keys[kKeyShift] = ImGui::IsKeyDown(ImGuiKey_LeftShift) || ImGui::IsKeyDown(ImGuiKey_RightShift);
+        in.keys[kKeySpace] = ImGui::IsKeyDown(ImGuiKey_Space);
+        in.keys[kKeyControl] = ImGui::IsKeyDown(ImGuiKey_LeftCtrl) || ImGui::IsKeyDown(ImGuiKey_RightCtrl);
     }
     // Rotate only when dragging on the render area (not over any UI element).
     const bool rotate = !io.WantCaptureMouse &&
@@ -4873,6 +4872,8 @@ void GuiApp::pumpInputFile() {
             if (!path.empty()) saveScreenshot(path.c_str());
         } else if (cmd == "graph") {
             graphWindow_.open = !graphWindow_.open; // Render Graph editor window
+        } else if (cmd == "profiler") {
+            profilerWindow_.open = !profilerWindow_.open; // GPU profiler window
         } else if (cmd == "pass") {
             // pass <name> <0|1>: toggle a runtime-switchable pass by its
             // PassToggle shorthand (same path as the graph node checkbox).
@@ -4961,13 +4962,16 @@ void GuiApp::run() {
         pollEngineConfig();
 
         // Debug hook (SR_GUI_DEBUG_INPUT=1): heartbeat to correlate input
-        // message dispatch with the frame loop during automation tests.
+        // event dispatch with the frame loop during automation tests.
         if (dbgInputEnabled() && renderFrameIndex_ % 120 == 0)
-            std::fprintf(stderr, "[run] frame=%u tick=%llu\n", renderFrameIndex_,
-                         static_cast<unsigned long long>(GetTickCount64()));
+            std::fprintf(stderr, "[run] frame=%u ms=%llu\n", renderFrameIndex_,
+                         static_cast<unsigned long long>(
+                             std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 now.time_since_epoch())
+                                 .count()));
 
         ImGui_ImplVulkan_NewFrame();
-        ImGui_ImplWin32_NewFrame();
+        ImGui_ImplSDL3_NewFrame();
         pumpInputFile(); // debug automation: queued after backend events
         ImGui::NewFrame();
         drawUi();

@@ -5,6 +5,10 @@
 // The GUI spawns its own executable in bench mode (reusing the production
 // CLI), drains the child's stdout/stderr incrementally so the UI stays
 // responsive, parses "[bench] i/n" progress lines, and reports the exit code.
+//
+// Process management (CreateProcess + pipe) is deliberately kept on the Win32
+// API: bench is a Windows-only tool.  The window/input layer, by contrast, is
+// pure SDL3 (renderer/core/Window).
 // ============================================================================
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX

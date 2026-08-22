@@ -244,7 +244,9 @@ build_all.bat          :: one-click configure + Release build
 Requirements: Windows 11, Visual Studio (C++ workload; discovered via
 vswhere), CMake >= 3.24 (on PATH or the VS-bundled one), Vulkan SDK 1.4+
 (`VULKAN_SDK` provides glslangValidator), Python 3.10+ (only for
-`scripts/fetch_sdks.py` and `metrics/`).
+`scripts/fetch_sdks.py` and `metrics/`). The SDL3 windowing library comes
+from `python scripts/fetch_sdks.py --only sdl3` (prebuilt VC x64 package
+staged into `third_party/sdl3/`; the build copies `SDL3.dll` next to the exe).
 
 DLSS needs a free NVIDIA Developer applicationId (env `SR_DLSS_APP_ID`).
 
@@ -265,7 +267,7 @@ plugin simply disables itself.
 `build/app/Release/` is self-contained after a build — copy it anywhere and
 run (no source or build tools needed):
 
-- `sr_compare.exe` + all runtime DLLs (XeSS / Streamline / DLSS / NSS, CRT)
+- `sr_compare.exe` + all runtime DLLs (SDL3, XeSS / Streamline / DLSS / NSS, CRT)
 - `sr_run_gui.bat` (one-click GUI)
 - `shaders/`, `assets/` (Bistro full-PBR ≈ 1.3 GB, trim as needed), `nss-emu/`
 

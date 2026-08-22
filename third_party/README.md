@@ -8,6 +8,7 @@
 | 子目录 | 名称 | 实际版本 | 许可证 |
 |---|---|---|---|
 | `fidelityfx/` | AMD FidelityFX SDK（FSR 1/2/3 全源码） | **v1.1.4** | MIT |
+| `sdl3/` | SDL3 窗口/输入库（预编译 VC x64 包：`include/` + `lib/x64/SDL3.lib/.dll` + `cmake/`） | **3.4.14**（`release-3.4.14`） | zlib |
 | `xess/` | Intel XeSS SDK（闭源 DLL） | **v3.0.2**（latest） | Intel Simplified Software License (Oct 2022) |
 | `streamline/` | NVIDIA Streamline SDK（框架 + DLSS DLL） | **v2.12.0**（latest） | 框架 MIT + `nvngx_dlss.dll` NVIDIA RTX SDKs LICENSE |
 | `snapdragon-gsr/` | Snapdragon SGSR 1/2（shader 源码） | git `d926f07`（main，浅克隆） | BSD-3-Clause |
@@ -43,6 +44,23 @@
 - shader 头文件（GPU）：`include/FidelityFX/gpu/fsr1/`、`fsr2/`、`fsr3/`、`fsr3upscaler/`
 - 源码：`src/components/fsr1/`、`fsr2/`、`fsr3/`、`fsr3upscaler/`，公共部分在
   `src/shared/` 与 `src/backends/`
+
+---
+
+## SDL3 — `sdl3/`
+
+- 来源：https://github.com/libsdl-org/SDL
+- release 资产：`SDL3-devel-3.4.14-VC.zip`（tag `release-3.4.14`）
+- 许可证：zlib（`sdl3/LICENSE.txt`）
+- 预编译 VC 开发包，抽取 `include/`、`lib/x64/`（`SDL3.lib` + `SDL3.dll`）与
+  `cmake/`；窗口/事件/Vulkan surface（`SDL_Vulkan_*`）全部由它提供
+  （`renderer/core/Window`），ImGui 后端为 `imgui_impl_sdl3`。
+  构建时 `SDL3.dll` 被拷到 exe 旁（见 `app/CMakeLists.txt`）。
+
+关键路径：
+
+- 头文件：`include/SDL3/SDL.h`、`include/SDL3/SDL_vulkan.h`
+- 库：`lib/x64/SDL3.lib`（导入库）、`lib/x64/SDL3.dll`（运行时）
 
 ---
 
