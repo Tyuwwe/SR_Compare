@@ -517,9 +517,14 @@ struct SsrHistory {
     uint32_t height = 0;
 };
 constexpr VkFormat kSsrTraceFormat = deferred::kHdrColorFormat; // RGBA16F trace target + history
-// Temporal accumulation constants (same ~8-frame EMA window and relative
-// view-Z tolerance as the GTAO temporal pass; see ssao_temporal.comp).
-constexpr float kSsrTemporalBlend = 0.125f;
+// Temporal accumulation constants (same relative view-Z tolerance as the
+// GTAO temporal pass; see ssao_temporal.comp).  The EMA window is ~12 frames
+// (0.08): the 8-frame window let the grazing-angle hit-position jitter of the
+// marcher through as per-pixel speckle flicker on ground planes; the
+// staleness-driven blend in ssr_temporal.comp still drops moved reflection
+// content within a frame or two, so the longer window costs no ghosting and
+// static accumulation (the mirror anti-aliasing) only gets sharper.
+constexpr float kSsrTemporalBlend = 0.08f;
 constexpr float kSsrTemporalDepthReject = 0.04f;
 
 // --- HDR color mip chain (box-filtered lit-color pyramid) --------------------

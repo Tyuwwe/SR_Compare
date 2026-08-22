@@ -236,7 +236,17 @@ vec4 traceSsr(sampler2D colorTex, int colorMipCount, sampler2D hizTex, int hizMi
     // between levels keeps the blur free of banding.  This is the standard
     // "colour mip chain" half of stochastic-free SSR (UE samples its blurred
     // scene-colour pyramid the same way once denoising is skipped).
-    const float lod = roughness * float(colorMipCount - 1);
+    //
+    // Grazing term: at |R·N| → 0 the ray runs nearly parallel to the surface,
+    // so a one-texel hit-position step spans metres of surface and the marched
+    // hit point (hence the sampled colour) is far less stable frame to frame
+    // than the roughness footprint alone implies — the dominant SSR flicker
+    // source on ground planes.  Widening the cone by (1-|R·N|)² (up to +1.25
+    // LOD at exact grazing, 0 head-on) pulls those samples from a coarser,
+    // temporally stable average; head-on mirror reflections are untouched.
+    const float lod = min(roughness * float(colorMipCount - 1) +
+                              (1.0 - grazing) * (1.0 - grazing) * 1.25,
+                          float(colorMipCount - 1));
     vec3 col = textureLod(colorTex, hitUv, lod).rgb;
     // UE tames fireflies with rcp(1+lum) because SSSR is stochastic; this
     // path is a single ray and the mip chain already averages out the hot
