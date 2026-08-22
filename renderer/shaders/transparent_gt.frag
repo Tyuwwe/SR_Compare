@@ -59,7 +59,8 @@ layout(set = 2, binding = 0) uniform LightingUBO {
 layout(set = 2, binding = 1) uniform samplerCube iblIrradiance;
 layout(set = 2, binding = 2) uniform samplerCube iblPrefilter;
 layout(set = 2, binding = 3) uniform sampler2D iblBrdfLut;
-// Screen-space AO (R16F, same resolution as this path's GBuffer).
+// Screen-space AO (R16F, same resolution as this path's GBuffer).  Bound for
+// layout parity but deliberately NOT sampled (see transparent.frag).
 layout(set = 2, binding = 4) uniform sampler2D ssaoTex;
 layout(set = 2, binding = 5) uniform sampler2DArrayShadow shadowMap; // CSM, comparison sampler
 layout(set = 2, binding = 6) uniform sampler2D ssrColor; // opaque HDR color mip chain (RGBA16F)
@@ -236,8 +237,9 @@ void main() {
     vec3 envBrdf = specularIblMultiScatter(F, F0, brdf); // same as transparent.frag
     vec3 specularIbl = prefiltered * envBrdf;
 
-    float ssao = texelFetch(ssaoTex, ivec2(gl_FragCoord.xy), 0).r;
-    float ambientScale = ao * ssao * lighting.iblParams.x;
+    // No SSAO on translucency (same as transparent.frag — keep in sync):
+    // ssaoTex describes the opaque surface behind the pane, not the glass.
+    float ambientScale = ao * lighting.iblParams.x;
 
     // Dielectric shop-window model (same as transparent.frag — keep in sync).
     vec3 Fg = F_Schlick(NdV, F0);

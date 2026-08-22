@@ -70,7 +70,9 @@ layout(set = 2, binding = 0) uniform LightingUBO {
 layout(set = 2, binding = 1) uniform samplerCube iblIrradiance;
 layout(set = 2, binding = 2) uniform samplerCube iblPrefilter;
 layout(set = 2, binding = 3) uniform sampler2D iblBrdfLut;
-// Screen-space AO (R16F, same resolution as this path's GBuffer).
+// Screen-space AO (R16F, same resolution as this path's GBuffer).  Bound for
+// layout parity but deliberately NOT sampled: it describes the opaque surface
+// behind the pane, not the glass (see the ambientScale note in main).
 layout(set = 2, binding = 4) uniform sampler2D ssaoTex;
 layout(set = 2, binding = 5) uniform sampler2DArrayShadow shadowMap; // CSM, comparison sampler
 // Opaque HDR color mip chain (RGBA16F) + depth pyramid (Hi-Z, R32F), both
@@ -264,8 +266,12 @@ void main() {
     // SSR composite below)
     vec3 specularIbl = prefiltered * envBrdf;
 
-    float ssao = texelFetch(ssaoTex, ivec2(gl_FragCoord.xy), 0).r;
-    float ambientScale = ao * ssao * lighting.iblParams.x;
+    // No SSAO on translucency: ssaoTex holds the occlusion of the first
+    // OPAQUE surface BEHIND the pane (glass writes no GBuffer), so multiplying
+    // the sky/SSR reflection by it imprinted the interior's blocky AO pattern
+    // onto shop windows (square blobs in the mirror).  `ao` is the glass
+    // material's own occlusion and stays.
+    float ambientScale = ao * lighting.iblParams.x;
 
     // Dielectric shop-window model:
     //  - Specular lobes (direct + IBL/SSR) are surface reflections and are
