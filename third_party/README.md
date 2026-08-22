@@ -14,6 +14,7 @@
 | `arm-nss/` | Arm Neural Super Sampling（SDK + 模型 + Vulkan ML 模拟层） | 见下 | SDK MIT + 模型 Arm AI Model Community License |
 | `meshoptimizer/` | zeux meshoptimizer（仅 `meshoptimizer.h` + `simplifier.cpp` + `allocator.cpp`，LOD 简化用） | **v0.25** | MIT |
 | `vma/` | GPUOpen Vulkan Memory Allocator（仅 `vk_mem_alloc.h` 单头文件） | **v3.4.0** | MIT |
+| `imnodes/` | Nelarius imnodes（Dear ImGui 节点编辑器，GUI "Render Graph" 窗口用；`imnodes.h/.cpp` + `imnodes_internal.h`） | git `eb36902`（master） | MIT |
 | `compressonator/` | AMD CompressonatorCLI（BC7 KTX2 离线转码用，见 `scripts/transcode_textures.py`） | **v4.5.52**（win64 命令行包） | MIT |
 | `../assets/sponza/` | Sponza glTF 测试场景 | Khronos glTF-Sample-Assets `main` | 模型文件 Cryengine Limited License Agreement；文档 CC-BY-4.0 |
 | `../assets/bistro/` | Amazon Lumberyard Bistro | NVIDIA ORCA 2017（FBX 转 glTF） | CC-BY 4.0 |
