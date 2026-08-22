@@ -1,0 +1,96 @@
+# ============================================================================
+# sr_compare runtime config — copy to "engine.toml" next to sr_compare.exe.
+#
+# Precedence: explicit CLI flag > this file > code defaults.  Every key is
+# optional; absent keys keep the code default.  A missing engine.toml is a
+# silent no-op; a malformed one prints a parse error to stderr and falls back
+# to defaults.  Applied values are echoed to stderr as "[engine.toml] ...".
+#
+# All modes (viewer / compare / bench / gui) read this file at startup; bench
+# child viewer processes read it too (same exe directory).  The GUI also
+# hot-reloads it (~1 s poll): the per-frame options ([effects], [dof],
+# [grading], [sun], [exposure], [culling], hdr) apply instantly; render_scale,
+# output resolution, env_map, scene and lut need an Apply rebuild / restart
+# and are NOT picked up by the hot reload.
+# ============================================================================
+
+[renderer]
+# Render resolution scale, (0, 1]  (CLI: --render-scale).  Needs rebuild.
+# render_scale = 0.5
+
+# HDR swapchain output (HDR10 PQ / scRGB probe, SDR fallback; viewer + GUI
+# only, compare/bench stay SDR).  CLI: --hdr.
+# hdr = false
+
+# Equirect HDR environment map for IBL + skybox; "" = procedural sky
+# atmosphere (default).  CLI: --env-map.  Needs rebuild in the GUI.
+# env_map = ""
+
+[exposure]
+# Manual display exposure (ACES input multiplier), (0, 16].  Setting it
+# disables auto exposure, exactly like CLI --exposure.
+# exposure = 1.0
+
+# Auto-exposure EV clamp range (min < max; no CLI flag).
+# min_ev = -8.0
+# max_ev = 8.0
+
+[effects]
+# Opaque screen-space reflections (default off; CLI: --ssr / --no-ssr).
+# ssr = false
+# Global SSR weight scale [0, 1] (CLI: --ssr-strength, default 0.6).
+# ssr_strength = 0.6
+# CSM sun shadows (CLI: --no-shadows).
+# shadows = true
+# Screen-space contact shadows for the sun (CLI: --no-contact-shadows).
+# contact_shadows = true
+# Froxel volumetric fog (CLI: --no-volfog).
+# volfog = true
+# HDR bloom pyramid (CLI: --no-bloom).
+# bloom = true
+# HDR motion blur (default off; CLI: --motion-blur).
+# motion_blur = false
+# Master switch for the present lens chain (CA/dirt/vignette/grain), viewer
+# and compare (CLI: --no-lens-fx).  Per-effect sub-items: [lens_fx] (GUI only).
+# lens_fx = true
+
+[lens_fx]
+# Individual compose lens effects (GUI only; per-frame, hot-reloadable).
+# chromatic_aberration = true
+# vignette = true
+# film_grain = true
+
+[culling]
+# GPU Hi-Z occlusion culling + screen-size LOD selection (GUI checkboxes;
+# the viewer CLI uses the SR_OCCLUSION / SR_LOD env vars instead).
+# occlusion = true
+# lod = true
+
+[dof]
+# Depth of field (default off; CLI: --dof).  All parameters per-frame.
+# enabled = false
+# Focus distance in metres [0, 10000]; 0 = auto-focus on the screen centre
+# (CLI: --dof-focus).
+# focus = 0.0
+# Aperture f-stop [0.5, 64]; smaller = wider bokeh (CLI: --dof-fstop).
+# fstop = 4.0
+# Max bokeh radius in display px at 1080p [1, 64] (CLI: --dof-max-blur).
+# max_blur = 12.0
+
+[grading]
+# Log-domain color grading (ACES input).  temperature > 0, tint [-1, 1],
+# contrast/saturation > 0.  CLI: --temperature/--tint/--contrast/--saturation
+# (viewer only; compare stays neutral, GUI has the sliders).
+# temperature = 6500
+# tint = 0.0
+# contrast = 1.0
+# saturation = 1.0
+# .cube 3D LUT (17^3/33^3), log domain pre-ACES; "" = identity.  Viewer only
+# (CLI: --lut); the GUI always uses the procedural identity LUT.
+# lut = ""
+
+[sun]
+# Sun elevation/azimuth in degrees (sky atmosphere + key light).  Negative =
+# use the scene preset (the code default).  CLI: --sun-elev / --sun-az.
+# elevation = 22.0
+# azimuth = 215.0

@@ -35,6 +35,7 @@
 #include "gui/GpuProfilerWindow.h"
 #include "gui/RenderGraphEditor.h"
 #include "renderer/ColorGrading.h"
+#include "renderer/core/EngineConfig.h"
 #include "renderer/core/GpuProfiler.h"
 #include "renderer/core/Swapchain.h"
 #include "renderer/core/TimestampQuery.h"
@@ -79,6 +80,10 @@ struct GuiOptions {
     bool compareGtSsaa = false; // preset the compare-tab GT SSAA checkbox
     std::string envMapPath;    // empty = procedural sky atmosphere (default)
     float exposure = 0.f;      // > 0 overrides the scene lighting preset
+    // engine.toml contents (loaded by main before init; empty optionals when
+    // absent) + the explicit-CLI mask for precedence — see EngineConfig.h.
+    EngineConfig engineCfg;
+    uint64_t engineCfgCli = cli::kNone;
 };
 
 class GuiApp {
@@ -410,6 +415,14 @@ private:
     void discardLoadResult();              // main thread: free worker products
     void drawLoadOverlay();                // progress bar + stage text
     void applyLaunchOptions();
+    // engine.toml application (renderer/core/EngineConfig.h).  applyEngineConfigHot
+    // sets only per-frame state (effects/DOF/grading/sun sliders, exposure,
+    // occlusion/lod, HDR swapchain toggle) — no rebuild — and is used both for
+    // the initial defaults and for hot reloads.  pollEngineConfig() stats the
+    // file once per second in run() and re-applies on modification; resolution/
+    // scale/env-map/scene/LUT changes need an Apply rebuild and are ignored.
+    void applyEngineConfigHot(const EngineConfig& cfg, EngineConfigLog& log);
+    void pollEngineConfig();
     void loadCameraPathFromUi();
     void saveScreenshot(const char* path);
     void drawScreenshotBusy(); // animated in-flight indicator next to the save buttons
@@ -879,6 +892,10 @@ private:
     GuiOptions opts_;
     std::string inputFile_;    // SR_GUI_INPUT_FILE automation (empty = off)
     uint64_t inputFileLine_ = 0; // lines consumed so far
+    // engine.toml hot-reload watch (path captured at init; ~1 s stat interval).
+    std::string engineCfgPath_;
+    int64_t engineCfgMtime_ = 0;
+    std::chrono::steady_clock::time_point engineCfgNextPoll_{};
     bool benchAutoRun_ = false;
     bool benchStarted_ = false;
     // Quit deadline after an auto bench finishes (time-based: ImGui-only

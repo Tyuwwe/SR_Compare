@@ -270,6 +270,10 @@ void GuiApp::computeViewRegion(uint32_t srcW, uint32_t srcH, uint32_t colW, uint
 // ---------------------------------------------------------------------------
 bool GuiApp::init(const GuiOptions& opts) {
     opts_ = opts;
+    // engine.toml watch state (the file was already parsed by main into
+    // opts_.engineCfg; the GUI re-stats it for hot reload in run()).
+    engineCfgPath_ = engineConfigPath();
+    engineCfgMtime_ = engineConfigWriteTime(engineCfgPath_);
     // CLI --exposure is a manual override: start in manual exposure mode.
     if (opts_.exposure > 0.f) autoExposureEnabled_ = false;
     // _dupenv_s / envFlag: plain getenv trips C4996 (this project builds /W4).
@@ -312,6 +316,10 @@ bool GuiApp::init(const GuiOptions& opts) {
     // HDR surface probe (Phase 6c): gates the UI checkbox; the default stays
     // SDR.  The checkbox handler re-creates the swapchain on toggle.
     Swapchain::queryHdrSupport(ctx_, hdrSupportHdr10_, hdrSupportScRgb_);
+    // engine.toml hdr default (no gui CLI flag for it): gated on the support
+    // probe, same rule as the UI checkbox.
+    if (opts_.engineCfg.hdr && (opts_.engineCfgCli & cli::kHdr) == 0)
+        hdrEnabled_ = *opts_.engineCfg.hdr && (hdrSupportHdr10_ || hdrSupportScRgb_);
     swapchainVsync_ = guiWantVsync();
     swapchainMailbox_ = guiAllowMailbox();
     if (!swapchain_.create(ctx_, active_.displayW, active_.displayH, swapchainVsync_,
@@ -383,6 +391,16 @@ bool GuiApp::init(const GuiOptions& opts) {
         std::fprintf(stderr, "gui: initial render stack failed: %s\n", statusLine_.c_str());
         // Continue anyway: the UI stays up (ImGui-only frames) and shows the
         // error; Apply retries.
+    }
+    // engine.toml per-frame defaults: applied AFTER the initial stack build so
+    // they win over the scene lighting preset (buildRenderStack re-asserts the
+    // preset on every scene rebuild, same as the manual "reset" UI button).
+    // The manual-exposure value additionally rides opts_.exposure (re-applied
+    // on rebuild), matching CLI --exposure.
+    if (!engineCfgPath_.empty()) {
+        EngineConfigLog log;
+        applyEngineConfigHot(opts_.engineCfg, log);
+        log.flush(" gui:");
     }
     if (opts_.compareZoom > 0.f) {
         // Applied on the first run() frame (after any spurious first-frame
@@ -585,6 +603,85 @@ void GuiApp::applyLaunchOptions() {
         tabRequest_ = 2;
         benchAutoRun_ = true;
     }
+}
+
+// engine.toml per-frame application (hot reload + initial defaults): only
+// options with no rebuild cost are touched (pass toggles go through
+// applyPassToggle for the checkbox side effects like the fog history reset).
+// Resolution/scale/scene/env-map/LUT changes still need Apply or a restart.
+void GuiApp::applyEngineConfigHot(const EngineConfig& cfg, EngineConfigLog& log) {
+    const uint64_t m = opts_.engineCfgCli;
+    auto takeToggle = [&](rg::PassToggle t, const std::optional<bool>& v, uint64_t bit,
+                          const char* key) {
+        if (v && (m & bit) == 0 && *v != passToggleValue(t)) {
+            applyPassToggle(t, *v);
+            log.add(key, *v);
+        }
+    };
+    takeToggle(rg::PassToggle::Shadows, cfg.shadows, cli::kShadows, "shadows");
+    takeToggle(rg::PassToggle::ContactShadows, cfg.contactShadows, cli::kContactShadows,
+               "contact_shadows");
+    takeToggle(rg::PassToggle::Ssr, cfg.ssr, cli::kSsr, "ssr");
+    takeToggle(rg::PassToggle::VolFog, cfg.volFog, cli::kVolFog, "volfog");
+    takeToggle(rg::PassToggle::Occlusion, cfg.occlusion, cli::kNone, "occlusion");
+    takeToggle(rg::PassToggle::Bloom, cfg.bloom, cli::kBloom, "bloom");
+    takeToggle(rg::PassToggle::MotionBlur, cfg.motionBlur, cli::kMotionBlur, "motion_blur");
+    takeToggle(rg::PassToggle::Dof, cfg.dof, cli::kDof, "dof");
+    takeToggle(rg::PassToggle::LensCa, cfg.lensCa, cli::kLensFx, "lens_ca");
+    takeToggle(rg::PassToggle::LensVignette, cfg.lensVignette, cli::kLensFx, "lens_vignette");
+    takeToggle(rg::PassToggle::LensGrain, cfg.lensGrain, cli::kLensFx, "lens_grain");
+    cfgTake(ssrStrength_, cfg.ssrStrength, m, cli::kSsrStrength, "ssr_strength", log);
+    cfgTake(dofFocus_, cfg.dofFocus, m, cli::kDofFocus, "dof_focus", log);
+    cfgTake(dofFstop_, cfg.dofFstop, m, cli::kDofFstop, "dof_fstop", log);
+    cfgTake(dofMaxBlur_, cfg.dofMaxBlur, m, cli::kDofMaxBlur, "dof_max_blur", log);
+    cfgTake(lodEnabled_, cfg.lod, m, cli::kNone, "lod", log);
+    cfgTake(gradeTemperatureK_, cfg.gradingTempK, m, cli::kGradingTemp, "temperature", log);
+    cfgTake(gradeTint_, cfg.gradingTint, m, cli::kGradingTint, "tint", log);
+    cfgTake(gradeContrast_, cfg.gradingContrast, m, cli::kGradingContrast, "contrast", log);
+    cfgTake(gradeSaturation_, cfg.gradingSat, m, cli::kGradingSat, "saturation", log);
+    cfgTake(exposureMinEV_, cfg.exposureMinEV, m, cli::kExposure, "exposure_min_ev", log);
+    cfgTake(exposureMaxEV_, cfg.exposureMaxEV, m, cli::kExposure, "exposure_max_ev", log);
+    if (cfg.exposure && (m & cli::kExposure) == 0) {
+        // Same semantics as CLI --exposure: manual value, auto exposure off.
+        autoExposureEnabled_ = false;
+        exposure_ = *cfg.exposure;
+        log.add("exposure", exposure_);
+    }
+    bool sunMoved = false;
+    sunMoved |= cfgTake(sunElevationDeg_, cfg.sunElevationDeg, m, cli::kSunElev, "sun_elev", log);
+    sunMoved |= cfgTake(sunAzimuthDeg_, cfg.sunAzimuthDeg, m, cli::kSunAz, "sun_az", log);
+    if (sunMoved) updateSkyFromUiSun();
+    if (cfg.hdr && (m & cli::kHdr) == 0 && *cfg.hdr != hdrEnabled_) {
+        if (*cfg.hdr && !hdrSupportHdr10_ && !hdrSupportScRgb_) {
+            std::fprintf(stderr, "[engine.toml] hdr=true ignored: no HDR surface support\n");
+        } else {
+            setHdrEnabled(*cfg.hdr);
+            log.add("hdr", hdrEnabled_);
+        }
+    }
+}
+
+// Hot-reload watch: stats engine.toml about once a second; on a modification
+// the per-frame options are re-applied (CLI-masked keys stay untouched).
+void GuiApp::pollEngineConfig() {
+    const auto now = std::chrono::steady_clock::now();
+    if (now < engineCfgNextPoll_) return;
+    engineCfgNextPoll_ = now + std::chrono::seconds(1);
+    if (engineCfgPath_.empty()) {
+        // No config at startup: keep watching so a newly created file applies.
+        engineCfgPath_ = engineConfigPath();
+        if (engineCfgPath_.empty()) return;
+        engineCfgMtime_ = 0;
+    }
+    const int64_t mt = engineConfigWriteTime(engineCfgPath_);
+    if (mt == engineCfgMtime_) return;
+    engineCfgMtime_ = mt;
+    EngineConfig cfg;
+    if (!loadEngineConfig(engineCfgPath_, cfg)) return; // missing/malformed: keep state
+    EngineConfigLog log;
+    applyEngineConfigHot(cfg, log);
+    if (!log.empty()) statusLine_ = "engine.toml reloaded";
+    log.flush(" gui (reload):");
 }
 
 void GuiApp::requestRebuild(const RenderConfig& cfg) {
@@ -4859,6 +4956,9 @@ void GuiApp::run() {
         }
 
         updateCamera(dt);
+
+        // engine.toml hot reload: ~1 s mtime poll, per-frame options only.
+        pollEngineConfig();
 
         // Debug hook (SR_GUI_DEBUG_INPUT=1): heartbeat to correlate input
         // message dispatch with the frame loop during automation tests.

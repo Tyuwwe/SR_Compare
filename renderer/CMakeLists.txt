@@ -9,6 +9,7 @@ add_library(renderer STATIC
     core/GpuProfiler.cpp
     core/MemoryBudget.cpp
     core/RenderGraph.cpp
+    core/EngineConfig.cpp
     scene/Scene.cpp
     scene/Animation.cpp
     scene/ProceduralScene.cpp

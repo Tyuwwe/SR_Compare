@@ -119,6 +119,28 @@ compare 另有 `--upscalers a,b,...`、`--gt-ssaa`、`--zoom <f>`、
 `--zoom-center <u,v>`、`--metric-interval <N>`；bench 另有 `--upscalers`、
 `--frames`、`--warmup`、`--out <csv>`。
 
+## 运行时配置（`engine.toml`）
+
+所有模式启动时都会读 exe 旁边的 `engine.toml`（从 `engine.toml.example`
+复制即可，该文件随构建拷到 exe 旁并注释了全部参数）。优先级：
+**显式 CLI 参数 > engine.toml > 代码默认**——CLI 解析会记录哪些 flag
+是用户显式传入的，toml 只填充其余项。文件缺失时完全无行为变化；解析
+失败会在 stderr 打印错误并回退默认值；实际生效的键以
+`[engine.toml] <mode>: key=value ...` 打印到 stderr，便于脚本核对。
+
+分节：`[renderer]`（render_scale、hdr、env_map）、`[exposure]`（手动曝光
++ 自动曝光 EV 范围）、`[effects]`（ssr/ssr_strength、shadows、
+contact_shadows、volfog、bloom、motion_blur、lens_fx）、`[lens_fx]`
+（GUI 子项）、`[culling]`（occlusion、lod，GUI）、`[dof]`、
+`[grading]`（temperature/tint/contrast/saturation/lut）、`[sun]`
+（elevation/azimuth）。bench 派生的 viewer 子进程读同一文件，因此同一
+engine.toml 下 bench 结果是确定的。
+
+**GUI 支持热重载**（约 1 秒轮询文件修改时间）：逐帧参数——效果开关、
+DOF/调色/太阳滑条、曝光、occlusion/lod、HDR 复选框——即时生效；
+render_scale、输出分辨率、env_map、场景、lut 需要 Apply 重建或重启，
+热重载会忽略这些键。
+
 ## 场景（`--scene`）
 
 - `boxes`（别名 `procedural`）：内置程序化盒子房间，无需外部资产

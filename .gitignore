@@ -6,6 +6,7 @@ third_party/*/
 !third_party/vma/
 !third_party/meshoptimizer/
 !third_party/imnodes/
+!third_party/tomlplusplus/
 assets/*/
 !assets/.gitkeep
 metrics/venv/

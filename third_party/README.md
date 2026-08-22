@@ -15,6 +15,7 @@
 | `meshoptimizer/` | zeux meshoptimizer（仅 `meshoptimizer.h` + `simplifier.cpp` + `allocator.cpp`，LOD 简化用） | **v0.25** | MIT |
 | `vma/` | GPUOpen Vulkan Memory Allocator（仅 `vk_mem_alloc.h` 单头文件） | **v3.4.0** | MIT |
 | `imnodes/` | Nelarius imnodes（Dear ImGui 节点编辑器，GUI "Render Graph" 窗口用；`imnodes.h/.cpp` + `imnodes_internal.h`） | git `eb36902`（master） | MIT |
+| `tomlplusplus/` | marzer toml++（TOML 解析，仅单头 `toml.hpp`，`engine.toml` 运行时配置用；随源码 vendor，不经 fetch_sdks.py） | **v3.4.0** | MIT |
 | `compressonator/` | AMD CompressonatorCLI（BC7 KTX2 离线转码用，见 `scripts/transcode_textures.py`） | **v4.5.52**（win64 命令行包） | MIT |
 | `../assets/sponza/` | Sponza glTF 测试场景 | Khronos glTF-Sample-Assets `main` | 模型文件 Cryengine Limited License Agreement；文档 CC-BY-4.0 |
 | `../assets/bistro/` | Amazon Lumberyard Bistro | NVIDIA ORCA 2017（FBX 转 glTF） | CC-BY 4.0 |
@@ -186,6 +187,15 @@
 - 来源：https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator
 - 版本：v3.4.0（头文件内 `VMA_VERSION`），只保留 `vk_mem_alloc.h` 单头文件（随源码 vendor，不经 fetch_sdks.py）
 - 许可证：MIT
+
+---
+
+## toml++ — `tomlplusplus/`
+
+- 来源：https://github.com/marzer/tomlplusplus
+- 版本：v3.4.0（tag `v3.4.0` 仓库根的 amalgamated 单头 `toml.hpp`，随源码 vendor，不经 fetch_sdks.py）
+- 许可证：MIT（见 `tomlplusplus/LICENSE`）
+- 用途：`engine.toml` 运行时配置解析（`renderer/core/EngineConfig.cpp`，见仓库根 `engine.toml.example`）
 
 ---
 

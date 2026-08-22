@@ -22,6 +22,12 @@ add_custom_command(TARGET sr_compare POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_SOURCE_DIR}/cmake/run_gui.bat" "${SR_EXE_DIR}/sr_run_gui.bat")
 
+# Annotated runtime-config template next to the exe (copy to engine.toml to
+# activate; a missing engine.toml keeps the built-in defaults).
+add_custom_command(TARGET sr_compare POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_SOURCE_DIR}/engine.toml.example" "${SR_EXE_DIR}/engine.toml.example")
+
 if(EXISTS "${SR_THIRD_PARTY_DIR}/arm-nss/prebuilt_binaries/ngsdk_windows_x64.dll")
     add_custom_command(TARGET sr_compare POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different

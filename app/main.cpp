@@ -11,6 +11,7 @@
 #include "compare/CompareMode.h"
 #include "gui/GuiApp.h"
 #include "renderer/Renderer.h"
+#include "renderer/core/EngineConfig.h"
 #include "renderer/scene/SceneRegistry.h"
 #include "upscalers/UpscalerFactory.h"
 
@@ -70,11 +71,16 @@ void printUsage() {
                  "  --temperature <K>                grading white balance (default 6500, scene preset may override)\n"
                  "  --tint <-1..1>                   grading green/magenta shift (default 0)\n"
                  "  --contrast <f>                   grading log-domain contrast (default 1)\n"
-                 "  --saturation <f>                 grading saturation (default 1)\n");
+                 "  --saturation <f>                 grading saturation (default 1)\n"
+                 "\n"
+                 "engine.toml (next to the exe, see engine.toml.example) supplies defaults\n"
+                 "for the renderer/effect/grading/sun options in every mode; explicit CLI\n"
+                 "flags always win.  The GUI hot-reloads it (~1 s) for per-frame options.\n");
 }
 
 int runViewer(int argc, char** argv) {
     sr::RendererOptions opts;
+    uint64_t cliMask = sr::cli::kNone; // explicit-CLI mask: engine.toml never overrides these
     for (int i = 0; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--scene") {
@@ -98,22 +104,27 @@ int runViewer(int argc, char** argv) {
                 std::fprintf(stderr, "invalid --render-scale value\n");
                 return 1;
             }
+            cliMask |= sr::cli::kRenderScale;
         } else if (a == "--output") {
             if (!sr::parseResolution(sr::nextArg(i, argc, argv, "--output"),
                                      opts.displayWidth, opts.displayHeight)) {
                 std::fprintf(stderr, "invalid --output resolution\n");
                 return 1;
             }
+            cliMask |= sr::cli::kOutput;
         } else if (a == "--camera-path") {
             opts.cameraPath = sr::nextArg(i, argc, argv, "--camera-path");
         } else if (a == "--env-map") {
             opts.envMapPath = sr::nextArg(i, argc, argv, "--env-map");
+            cliMask |= sr::cli::kEnvMap;
         } else if (a == "--sun-elev") {
             opts.sunElevationDeg =
                 static_cast<float>(std::atof(sr::nextArg(i, argc, argv, "--sun-elev")));
+            cliMask |= sr::cli::kSunElev;
         } else if (a == "--sun-az") {
             opts.sunAzimuthDeg =
                 static_cast<float>(std::atof(sr::nextArg(i, argc, argv, "--sun-az")));
+            cliMask |= sr::cli::kSunAz;
         } else if (a == "--frames") {
             opts.frames = std::atoi(sr::nextArg(i, argc, argv, "--frames"));
         } else if (a == "--screenshot") {
@@ -124,6 +135,7 @@ int runViewer(int argc, char** argv) {
             opts.vsync = true;
         } else if (a == "--no-shadows") {
             opts.shadows = false;
+            cliMask |= sr::cli::kShadows;
         } else if (a == "--shadow-debug") {
             opts.shadowDebug = true;
         } else if (a == "--exposure") {
@@ -133,69 +145,101 @@ int runViewer(int argc, char** argv) {
                 return 1;
             }
             opts.autoExposure = false;
+            cliMask |= sr::cli::kExposure;
         } else if (a == "--no-bloom") {
             opts.bloom = false;
+            cliMask |= sr::cli::kBloom;
         } else if (a == "--no-lens-fx") {
             opts.lensFx = false;
+            cliMask |= sr::cli::kLensFx;
         } else if (a == "--ssr") {
             opts.ssr = true;
+            cliMask |= sr::cli::kSsr;
         } else if (a == "--no-ssr") {
             opts.ssr = false;
+            cliMask |= sr::cli::kSsr;
         } else if (a == "--ssr-strength") {
             if (!sr::parseUnitInterval(sr::nextArg(i, argc, argv, "--ssr-strength"),
                                        opts.ssrStrength)) {
                 std::fprintf(stderr, "invalid --ssr-strength value\n");
                 return 1;
             }
+            cliMask |= sr::cli::kSsrStrength;
         } else if (a == "--no-contact-shadows") {
             opts.contactShadows = false;
+            cliMask |= sr::cli::kContactShadows;
         } else if (a == "--no-volfog") {
             opts.volFog = false;
+            cliMask |= sr::cli::kVolFog;
         } else if (a == "--motion-blur") {
             opts.motionBlur = true;
+            cliMask |= sr::cli::kMotionBlur;
         } else if (a == "--no-motion-blur") {
             opts.motionBlur = false;
+            cliMask |= sr::cli::kMotionBlur;
         } else if (a == "--dof") {
             opts.dof = true;
+            cliMask |= sr::cli::kDof;
         } else if (a == "--no-dof") {
             opts.dof = false;
+            cliMask |= sr::cli::kDof;
         } else if (a == "--dof-focus") {
             if (!sr::parseDofFocus(sr::nextArg(i, argc, argv, "--dof-focus"), opts.dofFocus)) {
                 std::fprintf(stderr, "invalid --dof-focus value\n");
                 return 1;
             }
+            cliMask |= sr::cli::kDofFocus;
         } else if (a == "--dof-fstop") {
             if (!sr::parseDofFstop(sr::nextArg(i, argc, argv, "--dof-fstop"), opts.dofFstop)) {
                 std::fprintf(stderr, "invalid --dof-fstop value\n");
                 return 1;
             }
+            cliMask |= sr::cli::kDofFstop;
         } else if (a == "--dof-max-blur") {
             if (!sr::parseDofMaxBlur(sr::nextArg(i, argc, argv, "--dof-max-blur"),
                                      opts.dofMaxBlurPx)) {
                 std::fprintf(stderr, "invalid --dof-max-blur value\n");
                 return 1;
             }
+            cliMask |= sr::cli::kDofMaxBlur;
         } else if (a == "--bake-probes") {
             opts.bakeProbes = true;
         } else if (a == "--hdr") {
             opts.hdr = true;
+            cliMask |= sr::cli::kHdr;
         } else if (a == "--lut") {
             opts.lutPath = sr::nextArg(i, argc, argv, "--lut");
+            cliMask |= sr::cli::kLut;
         } else if (a == "--temperature") {
             opts.grading.temperatureK =
                 static_cast<float>(std::atof(sr::nextArg(i, argc, argv, "--temperature")));
+            cliMask |= sr::cli::kGradingTemp;
         } else if (a == "--tint") {
             opts.grading.tint =
                 static_cast<float>(std::atof(sr::nextArg(i, argc, argv, "--tint")));
+            cliMask |= sr::cli::kGradingTint;
         } else if (a == "--contrast") {
             opts.grading.contrast =
                 static_cast<float>(std::atof(sr::nextArg(i, argc, argv, "--contrast")));
+            cliMask |= sr::cli::kGradingContrast;
         } else if (a == "--saturation") {
             opts.grading.saturation =
                 static_cast<float>(std::atof(sr::nextArg(i, argc, argv, "--saturation")));
+            cliMask |= sr::cli::kGradingSat;
         } else {
             std::fprintf(stderr, "unknown viewer option: %s\n", a.c_str());
             return 1;
+        }
+    }
+
+    // engine.toml (exe-relative) fills every option the CLI did not set
+    // explicitly; a missing file leaves the code defaults untouched.
+    {
+        sr::EngineConfig cfg;
+        if (sr::loadEngineConfig(cfg)) {
+            sr::EngineConfigLog log;
+            applyEngineConfig(opts, cfg, cliMask, log);
+            log.flush(" viewer:");
         }
     }
 
@@ -223,6 +267,7 @@ int runViewer(int argc, char** argv) {
 
 int runGui(int argc, char** argv) {
     sr::GuiOptions opts;
+    uint64_t cliMask = sr::cli::kNone; // explicit-CLI mask: engine.toml never overrides these
     for (int i = 0; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--scene") {
@@ -237,6 +282,7 @@ int runGui(int argc, char** argv) {
             opts.compareGtSsaa = true;
         } else if (a == "--env-map") {
             opts.envMapPath = sr::nextArg(i, argc, argv, "--env-map");
+            cliMask |= sr::cli::kEnvMap;
         } else if (a == "--bench") {
             opts.benchList = sr::nextArg(i, argc, argv, "--bench");
         } else if (a == "--render-scale") {
@@ -245,12 +291,14 @@ int runGui(int argc, char** argv) {
                 std::fprintf(stderr, "invalid --render-scale value\n");
                 return 1;
             }
+            cliMask |= sr::cli::kRenderScale;
         } else if (a == "--output") {
             if (!sr::parseResolution(sr::nextArg(i, argc, argv, "--output"),
                                      opts.displayW, opts.displayH)) {
                 std::fprintf(stderr, "invalid --output resolution\n");
                 return 1;
             }
+            cliMask |= sr::cli::kOutput;
         } else if (a == "--frames") {
             opts.frames = std::atoi(sr::nextArg(i, argc, argv, "--frames"));
         } else if (a == "--screenshot") {
@@ -260,10 +308,25 @@ int runGui(int argc, char** argv) {
                 std::fprintf(stderr, "invalid --exposure value\n");
                 return 1;
             }
+            cliMask |= sr::cli::kExposure;
         } else {
             std::fprintf(stderr, "unknown gui option: %s\n", a.c_str());
             return 1;
         }
+    }
+
+    // engine.toml (exe-relative): fills launch options the CLI did not set;
+    // the remaining keys become the GUI's initial effect/grading/sun state
+    // and are hot-reloaded by GuiApp (see GuiApp::pollEngineConfig).
+    opts.engineCfgCli = cliMask;
+    if (sr::loadEngineConfig(opts.engineCfg)) {
+        sr::EngineConfigLog log;
+        sr::cfgTake(opts.renderScale, opts.engineCfg.renderScale, cliMask, sr::cli::kRenderScale,
+                    "render_scale", log);
+        sr::cfgTake(opts.envMapPath, opts.engineCfg.envMap, cliMask, sr::cli::kEnvMap, "env_map", log);
+        sr::cfgTake(opts.exposure, opts.engineCfg.exposure, cliMask, sr::cli::kExposure, "exposure",
+                    log);
+        log.flush(" gui:");
     }
 
     // The dlss/xess/nss device-requirement hooks and slInit are gated on

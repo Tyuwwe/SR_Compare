@@ -14,6 +14,7 @@
 // ============================================================================
 #include "app/CliUtils.h"
 #include "bench/BenchMode.h"
+#include "renderer/core/EngineConfig.h"
 #include "upscalers/UpscalerFactory.h"
 
 #include <algorithm>
@@ -346,6 +347,7 @@ void printUsage() {
 
 int runBenchMode(int argc, char** argv) {
     BenchOptions opts;
+    uint64_t cliMask = cli::kNone; // explicit-CLI mask: engine.toml never overrides these
     for (int i = 0; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--upscalers") {
@@ -358,6 +360,7 @@ int runBenchMode(int argc, char** argv) {
             }
         } else if (a == "--render-scale") {
             opts.renderScale = static_cast<float>(std::atof(nextArg(i, argc, argv, "--render-scale")));
+            cliMask |= cli::kRenderScale;
         } else if (a == "--frames") {
             opts.frames = std::atoi(nextArg(i, argc, argv, "--frames"));
         } else if (a == "--warmup") {
@@ -375,6 +378,18 @@ int runBenchMode(int argc, char** argv) {
             std::fprintf(stderr, "unknown bench option: %s\n", a.c_str());
             printUsage();
             return 1;
+        }
+    }
+    // engine.toml (exe-relative): render_scale fills in when the CLI did not
+    // set it.  The per-run viewer children load the same file themselves
+    // (same exe directory), so effect/grading keys apply there directly.
+    {
+        EngineConfig cfg;
+        if (loadEngineConfig(cfg)) {
+            EngineConfigLog log;
+            cfgTake(opts.renderScale, cfg.renderScale, cliMask, cli::kRenderScale, "render_scale",
+                    log);
+            log.flush(" bench:");
         }
     }
     if (opts.frames <= 0 || opts.warmup < 0 || opts.renderScale <= 0.0f ||

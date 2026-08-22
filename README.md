@@ -144,6 +144,30 @@ compare additionally takes `--upscalers a,b,...`, `--gt-ssaa`, `--zoom <f>`,
 `--zoom-center <u,v>`, `--metric-interval <N>`; bench takes `--upscalers`,
 `--frames`, `--warmup`, `--out <csv>`.
 
+## Runtime config (`engine.toml`)
+
+Every mode reads an optional `engine.toml` next to the exe at startup (copy
+`engine.toml.example`, which is built next to the exe and documents all keys).
+Precedence: **explicit CLI flag > engine.toml > code default** — the CLI
+parsers track which flags were given explicitly and toml only fills the rest.
+A missing file is a silent no-op; a malformed file prints the parse error to
+stderr and falls back to defaults; applied keys are echoed to stderr as
+`[engine.toml] <mode>: key=value ...` so scripted runs can verify them.
+
+Sections: `[renderer]` (render_scale, hdr, env_map), `[exposure]` (manual
+exposure + auto-exposure EV range), `[effects]` (ssr/ssr_strength, shadows,
+contact_shadows, volfog, bloom, motion_blur, lens_fx), `[lens_fx]` (GUI
+sub-items), `[culling]` (occlusion, lod — GUI), `[dof]`, `[grading]`
+(temperature/tint/contrast/saturation/lut), `[sun]` (elevation/azimuth).
+Bench spawns viewer children that read the same file, so bench runs stay
+deterministic under a given engine.toml.
+
+The **GUI hot-reloads** the file (~1 s mtime poll): the per-frame options —
+effects toggles, DOF/grading/sun sliders, exposure, occlusion/lod, the HDR
+checkbox — apply immediately; render_scale, output resolution, env_map, scene
+and lut changes require an Apply rebuild or a restart and are ignored by the
+reload.
+
 ## Scenes (`--scene`)
 
 - `boxes` (alias `procedural`): built-in procedural box room, no assets needed
