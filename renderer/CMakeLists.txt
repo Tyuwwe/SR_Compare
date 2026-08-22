@@ -11,6 +11,8 @@ add_library(renderer STATIC
     scene/Animation.cpp
     scene/ProceduralScene.cpp
     scene/GltfLoader.cpp
+    scene/Ktx2.cpp
+    scene/TextureStreamer.cpp
     scene/LodBuilder.cpp
     scene/Camera.cpp
     scene/CameraPath.cpp

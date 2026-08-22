@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <set>
 #include <string>
 #include <utility>
@@ -237,6 +238,25 @@ bool Scene::loadGltf(const VulkanContext& ctx, const char* path, VkCommandPool p
         return true;
     };
 
+    // Resolves the sibling .ktx2 for URI-backed images (buffer-view / data-URI
+    // embedded images have no file to sit next to).  Only path resolution
+    // here; the file is parsed at upload time.
+    auto findImageKtx2 = [&](int i, std::string& out) -> bool {
+        const cgltf_image* img = &data->images[i];
+        if (img->buffer_view || !img->uri || img->uri[0] == '\0') return false;
+        if (std::string(img->uri).rfind("data:", 0) == 0) return false;
+        std::string p = dir + img->uri;
+        const size_t dot = p.find_last_of('.');
+        const size_t slash = p.find_last_of("/\\");
+        if (dot == std::string::npos || (slash != std::string::npos && dot < slash))
+            return false;
+        p.replace(dot, std::string::npos, ".ktx2");
+        std::ifstream f(p, std::ios::binary);
+        if (!f.good()) return false;
+        out = std::move(p);
+        return true;
+    };
+
     // Returns the Scene texture index for `image` in the requested color
     // space, uploading it on first use; -1 on failure.
     auto textureFor = [&](const cgltf_texture* tex, bool srgb) -> int32_t {
@@ -251,6 +271,21 @@ bool Scene::loadGltf(const VulkanContext& ctx, const char* path, VkCommandPool p
             texAttempted[attemptIdx] = 1;
             ++texUploadsDone;
             report(LoadStage::Textures, texUploadsDone, totalTexUploads);
+        }
+        // Prefer a pre-baked BC7 sibling (foo.ktx2 next to foo.png, produced
+        // by scripts/transcode_textures.py); fall back to the PNG/JPG path
+        // unchanged when absent.
+        std::string ktx2Path;
+        if (findImageKtx2(imgIdx, ktx2Path)) {
+            Ktx2Image ktx;
+            if (loadKtx2File(ktx2Path.c_str(), ktx)) {
+                Texture t;
+                if (!uploadTextureCompressed(ctx, ktx, srgb, t, ktx2Path.c_str(), pool))
+                    return -1;
+                textures.push_back(t);
+                slot = static_cast<int32_t>(textures.size() - 1);
+                return slot;
+            }
         }
         if (!loadImagePixels(imgIdx)) return -1;
         Texture t;

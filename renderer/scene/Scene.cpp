@@ -264,6 +264,9 @@ bool Scene::uploadTexture(const VulkanContext& ctx, uint32_t width, uint32_t hei
 }
 
 void Scene::destroy(const VulkanContext& ctx) {
+    // The streaming worker references texture images; join it first.
+    stopTextureStreaming();
+
     for (auto& m : meshes) {
         if (m.vertexBuffer) vmaDestroyBuffer(ctx.allocator, m.vertexBuffer, m.vertexMemory);
         if (m.indexBuffer) vmaDestroyBuffer(ctx.allocator, m.indexBuffer, m.indexMemory);

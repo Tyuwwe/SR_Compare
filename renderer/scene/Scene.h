@@ -6,10 +6,13 @@
 #include "renderer/core/Vk.h"
 #include "renderer/core/VulkanContext.h"
 #include "renderer/math/Math.h"
+#include "renderer/scene/Ktx2.h"
 
 #include <cstdint>
 #include <cstdlib>
 #include <functional>
+#include <memory>
+#include <string>
 #include <vector>
 
 namespace sr {
@@ -60,6 +63,39 @@ inline bool occlusionEnabledByDefault() {
 #endif
     return !v || v[0] != '0';
 }
+
+// --- Texture compression / mip streaming (Phase 7b) ---------------------------
+// Textures prefer a sibling .ktx2 (BC7, pre-baked full mip chain; see
+// scripts/transcode_textures.py) over the referenced .png/.jpg.  BC7 cuts
+// texture VRAM ~4x vs RGBA8.  sRGB vs UNORM is decided by material usage at
+// image-creation time (baseColor/emissive sRGB, normal/MR/AO linear) — the
+// block payload is identical either way.  Normal maps stay BC7 (not BC5) to
+// keep one code path; BC5 is a possible follow-up.
+//
+// Mip streaming: interactive hosts (viewer free-fly, GUI) upload only the
+// coarse tail (mip >= kStreamResidentBaseMip) of large KTX2 textures at load
+// and fill in finer levels from a background thread, nearest-to-camera first,
+// capped at kStreamBudgetBytesPerFrame per frame tick.  Un-uploaded levels
+// sit in SHADER_READ_ONLY with undefined contents (fresh device-local VRAM is
+// zeroed by the OS) — transient low-quality placeholders, never validation
+// errors.  Bench/compare/screenshot runs disable streaming (full upload at
+// load) so every frame is bit-reproducible; the PNG fallback path never
+// streams (no pre-baked chain to read back).  SR_TEX_STREAM: 0 = force off,
+// 1 = force on (debug/validation of the streaming path), unset = default.
+inline int texStreamingOverride() {
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4996) // std::getenv is portable; _dupenv_s is MSVC-only
+#endif
+    const char* v = std::getenv("SR_TEX_STREAM");
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
+    if (!v) return 0;
+    return v[0] == '1' ? 1 : -1;
+}
+inline constexpr uint32_t kStreamResidentBaseMip = 4; // resident: 1/16 resolution tail
+inline constexpr uint64_t kStreamBudgetBytesPerFrame = 8ull * 1024 * 1024;
 
 // One draw range into the merged scene buffers (index span + vertex offset).
 struct LodDraw {
@@ -314,6 +350,17 @@ struct ReflectionProbe {
 
 class Scene {
 public:
+    // Movable but not copyable (owns GPU handles; the GUI installs async-loaded
+    // scenes via move).  All special members are out-of-line: TextureStreamer
+    // is incomplete here and unique_ptr member cleanup must not be
+    // instantiated in other TUs.
+    Scene();
+    ~Scene();
+    Scene(Scene&&) noexcept;
+    Scene& operator=(Scene&&) noexcept;
+    Scene(const Scene&) = delete;
+    Scene& operator=(const Scene&) = delete;
+
     std::vector<Mesh> meshes;
     std::vector<Texture> textures;
     std::vector<Material> materials;
@@ -426,6 +473,25 @@ public:
     bool uploadTexture(const VulkanContext& ctx, uint32_t width, uint32_t height,
                        const uint8_t* rgba8, Texture& out, bool srgb = true,
                        VkCommandPool pool = VK_NULL_HANDLE);
+    // Uploads a pre-baked BC7 KTX2 (no blits: block data copies directly).
+    // With streamingEnabled and a long enough mip chain, only the coarse tail
+    // (mip >= kStreamResidentBaseMip) is uploaded now and a stream job for the
+    // fine levels is queued for updateTextureStreaming(); otherwise the full
+    // chain uploads here (bench/compare determinism).
+    bool uploadTextureCompressed(const VulkanContext& ctx, const Ktx2Image& img, bool srgb,
+                                 Texture& out, const char* sourcePath,
+                                 VkCommandPool pool = VK_NULL_HANDLE);
+
+    // Per-frame streaming tick (interactive hosts only): reprioritizes pending
+    // fine-mip uploads by distance to the camera and hands the background
+    // thread one frame's byte budget.  Starts the worker lazily on first call
+    // (after the scene has been moved into its final home).  No-op when
+    // streaming is disabled or nothing is pending.
+    void updateTextureStreaming(const VulkanContext& ctx, const Vec3& cameraPos);
+
+    // Set by the host before loadGltf: interactive viewer/GUI = true,
+    // bench/compare/screenshot = false (see the Phase 7b comment block above).
+    bool streamingEnabled = false;
 
     // Uploads the accumulated merged vertex/index data.  Call once after all
     // meshes are uploaded; frees the CPU-side accumulation.
@@ -435,6 +501,25 @@ private:
     // CPU-side accumulation for the merged buffers (cleared by buildMergedBuffers).
     std::vector<Vertex> mergedVerts_;
     std::vector<uint32_t> mergedIndices_;
+
+    // Queued by uploadTextureCompressed when streaming is enabled; consumed by
+    // the background worker started in updateTextureStreaming.
+    struct TextureStreamJob {
+        uint32_t textureIndex = 0;   // into textures
+        std::string path;            // source .ktx2 (levels re-read on demand)
+        uint32_t width = 0, height = 0;
+        uint32_t nextLevel = 0;      // next fine level to upload (descends to 0)
+        std::vector<Ktx2Image::Level> levels;
+        uint64_t bytesRemaining = 0;
+    };
+    std::vector<TextureStreamJob> pendingStreamTextures_;
+    // Pimpl keeps Scene movable (mutex/thread members are not).  Defined in
+    // TextureStreamer.cpp.
+    struct TextureStreamer;
+    std::unique_ptr<TextureStreamer> streamer_;
+    // Stops + joins the streaming worker (idempotent).  Called by destroy() and
+    // the destructor; must complete before any texture image is destroyed.
+    void stopTextureStreaming();
 };
 
 } // namespace sr
