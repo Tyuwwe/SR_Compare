@@ -50,12 +50,13 @@ its performance numbers are not representative of real hardware.
 - Volumetric fog: froxel grid (inject/light/temporal/march/composite) lit by
   the CSM + cluster lights, god rays; scene presets carry the media params
   (`--no-volfog`)
-- Post chain: thresholded bloom pyramid (13-tap down / tent up; on by default,
-  `--no-bloom`), HDR motion blur (McGuire 2012 tile-max gather) and depth of
-  field (UE4 scatter-as-gather CoC, centre-texel autofocus) — both off by
-  default in every mode, opt in with `--motion-blur` / `--dof` (viewer +
-  compare) or the GUI checkboxes; same algorithm and parameters on the LR, GT
-  and GT-SSAA paths, deterministic frame-index-driven noise
+- Post chain: thresholded bloom pyramid (13-tap down / tent up; off by default
+  in every mode, opt in with `--bloom` / the GUI checkbox), HDR motion blur
+  (McGuire 2012 tile-max gather) and depth of field (UE4 scatter-as-gather
+  CoC, centre-texel autofocus) — both off by default in every mode, opt in
+  with `--motion-blur` / `--dof` (viewer + compare) or the GUI checkboxes;
+  same algorithm and parameters on the LR, GT and GT-SSAA paths,
+  deterministic frame-index-driven noise
 - Color grading: simplified-ACEScc log domain (temperature/tint/contrast/
   saturation, CLI `--temperature`/`--tint`/`--contrast`/`--saturation`, GUI
   sliders) + `.cube` 3D LUT (`--lut`), mirrored on the CPU for PNG
@@ -131,7 +132,9 @@ full text):
                      mode; --no-ssr accepted for compatibility) and scale their
                      weight (default 0.6)
 --no-volfog          disable froxel volumetric fog
---no-bloom / --no-lens-fx
+--bloom / --no-lens-fx
+                     enable HDR bloom (default off; --no-bloom accepted for
+                     compatibility) / disable the lens chain
 --motion-blur / --dof
                      enable motion blur / depth of field (default off in every
                      mode; --no-motion-blur / --no-dof accepted for compatibility)
@@ -157,7 +160,8 @@ A missing file is a silent no-op; a malformed file prints the parse error to
 stderr and falls back to defaults; applied keys are echoed to stderr as
 `[engine.toml] <mode>: key=value ...` so scripted runs can verify them.
 
-Sections: `[renderer]` (render_scale, hdr, env_map), `[exposure]` (manual
+Sections: `[window]` (fullscreen — borderless desktop fullscreen, GUI only),
+`[renderer]` (render_scale, hdr, env_map), `[exposure]` (manual
 exposure + auto-exposure EV range), `[effects]` (ssr/ssr_strength — the GUI
 counts as CLI side here, hot reload applies them but the panel checkbox stays
 locked —, shadows, contact_shadows, volfog, bloom, motion_blur, lens_fx),
@@ -169,9 +173,16 @@ deterministic under a given engine.toml.
 
 The **GUI hot-reloads** the file (~1 s mtime poll): the per-frame options —
 effects toggles, DOF/grading/sun sliders, exposure, occlusion/lod, the HDR
-checkbox — apply immediately; render_scale, output resolution, env_map, scene
-and lut changes require an Apply rebuild or a restart and are ignored by the
-reload.
+checkbox, borderless fullscreen — apply immediately; render_scale, output
+resolution, env_map, scene and lut changes require an Apply rebuild or a
+restart and are ignored by the reload.
+
+The GUI also **owns the file**: a missing `engine.toml` is auto-created from
+the effective values (defaults + CLI overrides) at startup, UI edits are
+saved back after a ~1.5 s debounce (atomic temp-file + replace, so the hot
+reload never reads a truncated file), and deleting the file at runtime resets
+the hot parameters to defaults and re-creates it.  viewer / compare / bench
+never write the file (bench child processes included).
 
 ## Scenes (`--scene`)
 

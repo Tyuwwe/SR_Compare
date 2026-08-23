@@ -9,10 +9,20 @@
 # All modes (viewer / compare / bench / gui) read this file at startup; bench
 # child viewer processes read it too (same exe directory).  The GUI also
 # hot-reloads it (~1 s poll): the per-frame options ([effects], [dof],
-# [grading], [sun], [exposure], [culling], hdr) apply instantly; render_scale,
-# output resolution, env_map, scene and lut need an Apply rebuild / restart
-# and are NOT picked up by the hot reload.
+# [grading], [sun], [exposure], [culling], hdr, [window] fullscreen) apply
+# instantly; render_scale, output resolution, env_map, scene and lut need an
+# Apply rebuild / restart and are NOT picked up by the hot reload.
+#
+# The GUI owns the file: it auto-creates a missing engine.toml from the
+# effective values (defaults + CLI overrides), rewrites it (debounced,
+# atomic) after UI edits, and re-creates it with default values when it is
+# deleted at runtime.  viewer / compare / bench never write it.
 # ============================================================================
+
+[window]
+# Borderless (desktop) fullscreen at startup, GUI only (the panel has a
+# "fullscreen (borderless)" checkbox; hot-reloadable).  Not exclusive mode.
+# fullscreen = false
 
 [renderer]
 # Render resolution scale, (0, 1]  (CLI: --render-scale).  Needs rebuild.
@@ -48,8 +58,9 @@
 # contact_shadows = true
 # Froxel volumetric fog (CLI: --no-volfog).
 # volfog = true
-# HDR bloom pyramid (CLI: --no-bloom).
-# bloom = true
+# HDR bloom pyramid (default off; CLI: --bloom, --no-bloom accepted for
+# compatibility).
+# bloom = false
 # HDR motion blur (default off; CLI: --motion-blur).
 # motion_blur = false
 # Master switch for the present lens chain (CA/dirt/vignette/grain), viewer

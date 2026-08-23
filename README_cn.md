@@ -40,11 +40,12 @@ Arm NSS 在 PC 上经 Vulkan ML Emulation Layer 软件模拟推理，性能数�
 - TAA：YCoCg 历史 clip、深度 disocclusion、自适应 alpha、RCAS 锐化
 - 体积雾：froxel 网格（注入/光照/temporal/march/composite 五 pass），复用 CSM +
   cluster 灯光，god rays；介质参数由场景预设携带（`--no-volfog`）
-- 后处理链：阈值提取 bloom 金字塔（13-tap 降采样 / tent 上采样；默认开，
-  `--no-bloom`）、HDR 运动模糊（McGuire 2012 tile-max gather）、景深
-  （UE4 scatter-as-gather CoC，中心像素自动对焦）——运动模糊与景深在所有模式下
-  默认关闭，用 `--motion-blur` / `--dof`（viewer + compare）或 GUI checkbox 显式
-  打开；LR/GT/GT-SSAA 三条路径同算法同参数，帧号驱动噪声保证确定性
+- 后处理链：阈值提取 bloom 金字塔（13-tap 降采样 / tent 上采样；所有模式
+  默认关，用 `--bloom` 或 GUI checkbox 显式打开）、HDR 运动模糊（McGuire
+  2012 tile-max gather）、景深（UE4 scatter-as-gather CoC，中心像素自动对焦）
+  ——运动模糊与景深在所有模式下默认关闭，用 `--motion-blur` / `--dof`
+  （viewer + compare）或 GUI checkbox 显式打开；LR/GT/GT-SSAA 三条路径同算法
+  同参数，帧号驱动噪声保证确定性
 - 色彩分级：简化 ACEScc log 域（色温/tint/对比度/饱和度，CLI
   `--temperature`/`--tint`/`--contrast`/`--saturation`，GUI 滑条）+ `.cube`
   3D LUT（`--lut`），CPU 镜像用于 PNG 截图；末端镜头链（色差/污渍/暗角/颗粒，
@@ -105,7 +106,9 @@ sr_compare viewer --list-upscalers
                      打开不透明 SSR（所有模式默认关；--no-ssr 保留兼容旧脚本）
                      并缩放其强度（默认 0.6）
 --no-volfog          关闭 froxel 体积雾
---no-bloom / --no-lens-fx
+--bloom / --no-lens-fx
+                     打开 HDR bloom（默认关；--no-bloom 保留兼容旧脚本）/
+                     关闭镜头链
 --motion-blur / --dof
                      打开运动模糊 / 景深（所有模式默认关；--no-motion-blur /
                      --no-dof 保留兼容旧脚本）
@@ -130,7 +133,8 @@ compare 另有 `--upscalers a,b,...`、`--gt-ssaa`、`--zoom <f>`、
 失败会在 stderr 打印错误并回退默认值；实际生效的键以
 `[engine.toml] <mode>: key=value ...` 打印到 stderr，便于脚本核对。
 
-分节：`[renderer]`（render_scale、hdr、env_map）、`[exposure]`（手动曝光
+分节：`[window]`（fullscreen——无边框桌面全屏，仅 GUI）、`[renderer]`
+（render_scale、hdr、env_map）、`[exposure]`（手动曝光
 + 自动曝光 EV 范围）、`[effects]`（ssr/ssr_strength、shadows、
 contact_shadows、volfog、bloom、motion_blur、lens_fx）、`[lens_fx]`
 （GUI 子项）、`[culling]`（occlusion、lod，GUI）、`[dof]`、
@@ -139,9 +143,15 @@ contact_shadows、volfog、bloom、motion_blur、lens_fx）、`[lens_fx]`
 engine.toml 下 bench 结果是确定的。
 
 **GUI 支持热重载**（约 1 秒轮询文件修改时间）：逐帧参数——效果开关、
-DOF/调色/太阳滑条、曝光、occlusion/lod、HDR 复选框——即时生效；
-render_scale、输出分辨率、env_map、场景、lut 需要 Apply 重建或重启，
+DOF/调色/太阳滑条、曝光、occlusion/lod、HDR 复选框、无边框全屏——即时
+生效；render_scale、输出分辨率、env_map、场景、lut 需要 Apply 重建或重启，
 热重载会忽略这些键。
+
+**GUI 同时负责写这个文件**：启动时若无 engine.toml，会用当前生效值
+（默认值 + CLI 覆盖）自动创建一份；GUI 里改动参数后约 1.5 秒去抖写回
+（临时文件 + 原子替换，热重载不会读到半截文件）；运行中删除文件会把
+热参数重置为默认并立即重建文件。viewer / compare / bench（含 bench 派生
+的子进程）从不写该文件。
 
 ## 场景（`--scene`）
 

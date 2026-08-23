@@ -49,7 +49,8 @@ void printUsage() {
                  "  --no-shadows                     disable CSM sun shadows\n"
                  "  --shadow-debug                   tint pixels per shadow cascade\n"
                  "  --exposure <f>                   manual display exposure (disables auto exposure)\n"
-                 "  --no-bloom                       disable HDR bloom\n"
+                 "  --bloom                          enable HDR bloom (default off; --no-bloom accepted\n"
+                 "                                 for compatibility)\n"
                  "  --no-lens-fx                     disable the present lens chain (CA/dirt/vignette/grain)\n"
                  "  --ssr                            enable opaque screen-space reflections (default off;\n"
                  "                                 --no-ssr accepted for compatibility)\n"
@@ -74,8 +75,9 @@ void printUsage() {
                  "  --saturation <f>                 grading saturation (default 1)\n"
                  "\n"
                  "engine.toml (next to the exe, see engine.toml.example) supplies defaults\n"
-                 "for the renderer/effect/grading/sun options in every mode; explicit CLI\n"
-                 "flags always win.  The GUI hot-reloads it (~1 s) for per-frame options.\n");
+                 "for the window/renderer/effect/grading/sun options in every mode; explicit\n"
+                 "CLI flags always win.  The GUI hot-reloads it (~1 s) for per-frame options,\n"
+                 "auto-creates it when missing and auto-saves UI changes back to it.\n");
 }
 
 int runViewer(int argc, char** argv) {
@@ -146,7 +148,11 @@ int runViewer(int argc, char** argv) {
             }
             opts.autoExposure = false;
             cliMask |= sr::cli::kExposure;
+        } else if (a == "--bloom") {
+            opts.bloom = true;
+            cliMask |= sr::cli::kBloom;
         } else if (a == "--no-bloom") {
+            // Accepted for compatibility (bloom is off by default now).
             opts.bloom = false;
             cliMask |= sr::cli::kBloom;
         } else if (a == "--no-lens-fx") {

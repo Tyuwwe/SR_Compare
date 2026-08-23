@@ -42,7 +42,8 @@ struct CompareOptions {
     bool gtSsaa = false;                // render GT at 2x and downsample to 1080p
     bool shadows = true;                // CSM sun shadows (all paths share one map)
     bool shadowDebug = false;           // tint pixels per shadow cascade
-    bool bloom = true;                  // HDR bloom before upscale
+    bool bloom = false;                 // HDR bloom before upscale (default off; unused —
+                                        // the compare paths have no bloom chain)
     // Terminal lens-effects chain in the column compose (chromatic
     // aberration / vignette / film grain; same strengths as the viewer
     // present pass).  CLI: --no-lens-fx.  Lens dirt is viewer-only (the

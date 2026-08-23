@@ -54,7 +54,10 @@ struct RendererOptions {
     bool autoExposure = true;
     float exposureMinEV = -8.f; // auto-exposure EV clamp range
     float exposureMaxEV = 8.f;
-    bool bloom = true;        // HDR bloom pyramid before upscale (CLI: --no-bloom)
+    // HDR bloom pyramid before upscale; off by default in every mode (same
+    // policy as motion blur / DOF).  CLI: --bloom opts in, --no-bloom accepted
+    // for compatibility.
+    bool bloom = false;
     // Terminal lens-effects chain at present (chromatic aberration / lens dirt
     // in HDR, vignette + film grain in display domain; CLI: --no-lens-fx).
     // Strengths are the shared DeferredCore defaults (kLens*Strength).
