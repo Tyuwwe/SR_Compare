@@ -135,4 +135,18 @@ void Window::setClientSize(int width, int height) {
     height_ = height;
 }
 
+void Window::setFullscreen(bool enabled) {
+    if (!window_ || fullscreen_ == enabled) return;
+    // SDL3: bool fullscreen = borderless desktop mode (no exclusive mode
+    // switch).  On failure keep the old state.
+    if (!SDL_SetWindowFullscreen(window_, enabled)) {
+        std::fprintf(stderr, "window: SDL_SetWindowFullscreen failed: %s\n", SDL_GetError());
+        return;
+    }
+    fullscreen_ = enabled;
+    // The OS resize events update width_/height_ asynchronously via poll();
+    // fullscreen entry arrives as SDL_EVENT_WINDOW_RESIZED with the desktop
+    // size, exit restores the windowed size.
+}
+
 } // namespace sr

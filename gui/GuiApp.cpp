@@ -300,6 +300,8 @@ bool GuiApp::init(const GuiOptions& opts) {
                         static_cast<int>(active_.displayH)))
         return false;
     window_.setClickToCaptureEnabled(false); // LMB belongs to the UI now
+    // engine.toml [window] fullscreen (no CLI flag): borderless desktop mode.
+    if (opts_.engineCfg.fullscreen) setFullscreenEnabled(*opts_.engineCfg.fullscreen);
     if (!ctx_.create(window_)) return false;
 
     // Hold one Streamline reference for the whole GUI session: slInit already
@@ -400,6 +402,23 @@ bool GuiApp::init(const GuiOptions& opts) {
         EngineConfigLog log;
         applyEngineConfigHot(opts_.engineCfg, log);
         log.flush(" gui:");
+    }
+    // [grading] lut is a viewer-only key the GUI cannot edit; carry the loaded
+    // value through so the auto-save does not clobber it.
+    lutCarry_ = opts_.engineCfg.lut.value_or("");
+    // engine.toml auto-create: the GUI owns the file — a missing one is
+    // written from the effective values (code defaults + CLI overrides, scene
+    // preset already applied by the initial stack build above) so there is
+    // always a file to edit; the debounced auto-save keeps it in sync.
+    engineCfgBaseline_ = engineConfigToToml(currentEngineConfig());
+    if (engineCfgPath_.empty()) {
+        const std::string path = engineConfigFilePath();
+        if (writeFileAtomic(path, engineCfgBaseline_)) {
+            engineCfgPath_ = path;
+            engineCfgMtime_ = engineConfigWriteTime(path);
+            statusLine_ = "engine.toml created (defaults)";
+            std::fprintf(stderr, "[engine.toml] created %s\n", path.c_str());
+        } // else: no write target — hot reload keeps watching for the file
     }
     if (opts_.compareZoom > 0.f) {
         // Applied on the first run() frame (after any spurious first-frame
@@ -658,10 +677,18 @@ void GuiApp::applyEngineConfigHot(const EngineConfig& cfg, EngineConfigLog& log)
             log.add("hdr", hdrEnabled_);
         }
     }
+    // Borderless fullscreen (no CLI flag): window-state toggle, applied hot.
+    if (cfg.fullscreen && *cfg.fullscreen != fullscreenEnabled_) {
+        setFullscreenEnabled(*cfg.fullscreen);
+        log.add("fullscreen", fullscreenEnabled_);
+    }
 }
 
 // Hot-reload watch: stats engine.toml about once a second; on a modification
-// the per-frame options are re-applied (CLI-masked keys stay untouched).
+// the per-frame options are re-applied (CLI-masked keys stay untouched).  A
+// deleted file resets the hot parameters to the code/scene-preset defaults
+// and is re-created (the GUI owns the file); the re-create write updates the
+// baseline, so the follow-up self-read is a no-op (idempotent).
 void GuiApp::pollEngineConfig() {
     const auto now = std::chrono::steady_clock::now();
     if (now < engineCfgNextPoll_) return;
@@ -675,12 +702,146 @@ void GuiApp::pollEngineConfig() {
     const int64_t mt = engineConfigWriteTime(engineCfgPath_);
     if (mt == engineCfgMtime_) return;
     engineCfgMtime_ = mt;
+    if (mt == 0) {
+        // Deleted at runtime: defaults back in, then rebuild the file from
+        // them (immediate write — no debounce on the recovery path).
+        resetEngineConfigDefaults();
+        engineCfgBaseline_ = engineConfigToToml(currentEngineConfig());
+        engineCfgPendingText_ = engineCfgBaseline_;
+        engineCfgDirty_ = false;
+        if (writeFileAtomic(engineCfgPath_, engineCfgPendingText_)) {
+            engineCfgMtime_ = engineConfigWriteTime(engineCfgPath_);
+            statusLine_ = "engine.toml deleted — defaults restored, file re-created";
+            std::fprintf(stderr, "[engine.toml] deleted — defaults restored, re-created %s\n",
+                         engineCfgPath_.c_str());
+        }
+        return;
+    }
     EngineConfig cfg;
-    if (!loadEngineConfig(engineCfgPath_, cfg)) return; // missing/malformed: keep state
+    if (!loadEngineConfig(engineCfgPath_, cfg)) return; // malformed: keep state
     EngineConfigLog log;
     applyEngineConfigHot(cfg, log);
+    // Needs-Apply keys are not applied hot but DO update the UI fields (same
+    // as the user moving the slider), so the auto-save never clobbers an
+    // external edit with a stale value.
+    if (cfg.renderScale) ui_.renderScale = *cfg.renderScale;
+    if (cfg.envMap)
+        std::snprintf(ui_.envMap, sizeof(ui_.envMap), "%s", cfg.envMap->c_str());
+    if (cfg.lut) lutCarry_ = *cfg.lut; // preserve the viewer-only key across saves
+    // The external edit becomes the save baseline: the auto-save reacts to
+    // UI-side changes only, it does not rewrite the file the user just edited.
+    engineCfgBaseline_ = engineConfigToToml(currentEngineConfig());
+    engineCfgDirty_ = false;
     if (!log.empty()) statusLine_ = "engine.toml reloaded";
     log.flush(" gui (reload):");
+}
+
+// Full file snapshot from the current UI state (every key the GUI writes).
+// [exposure] exposure is omitted while auto exposure is on — writing it would
+// re-disable auto on the next load (same semantics as CLI --exposure).
+EngineConfig GuiApp::currentEngineConfig() const {
+    EngineConfig c;
+    c.fullscreen = fullscreenEnabled_;
+    c.renderScale = ui_.renderScale;
+    c.hdr = hdrEnabled_;
+    c.envMap = std::string(ui_.envMap);
+    if (!autoExposureEnabled_) c.exposure = exposure_;
+    c.exposureMinEV = exposureMinEV_;
+    c.exposureMaxEV = exposureMaxEV_;
+    c.ssr = ssrEnabled_;
+    c.ssrStrength = ssrStrength_;
+    c.shadows = shadowsEnabled_;
+    c.contactShadows = contactShadowsEnabled_;
+    c.volFog = volFogEnabled_;
+    c.bloom = bloomEnabled_;
+    c.motionBlur = motionBlurEnabled_;
+    // The GUI has no master lens-fx switch (only the per-effect items); write
+    // the master as "any on" so the viewer keeps its chain when at least one
+    // effect is enabled.
+    c.lensFx = lensCaEnabled_ || lensVignetteEnabled_ || lensGrainEnabled_;
+    c.lensCa = lensCaEnabled_;
+    c.lensVignette = lensVignetteEnabled_;
+    c.lensGrain = lensGrainEnabled_;
+    c.occlusion = occlusionEnabled_;
+    c.lod = lodEnabled_;
+    c.dof = dofEnabled_;
+    c.dofFocus = dofFocus_;
+    c.dofFstop = dofFstop_;
+    c.dofMaxBlur = dofMaxBlur_;
+    c.gradingTempK = gradeTemperatureK_;
+    c.gradingTint = gradeTint_;
+    c.gradingContrast = gradeContrast_;
+    c.gradingSat = gradeSaturation_;
+    c.lut = lutCarry_;
+    c.sunElevationDeg = sunElevationDeg_;
+    c.sunAzimuthDeg = sunAzimuthDeg_;
+    return c;
+}
+
+void GuiApp::saveEngineConfigNow() {
+    engineCfgDirty_ = false;
+    if (engineCfgPath_.empty()) return; // no write target (creation failed)
+    if (writeFileAtomic(engineCfgPath_, engineCfgPendingText_)) {
+        engineCfgMtime_ = engineConfigWriteTime(engineCfgPath_);
+        statusLine_ = "engine.toml saved";
+    }
+}
+
+// Debounced auto-save: once per frame, diff the canonical serialization of
+// the UI state against the saved/loaded baseline; write 1.5 s after the last
+// change (atomic temp+replace, so the hot-reload poll never sees a stub).
+void GuiApp::pollEngineConfigAutoSave() {
+    if (engineCfgPath_.empty()) return;
+    const std::string cur = engineConfigToToml(currentEngineConfig());
+    const auto now = std::chrono::steady_clock::now();
+    if (cur != engineCfgBaseline_) {
+        engineCfgBaseline_ = cur;
+        engineCfgPendingText_ = cur;
+        engineCfgDirty_ = true;
+        engineCfgDirtyAt_ = now; // sliding window: edits keep pushing the write out
+    }
+    if (engineCfgDirty_ && now - engineCfgDirtyAt_ >= std::chrono::milliseconds(1500))
+        saveEngineConfigNow();
+}
+
+// Inverse of applyEngineConfigHot with no file: every hot-applied parameter
+// back to its code default (GUI member initializer values / scene preset).
+// Toggles go through applyPassToggle for the same side effects as the panel
+// checkboxes (fog history reset, auto-exposure snap).
+void GuiApp::resetEngineConfigDefaults() {
+    applyLightingPreset(lightingPresetForScene(active_.scenePath)); // sun/exposure/fog preset
+    applyPassToggle(rg::PassToggle::AutoExposure, true);
+    exposureMinEV_ = -8.f;
+    exposureMaxEV_ = 8.f;
+    applyPassToggle(rg::PassToggle::Shadows, true);
+    applyPassToggle(rg::PassToggle::ContactShadows, true);
+    applyPassToggle(rg::PassToggle::Ssr, false);
+    applyPassToggle(rg::PassToggle::VolFog, volFogEnabled_); // preset value + history reset
+    applyPassToggle(rg::PassToggle::Occlusion, occlusionEnabledByDefault());
+    applyPassToggle(rg::PassToggle::Bloom, false);
+    applyPassToggle(rg::PassToggle::MotionBlur, false);
+    applyPassToggle(rg::PassToggle::Dof, false);
+    applyPassToggle(rg::PassToggle::LensCa, true);
+    applyPassToggle(rg::PassToggle::LensVignette, true);
+    applyPassToggle(rg::PassToggle::LensGrain, true);
+    ssrStrength_ = 0.6f;
+    dofFocus_ = 0.f;
+    dofFstop_ = kDofDefaultFstop;
+    dofMaxBlur_ = kDofMaxCoC;
+    lodEnabled_ = lodEnabledByDefault();
+    gradeTemperatureK_ = 6500.f;
+    gradeTint_ = 0.f;
+    gradeContrast_ = 1.f;
+    gradeSaturation_ = 1.f;
+    lutCarry_.clear();
+    if (hdrEnabled_) setHdrEnabled(false);
+    setFullscreenEnabled(false);
+}
+
+void GuiApp::setFullscreenEnabled(bool enabled) {
+    if (fullscreenEnabled_ == enabled) return;
+    fullscreenEnabled_ = enabled;
+    window_.setFullscreen(enabled);
 }
 
 void GuiApp::requestRebuild(const RenderConfig& cfg) {
@@ -4891,6 +5052,11 @@ void GuiApp::pumpInputFile() {
             else if (name == "dof") t = rg::PassToggle::Dof;
             else if (name == "autoexp") t = rg::PassToggle::AutoExposure;
             if (t != rg::PassToggle::None) applyPassToggle(t, on != 0);
+        } else if (cmd == "fullscreen") {
+            // fullscreen <0|1>: borderless fullscreen (same as the checkbox).
+            int on = 0;
+            ss >> on;
+            setFullscreenEnabled(on != 0);
         } // "wait" and unknown commands just consume the frame
         if (dbgInputEnabled())
             std::fprintf(stderr, "[inputfile] line %llu: %s\n",
@@ -4960,6 +5126,8 @@ void GuiApp::run() {
 
         // engine.toml hot reload: ~1 s mtime poll, per-frame options only.
         pollEngineConfig();
+        // engine.toml auto-save: debounced write of UI-side changes.
+        pollEngineConfigAutoSave();
 
         // Debug hook (SR_GUI_DEBUG_INPUT=1): heartbeat to correlate input
         // event dispatch with the frame loop during automation tests.
@@ -5371,6 +5539,14 @@ void GuiApp::drawSharedControls() {
         ImGui::TextDisabled("%s%s (sdr content in hdr container)",
                             hdrSupportHdr10_ ? "hdr10" : "",
                             hdrSupportScRgb_ ? (hdrSupportHdr10_ ? " + scrgb" : "scrgb") : "");
+    }
+    // Borderless fullscreen (desktop mode; [window] fullscreen in
+    // engine.toml, hot-reloadable).  The render resolution stays the
+    // configured output size; the swapchain is recreated through the normal
+    // OUT_OF_DATE path on the mode switch.
+    {
+        bool fs = fullscreenEnabled_;
+        if (ImGui::Checkbox("fullscreen (borderless)", &fs)) setFullscreenEnabled(fs);
     }
 }
 

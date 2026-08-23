@@ -355,7 +355,7 @@ private:
     // "key F1" / "keyup F1", "shot path.png", "graph" (toggle the Render
     // Graph editor window), "profiler" (toggle the GPU profiler window), "pass <name> <0|1>" (toggle a runtime pass
     // switch: shadows/contact/ssr/volfog/occlusion/bloom/mb/dof/autoexp),
-    // "wait" (one frame gap).
+    // "fullscreen <0|1>" (borderless fullscreen), "wait" (one frame gap).
     void pumpInputFile();
     // Column layout origin: while the side panel is visible the render
     // columns start right of it; collapsed, they span the full window (the
@@ -417,12 +417,27 @@ private:
     void applyLaunchOptions();
     // engine.toml application (renderer/core/EngineConfig.h).  applyEngineConfigHot
     // sets only per-frame state (effects/DOF/grading/sun sliders, exposure,
-    // occlusion/lod, HDR swapchain toggle) — no rebuild — and is used both for
-    // the initial defaults and for hot reloads.  pollEngineConfig() stats the
-    // file once per second in run() and re-applies on modification; resolution/
-    // scale/env-map/scene/LUT changes need an Apply rebuild and are ignored.
+    // occlusion/lod, HDR swapchain toggle, window fullscreen) — no rebuild —
+    // and is used both for the initial defaults and for hot reloads.
+    // pollEngineConfig() stats the file once per second in run() and
+    // re-applies on modification; resolution/scale/env-map/scene/LUT changes
+    // need an Apply rebuild and are ignored (scale/env-map do land in the UI
+    // fields, so the auto-save never clobbers an external edit).
     void applyEngineConfigHot(const EngineConfig& cfg, EngineConfigLog& log);
     void pollEngineConfig();
+    // engine.toml auto-create/auto-save (the GUI owns the file — see
+    // EngineConfig.h).  currentEngineConfig snapshots every file key from the
+    // UI state; pollEngineConfigAutoSave diffs the canonical serialization
+    // once per frame and writes (atomic temp+replace) after ~1.5 s without
+    // further changes.  A deleted file is re-created with the hot parameters
+    // reset to defaults (resetEngineConfigDefaults) by pollEngineConfig.
+    EngineConfig currentEngineConfig() const;
+    void saveEngineConfigNow();
+    void pollEngineConfigAutoSave();
+    void resetEngineConfigDefaults();
+    // Borderless fullscreen switch (panel checkbox, toml hot path, input-file
+    // automation); forwards to Window::setFullscreen.
+    void setFullscreenEnabled(bool enabled);
     void loadCameraPathFromUi();
     void saveScreenshot(const char* path);
     void drawScreenshotBusy(); // animated in-flight indicator next to the save buttons
@@ -557,9 +572,9 @@ private:
     bool lensVignetteEnabled_ = true;
     bool lensGrainEnabled_ = true;
     // HDR bloom (Phase 6a pyramid): per-frame pass skip like SSR, no rebuild —
-    // the per-path chains stay allocated either way.  On by default, matching
-    // the viewer CLI (bloom on, --no-bloom to disable).
-    bool bloomEnabled_ = true;
+    // the per-path chains stay allocated either way.  Off by default in every
+    // mode (CLI --bloom / engine.toml [effects] bloom opt in).
+    bool bloomEnabled_ = false;
     // Motion blur + depth of field (Phase 6b, per-frame pass skip, no temporal
     // state — no history reset needed).  Off by default in every mode (same
     // default policy as the viewer/compare CLI); when enabled the same
@@ -593,6 +608,11 @@ private:
     bool hdrEnabled_ = false;
     bool hdrSupportHdr10_ = false;
     bool hdrSupportScRgb_ = false;
+    // Borderless (desktop) fullscreen ([window] fullscreen in engine.toml;
+    // hot-reloadable, no CLI flag).  The render resolution stays the
+    // configured output size; the swapchain is recreated through the normal
+    // OUT_OF_DATE path on the mode switch.
+    bool fullscreenEnabled_ = false;
 
     ImageResource gbColor_;
     ImageResource gbColorSpatial_; // unjittered LR HDR copy for spatial upscalers
@@ -895,10 +915,17 @@ private:
     GuiOptions opts_;
     std::string inputFile_;    // SR_GUI_INPUT_FILE automation (empty = off)
     uint64_t inputFileLine_ = 0; // lines consumed so far
-    // engine.toml hot-reload watch (path captured at init; ~1 s stat interval).
+    // engine.toml hot-reload watch (path captured at init; ~1 s stat interval)
+    // + auto-save state (debounced write of the canonical serialization).
     std::string engineCfgPath_;
     int64_t engineCfgMtime_ = 0;
     std::chrono::steady_clock::time_point engineCfgNextPoll_{};
+    std::string engineCfgBaseline_;     // canonical toml of the saved/loaded state
+    std::string engineCfgPendingText_;  // dirty snapshot awaiting the debounce
+    std::chrono::steady_clock::time_point engineCfgDirtyAt_{};
+    bool engineCfgDirty_ = false;
+    std::string lutCarry_; // [grading] lut passthrough (viewer-only key the GUI
+                           // does not edit but must not clobber on auto-save)
     bool benchAutoRun_ = false;
     bool benchStarted_ = false;
     // Quit deadline after an auto bench finishes (time-based: ImGui-only

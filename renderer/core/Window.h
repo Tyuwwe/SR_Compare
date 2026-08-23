@@ -55,12 +55,21 @@ public:
     // Resize the client area (keeps the window position/top-left corner).
     void setClientSize(int width, int height);
 
+    // Borderless (desktop) fullscreen toggle — SDL_SetWindowFullscreen's
+    // non-exclusive mode: the desktop resolution is kept and the windowed
+    // size/position are restored on the way back.  The resize events it
+    // generates flow through the normal poll() path (swapchain OUT_OF_DATE
+    // handling covers the mode switch).
+    void setFullscreen(bool enabled);
+    bool isFullscreen() const { return fullscreen_; }
+
 private:
     void setCaptured(bool captured);
 
     SDL_Window* window_ = nullptr;
     int width_ = 0, height_ = 0;
     bool shouldClose_ = false;
+    bool fullscreen_ = false;
     Input input_;
     EventHook eventHook_ = nullptr;
     bool clickToCapture_ = true;

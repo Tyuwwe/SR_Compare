@@ -16,8 +16,16 @@
 // Modes: viewer/compare/bench/gui all load it once at startup.  The GUI
 // additionally hot-reloads on file modification (~1 s stat interval):
 // per-frame parameters (effects toggles, DOF/grading/sun sliders, exposure,
-// occlusion/lod, HDR) apply immediately; resolution/scale/env-map/scene/LUT
-// changes need an Apply rebuild or a restart and are ignored by the reload.
+// occlusion/lod, HDR, window fullscreen) apply immediately; resolution/scale/
+// env-map/scene/LUT changes need an Apply rebuild or a restart and are
+// ignored by the reload.
+//
+// The GUI also OWNS the file: it auto-creates a missing engine.toml from the
+// effective values (code defaults + CLI overrides) at startup, auto-saves the
+// full parameter set after UI edits (debounced ~1.5 s, atomic temp-file +
+// replace), and re-creates the file with reset-to-default values when it is
+// deleted at runtime.  viewer/compare/bench never write it (bench child
+// processes included), so scripted runs stay side-effect free.
 // ============================================================================
 #include <cstdint>
 #include <optional>
@@ -58,6 +66,8 @@ inline constexpr uint64_t kOutput = 1ull << 23;
 // Parsed engine.toml content.  Absent keys stay empty optionals; the apply
 // step leaves the corresponding option at its code default.
 struct EngineConfig {
+    // [window]
+    std::optional<bool> fullscreen;        // borderless (desktop) fullscreen (GUI)
     // [renderer]
     std::optional<float> renderScale;      // (0, 1]
     std::optional<bool> hdr;               // HDR swapchain (viewer/gui)
@@ -100,6 +110,20 @@ struct EngineConfig {
 
 // Path of the config file (<exe dir>/engine.toml), or "" when absent.
 std::string engineConfigPath();
+
+// Always-resolved config path (<exe dir>/engine.toml), existing or not —
+// the write target for the GUI auto-create/auto-save.
+std::string engineConfigFilePath();
+
+// Canonical engine.toml text for the set keys of `cfg` (same section layout
+// as engine.toml.example, generated-file header).  Unset optionals are
+// omitted.  Used by the GUI auto-create/auto-save; comparing two serializa-
+// tions doubles as the change detector for the debounced save.
+std::string engineConfigToToml(const EngineConfig& cfg);
+
+// Atomic file write: temp file + replace, so the hot-reload poll never reads
+// a truncated file.  False on error (stderr note).
+bool writeFileAtomic(const std::string& path, const std::string& text);
 
 // Parse `path` into `out`.  Returns false (leaving `out` at defaults) when
 // the file is missing or malformed; errors go to stderr, never fatal.
