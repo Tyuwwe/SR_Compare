@@ -3,19 +3,23 @@
 // ============================================================================
 #include "gui/GuiApp.h"
 
+#include "app/CliUtils.h"
 #include "compare/Font5x7.h"
 #include "renderer/Screenshot.h"
 #include "renderer/core/MemoryBudget.h"
 #include "renderer/core/PathUtil.h"
 #include "renderer/core/VkUtil.h"
+#include "renderer/core/Vma.h"
 #include "renderer/scene/SceneRegistry.h"
 #include "upscalers/UpscalerFactory.h"
 #include "upscalers/dlss/SlContext.h"
 
 #include <imgui.h>
+#include <imgui_impl_sdl3.h>
 #include <imgui_impl_vulkan.h>
-#include <imgui_impl_win32.h>
 #include <imgui_internal.h> // GImGui->InputEventsQueue (input-path debug)
+
+#include <SDL3/SDL.h> // SDL_Event/SDL_EVENT_* for the automation debug hook
 
 #include <algorithm>
 #include <cctype>
@@ -29,26 +33,23 @@
 #include <sstream>
 #include <vector>
 
-// The Win32 backend header intentionally leaves this declaration inside an
-// #if 0 block (to avoid dragging <windows.h> into the header); declare it here.
-extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg,
-                                                             WPARAM wParam, LPARAM lParam);
-
 namespace {
 // Debug hook (SR_GUI_DEBUG_INPUT=1): verify the backend actually queues a
-// wheel event when the message arrives.
+// wheel event when the event arrives.
 bool dbgInputEnabled() {
-    static const bool enabled = std::getenv("SR_GUI_DEBUG_INPUT") != nullptr;
+    static const bool enabled = sr::envFlag("SR_GUI_DEBUG_INPUT");
     return enabled;
 }
 
-LRESULT guiWndProcHook(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+bool guiSdlEventHook(const SDL_Event& event) {
     const int queueBefore = GImGui ? GImGui->InputEventsQueue.Size : -1;
-    const LRESULT r = ImGui_ImplWin32_WndProcHandler(hwnd, msg, wp, lp);
-    if (dbgInputEnabled() && (msg == WM_MOUSEWHEEL || msg == WM_MBUTTONDOWN)) {
+    const bool r = ImGui_ImplSDL3_ProcessEvent(&event);
+    if (dbgInputEnabled() &&
+        (event.type == SDL_EVENT_MOUSE_WHEEL ||
+         event.type == SDL_EVENT_MOUSE_BUTTON_DOWN)) {
         const ImGuiIO& io = ImGui::GetIO();
-        std::fprintf(stderr, "[hook] msg=0x%04x ret=%lld queue=%d->%d wheelNow=%.3f capture=%d\n",
-                     msg, static_cast<long long>(r), queueBefore,
+        std::fprintf(stderr, "[hook] type=0x%04x consumed=%d queue=%d->%d wheelNow=%.3f capture=%d\n",
+                     event.type, r ? 1 : 0, queueBefore,
                      GImGui->InputEventsQueue.Size, static_cast<double>(io.MouseWheel),
                      io.WantCaptureMouse ? 1 : 0);
     }
@@ -96,7 +97,11 @@ Camera lerpCamera(const Camera& a, const Camera& b, float t) {
 // shared with the viewer renderer via renderer/deferred/DeferredCore.h.
 
 // Compose pass push constants: column pixel size + text scale + text slot,
-// the source-region window (normalized offset/size) and source dimensions.
+// the source-region window (normalized offset/size) and source dimensions,
+// plus the terminal lens-effects chain (Phase 6a; same algorithm/defaults as
+// the viewer present.frag — lens dirt excluded, the compose has no dirt
+// binding) and the log-domain grading set (Phase 6c; identical for every
+// column, sliders in the shared controls).
 struct ComposePush {
     float colSize[2];
     float textScale;
@@ -105,8 +110,12 @@ struct ComposePush {
     float srcSize[2]; // source image pixels
     float nearest;    // != 0: sample nearest (magnification >= 1:1)
     float exposure;   // display-domain ACES input multiplier
+    float lensA[4];   // x = chromatic aberration, y = vignette, z = film grain,
+                      // w = frame index (grain hash seed)
+    float gradeA[4];  // x = contrast, y = saturation (zw unused; SDR composite)
+    float gradeB[4];  // xyz = white balance, w = LUT size
 };
-static_assert(sizeof(ComposePush) == 48, "ComposePush size mismatch");
+static_assert(sizeof(ComposePush) == 96, "ComposePush size mismatch");
 
 // Metric compute push constants (two uvec4s in the shaders).
 struct MetricPush {
@@ -114,8 +123,9 @@ struct MetricPush {
     uint32_t x2 = 0, y2 = 0, z2 = 0, w2 = 0;  // x2 = blocks per row (region);
                                               // y2 = 1 => ref is low-res (normalized sampling);
                                               // z2/w2 = test image full size (px)
-    float exposure = 1.f;
-    float pad[3] = {};
+    float exposureTest = 1.f; // test image (upscaler column / LR path)
+    float exposureRef = 1.f;  // reference image (GT column / GT path)
+    float pad[2] = {};
 };
 static_assert(sizeof(MetricPush) == 48, "MetricPush std140/push size mismatch");
 
@@ -230,8 +240,7 @@ bool ensureSceneFallbacks(Scene& scene, const VulkanContext& ctx, VkCommandPool 
 
 void GuiApp::ImageResource::destroy(const VulkanContext& ctx) {
     if (view) { vkDestroyImageView(ctx.device, view, nullptr); view = VK_NULL_HANDLE; }
-    if (image) { vkDestroyImage(ctx.device, image, nullptr); image = VK_NULL_HANDLE; }
-    if (memory) { vkFreeMemory(ctx.device, memory, nullptr); memory = VK_NULL_HANDLE; }
+    if (image) { vmaDestroyImage(ctx.allocator, image, memory); image = VK_NULL_HANDLE; memory = VK_NULL_HANDLE; }
 }
 
 void GuiApp::computeViewRegion(uint32_t srcW, uint32_t srcH, uint32_t colW, uint32_t colH,
@@ -260,8 +269,26 @@ void GuiApp::computeViewRegion(uint32_t srcW, uint32_t srcH, uint32_t colW, uint
 // ---------------------------------------------------------------------------
 bool GuiApp::init(const GuiOptions& opts) {
     opts_ = opts;
+    // engine.toml watch state (the file was already parsed by main into
+    // opts_.engineCfg; the GUI re-stats it for hot reload in run()).
+    engineCfgPath_ = engineConfigPath();
+    engineCfgMtime_ = engineConfigWriteTime(engineCfgPath_);
+    // CLI --exposure is a manual override: start in manual exposure mode.
+    if (opts_.exposure > 0.f) autoExposureEnabled_ = false;
+    // _dupenv_s / envFlag: plain getenv trips C4996 (this project builds /W4).
+#ifdef _MSC_VER
+    {
+        char* f = nullptr;
+        size_t fLen = 0;
+        if (_dupenv_s(&f, &fLen, "SR_GUI_INPUT_FILE") == 0 && f != nullptr) {
+            inputFile_ = f;
+            std::free(f);
+        }
+    }
+#else
     if (const char* f = std::getenv("SR_GUI_INPUT_FILE")) inputFile_ = f;
-    uiShot_ = std::getenv("SR_GUI_UI_SHOT") != nullptr;
+#endif
+    uiShot_ = envFlag("SR_GUI_UI_SHOT");
     scenes_ = listScenes();
     upscalerNames_ = listUpscalers();
     applyLaunchOptions();
@@ -269,10 +296,19 @@ bool GuiApp::init(const GuiOptions& opts) {
     active_.displayW = kOutputResolutions[ui_.outputResIndex][0];
     active_.displayH = kOutputResolutions[ui_.outputResIndex][1];
 
-    if (!window_.create("sr_compare — gui", static_cast<int>(active_.displayW),
-                        static_cast<int>(active_.displayH)))
+    // Windowed client size: the remembered [window] width/height wins over
+    // the output resolution (the swapchain follows the actual window size).
+    windowedW_ = static_cast<int>(active_.displayW);
+    windowedH_ = static_cast<int>(active_.displayH);
+    if (opts_.engineCfg.width && opts_.engineCfg.height) {
+        windowedW_ = *opts_.engineCfg.width;
+        windowedH_ = *opts_.engineCfg.height;
+    }
+    if (!window_.create("sr_compare — gui", windowedW_, windowedH_))
         return false;
     window_.setClickToCaptureEnabled(false); // LMB belongs to the UI now
+    // engine.toml [window] fullscreen (no CLI flag): borderless desktop mode.
+    if (opts_.engineCfg.fullscreen) setFullscreenEnabled(*opts_.engineCfg.fullscreen);
     if (!ctx_.create(window_)) return false;
 
     // Hold one Streamline reference for the whole GUI session: slInit already
@@ -285,14 +321,27 @@ bool GuiApp::init(const GuiOptions& opts) {
 
     refreshUpscalerAvailability();
 
+    // HDR surface probe (Phase 6c): gates the UI checkbox; the default stays
+    // SDR.  The checkbox handler re-creates the swapchain on toggle.
+    Swapchain::queryHdrSupport(ctx_, hdrSupportHdr10_, hdrSupportScRgb_);
+    // engine.toml hdr default (no gui CLI flag for it): gated on the support
+    // probe, same rule as the UI checkbox.
+    if (opts_.engineCfg.hdr && (opts_.engineCfgCli & cli::kHdr) == 0)
+        hdrEnabled_ = *opts_.engineCfg.hdr && (hdrSupportHdr10_ || hdrSupportScRgb_);
     swapchainVsync_ = guiWantVsync();
     swapchainMailbox_ = guiAllowMailbox();
-    if (!swapchain_.create(ctx_, active_.displayW, active_.displayH, swapchainVsync_,
-                           swapchainMailbox_))
+    // The swapchain extent follows the actual window client size; the
+    // composite scales to it in the present copy pass.
+    if (!swapchain_.create(ctx_, static_cast<uint32_t>(window_.width()),
+                           static_cast<uint32_t>(window_.height()), swapchainVsync_,
+                           swapchainMailbox_, hdrEnabled_))
         return false;
+    // Grading LUT (Phase 6c): procedural identity, created once — it survives
+    // render-stack rebuilds (independent of scene/env/resolution).
+    if (!gradingLut_.create(ctx_, makeIdentityLut())) return false;
     if (!createUiSync()) return false;
     if (!initImGui()) return false;
-    window_.setWndProcHook(&guiWndProcHook);
+    window_.setEventHook(&guiSdlEventHook);
 
     // Default selection: taa for the viewer, taa+fsr2 for compare (launch
     // options may have preset these already).
@@ -311,8 +360,10 @@ bool GuiApp::init(const GuiOptions& opts) {
 
     active_ = configFromUi(currentTab_ == 1 ? Mode::Compare : Mode::Viewer);
     // IBL maps + deferred pipelines are built once per env map, not per Apply.
+    // Empty env map = sky atmosphere, rendered for the current UI sun.
     envMapActive_ = active_.envMapPath;
-    stackOk_ = deferred_.init(ctx_, envMapActive_.c_str());
+    stackOk_ = deferred_.init(ctx_, envMapActive_.c_str(),
+                              sunDirectionFromElevAzimuth(sunElevationDeg_, sunAzimuthDeg_));
     if (stackOk_) {
         // CSM shadow targets: resolution-independent, so they live next to
         // deferred_ and survive scene/config rebuilds.  A failure degrades to
@@ -320,6 +371,29 @@ bool GuiApp::init(const GuiOptions& opts) {
         shadowsActive_ = deferred_.createShadowTargets(ctx_, shadow_);
         if (!shadowsActive_)
             std::fprintf(stderr, "gui: shadow target creation failed, shadows disabled\n");
+        // Spot shadow atlas (Phase 4b); a failure degrades to sun-only shadows.
+        spotAtlasActive_ = deferred_.createShadowAtlas(ctx_, spotAtlas_);
+        if (!spotAtlasActive_)
+            std::fprintf(stderr, "gui: spot shadow atlas creation failed, spot shadows disabled\n");
+        // Start both shadow maps in SHADER_READ_ONLY so the descriptor
+        // bindings are layout-valid even on frames that render no shadows
+        // (shadows checkbox off, or a scene without casting lights).
+        submitOneShot(ctx_, [&](VkCommandBuffer cmd) {
+            if (shadowsActive_) {
+                imageBarrier(cmd, shadow_.image, VK_IMAGE_LAYOUT_UNDEFINED,
+                             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_NONE,
+                             VK_ACCESS_2_NONE, sync::kFragment, sync::kSampled,
+                             VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, kShadowCascadeCount);
+                shadow_.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            }
+            if (spotAtlasActive_) {
+                imageBarrier(cmd, spotAtlas_.image, VK_IMAGE_LAYOUT_UNDEFINED,
+                             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_NONE,
+                             VK_ACCESS_2_NONE, sync::kFragment, sync::kSampled,
+                             VK_IMAGE_ASPECT_DEPTH_BIT);
+                spotAtlas_.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            }
+        });
         stackOk_ = buildRenderStack();
     } else {
         statusLine_ = "deferred core init failed";
@@ -328,6 +402,33 @@ bool GuiApp::init(const GuiOptions& opts) {
         std::fprintf(stderr, "gui: initial render stack failed: %s\n", statusLine_.c_str());
         // Continue anyway: the UI stays up (ImGui-only frames) and shows the
         // error; Apply retries.
+    }
+    // engine.toml per-frame defaults: applied AFTER the initial stack build so
+    // they win over the scene lighting preset (buildRenderStack re-asserts the
+    // preset on every scene rebuild, same as the manual "reset" UI button).
+    // The manual-exposure value additionally rides opts_.exposure (re-applied
+    // on rebuild), matching CLI --exposure.
+    if (!engineCfgPath_.empty()) {
+        EngineConfigLog log;
+        applyEngineConfigHot(opts_.engineCfg, log);
+        log.flush(" gui:");
+    }
+    // [grading] lut is a viewer-only key the GUI cannot edit; carry the loaded
+    // value through so the auto-save does not clobber it.
+    lutCarry_ = opts_.engineCfg.lut.value_or("");
+    // engine.toml auto-create: the GUI owns the file — a missing one is
+    // written from the effective values (code defaults + CLI overrides, scene
+    // preset already applied by the initial stack build above) so there is
+    // always a file to edit; the debounced auto-save keeps it in sync.
+    engineCfgBaseline_ = engineConfigToToml(currentEngineConfig());
+    if (engineCfgPath_.empty()) {
+        const std::string path = engineConfigFilePath();
+        if (writeFileAtomic(path, engineCfgBaseline_)) {
+            engineCfgPath_ = path;
+            engineCfgMtime_ = engineConfigWriteTime(path);
+            statusLine_ = "engine.toml created (defaults)";
+            std::fprintf(stderr, "[engine.toml] created %s\n", path.c_str());
+        } // else: no write target — hot reload keeps watching for the file
     }
     if (opts_.compareZoom > 0.f) {
         // Applied on the first run() frame (after any spurious first-frame
@@ -366,8 +467,14 @@ bool GuiApp::initImGui() {
     style.WindowRounding = 4.f;
     style.FrameRounding = 3.f;
 
-    if (!ImGui_ImplWin32_Init(window_.hwnd())) return false;
+    if (!ImGui_ImplSDL3_InitForVulkan(window_.sdlWindow())) return false;
+    return initImGuiVulkanBackend();
+}
 
+// Vulkan backend (device objects + pipeline) — the pipeline bakes the
+// swapchain format, so setHdrEnabled shuts it down and re-runs this after a
+// swapchain re-creation (the ImGui context and the SDL3 backend persist).
+bool GuiApp::initImGuiVulkanBackend() {
     ImGui_ImplVulkan_InitInfo ii = {};
     ii.ApiVersion = VK_API_VERSION_1_3;
     ii.Instance = ctx_.instance;
@@ -388,9 +495,10 @@ bool GuiApp::initImGui() {
 }
 
 void GuiApp::shutdownImGui() {
-    window_.setWndProcHook(nullptr);
+    graphWindow_.destroy(); // ImNodes context (independent of the ImGui one)
+    window_.setEventHook(nullptr);
     ImGui_ImplVulkan_Shutdown();
-    ImGui_ImplWin32_Shutdown();
+    ImGui_ImplSDL3_Shutdown();
     ImGui::DestroyContext();
 }
 
@@ -408,6 +516,7 @@ void GuiApp::shutdown() {
     bench_.stop();
     destroyRenderStack();
     if (shadowsActive_) { deferred_.destroyShadowTargets(ctx_, shadow_); shadowsActive_ = false; }
+    if (spotAtlasActive_) { deferred_.destroyShadowAtlas(ctx_, spotAtlas_); spotAtlasActive_ = false; }
     deferred_.destroy(ctx_);
     destroyUiSync();
     shutdownImGui();
@@ -417,6 +526,7 @@ void GuiApp::shutdown() {
         slRefHeld_ = false;
     }
     swapchain_.destroy(ctx_);
+    gradingLut_.destroy(ctx_);
     ctx_.destroy();
     window_.destroy();
 }
@@ -463,8 +573,8 @@ GuiApp::RenderConfig GuiApp::configFromUi(Mode mode) const {
 }
 
 void GuiApp::applyLaunchOptions() {
-    std::snprintf(ui_.envMap, sizeof(ui_.envMap), "%s",
-                  opts_.envMapPath.empty() ? kDefaultEnvMapPath : opts_.envMapPath.c_str());
+    // Empty env map field = procedural sky atmosphere (the default look).
+    std::snprintf(ui_.envMap, sizeof(ui_.envMap), "%s", opts_.envMapPath.c_str());
     if (opts_.renderScale > 0.f) ui_.renderScale = opts_.renderScale;
     if (opts_.displayW > 0 && opts_.displayH > 0) {
         for (int i = 0; i < 4; ++i) {
@@ -521,6 +631,242 @@ void GuiApp::applyLaunchOptions() {
         tabRequest_ = 2;
         benchAutoRun_ = true;
     }
+}
+
+// engine.toml per-frame application (hot reload + initial defaults): only
+// options with no rebuild cost are touched (pass toggles go through
+// applyPassToggle for the checkbox side effects like the fog history reset).
+// Resolution/scale/scene/env-map/LUT changes still need Apply or a restart.
+void GuiApp::applyEngineConfigHot(const EngineConfig& cfg, EngineConfigLog& log) {
+    const uint64_t m = opts_.engineCfgCli;
+    auto takeToggle = [&](rg::PassToggle t, const std::optional<bool>& v, uint64_t bit,
+                          const char* key) {
+        if (v && (m & bit) == 0 && *v != passToggleValue(t)) {
+            applyPassToggle(t, *v);
+            log.add(key, *v);
+        }
+    };
+    takeToggle(rg::PassToggle::Shadows, cfg.shadows, cli::kShadows, "shadows");
+    takeToggle(rg::PassToggle::ContactShadows, cfg.contactShadows, cli::kContactShadows,
+               "contact_shadows");
+    takeToggle(rg::PassToggle::Ssr, cfg.ssr, cli::kSsr, "ssr");
+    takeToggle(rg::PassToggle::VolFog, cfg.volFog, cli::kVolFog, "volfog");
+    takeToggle(rg::PassToggle::Occlusion, cfg.occlusion, cli::kNone, "occlusion");
+    takeToggle(rg::PassToggle::Bloom, cfg.bloom, cli::kBloom, "bloom");
+    takeToggle(rg::PassToggle::MotionBlur, cfg.motionBlur, cli::kMotionBlur, "motion_blur");
+    takeToggle(rg::PassToggle::Dof, cfg.dof, cli::kDof, "dof");
+    takeToggle(rg::PassToggle::LensCa, cfg.lensCa, cli::kLensFx, "lens_ca");
+    takeToggle(rg::PassToggle::LensVignette, cfg.lensVignette, cli::kLensFx, "lens_vignette");
+    takeToggle(rg::PassToggle::LensGrain, cfg.lensGrain, cli::kLensFx, "lens_grain");
+    cfgTake(ssrStrength_, cfg.ssrStrength, m, cli::kSsrStrength, "ssr_strength", log);
+    cfgTake(dofFocus_, cfg.dofFocus, m, cli::kDofFocus, "dof_focus", log);
+    cfgTake(dofFstop_, cfg.dofFstop, m, cli::kDofFstop, "dof_fstop", log);
+    cfgTake(dofMaxBlur_, cfg.dofMaxBlur, m, cli::kDofMaxBlur, "dof_max_blur", log);
+    cfgTake(lodEnabled_, cfg.lod, m, cli::kNone, "lod", log);
+    cfgTake(gradeTemperatureK_, cfg.gradingTempK, m, cli::kGradingTemp, "temperature", log);
+    cfgTake(gradeTint_, cfg.gradingTint, m, cli::kGradingTint, "tint", log);
+    cfgTake(gradeContrast_, cfg.gradingContrast, m, cli::kGradingContrast, "contrast", log);
+    cfgTake(gradeSaturation_, cfg.gradingSat, m, cli::kGradingSat, "saturation", log);
+    cfgTake(exposureMinEV_, cfg.exposureMinEV, m, cli::kExposure, "exposure_min_ev", log);
+    cfgTake(exposureMaxEV_, cfg.exposureMaxEV, m, cli::kExposure, "exposure_max_ev", log);
+    if (cfg.exposure && (m & cli::kExposure) == 0) {
+        // Same semantics as CLI --exposure: manual value, auto exposure off.
+        autoExposureEnabled_ = false;
+        exposure_ = *cfg.exposure;
+        log.add("exposure", exposure_);
+    }
+    bool sunMoved = false;
+    sunMoved |= cfgTake(sunElevationDeg_, cfg.sunElevationDeg, m, cli::kSunElev, "sun_elev", log);
+    sunMoved |= cfgTake(sunAzimuthDeg_, cfg.sunAzimuthDeg, m, cli::kSunAz, "sun_az", log);
+    if (sunMoved) updateSkyFromUiSun();
+    if (cfg.hdr && (m & cli::kHdr) == 0 && *cfg.hdr != hdrEnabled_) {
+        if (*cfg.hdr && !hdrSupportHdr10_ && !hdrSupportScRgb_) {
+            std::fprintf(stderr, "[engine.toml] hdr=true ignored: no HDR surface support\n");
+        } else {
+            setHdrEnabled(*cfg.hdr);
+            log.add("hdr", hdrEnabled_);
+        }
+    }
+    // Borderless fullscreen (no CLI flag): window-state toggle, applied hot.
+    if (cfg.fullscreen && *cfg.fullscreen != fullscreenEnabled_) {
+        setFullscreenEnabled(*cfg.fullscreen);
+        log.add("fullscreen", fullscreenEnabled_);
+    }
+    // Windowed size memory (no CLI flag): applied hot while windowed.  While
+    // fullscreen the values are kept for the round-trip but not applied to
+    // the (desktop-sized) window.
+    if (cfg.width && cfg.height &&
+        (*cfg.width != windowedW_ || *cfg.height != windowedH_)) {
+        windowedW_ = *cfg.width;
+        windowedH_ = *cfg.height;
+        if (!fullscreenEnabled_) window_.setClientSize(windowedW_, windowedH_);
+        log.add("width", windowedW_);
+        log.add("height", windowedH_);
+    }
+}
+
+// Hot-reload watch: stats engine.toml about once a second; on a modification
+// the per-frame options are re-applied (CLI-masked keys stay untouched).  A
+// deleted file resets the hot parameters to the code/scene-preset defaults
+// and is re-created (the GUI owns the file); the re-create write updates the
+// baseline, so the follow-up self-read is a no-op (idempotent).
+void GuiApp::pollEngineConfig() {
+    const auto now = std::chrono::steady_clock::now();
+    if (now < engineCfgNextPoll_) return;
+    engineCfgNextPoll_ = now + std::chrono::seconds(1);
+    if (engineCfgPath_.empty()) {
+        // No config at startup: keep watching so a newly created file applies.
+        engineCfgPath_ = engineConfigPath();
+        if (engineCfgPath_.empty()) return;
+        engineCfgMtime_ = 0;
+    }
+    const int64_t mt = engineConfigWriteTime(engineCfgPath_);
+    if (mt == engineCfgMtime_) return;
+    engineCfgMtime_ = mt;
+    if (mt == 0) {
+        // Deleted at runtime: defaults back in, then rebuild the file from
+        // them (immediate write — no debounce on the recovery path).
+        resetEngineConfigDefaults();
+        engineCfgBaseline_ = engineConfigToToml(currentEngineConfig());
+        engineCfgPendingText_ = engineCfgBaseline_;
+        engineCfgDirty_ = false;
+        if (writeFileAtomic(engineCfgPath_, engineCfgPendingText_)) {
+            engineCfgMtime_ = engineConfigWriteTime(engineCfgPath_);
+            statusLine_ = "engine.toml deleted — defaults restored, file re-created";
+            std::fprintf(stderr, "[engine.toml] deleted — defaults restored, re-created %s\n",
+                         engineCfgPath_.c_str());
+        }
+        return;
+    }
+    EngineConfig cfg;
+    if (!loadEngineConfig(engineCfgPath_, cfg)) return; // malformed: keep state
+    EngineConfigLog log;
+    applyEngineConfigHot(cfg, log);
+    // Needs-Apply keys are not applied hot but DO update the UI fields (same
+    // as the user moving the slider), so the auto-save never clobbers an
+    // external edit with a stale value.
+    if (cfg.renderScale) ui_.renderScale = *cfg.renderScale;
+    if (cfg.envMap)
+        std::snprintf(ui_.envMap, sizeof(ui_.envMap), "%s", cfg.envMap->c_str());
+    if (cfg.lut) lutCarry_ = *cfg.lut; // preserve the viewer-only key across saves
+    // The external edit becomes the save baseline: the auto-save reacts to
+    // UI-side changes only, it does not rewrite the file the user just edited.
+    engineCfgBaseline_ = engineConfigToToml(currentEngineConfig());
+    engineCfgDirty_ = false;
+    if (!log.empty()) statusLine_ = "engine.toml reloaded";
+    log.flush(" gui (reload):");
+}
+
+// Full file snapshot from the current UI state (every key the GUI writes).
+// [exposure] exposure is omitted while auto exposure is on — writing it would
+// re-disable auto on the next load (same semantics as CLI --exposure).
+EngineConfig GuiApp::currentEngineConfig() const {
+    EngineConfig c;
+    c.fullscreen = fullscreenEnabled_;
+    if (windowedW_ > 0 && windowedH_ > 0) {
+        c.width = windowedW_;
+        c.height = windowedH_;
+    }
+    c.renderScale = ui_.renderScale;
+    c.hdr = hdrEnabled_;
+    c.envMap = std::string(ui_.envMap);
+    if (!autoExposureEnabled_) c.exposure = exposure_;
+    c.exposureMinEV = exposureMinEV_;
+    c.exposureMaxEV = exposureMaxEV_;
+    c.ssr = ssrEnabled_;
+    c.ssrStrength = ssrStrength_;
+    c.shadows = shadowsEnabled_;
+    c.contactShadows = contactShadowsEnabled_;
+    c.volFog = volFogEnabled_;
+    c.bloom = bloomEnabled_;
+    c.motionBlur = motionBlurEnabled_;
+    // The GUI has no master lens-fx switch (only the per-effect items); write
+    // the master as "any on" so the viewer keeps its chain when at least one
+    // effect is enabled.
+    c.lensFx = lensCaEnabled_ || lensVignetteEnabled_ || lensGrainEnabled_;
+    c.lensCa = lensCaEnabled_;
+    c.lensVignette = lensVignetteEnabled_;
+    c.lensGrain = lensGrainEnabled_;
+    c.occlusion = occlusionEnabled_;
+    c.lod = lodEnabled_;
+    c.dof = dofEnabled_;
+    c.dofFocus = dofFocus_;
+    c.dofFstop = dofFstop_;
+    c.dofMaxBlur = dofMaxBlur_;
+    c.gradingTempK = gradeTemperatureK_;
+    c.gradingTint = gradeTint_;
+    c.gradingContrast = gradeContrast_;
+    c.gradingSat = gradeSaturation_;
+    c.lut = lutCarry_;
+    c.sunElevationDeg = sunElevationDeg_;
+    c.sunAzimuthDeg = sunAzimuthDeg_;
+    return c;
+}
+
+void GuiApp::saveEngineConfigNow() {
+    engineCfgDirty_ = false;
+    if (engineCfgPath_.empty()) return; // no write target (creation failed)
+    if (writeFileAtomic(engineCfgPath_, engineCfgPendingText_)) {
+        engineCfgMtime_ = engineConfigWriteTime(engineCfgPath_);
+        statusLine_ = "engine.toml saved";
+    }
+}
+
+// Debounced auto-save: once per frame, diff the canonical serialization of
+// the UI state against the saved/loaded baseline; write 1.5 s after the last
+// change (atomic temp+replace, so the hot-reload poll never sees a stub).
+void GuiApp::pollEngineConfigAutoSave() {
+    if (engineCfgPath_.empty()) return;
+    const std::string cur = engineConfigToToml(currentEngineConfig());
+    const auto now = std::chrono::steady_clock::now();
+    if (cur != engineCfgBaseline_) {
+        engineCfgBaseline_ = cur;
+        engineCfgPendingText_ = cur;
+        engineCfgDirty_ = true;
+        engineCfgDirtyAt_ = now; // sliding window: edits keep pushing the write out
+    }
+    if (engineCfgDirty_ && now - engineCfgDirtyAt_ >= std::chrono::milliseconds(1500))
+        saveEngineConfigNow();
+}
+
+// Inverse of applyEngineConfigHot with no file: every hot-applied parameter
+// back to its code default (GUI member initializer values / scene preset).
+// Toggles go through applyPassToggle for the same side effects as the panel
+// checkboxes (fog history reset, auto-exposure snap).
+void GuiApp::resetEngineConfigDefaults() {
+    applyLightingPreset(lightingPresetForScene(active_.scenePath)); // sun/exposure/fog preset
+    applyPassToggle(rg::PassToggle::AutoExposure, true);
+    exposureMinEV_ = -8.f;
+    exposureMaxEV_ = 8.f;
+    applyPassToggle(rg::PassToggle::Shadows, true);
+    applyPassToggle(rg::PassToggle::ContactShadows, true);
+    applyPassToggle(rg::PassToggle::Ssr, false);
+    applyPassToggle(rg::PassToggle::VolFog, volFogEnabled_); // preset value + history reset
+    applyPassToggle(rg::PassToggle::Occlusion, occlusionEnabledByDefault());
+    applyPassToggle(rg::PassToggle::Bloom, false);
+    applyPassToggle(rg::PassToggle::MotionBlur, false);
+    applyPassToggle(rg::PassToggle::Dof, false);
+    applyPassToggle(rg::PassToggle::LensCa, true);
+    applyPassToggle(rg::PassToggle::LensVignette, true);
+    applyPassToggle(rg::PassToggle::LensGrain, true);
+    ssrStrength_ = 0.6f;
+    dofFocus_ = 0.f;
+    dofFstop_ = kDofDefaultFstop;
+    dofMaxBlur_ = kDofMaxCoC;
+    lodEnabled_ = lodEnabledByDefault();
+    gradeTemperatureK_ = 6500.f;
+    gradeTint_ = 0.f;
+    gradeContrast_ = 1.f;
+    gradeSaturation_ = 1.f;
+    lutCarry_.clear();
+    if (hdrEnabled_) setHdrEnabled(false);
+    setFullscreenEnabled(false);
+}
+
+void GuiApp::setFullscreenEnabled(bool enabled) {
+    if (fullscreenEnabled_ == enabled) return;
+    fullscreenEnabled_ = enabled;
+    window_.setFullscreen(enabled);
 }
 
 void GuiApp::requestRebuild(const RenderConfig& cfg) {
@@ -618,6 +964,10 @@ void GuiApp::loadWorkerMain(RenderConfig cfg) {
         // null and finishAsyncRebuild preserves scene_).
         if (loadSceneDirty_) {
             bool sceneOk = false;
+            // GUI is interactive: enable background fine-mip streaming
+            // (Phase 7b).  Bench subprocesses run the viewer with --frames,
+            // which disables it there.
+            scene->streamingEnabled = texStreamingOverride() >= 0;
             if (!cfg.scenePath.empty())
                 sceneOk = scene->loadGltf(ctx_, cfg.scenePath.c_str(), loadPool_, progress);
             if (!sceneOk) {
@@ -745,11 +1095,12 @@ void GuiApp::finishAsyncRebuild() {
         loadResult_.algos.clear();
 
         // The env map is part of the deferred core (IBL maps): rebuild it only
-        // when the path actually changed.
+        // when the path actually changed.  Empty = sky atmosphere.
         if (active_.envMapPath != envMapActive_) {
             deferred_.destroy(ctx_);
             envMapActive_ = active_.envMapPath;
-            if (!deferred_.init(ctx_, envMapActive_.c_str())) {
+            if (!deferred_.init(ctx_, envMapActive_.c_str(),
+                                sunDirectionFromElevAzimuth(sunElevationDeg_, sunAzimuthDeg_))) {
                 statusLine_ = "deferred core init failed (env map: " + envMapActive_ + ")";
                 stackOk_ = false;
                 return;
@@ -861,6 +1212,7 @@ bool GuiApp::buildRenderStack() {
     if (!beginStackConfig()) return false;
 
     bool sceneOk = false;
+    scene_.streamingEnabled = texStreamingOverride() >= 0; // interactive GUI (Phase 7b)
     if (!active_.scenePath.empty()) sceneOk = scene_.loadGltf(ctx_, active_.scenePath.c_str());
     if (!sceneOk) sceneOk = scene_.loadProcedural(ctx_);
     if (!sceneOk || !ensureSceneFallbacks(scene_, ctx_, VK_NULL_HANDLE)) {
@@ -898,6 +1250,7 @@ bool GuiApp::buildStackTail() {
     if (!createSyncResources()) { statusLine_ = "sync resource creation failed"; return false; }
     if (!createScreenshotStaging()) { statusLine_ = "screenshot staging failed"; return false; }
     if (!timestamps_.create(ctx_, kFramesInFlight)) { statusLine_ = "timestamp query failed"; return false; }
+    if (!profiler_.create(ctx_, kFramesInFlight)) { statusLine_ = "gpu profiler query failed"; return false; }
 
     resetFrameState();
     // Launch-option zoom (--compare-zoom): the first frames can trigger
@@ -939,6 +1292,7 @@ void GuiApp::resetFrameState() {
     jitterX_ = jitterY_ = prevJitterX_ = prevJitterY_ = 0.f;
     metricPending_[0] = metricPending_[1] = false;
     metricMask_[0] = metricMask_[1] = 0;
+    autoExposureJustEnabled_ = false; // fresh channels re-seed from exposure_
     frameTimesLog_.clear();
     historyHead_ = 0;
     historyCount_ = 0;
@@ -1085,6 +1439,11 @@ bool GuiApp::createRenderTargets() {
                       VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                   VK_IMAGE_ASPECT_COLOR_BIT))
         return false;
+    // Dilated coverage mask (reactive_dilate.comp output; see GuiApp.h).
+    if (!createRT(gbReactiveDilated_, renderWidth_, renderHeight_, deferred::kReactiveFormat,
+                  VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                  VK_IMAGE_ASPECT_COLOR_BIT))
+        return false;
     if (!createRT(gbDepth_, renderWidth_, renderHeight_, deferred::kDepthFormat,
                   VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
                       VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
@@ -1126,6 +1485,10 @@ bool GuiApp::createRenderTargets() {
                   VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
                   VK_IMAGE_ASPECT_COLOR_BIT))
         return false;
+    if (!createRT(gtMotion_, gtW, gtH, deferred::kMotionFormat,
+                  VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                  VK_IMAGE_ASPECT_COLOR_BIT))
+        return false;
     if (!createRT(gtDepth_, gtW, gtH, deferred::kDepthFormat,
                   VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
                   VK_IMAGE_ASPECT_DEPTH_BIT))
@@ -1134,13 +1497,38 @@ bool GuiApp::createRenderTargets() {
         return false;
     if (!createRT(gtAo_, gtW, gtH, VK_FORMAT_R16_SFLOAT, aoUsage, VK_IMAGE_ASPECT_COLOR_BIT))
         return false;
-    const VkImageUsageFlags ssrUsage =
-        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-    if (!createRT(gbSsrSrc_, renderWidth_, renderHeight_, deferred::kHdrColorFormat, ssrUsage,
-                  VK_IMAGE_ASPECT_COLOR_BIT))
+    // Motion blur + DOF working sets (Phase 6b), LR + GT paths.
+    if (!deferred_.createPostFxTargets(ctx_, renderWidth_, renderHeight_, gbPostFx_))
         return false;
-    if (!createRT(gtSsrSrc_, gtW, gtH, deferred::kHdrColorFormat, ssrUsage, VK_IMAGE_ASPECT_COLOR_BIT))
+    if (!deferred_.createPostFxTargets(ctx_, gtW, gtH, gtPostFx_))
         return false;
+    // HDR bloom pyramids (Phase 6a), one per path; the runtime checkbox skips
+    // the pass, so creation is unconditional.
+    if (!deferred_.createBloomPyramid(ctx_, renderWidth_, renderHeight_, gbBloom_))
+        return false;
+    if (!deferred_.createBloomPyramid(ctx_, gtW, gtH, gtBloom_))
+        return false;
+    // Color mip chains for roughness-aware SSR (mip 0 = the lit-color copy).
+    if (!deferred_.createColorPyramid(ctx_, renderWidth_, renderHeight_, gbColorPyramid_))
+        return false;
+    if (!deferred_.createColorPyramid(ctx_, gtW, gtH, gtColorPyramid_))
+        return false;
+    // Clustered shading grids (per-path resolution, per-slot buffers).
+    if (!deferred_.createClusterGrid(ctx_, renderWidth_, renderHeight_, gbCluster_))
+        return false;
+    if (!deferred_.createClusterGrid(ctx_, gtW, gtH, gtCluster_))
+        return false;
+    // Froxel volumetric fog volumes (Phase 5a), one per path; the runtime
+    // checkbox skips the passes, so creation follows the preset only.
+    if (fogParams_.enabled) {
+        if (!deferred_.createVolFogVolume(ctx_, renderWidth_, renderHeight_, gbFog_) ||
+            !deferred_.createVolFogVolume(ctx_, gtW, gtH, gtFog_)) {
+            std::fprintf(stderr, "warning: volumetric fog volume creation failed; fog disabled\n");
+            deferred_.destroyVolFogVolume(ctx_, gbFog_);
+            deferred_.destroyVolFogVolume(ctx_, gtFog_);
+            fogParams_.enabled = false;
+        }
+    }
 
     // 200% SSAA ground truth: deferred render at 2x, downsample into gtColor_.
     if (active_.gtSsaa) {
@@ -1165,6 +1553,10 @@ bool GuiApp::createRenderTargets() {
                       VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
                       VK_IMAGE_ASPECT_COLOR_BIT))
             return false;
+        if (!createRT(gtSsaaMotion_, dw * 2, dh * 2, deferred::kMotionFormat,
+                      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                      VK_IMAGE_ASPECT_COLOR_BIT))
+            return false;
         if (!createRT(gtSsaaDepth_, dw * 2, dh * 2, deferred::kDepthFormat,
                       VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
                       VK_IMAGE_ASPECT_DEPTH_BIT))
@@ -1175,10 +1567,60 @@ bool GuiApp::createRenderTargets() {
         if (!createRT(gtSsaaAo_, dw * 2, dh * 2, VK_FORMAT_R16_SFLOAT, aoUsage,
                       VK_IMAGE_ASPECT_COLOR_BIT))
             return false;
-        if (!createRT(gtSsaaSsrSrc_, dw * 2, dh * 2, deferred::kHdrColorFormat, ssrUsage,
+        if (!deferred_.createDepthPyramid(ctx_, dw * 2, dh * 2, gtSsaaPyramid_))
+            return false;
+        if (!deferred_.createDepthPyramid(ctx_, dw * 2, dh * 2, gtSsaaPyramidAo_,
+                                          /*aoFilter=*/true, camera_.nearPlane, camera_.farPlane))
+            return false;
+        if (!deferred_.createAoHistory(ctx_, dw * 2, dh * 2, gtSsaaAoHist_))
+            return false;
+        if (!createRT(gtSsaaSsrTrace_, dw * 2, dh * 2, kSsrTraceFormat, aoUsage,
                       VK_IMAGE_ASPECT_COLOR_BIT))
             return false;
+        if (!deferred_.createSsrHistory(ctx_, dw * 2, dh * 2, gtSsaaSsrHist_))
+            return false;
+        if (!deferred_.createColorPyramid(ctx_, dw * 2, dh * 2, gtSsaaColorPyramid_))
+            return false;
+        if (!deferred_.createClusterGrid(ctx_, dw * 2, dh * 2, gtSsaaCluster_))
+            return false;
+        if (!deferred_.createPostFxTargets(ctx_, dw * 2, dh * 2, gtSsaaPostFx_))
+            return false;
+        if (!deferred_.createBloomPyramid(ctx_, dw * 2, dh * 2, gtSsaaBloom_))
+            return false;
+        if (fogParams_.enabled &&
+            !deferred_.createVolFogVolume(ctx_, dw * 2, dh * 2, gtSsaaFog_)) {
+            std::fprintf(stderr,
+                         "warning: SSAA volumetric fog volume creation failed; SSAA fog off\n");
+            deferred_.destroyVolFogVolume(ctx_, gtSsaaFog_);
+        }
     }
+
+    // Hi-Z depth pyramids for the SSR march (LR / GT paths).
+    if (!deferred_.createDepthPyramid(ctx_, renderWidth_, renderHeight_, gbPyramid_))
+        return false;
+    if (!deferred_.createDepthPyramid(ctx_, gtW, gtH, gtPyramid_))
+        return false;
+    // GTAO view-Z depth chains (XeGTAO DepthMIPFilter) + temporal history.
+    if (!deferred_.createDepthPyramid(ctx_, renderWidth_, renderHeight_, gbPyramidAo_,
+                                      /*aoFilter=*/true, camera_.nearPlane, camera_.farPlane))
+        return false;
+    if (!deferred_.createDepthPyramid(ctx_, gtW, gtH, gtPyramidAo_, /*aoFilter=*/true,
+                                      camera_.nearPlane, camera_.farPlane))
+        return false;
+    if (!deferred_.createAoHistory(ctx_, renderWidth_, renderHeight_, gbAoHist_))
+        return false;
+    if (!deferred_.createAoHistory(ctx_, gtW, gtH, gtAoHist_))
+        return false;
+    // Opaque SSR trace targets + temporal history (Phase 2d), one per path.
+    if (!createRT(gbSsrTrace_, renderWidth_, renderHeight_, kSsrTraceFormat, aoUsage,
+                  VK_IMAGE_ASPECT_COLOR_BIT))
+        return false;
+    if (!createRT(gtSsrTrace_, gtW, gtH, kSsrTraceFormat, aoUsage, VK_IMAGE_ASPECT_COLOR_BIT))
+        return false;
+    if (!deferred_.createSsrHistory(ctx_, renderWidth_, renderHeight_, gbSsrHist_))
+        return false;
+    if (!deferred_.createSsrHistory(ctx_, gtW, gtH, gtSsrHist_))
+        return false;
 
     // (Per-algorithm output images are created by createAlgoResources, after
     // the descriptor pool exists, so algo-only rebuilds can redo just those.)
@@ -1203,34 +1645,35 @@ bool GuiApp::createRenderTargets() {
 
 bool GuiApp::createFontAtlas() {
     VkBuffer staging = VK_NULL_HANDLE;
-    VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
+    VmaAllocation stagingMemory = VK_NULL_HANDLE;
     const VkDeviceSize size = kFontAtlasW * kFontAtlasH;
     if (createBuffer(ctx_, size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                      staging, stagingMemory) != VK_SUCCESS)
         return false;
     void* mapped = nullptr;
-    vkMapMemory(ctx_.device, stagingMemory, 0, size, 0, &mapped);
+    vmaMapMemory(ctx_.allocator, stagingMemory, &mapped);
     buildFontAtlas(static_cast<uint8_t*>(mapped));
-    vkUnmapMemory(ctx_.device, stagingMemory);
+    vmaUnmapMemory(ctx_.allocator, stagingMemory);
 
     if (createImage(ctx_, kFontAtlasW, kFontAtlasH, VK_FORMAT_R8_UNORM,
                     VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                     fontAtlas_.image, fontAtlas_.memory) != VK_SUCCESS) {
-        vkDestroyBuffer(ctx_.device, staging, nullptr);
-        vkFreeMemory(ctx_.device, stagingMemory, nullptr);
+        vmaDestroyBuffer(ctx_.allocator, staging, stagingMemory);
         return false;
     }
     fontAtlas_.width = kFontAtlasW;
     fontAtlas_.height = kFontAtlasH;
     fontAtlas_.format = VK_FORMAT_R8_UNORM;
 
-    submitOneShot(ctx_, [&](VkCommandBuffer cmd) {
-        copyBufferToImage(cmd, staging, fontAtlas_.image, kFontAtlasW, kFontAtlasH,
-                          VK_FORMAT_R8_UNORM);
-    });
-    vkDestroyBuffer(ctx_.device, staging, nullptr);
-    vkFreeMemory(ctx_.device, stagingMemory, nullptr);
+    submitUploadOneShot(
+        ctx_,
+        [&](VkCommandBuffer cmd) {
+            copyBufferToImageTransferStage(cmd, staging, fontAtlas_.image, kFontAtlasW,
+                                           kFontAtlasH);
+        },
+        [&](VkCommandBuffer cmd) { transitionImageToShaderRead(cmd, fontAtlas_.image); });
+    vmaDestroyBuffer(ctx_.allocator, staging, stagingMemory);
 
     fontAtlas_.view = createImageView(ctx_, fontAtlas_.image, VK_FORMAT_R8_UNORM,
                                       VK_IMAGE_ASPECT_COLOR_BIT);
@@ -1263,7 +1706,7 @@ bool GuiApp::createMetricResources() {
                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                          metricStaging_[i], metricStagingMemory_[i]) != VK_SUCCESS)
             return false;
-        vkMapMemory(ctx_.device, metricStagingMemory_[i], 0, resultSize, 0,
+        vmaMapMemory(ctx_.allocator, metricStagingMemory_[i],
                     &metricStagingMapped_[i]);
     }
     return true;
@@ -1302,8 +1745,8 @@ bool GuiApp::createShaders() {
 
 bool GuiApp::createDescriptors() {
     // Scene/texture/lighting set layouts are owned by DeferredCore.
-    VkDescriptorSetLayoutBinding composeBindings[3] = {};
-    for (uint32_t i = 0; i < 3; ++i) {
+    VkDescriptorSetLayoutBinding composeBindings[4] = {};
+    for (uint32_t i = 0; i < 4; ++i) {
         composeBindings[i].binding = i;
         composeBindings[i].descriptorCount = 1;
         composeBindings[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
@@ -1312,7 +1755,7 @@ bool GuiApp::createDescriptors() {
     }
     VkDescriptorSetLayoutCreateInfo composeLayoutCi = {};
     composeLayoutCi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    composeLayoutCi.bindingCount = 3;
+    composeLayoutCi.bindingCount = 4;
     composeLayoutCi.pBindings = composeBindings;
     if (vkCreateDescriptorSetLayout(ctx_.device, &composeLayoutCi, nullptr, &composeSetLayout_) != VK_SUCCESS)
         return false;
@@ -1354,30 +1797,144 @@ bool GuiApp::createDescriptors() {
     // each; transparent sets: 3 per frame (GB/GT/SSAA), 5 samplers + 1 UBO each;
     // SSAO sets: static, 3 samplers + 2 storage images per path.
     // (+1 sampler per lighting/transparent set is the CSM shadow map binding.)
+    // Opaque-SSR sets: 4 per frame (GB/GT/SSAA/spatial), 9 samplers + 1 UBO +
+    // 1 storage image each.
+    // Hi-Z / color downsample sets: one per mip per pyramid (sampler + storage image).
+    const uint32_t hizSets = gbPyramid_.mipCount + gtPyramid_.mipCount + gtSsaaPyramid_.mipCount +
+                             gbPyramidAo_.mipCount + gtPyramidAo_.mipCount +
+                             gtSsaaPyramidAo_.mipCount;
+    const uint32_t colorSets =
+        gbColorPyramid_.mipCount + gtColorPyramid_.mipCount + gtSsaaColorPyramid_.mipCount;
     VkDescriptorPoolSize sizes[5] = {};
+    // Froxel fog sets (Phase 5a): per path 14 samplers + 8 storage images +
+    // per-slot light sets (1 UBO + 2 SSBO each).
+    const uint32_t fogPaths = gbFog_.injectImage != VK_NULL_HANDLE
+                                  ? (gtSsaaFog_.injectImage != VK_NULL_HANDLE ? 3 : 2)
+                                  : 0;
+    // MB/DOF post-fx sets (Phase 6b): per path 17 samplers + 13 storage images
+    // + 9 sets (tile/neighbor/gather + coc/gather/composite x MB/lit variants
+    // + MB copy-back).
+    const uint32_t postFxPaths = active_.gtSsaa ? 3 : 2;
+    // Bloom pyramid sets (Phase 6a): per path 2*kBloomMipCount sets (extract +
+    // down/up pairs + composite), 1 sampler + 1 storage image each.
+    const uint32_t bloomSets = 2 * kBloomMipCount * postFxPaths;
     sizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     sizes[0].descriptorCount =
-        deferred::kMaxTextures + numColumns * 2 + 2 + numAlgos * 6 + 11 * kFramesInFlight * 4 +
-        7 * kFramesInFlight * 4 + 3 * 3;
+        deferred::kMaxTextures + numColumns * 3 + 2 + numAlgos * 8 + 14 * kFramesInFlight * 4 +
+        8 * kFramesInFlight * 4 + 11 * kFramesInFlight * 4 + 10 * 3 + 3 * 6 + hizSets + colorSets +
+        2 + 14 * fogPaths + 17 * postFxPaths + bloomSets + 3 + 2;
+                           // + ssr temporal samplers (GB/GT/SSAA x2 sets); auto-exposure HDR
+                           // sources (LR + GT); volfog light/temporal/march/composite samplers;
+                           // lighting sets: 14 samplers each (GB/GT/SSAA/spatial), incl. shadow +
+                           // spot atlas + 2 probe arrays; transparent sets: 8 each (incl. the
+                           // froxel fog volume); SSR trace sets: 11 each; post-fx sets; bloom
+                           // pyramid src taps (Phase 6a);
+                           // occlusion cull sets: Hi-Z chains (GB/GT/SSAA, Phase 7a);
+                           // reactive mask dilate: src mask + motion
     sizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     sizes[1].descriptorCount = kFramesInFlight * 3 + numColumns + numAlgos + kFramesInFlight * 4 +
-                               kFramesInFlight * 4;
+                               kFramesInFlight * 4 + kFramesInFlight * 4 + // + opaque-SSR UBOs
+                               kFramesInFlight * 8 + // + probe UBOs (lighting + SSR sets)
+                               kClusterSlots * fogPaths; // volfog light sets
     sizes[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
     sizes[2].descriptorCount = kFramesInFlight * 3;
     sizes[3].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    sizes[3].descriptorCount = numAlgos * 2;
+    sizes[3].descriptorCount = numAlgos * 2 + 4 + // metric blocks/result + auto-exposure (LR + GT)
+                               2 * kFramesInFlight * 4 + // lighting sets: cluster lights + grid SSBOs
+                               2 * kClusterSlots * 3 +    // cluster assign sets (GB/GT/SSAA paths)
+                               kFramesInFlight * 3 +      // scene sets: instance SSBO (Phase 7a)
+                               2 * 3 +                    // occlusion cull sets (GB/GT/SSAA, Phase 7a)
+                               2 * kClusterSlots * fogPaths; // volfog light sets
     sizes[4].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    sizes[4].descriptorCount = 6; // ssao raw + blurred outputs (GB/GT/SSAA)
+    // ssao raw + temporal history + blur outputs (GB/GT/SSAA) + pyramid mips +
+    // SSR trace targets + SSR temporal history write / scene-color RMW (x2 sets per path)
+    // + volfog inject/light/temporal/march/composite storage (per fog path)
+    // + bloom pyramid dst mips (Phase 6a, per path)
+    sizes[4].descriptorCount = 15 + hizSets + colorSets + kFramesInFlight * 4 + 2 * 6 +
+                               8 * fogPaths + 11 * postFxPaths + 2 * postFxPaths + bloomSets +
+                               1; // reactive mask dilate dst
     VkDescriptorPoolCreateInfo poolCi = {};
     poolCi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     poolCi.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
     poolCi.maxSets = kFramesInFlight * 3 + 2 + numColumns + 1 + numAlgos * 3 + kFramesInFlight * 4 +
                      kFramesInFlight * 4 + // transparent sets (GB/GT/SSAA/spatial)
-                     6;                     // ssao sets (GB/GT/SSAA, static)
+                     kFramesInFlight * 4 + // opaque-SSR sets (GB/GT/SSAA/spatial)
+                     15 +                  // ssao + temporal + blur sets (GB/GT/SSAA, static)
+                     6 +                   // ssr temporal sets (GB/GT/SSAA x2, static)
+                     2 +                   // auto-exposure sets (LR + GT)
+                     kClusterSlots * 3 +   // cluster assign sets (GB/GT/SSAA)
+                     8 * fogPaths +        // volfog sets (per fog path)
+                     8 * postFxPaths +     // MB/DOF post-fx sets (Phase 6b)
+                     1 * postFxPaths +     // MB copy-back set (Phase 6b)
+                     bloomSets +           // bloom pyramid sets (Phase 6a)
+                     1 +                   // reactive mask dilate set
+                     3 +                   // occlusion cull sets (GB/GT/SSAA, Phase 7a)
+                     hizSets + colorSets;
     poolCi.poolSizeCount = 5;
     poolCi.pPoolSizes = sizes;
     if (vkCreateDescriptorPool(ctx_.device, &poolCi, nullptr, &descriptorPool_) != VK_SUCCESS)
         return false;
+
+    // Cluster assignment sets (per slot, per path); buffers from createRenderTargets.
+    if (!deferred_.writeClusterGridSets(ctx_, descriptorPool_, gbCluster_)) return false;
+    if (!deferred_.writeClusterGridSets(ctx_, descriptorPool_, gtCluster_)) return false;
+    if (active_.gtSsaa && !deferred_.writeClusterGridSets(ctx_, descriptorPool_, gtSsaaCluster_))
+        return false;
+
+    if (!deferred_.writeDepthPyramidSets(ctx_, descriptorPool_, gbDepth_.view, gbPyramid_))
+        return false;
+    if (!deferred_.writeDepthPyramidSets(ctx_, descriptorPool_, gtDepth_.view, gtPyramid_))
+        return false;
+    if (active_.gtSsaa &&
+        !deferred_.writeDepthPyramidSets(ctx_, descriptorPool_, gtSsaaDepth_.view,
+                                         gtSsaaPyramid_))
+        return false;
+    if (!deferred_.writeDepthPyramidSets(ctx_, descriptorPool_, gbDepth_.view, gbPyramidAo_))
+        return false;
+    if (!deferred_.writeDepthPyramidSets(ctx_, descriptorPool_, gtDepth_.view, gtPyramidAo_))
+        return false;
+    if (active_.gtSsaa &&
+        !deferred_.writeDepthPyramidSets(ctx_, descriptorPool_, gtSsaaDepth_.view,
+                                         gtSsaaPyramidAo_))
+        return false;
+    // Color chain set 0 samples the lit HDR target of each path.
+    if (!deferred_.writeColorPyramidSets(ctx_, descriptorPool_, gbColor_.view, gbColorPyramid_))
+        return false;
+    if (!deferred_.writeColorPyramidSets(ctx_, descriptorPool_, gtColor_.view, gtColorPyramid_))
+        return false;
+    if (active_.gtSsaa &&
+        !deferred_.writeColorPyramidSets(ctx_, descriptorPool_, gtSsaaColor_.view,
+                                         gtSsaaColorPyramid_))
+        return false;
+
+    // MB/DOF post-fx sets (Phase 6b): srcColor = the path's lit HDR target.
+    if (!deferred_.writePostFxSets(ctx_, descriptorPool_, gbColor_.view, gbMotion_.view,
+                                   gbDepth_.view, gbPostFx_))
+        return false;
+    if (!deferred_.writePostFxSets(ctx_, descriptorPool_, gtColor_.view, gtMotion_.view,
+                                   gtDepth_.view, gtPostFx_))
+        return false;
+    if (active_.gtSsaa &&
+        !deferred_.writePostFxSets(ctx_, descriptorPool_, gtSsaaColor_.view, gtSsaaMotion_.view,
+                                   gtSsaaDepth_.view, gtSsaaPostFx_))
+        return false;
+
+    // Bloom pyramid sets (Phase 6a): srcColor = the path's lit HDR target.
+    if (!deferred_.writeBloomPyramidSets(ctx_, descriptorPool_, gbColor_.view, gbBloom_))
+        return false;
+    if (!deferred_.writeBloomPyramidSets(ctx_, descriptorPool_, gtColor_.view, gtBloom_))
+        return false;
+    if (active_.gtSsaa &&
+        !deferred_.writeBloomPyramidSets(ctx_, descriptorPool_, gtSsaaColor_.view, gtSsaaBloom_))
+        return false;
+    // Coverage mask dilate set: raw mask + motion -> dilated/gated target
+    // (pool-owned set).
+    if (!deferred_.writeReactiveDilateSet(ctx_, descriptorPool_, gbReactive_.view,
+                                          gbReactiveDilated_.view, gbMotion_.view,
+                                          reactiveDilateSet_))
+        return false;
+
+    if (!createAutoExposureResources()) return false;
 
     linearSampler_ = createSampler(ctx_, VK_FILTER_LINEAR, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
     fontSampler_ = createSampler(ctx_, VK_FILTER_LINEAR, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
@@ -1394,7 +1951,7 @@ bool GuiApp::createDescriptors() {
                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                      textUbo_, textUboMemory_) != VK_SUCCESS)
         return false;
-    vkMapMemory(ctx_.device, textUboMemory_, 0, textSize, 0, &textUboMapped_);
+    vmaMapMemory(ctx_.allocator, textUboMemory_, &textUboMapped_);
 
     // --- allocate sets -------------------------------------------------------------
     auto allocSet = [&](VkDescriptorSetLayout layout, VkDescriptorSet& set) {
@@ -1420,15 +1977,16 @@ bool GuiApp::createDescriptors() {
         if (!allocSet(deferred_.transparentSetLayout(), frames_[i].transparentSetGt)) return false;
         if (!allocSet(deferred_.transparentSetLayout(), frames_[i].transparentSetSsaa))
             return false;
+        if (!allocSet(deferred_.ssrSetLayout(), frames_[i].ssrSetGb)) return false;
+        if (!allocSet(deferred_.ssrSetLayout(), frames_[i].ssrSetGbSpatial)) return false;
+        if (!allocSet(deferred_.ssrSetLayout(), frames_[i].ssrSetGt)) return false;
+        if (!allocSet(deferred_.ssrSetLayout(), frames_[i].ssrSetSsaa)) return false;
     }
     if (!allocSet(deferred_.textureSetLayout(), textureSet_)) return false;
     if (!allocSet(deferred_.ssaoSetLayout(), ssaoSetGb_)) return false;
-    if (!allocSet(deferred_.ssaoBlurSetLayout(), ssaoBlurSetGb_)) return false;
     if (!allocSet(deferred_.ssaoSetLayout(), ssaoSetGt_)) return false;
-    if (!allocSet(deferred_.ssaoBlurSetLayout(), ssaoBlurSetGt_)) return false;
     if (active_.gtSsaa) {
         if (!allocSet(deferred_.ssaoSetLayout(), ssaoSetSsaa_)) return false;
-        if (!allocSet(deferred_.ssaoBlurSetLayout(), ssaoBlurSetSsaa_)) return false;
     }
     if (!allocSet(composeSetLayout_, gtComposeSet_)) return false;
     if (!allocSet(copySetLayout_, copySet_)) return false;
@@ -1472,6 +2030,11 @@ bool GuiApp::createDescriptors() {
         vkUpdateDescriptorSets(ctx_.device, 1, &write, 0, nullptr);
     }
 
+    // Phase 7a cull resources: instance SSBO + per-path cull channels bound to
+    // the depth pyramids (created by createRenderTargets above); scene sets
+    // are already allocated, so binding 3 can be written here.
+    if (!createCullResources()) return false;
+
     return true;
 }
 
@@ -1488,8 +2051,12 @@ void GuiApp::writeComposeSetInto(VkDescriptorSet set, VkImageView source) {
     fontInfo.sampler = fontSampler_;
     fontInfo.imageView = fontAtlas_.view;
     fontInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    VkDescriptorImageInfo lutInfo = {};
+    lutInfo.sampler = gradingLut_.sampler();
+    lutInfo.imageView = gradingLut_.view();
+    lutInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
-    VkWriteDescriptorSet writes[3] = {};
+    VkWriteDescriptorSet writes[4] = {};
     writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     writes[0].dstSet = set;
     writes[0].dstBinding = 0;
@@ -1508,7 +2075,13 @@ void GuiApp::writeComposeSetInto(VkDescriptorSet set, VkImageView source) {
     writes[2].descriptorCount = 1;
     writes[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     writes[2].pImageInfo = &fontInfo;
-    vkUpdateDescriptorSets(ctx_.device, 3, writes, 0, nullptr);
+    writes[3].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[3].dstSet = set;
+    writes[3].dstBinding = 3;
+    writes[3].descriptorCount = 1;
+    writes[3].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    writes[3].pImageInfo = &lutInfo;
+    vkUpdateDescriptorSets(ctx_.device, 4, writes, 0, nullptr);
 }
 
 bool GuiApp::createAlgoResources(AlgoColumn& algo, uint32_t index) {
@@ -1610,6 +2183,57 @@ bool GuiApp::createAlgoResources(AlgoColumn& algo, uint32_t index) {
     return true;
 }
 
+bool GuiApp::createAutoExposureResources() {
+    // Seed both solvers with the current (preset/slider) exposure so the
+    // frames before the first readback match the fixed-exposure look.
+    const float initialEV = -std::log2(std::max(exposure_, 1e-4f));
+    if (!deferred_.createExposureChannel(ctx_, descriptorPool_, gbColor_.view, renderWidth_,
+                                         renderHeight_, initialEV, lrExposure_))
+        return false;
+    const ImageResource& gtSrc = active_.gtSsaa ? gtSsaaColor_ : gtColor_;
+    return deferred_.createExposureChannel(ctx_, descriptorPool_, gtSrc.view, gtSrc.width,
+                                           gtSrc.height, initialEV, gtExposure_);
+}
+
+bool GuiApp::createCullResources() {
+    // Phase 7a: shared instance SSBO + one cull channel per path (LR / GT /
+    // GT-SSAA), each bound to that path's Hi-Z chain.  Capacity covers the
+    // full instance list (the candidate build skips blend/skinned/culled).
+    const uint32_t capacity = static_cast<uint32_t>(scene_.instances.size());
+    if (!deferred_.createInstanceBuffer(ctx_, capacity, instances_)) return false;
+    if (!deferred_.createCullChannel(ctx_, capacity, gbCull_)) return false;
+    if (!deferred_.createCullChannel(ctx_, capacity, gtCull_)) return false;
+    if (!deferred_.writeCullSet(ctx_, descriptorPool_, instances_, gbPyramid_.chainView, gbCull_))
+        return false;
+    if (!deferred_.writeCullSet(ctx_, descriptorPool_, instances_, gtPyramid_.chainView, gtCull_))
+        return false;
+    if (active_.gtSsaa) {
+        if (!deferred_.createCullChannel(ctx_, capacity, gtSsaaCull_)) return false;
+        if (!deferred_.writeCullSet(ctx_, descriptorPool_, instances_, gtSsaaPyramid_.chainView,
+                                    gtSsaaCull_))
+            return false;
+    }
+    // Scene set binding 3 (instance SSBO) for every slot's GB/spatial/GT set.
+    if (instances_.buffer) {
+        for (uint32_t i = 0; i < kFramesInFlight; ++i) {
+            deferred_.writeSceneInstanceBinding(ctx_, frames_[i].sceneSetGb, instances_.buffer);
+            deferred_.writeSceneInstanceBinding(ctx_, frames_[i].sceneSetGbSpatial,
+                                                instances_.buffer);
+            deferred_.writeSceneInstanceBinding(ctx_, frames_[i].sceneSetGt, instances_.buffer);
+        }
+    }
+    cullInstCpu_.resize(capacity);
+    cullCmdCpu_.resize(capacity);
+    return true;
+}
+
+void GuiApp::destroyCullResources() {
+    deferred_.destroyCullChannel(ctx_, gbCull_);
+    deferred_.destroyCullChannel(ctx_, gtCull_);
+    deferred_.destroyCullChannel(ctx_, gtSsaaCull_);
+    deferred_.destroyInstanceBuffer(ctx_, instances_);
+}
+
 bool GuiApp::createPipelines() {
     VkPushConstantRange composePushRange = {};
     composePushRange.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
@@ -1624,10 +2248,16 @@ bool GuiApp::createPipelines() {
     if (vkCreatePipelineLayout(ctx_.device, &composeLayoutCi, nullptr, &composePipelineLayout_) != VK_SUCCESS)
         return false;
 
+    VkPushConstantRange copyPushRange = {};
+    copyPushRange.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    copyPushRange.offset = 0;
+    copyPushRange.size = 16; // vec4: hdr mode + paper white (copy.frag)
     VkPipelineLayoutCreateInfo copyLayoutCi = {};
     copyLayoutCi.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     copyLayoutCi.setLayoutCount = 1;
     copyLayoutCi.pSetLayouts = &copySetLayout_;
+    copyLayoutCi.pushConstantRangeCount = 1;
+    copyLayoutCi.pPushConstantRanges = &copyPushRange;
     if (vkCreatePipelineLayout(ctx_.device, &copyLayoutCi, nullptr, &copyPipelineLayout_) != VK_SUCCESS)
         return false;
 
@@ -1714,28 +2344,20 @@ bool GuiApp::createPipelines() {
     composeRendering.pColorAttachmentFormats = &kComposeFormat;
     fsCi.pNext = &composeRendering;
     fsCi.layout = composePipelineLayout_;
-    if (vkCreateGraphicsPipelines(ctx_.device, VK_NULL_HANDLE, 1, &fsCi, nullptr, &composePipeline_) != VK_SUCCESS)
+    if (createGraphicsPipeline(ctx_, fsCi, composePipeline_) != VK_SUCCESS)
         return false;
 
-    fsStages[1].module = copyFrag_;
-    VkPipelineRenderingCreateInfo copyRendering = {};
-    copyRendering.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
-    copyRendering.colorAttachmentCount = 1;
-    const VkFormat presentFormat = swapchain_.format();
-    copyRendering.pColorAttachmentFormats = &presentFormat;
-    fsCi.pNext = &copyRendering;
-    fsCi.layout = copyPipelineLayout_;
-    if (vkCreateGraphicsPipelines(ctx_.device, VK_NULL_HANDLE, 1, &fsCi, nullptr, &copyPipeline_) != VK_SUCCESS)
-        return false;
+    if (!createCopyPipeline()) return false;
 
     // GT SSAA downsample: same passthrough fragment shader, HDR target.
+    fsStages[1].module = copyFrag_;
+    fsCi.layout = copyPipelineLayout_;
     VkPipelineRenderingCreateInfo downsampleRendering = {};
     downsampleRendering.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
     downsampleRendering.colorAttachmentCount = 1;
     downsampleRendering.pColorAttachmentFormats = &deferred::kHdrColorFormat;
     fsCi.pNext = &downsampleRendering;
-    if (vkCreateGraphicsPipelines(ctx_.device, VK_NULL_HANDLE, 1, &fsCi, nullptr,
-                                  &downsamplePipeline_) != VK_SUCCESS)
+    if (createGraphicsPipeline(ctx_, fsCi, downsamplePipeline_) != VK_SUCCESS)
         return false;
 
     // --- metric compute pipelines --------------------------------------------------
@@ -1746,15 +2368,118 @@ bool GuiApp::createPipelines() {
     compCi.stage.module = metricBlocksComp_;
     compCi.stage.pName = "main";
     compCi.layout = metricPipelineLayout_;
-    if (vkCreateComputePipelines(ctx_.device, VK_NULL_HANDLE, 1, &compCi, nullptr,
-                                 &metricBlocksPipeline_) != VK_SUCCESS)
+    if (createComputePipeline(ctx_, compCi, metricBlocksPipeline_) != VK_SUCCESS)
         return false;
     compCi.stage.module = metricReduceComp_;
-    if (vkCreateComputePipelines(ctx_.device, VK_NULL_HANDLE, 1, &compCi, nullptr,
-                                 &metricReducePipeline_) != VK_SUCCESS)
+    if (createComputePipeline(ctx_, compCi, metricReducePipeline_) != VK_SUCCESS)
         return false;
 
     return true;
+}
+
+bool GuiApp::createCopyPipeline() {
+    // Swapchain copy (compare_copy.frag into the swapchain image).  Factored
+    // out of createPipelines: setHdrEnabled re-creates just this pipeline
+    // when the swapchain format changes (Phase 6c).
+    VkPipelineInputAssemblyStateCreateInfo inputAssembly = {};
+    inputAssembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineViewportStateCreateInfo viewportState = {};
+    viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    viewportState.viewportCount = 1;
+    viewportState.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo rasterizer = {};
+    rasterizer.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
+    rasterizer.cullMode = VK_CULL_MODE_NONE;
+    rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rasterizer.lineWidth = 1.f;
+    VkPipelineMultisampleStateCreateInfo multisample = {};
+    multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineColorBlendAttachmentState blend = {};
+    blend.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                           VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    VkPipelineColorBlendStateCreateInfo colorBlend = {};
+    colorBlend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    colorBlend.attachmentCount = 1;
+    colorBlend.pAttachments = &blend;
+    VkDynamicState dynamicStates[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dynamicState = {};
+    dynamicState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    dynamicState.dynamicStateCount = 2;
+    dynamicState.pDynamicStates = dynamicStates;
+    VkPipelineVertexInputStateCreateInfo emptyVertexInput = {};
+    emptyVertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    VkPipelineDepthStencilStateCreateInfo noDepth = {};
+    noDepth.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+
+    VkPipelineShaderStageCreateInfo stages[2] = {};
+    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = fullscreenVert_;
+    stages[0].pName = "main";
+    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = copyFrag_;
+    stages[1].pName = "main";
+
+    VkPipelineRenderingCreateInfo rendering = {};
+    rendering.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+    rendering.colorAttachmentCount = 1;
+    const VkFormat presentFormat = swapchain_.format();
+    rendering.pColorAttachmentFormats = &presentFormat;
+
+    VkGraphicsPipelineCreateInfo ci = {};
+    ci.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    ci.stageCount = 2;
+    ci.pStages = stages;
+    ci.pVertexInputState = &emptyVertexInput;
+    ci.pInputAssemblyState = &inputAssembly;
+    ci.pViewportState = &viewportState;
+    ci.pRasterizationState = &rasterizer;
+    ci.pMultisampleState = &multisample;
+    ci.pDepthStencilState = &noDepth;
+    ci.pColorBlendState = &colorBlend;
+    ci.pDynamicState = &dynamicState;
+    ci.pNext = &rendering;
+    ci.layout = copyPipelineLayout_;
+    return createGraphicsPipeline(ctx_, ci, copyPipeline_) == VK_SUCCESS;
+}
+
+void GuiApp::setHdrEnabled(bool enabled) {
+    if (hdrEnabled_ == enabled) return;
+    hdrEnabled_ = enabled;
+    vkDeviceWaitIdle(ctx_.device);
+    // Everything that bakes the swapchain format is re-created: the swapchain
+    // itself, the copy pipeline and the ImGui backend pipeline.
+    if (!recreateGuiSwapchain()) {
+        std::fprintf(stderr, "gui: hdr swapchain re-creation failed, reverting to SDR\n");
+        hdrEnabled_ = false;
+        recreateGuiSwapchain();
+    }
+    if (copyPipeline_) {
+        vkDestroyPipeline(ctx_.device, copyPipeline_, nullptr);
+        copyPipeline_ = VK_NULL_HANDLE;
+    }
+    if (stackOk_ && !createCopyPipeline())
+        std::fprintf(stderr, "gui: copy pipeline re-creation failed\n");
+    ImGui_ImplVulkan_Shutdown();
+    initImGuiVulkanBackend();
+    // The debug UI-shot target bakes the swapchain format too.
+    if (uiShot_ && uiShotImage_.image) {
+        uiShotImage_.destroy(ctx_);
+        uiShotLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+        uiShotImage_.width = active_.displayW;
+        uiShotImage_.height = active_.displayH;
+        uiShotImage_.format = swapchain_.format();
+        if (createImage(ctx_, uiShotImage_.width, uiShotImage_.height, uiShotImage_.format,
+                        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                        uiShotImage_.image, uiShotImage_.memory) == VK_SUCCESS) {
+            uiShotImage_.view = createImageView(ctx_, uiShotImage_.image, uiShotImage_.format,
+                                                VK_IMAGE_ASPECT_COLOR_BIT);
+        }
+    }
 }
 
 bool GuiApp::createSyncResources() {
@@ -1780,7 +2505,7 @@ bool GuiApp::createSyncResources() {
         if (vkCreateFence(ctx_.device, &fenceCi, nullptr, &fr.fence) != VK_SUCCESS) return false;
 
         VkBuffer ubos[3] = {};
-        VkDeviceMemory uboMems[3] = {};
+        VmaAllocation uboMems[3] = {};
         void* uboMaps[3] = {};
         VkDescriptorSet sets[3] = {fr.sceneSetGb, fr.sceneSetGbSpatial, fr.sceneSetGt};
         for (int k = 0; k < 3; ++k) {
@@ -1788,7 +2513,7 @@ bool GuiApp::createSyncResources() {
                              VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                              ubos[k], uboMems[k]) != VK_SUCCESS)
                 return false;
-            vkMapMemory(ctx_.device, uboMems[k], 0, uboSize, 0, &uboMaps[k]);
+            vmaMapMemory(ctx_.allocator, uboMems[k], &uboMaps[k]);
 
             VkDescriptorBufferInfo sceneBuf = {};
             sceneBuf.buffer = ubos[k];
@@ -1813,6 +2538,11 @@ bool GuiApp::createSyncResources() {
             writes[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
             writes[1].pBufferInfo = &materialBuf;
             vkUpdateDescriptorSets(ctx_.device, 2, writes, 0, nullptr);
+
+            // Joint palette for skinned draws (per-slot buffer, matching the
+            // slot advanceToFrame(frameIndex) writes).
+            if (scene_.hasSkinnedMeshes())
+                deferred_.writeSceneSkinBinding(ctx_, sets[k], scene_.skinPalette(i));
         }
         fr.uboGb = ubos[0]; fr.uboGbMemory = uboMems[0]; fr.uboGbMapped = uboMaps[0];
         fr.uboGbSpatial = ubos[1]; fr.uboGbSpatialMemory = uboMems[1];
@@ -1825,19 +2555,19 @@ bool GuiApp::createSyncResources() {
                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                          fr.lightingUboGb, fr.lightingUboGbMemory) != VK_SUCCESS)
             return false;
-        vkMapMemory(ctx_.device, fr.lightingUboGbMemory, 0, lightingSize, 0,
+        vmaMapMemory(ctx_.allocator, fr.lightingUboGbMemory,
                     &fr.lightingUboGbMapped);
         if (createBuffer(ctx_, lightingSize, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                          fr.lightingUboGbSpatial, fr.lightingUboGbSpatialMemory) != VK_SUCCESS)
             return false;
-        vkMapMemory(ctx_.device, fr.lightingUboGbSpatialMemory, 0, lightingSize, 0,
+        vmaMapMemory(ctx_.allocator, fr.lightingUboGbSpatialMemory,
                     &fr.lightingUboGbSpatialMapped);
         if (createBuffer(ctx_, lightingSize, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                          fr.lightingUboGt, fr.lightingUboGtMemory) != VK_SUCCESS)
             return false;
-        vkMapMemory(ctx_.device, fr.lightingUboGtMemory, 0, lightingSize, 0,
+        vmaMapMemory(ctx_.allocator, fr.lightingUboGtMemory,
                     &fr.lightingUboGtMapped);
 
         // Shadow map binding: the array view is always bound when the targets
@@ -1845,47 +2575,122 @@ bool GuiApp::createSyncResources() {
         // off) via fillLightingUBO.  VK_NULL_HANDLE (creation failed) leaves
         // binding 11 unwritten, which is safe only while shadows stay off.
         const VkImageView shadowView = shadowsActive_ ? shadow_.arrayView : VK_NULL_HANDLE;
+        const VkImageView spotAtlasView = spotAtlasActive_ ? spotAtlas_.view : VK_NULL_HANDLE;
         deferred_.writeLightingSet(ctx_, fr.lightingSetGb, fr.lightingUboGb, gbAlbedo_.view,
                                    gbNormal_.view, gbMaterial_.view, gbEmissive_.view,
-                                   gbDepth_.view, gbAo_.view, shadowView);
+                                   gbDepth_.view, gbAo_.view, shadowView, spotAtlasView,
+                                   gbCluster_.lightsBuffer[i], gbCluster_.gridBuffer[i]);
         deferred_.writeLightingSet(ctx_, fr.lightingSetGbSpatial, fr.lightingUboGbSpatial,
                                    gbAlbedo_.view, gbNormal_.view, gbMaterial_.view,
-                                   gbEmissive_.view, gbDepth_.view, gbAo_.view, shadowView);
+                                   gbEmissive_.view, gbDepth_.view, gbAo_.view, shadowView,
+                                   spotAtlasView,
+                                   gbCluster_.lightsBuffer[i], gbCluster_.gridBuffer[i]);
         deferred_.writeLightingSet(ctx_, fr.lightingSetGt, fr.lightingUboGt, gtAlbedo_.view,
                                    gtNormal_.view, gtMaterial_.view, gtEmissive_.view,
-                                   gtDepth_.view, gtAo_.view, shadowView);
+                                   gtDepth_.view, gtAo_.view, shadowView, spotAtlasView,
+                                   gtCluster_.lightsBuffer[i], gtCluster_.gridBuffer[i]);
         if (active_.gtSsaa) {
             // GT and GT-SSAA share the same (resolution-independent) UBO.
             deferred_.writeLightingSet(ctx_, fr.lightingSetSsaa, fr.lightingUboGt,
                                        gtSsaaAlbedo_.view, gtSsaaNormal_.view,
                                        gtSsaaMaterial_.view, gtSsaaEmissive_.view,
-                                       gtSsaaDepth_.view, gtSsaaAo_.view, shadowView);
+                                       gtSsaaDepth_.view, gtSsaaAo_.view, shadowView, spotAtlasView,
+                                       gtSsaaCluster_.lightsBuffer[i], gtSsaaCluster_.gridBuffer[i]);
         }
 
         // The transparency shader reads iblParams (identical in both lighting
-        // UBOs) plus the path's own SSAO texture: one set per path.
+        // UBOs) plus the path's own SSAO texture: one set per path.  Binding 8
+        // is the path's ray-integrated froxel volume (volumetric fog on
+        // translucency); the spatial LR variant shares gbFog_ (same rule as
+        // the fog light sets).  Written whenever the volume exists — the
+        // per-frame checkbox gate lives in the record-side push constant.
         deferred_.writeTransparentSet(ctx_, fr.transparentSetGb, fr.lightingUboGb, gbAo_.view,
-                                      shadowView, gbSsrSrc_.view, gbDepth_.view);
+                                      shadowView, gbColorPyramid_.chainView,
+                                      gbPyramid_.chainView, gbFog_.intView);
         deferred_.writeTransparentSet(ctx_, fr.transparentSetGbSpatial, fr.lightingUboGbSpatial,
-                                      gbAo_.view, shadowView, gbSsrSrc_.view, gbDepth_.view);
+                                      gbAo_.view, shadowView, gbColorPyramid_.chainView,
+                                      gbPyramid_.chainView, gbFog_.intView);
         deferred_.writeTransparentSet(ctx_, fr.transparentSetGt, fr.lightingUboGt, gtAo_.view,
-                                      shadowView, gtSsrSrc_.view, gtDepth_.view);
+                                      shadowView, gtColorPyramid_.chainView,
+                                      gtPyramid_.chainView, gtFog_.intView);
         if (active_.gtSsaa) {
             deferred_.writeTransparentSet(ctx_, fr.transparentSetSsaa, fr.lightingUboGt,
-                                          gtSsaaAo_.view, shadowView, gtSsaaSsrSrc_.view,
-                                          gtSsaaDepth_.view);
+                                          gtSsaaAo_.view, shadowView,
+                                          gtSsaaColorPyramid_.chainView,
+                                          gtSsaaPyramid_.chainView, gtSsaaFog_.intView);
+        }
+
+        // Opaque-SSR trace sets: binding 0 reuses the path's lighting UBO; the
+        // rest is the GBuffer + SSAO + pyramids + the path's trace target
+        // (write-only storage; the temporal pass owns the lit-target RMW).
+        deferred_.writeSsrSet(ctx_, fr.ssrSetGb, fr.lightingUboGb, gbAlbedo_.view,
+                              gbNormal_.view, gbMaterial_.view, gbDepth_.view, gbAo_.view,
+                              gbColorPyramid_.chainView, gbPyramid_.chainView, gbSsrTrace_.view);
+        deferred_.writeSsrSet(ctx_, fr.ssrSetGbSpatial, fr.lightingUboGbSpatial, gbAlbedo_.view,
+                              gbNormal_.view, gbMaterial_.view, gbDepth_.view, gbAo_.view,
+                              gbColorPyramid_.chainView, gbPyramid_.chainView, gbSsrTrace_.view);
+        deferred_.writeSsrSet(ctx_, fr.ssrSetGt, fr.lightingUboGt, gtAlbedo_.view,
+                              gtNormal_.view, gtMaterial_.view, gtDepth_.view, gtAo_.view,
+                              gtColorPyramid_.chainView, gtPyramid_.chainView, gtSsrTrace_.view);
+        if (active_.gtSsaa) {
+            deferred_.writeSsrSet(ctx_, fr.ssrSetSsaa, fr.lightingUboGt, gtSsaaAlbedo_.view,
+                                  gtSsaaNormal_.view, gtSsaaMaterial_.view, gtSsaaDepth_.view,
+                                  gtSsaaAo_.view, gtSsaaColorPyramid_.chainView,
+                                  gtSsaaPyramid_.chainView, gtSsaaSsrTrace_.view);
         }
     }
 
+    // Froxel volumetric fog sets (Phase 5a), one writeVolFogSets per path.
+    // GB light sets bind the non-spatial lightingUboGb for both slots (the
+    // fog light pass only reads camera-independent fields; see CompareApp).
+    if (gbFog_.injectImage != VK_NULL_HANDLE) {
+        const VkImageView shadowView = shadowsActive_ ? shadow_.arrayView : VK_NULL_HANDLE;
+        const VkImageView spotAtlasView = spotAtlasActive_ ? spotAtlas_.view : VK_NULL_HANDLE;
+        const VkBuffer gbFogUbos[kClusterSlots] = {frames_[0].lightingUboGb,
+                                                   frames_[1].lightingUboGb};
+        const VkBuffer gtFogUbos[kClusterSlots] = {frames_[0].lightingUboGt,
+                                                   frames_[1].lightingUboGt};
+        if (!deferred_.writeVolFogSets(ctx_, descriptorPool_, gbFog_, gbCluster_, gbFogUbos,
+                                       shadowView, spotAtlasView, gbDepth_.view, gbColor_.view))
+            return false;
+        if (!deferred_.writeVolFogSets(ctx_, descriptorPool_, gtFog_, gtCluster_, gtFogUbos,
+                                       shadowView, spotAtlasView, gtDepth_.view, gtColor_.view))
+            return false;
+        if (active_.gtSsaa && gtSsaaFog_.injectImage != VK_NULL_HANDLE &&
+            !deferred_.writeVolFogSets(ctx_, descriptorPool_, gtSsaaFog_, gtSsaaCluster_,
+                                       gtFogUbos, shadowView, spotAtlasView, gtSsaaDepth_.view,
+                                       gtSsaaColor_.view))
+            return false;
+    }
+
     // SSAO sets (static bindings; per-frame data goes through push constants).
-    deferred_.writeSsaoSet(ctx_, ssaoSetGb_, gbDepth_.view, gbNormal_.view, gbAoRaw_.view);
-    deferred_.writeSsaoBlurSet(ctx_, ssaoBlurSetGb_, gbAoRaw_.view, gbAo_.view);
-    deferred_.writeSsaoSet(ctx_, ssaoSetGt_, gtDepth_.view, gtNormal_.view, gtAoRaw_.view);
-    deferred_.writeSsaoBlurSet(ctx_, ssaoBlurSetGt_, gtAoRaw_.view, gtAo_.view);
+    deferred_.writeSsaoSet(ctx_, ssaoSetGb_, gbPyramidAo_.chainView, gbNormal_.view,
+                           gbAoRaw_.view);
+    deferred_.writeSsaoSet(ctx_, ssaoSetGt_, gtPyramidAo_.chainView, gtNormal_.view,
+                           gtAoRaw_.view);
+    if (!deferred_.writeAoHistorySets(ctx_, descriptorPool_, gbAoRaw_.view, gbDepth_.view,
+                                      gbAo_.view, gbAoHist_))
+        return false;
+    if (!deferred_.writeAoHistorySets(ctx_, descriptorPool_, gtAoRaw_.view, gtDepth_.view,
+                                      gtAo_.view, gtAoHist_))
+        return false;
     if (active_.gtSsaa) {
-        deferred_.writeSsaoSet(ctx_, ssaoSetSsaa_, gtSsaaDepth_.view, gtSsaaNormal_.view,
-                               gtSsaaAoRaw_.view);
-        deferred_.writeSsaoBlurSet(ctx_, ssaoBlurSetSsaa_, gtSsaaAoRaw_.view, gtSsaaAo_.view);
+        deferred_.writeSsaoSet(ctx_, ssaoSetSsaa_, gtSsaaPyramidAo_.chainView,
+                               gtSsaaNormal_.view, gtSsaaAoRaw_.view);
+        if (!deferred_.writeAoHistorySets(ctx_, descriptorPool_, gtSsaaAoRaw_.view,
+                                          gtSsaaDepth_.view, gtSsaaAo_.view, gtSsaaAoHist_))
+            return false;
+    }
+    if (!deferred_.writeSsrHistorySets(ctx_, descriptorPool_, gbSsrTrace_.view, gbDepth_.view,
+                                       gbColor_.view, gbSsrHist_))
+        return false;
+    if (!deferred_.writeSsrHistorySets(ctx_, descriptorPool_, gtSsrTrace_.view, gtDepth_.view,
+                                       gtColor_.view, gtSsrHist_))
+        return false;
+    if (active_.gtSsaa) {
+        if (!deferred_.writeSsrHistorySets(ctx_, descriptorPool_, gtSsaaSsrTrace_.view,
+                                           gtSsaaDepth_.view, gtSsaaColor_.view, gtSsaaSsrHist_))
+            return false;
     }
     return true;
 }
@@ -1910,7 +2715,7 @@ bool GuiApp::createScreenshotStaging() {
                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                      screenshotStaging_, screenshotStagingMemory_) != VK_SUCCESS)
         return false;
-    vkMapMemory(ctx_.device, screenshotStagingMemory_, 0, size, 0, &screenshotMapped_);
+    vmaMapMemory(ctx_.allocator, screenshotStagingMemory_, &screenshotMapped_);
     return true;
 }
 
@@ -1924,8 +2729,7 @@ void GuiApp::destroyAlgoResources() {
         algo.fgHistory = false;
         algo.fgReady = false;
         if (algo.blocksBuffer) {
-            vkDestroyBuffer(ctx_.device, algo.blocksBuffer, nullptr);
-            vkFreeMemory(ctx_.device, algo.blocksMemory, nullptr);
+            vmaDestroyBuffer(ctx_.allocator, algo.blocksBuffer, algo.blocksMemory);
             algo.blocksBuffer = VK_NULL_HANDLE;
             algo.blocksMemory = VK_NULL_HANDLE;
         }
@@ -1955,20 +2759,19 @@ void GuiApp::destroyStackResources() {
     vkDeviceWaitIdle(ctx_.device);
 
     timestamps_.destroy(ctx_);
+    profiler_.destroy(ctx_);
 
     destroyAlgoResources();
 
     if (screenshotStaging_) {
-        vkDestroyBuffer(ctx_.device, screenshotStaging_, nullptr);
-        vkFreeMemory(ctx_.device, screenshotStagingMemory_, nullptr);
+        vmaDestroyBuffer(ctx_.allocator, screenshotStaging_, screenshotStagingMemory_);
         screenshotStaging_ = VK_NULL_HANDLE;
         screenshotStagingMemory_ = VK_NULL_HANDLE;
         screenshotMapped_ = nullptr;
     }
     for (uint32_t i = 0; i < kFramesInFlight; ++i) {
         if (metricStaging_[i]) {
-            vkDestroyBuffer(ctx_.device, metricStaging_[i], nullptr);
-            vkFreeMemory(ctx_.device, metricStagingMemory_[i], nullptr);
+            vmaDestroyBuffer(ctx_.allocator, metricStaging_[i], metricStagingMemory_[i]);
             metricStaging_[i] = VK_NULL_HANDLE;
             metricStagingMemory_[i] = VK_NULL_HANDLE;
             metricStagingMapped_[i] = nullptr;
@@ -1976,14 +2779,15 @@ void GuiApp::destroyStackResources() {
         metricPending_[i] = false;
     }
     if (metricResultBuf_) {
-        vkDestroyBuffer(ctx_.device, metricResultBuf_, nullptr);
-        vkFreeMemory(ctx_.device, metricResultMemory_, nullptr);
+        vmaDestroyBuffer(ctx_.allocator, metricResultBuf_, metricResultMemory_);
         metricResultBuf_ = VK_NULL_HANDLE;
         metricResultMemory_ = VK_NULL_HANDLE;
     }
+
+    deferred_.destroyExposureChannel(ctx_, lrExposure_);
+    deferred_.destroyExposureChannel(ctx_, gtExposure_);
     if (textUbo_) {
-        vkDestroyBuffer(ctx_.device, textUbo_, nullptr);
-        vkFreeMemory(ctx_.device, textUboMemory_, nullptr);
+        vmaDestroyBuffer(ctx_.allocator, textUbo_, textUboMemory_);
         textUbo_ = VK_NULL_HANDLE;
         textUboMemory_ = VK_NULL_HANDLE;
         textUboMapped_ = nullptr;
@@ -1996,43 +2800,37 @@ void GuiApp::destroyStackResources() {
             fr.cmd = VK_NULL_HANDLE;
         }
         if (fr.uboGb) {
-            vkDestroyBuffer(ctx_.device, fr.uboGb, nullptr);
-            vkFreeMemory(ctx_.device, fr.uboGbMemory, nullptr);
+            vmaDestroyBuffer(ctx_.allocator, fr.uboGb, fr.uboGbMemory);
             fr.uboGb = VK_NULL_HANDLE;
             fr.uboGbMemory = VK_NULL_HANDLE;
             fr.uboGbMapped = nullptr;
         }
         if (fr.uboGbSpatial) {
-            vkDestroyBuffer(ctx_.device, fr.uboGbSpatial, nullptr);
-            vkFreeMemory(ctx_.device, fr.uboGbSpatialMemory, nullptr);
+            vmaDestroyBuffer(ctx_.allocator, fr.uboGbSpatial, fr.uboGbSpatialMemory);
             fr.uboGbSpatial = VK_NULL_HANDLE;
             fr.uboGbSpatialMemory = VK_NULL_HANDLE;
             fr.uboGbSpatialMapped = nullptr;
         }
         if (fr.uboGt) {
-            vkDestroyBuffer(ctx_.device, fr.uboGt, nullptr);
-            vkFreeMemory(ctx_.device, fr.uboGtMemory, nullptr);
+            vmaDestroyBuffer(ctx_.allocator, fr.uboGt, fr.uboGtMemory);
             fr.uboGt = VK_NULL_HANDLE;
             fr.uboGtMemory = VK_NULL_HANDLE;
             fr.uboGtMapped = nullptr;
         }
         if (fr.lightingUboGb) {
-            vkDestroyBuffer(ctx_.device, fr.lightingUboGb, nullptr);
-            vkFreeMemory(ctx_.device, fr.lightingUboGbMemory, nullptr);
+            vmaDestroyBuffer(ctx_.allocator, fr.lightingUboGb, fr.lightingUboGbMemory);
             fr.lightingUboGb = VK_NULL_HANDLE;
             fr.lightingUboGbMemory = VK_NULL_HANDLE;
             fr.lightingUboGbMapped = nullptr;
         }
         if (fr.lightingUboGbSpatial) {
-            vkDestroyBuffer(ctx_.device, fr.lightingUboGbSpatial, nullptr);
-            vkFreeMemory(ctx_.device, fr.lightingUboGbSpatialMemory, nullptr);
+            vmaDestroyBuffer(ctx_.allocator, fr.lightingUboGbSpatial, fr.lightingUboGbSpatialMemory);
             fr.lightingUboGbSpatial = VK_NULL_HANDLE;
             fr.lightingUboGbSpatialMemory = VK_NULL_HANDLE;
             fr.lightingUboGbSpatialMapped = nullptr;
         }
         if (fr.lightingUboGt) {
-            vkDestroyBuffer(ctx_.device, fr.lightingUboGt, nullptr);
-            vkFreeMemory(ctx_.device, fr.lightingUboGtMemory, nullptr);
+            vmaDestroyBuffer(ctx_.allocator, fr.lightingUboGt, fr.lightingUboGtMemory);
             fr.lightingUboGt = VK_NULL_HANDLE;
             fr.lightingUboGtMemory = VK_NULL_HANDLE;
             fr.lightingUboGtMapped = nullptr;
@@ -2079,15 +2877,11 @@ void GuiApp::destroyStackResources() {
     gtComposeSet_ = VK_NULL_HANDLE;
     gtDownsampleSet_ = VK_NULL_HANDLE;
     ssaoSetGb_ = VK_NULL_HANDLE;
-    ssaoBlurSetGb_ = VK_NULL_HANDLE;
     ssaoSetGt_ = VK_NULL_HANDLE;
-    ssaoBlurSetGt_ = VK_NULL_HANDLE;
     ssaoSetSsaa_ = VK_NULL_HANDLE;
-    ssaoBlurSetSsaa_ = VK_NULL_HANDLE;
 
     if (materialUbo_) {
-        vkDestroyBuffer(ctx_.device, materialUbo_, nullptr);
-        vkFreeMemory(ctx_.device, materialUboMemory_, nullptr);
+        vmaDestroyBuffer(ctx_.allocator, materialUbo_, materialUboMemory_);
         materialUbo_ = VK_NULL_HANDLE;
         materialUboMemory_ = VK_NULL_HANDLE;
     }
@@ -2100,28 +2894,69 @@ void GuiApp::destroyStackResources() {
     gbEmissive_.destroy(ctx_);
     gbMotion_.destroy(ctx_);
     gbReactive_.destroy(ctx_);
+    gbReactiveDilated_.destroy(ctx_);
     gbDepth_.destroy(ctx_);
     gtColor_.destroy(ctx_);
     gtAlbedo_.destroy(ctx_);
     gtNormal_.destroy(ctx_);
     gtMaterial_.destroy(ctx_);
     gtEmissive_.destroy(ctx_);
+    gtMotion_.destroy(ctx_);
     gtDepth_.destroy(ctx_);
     gtSsaaColor_.destroy(ctx_);
     gtSsaaAlbedo_.destroy(ctx_);
     gtSsaaNormal_.destroy(ctx_);
     gtSsaaMaterial_.destroy(ctx_);
     gtSsaaEmissive_.destroy(ctx_);
+    gtSsaaMotion_.destroy(ctx_);
     gtSsaaDepth_.destroy(ctx_);
+    deferred_.destroyPostFxTargets(ctx_, gbPostFx_);
+    deferred_.destroyPostFxTargets(ctx_, gtPostFx_);
+    deferred_.destroyPostFxTargets(ctx_, gtSsaaPostFx_);
+    deferred_.destroyBloomPyramid(ctx_, gbBloom_);
+    deferred_.destroyBloomPyramid(ctx_, gtBloom_);
+    deferred_.destroyBloomPyramid(ctx_, gtSsaaBloom_);
     gbAoRaw_.destroy(ctx_);
     gbAo_.destroy(ctx_);
     gtAoRaw_.destroy(ctx_);
     gtAo_.destroy(ctx_);
     gtSsaaAoRaw_.destroy(ctx_);
     gtSsaaAo_.destroy(ctx_);
-    gbSsrSrc_.destroy(ctx_);
-    gtSsrSrc_.destroy(ctx_);
-    gtSsaaSsrSrc_.destroy(ctx_);
+    deferred_.destroyColorPyramid(ctx_, gbColorPyramid_);
+    deferred_.destroyColorPyramid(ctx_, gtColorPyramid_);
+    deferred_.destroyColorPyramid(ctx_, gtSsaaColorPyramid_);
+    deferred_.destroyClusterGrid(ctx_, gbCluster_);
+    deferred_.destroyClusterGrid(ctx_, gtCluster_);
+    deferred_.destroyClusterGrid(ctx_, gtSsaaCluster_);
+    deferred_.destroyDepthPyramid(ctx_, gbPyramid_);
+    deferred_.destroyDepthPyramid(ctx_, gtPyramid_);
+    deferred_.destroyDepthPyramid(ctx_, gtSsaaPyramid_);
+    // Phase 7a cull channels + shared instance SSBO (sets die with the pool).
+    destroyCullResources();
+    deferred_.destroyDepthPyramid(ctx_, gbPyramidAo_);
+    deferred_.destroyDepthPyramid(ctx_, gtPyramidAo_);
+    deferred_.destroyDepthPyramid(ctx_, gtSsaaPyramidAo_);
+    deferred_.destroyAoHistory(ctx_, gbAoHist_);
+    deferred_.destroyAoHistory(ctx_, gtAoHist_);
+    deferred_.destroyAoHistory(ctx_, gtSsaaAoHist_);
+    deferred_.destroySsrHistory(ctx_, gbSsrHist_);
+    deferred_.destroySsrHistory(ctx_, gtSsrHist_);
+    deferred_.destroySsrHistory(ctx_, gtSsaaSsrHist_);
+    gbSsrTrace_.destroy(ctx_);
+    gtSsrTrace_.destroy(ctx_);
+    gtSsaaSsrTrace_.destroy(ctx_);
+    deferred_.destroyVolFogVolume(ctx_, gbFog_);
+    deferred_.destroyVolFogVolume(ctx_, gtFog_);
+    deferred_.destroyVolFogVolume(ctx_, gtSsaaFog_);
+    // AO/SSR temporal state restarts after a stack rebuild (history buffers are fresh).
+    aoFramesGb_ = aoFramesGt_ = aoFramesSsaa_ = 0;
+    prevAoViewProjGb_ = prevAoViewProjGt_ = prevAoViewProjSsaa_ = Mat4::identity();
+    ssrFramesGb_ = ssrFramesGt_ = ssrFramesSsaa_ = 0;
+    prevSsrViewProjGb_ = prevSsrViewProjGt_ = prevSsrViewProjSsaa_ = Mat4::identity();
+    // Same for the froxel fog history volumes.
+    fogFramesGb_ = fogFramesGt_ = fogFramesSsaa_ = 0;
+    prevFogViewProjGb_ = prevFogViewProjGt_ = prevFogViewProjSsaa_ = Mat4::identity();
+    fogAccumFrameGb_ = fogAccumFrameGt_ = fogAccumFrameSsaa_ = ~0u;
     composeImage_.destroy(ctx_);
     uiShotImage_.destroy(ctx_);
     uiShotLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -2135,6 +2970,7 @@ void GuiApp::destroyStackResources() {
     gbEmissiveLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     gbMotionLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     gbReactiveLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+    gbReactiveDilatedLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     gbDepthLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     gtColorLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     gtAlbedoLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -2154,9 +2990,9 @@ void GuiApp::destroyStackResources() {
     gtAoLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     gtSsaaAoRawLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     gtSsaaAoLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
-    gbSsrSrcLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
-    gtSsrSrcLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
-    gtSsaaSsrSrcLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+    gbSsrTraceLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+    gtSsrTraceLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+    gtSsaaSsrTraceLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     composeLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
 }
 
@@ -2221,7 +3057,8 @@ void GuiApp::recordUiOnlyFrame(uint32_t slot, uint32_t swapchainIndex) {
 
     const VkImage swapImage = swapchain_.image(swapchainIndex);
     const VkImageView swapView = swapchain_.view(swapchainIndex);
-    imageBarrier(cmd, swapImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    imageBarrier(cmd, swapImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                 sync::kColorAttach, sync::kColorWrite, sync::kColorAttach, sync::kColorWrite);
     {
         VkRenderingAttachmentInfo color =
             makeColorAttachment(swapView, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
@@ -2232,7 +3069,8 @@ void GuiApp::recordUiOnlyFrame(uint32_t slot, uint32_t swapchainIndex) {
         vkCmdEndRendering(cmd);
     }
     imageBarrier(cmd, swapImage, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                 VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+                 VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                 sync::kColorAttach, sync::kColorWrite, VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE);
     vkEndCommandBuffer(cmd);
 }
 
@@ -2308,14 +3146,38 @@ void GuiApp::applyLightingPreset(const LightingPreset& p) {
     fillEnabled_ = p.fillEnabled;
     iblIntensity_ = p.iblIntensity;
     exposure_ = p.exposure;
+    fogParams_ = p.fog;
+    volFogEnabled_ = p.fog.enabled;
+    // Atmosphere mode: the sky + IBL follow the preset sun.
+    updateSkyFromUiSun();
 }
 
-void GuiApp::updateLightingUBO(void* mapped, const Mat4& invViewProj,
+void GuiApp::updateSkyFromUiSun() {
+    if (!stackOk_ || !deferred_.atmosphereSky()) return;
+    // The one-shot command pool is shared with the async loader; skip while a
+    // load is in flight (the post-load applyLightingPreset re-runs this).
+    if (loadPhase_.load(std::memory_order_acquire) == LoadPhase::Loading) return;
+    deferred_.updateAtmosphereSky(
+        ctx_, sunDirectionFromElevAzimuth(sunElevationDeg_, sunAzimuthDeg_));
+}
+
+void GuiApp::updateLightingUBO(void* mapped, const Mat4& viewProj,
                                const std::vector<Light>& lights, const ShadowFrame* shadow) {
     LightingUBO ubo;
-    deferred_.fillLightingUBO(ubo, scene_, camera_, invViewProj, &lights, shadow,
-                              iblIntensity_);
+    deferred_.fillLightingUBO(ubo, scene_, camera_, viewProj, Mat4::inverse(viewProj), &lights,
+                              shadow, iblIntensity_);
+    ubo.shadowAtlasParams[3] = contactShadowsEnabled_ ? 1.f : 0.f;
     std::memcpy(mapped, &ubo, sizeof(ubo));
+}
+
+void GuiApp::updateClusterLights(uint32_t frameIndex, const std::vector<Light>& lights) {
+    // Full point/spot set for the clustered pass (the GUI override list, so
+    // sun/fill toggles apply); same per-slot rule as the UBOs.
+    const uint32_t slot = frameIndex % kFramesInFlight;
+    deferred_.fillClusterLights(gbCluster_.lightsMapped[slot], lights);
+    deferred_.fillClusterLights(gtCluster_.lightsMapped[slot], lights);
+    if (gtSsaaCluster_.lightsMapped[slot])
+        deferred_.fillClusterLights(gtSsaaCluster_.lightsMapped[slot], lights);
 }
 
 // ---------------------------------------------------------------------------
@@ -2327,7 +3189,7 @@ void GuiApp::handleCompareZoomInput() {
     const ImGuiIO& io = ImGui::GetIO();
     // Debug hook (SR_GUI_DEBUG_INPUT=1): trace the input path for the
     // interactive zoom/pan verification.
-    static const bool dbgInput = std::getenv("SR_GUI_DEBUG_INPUT") != nullptr;
+    static const bool dbgInput = envFlag("SR_GUI_DEBUG_INPUT");
     if (dbgInput && (io.MouseWheel != 0.f || ImGui::IsMouseDown(ImGuiMouseButton_Middle))) {
         std::fprintf(stderr,
                      "[zoomdbg] wheel=%.2f mbtn=%d pos=%.0f,%.0f wantCapture=%d drag=%d "
@@ -2444,9 +3306,9 @@ void GuiApp::updateCamera(float dt) {
         in.keys['D'] = ImGui::IsKeyDown(ImGuiKey_D);
         in.keys['Q'] = ImGui::IsKeyDown(ImGuiKey_Q);
         in.keys['E'] = ImGui::IsKeyDown(ImGuiKey_E);
-        in.keys[VK_SHIFT] = ImGui::IsKeyDown(ImGuiKey_LeftShift) || ImGui::IsKeyDown(ImGuiKey_RightShift);
-        in.keys[VK_SPACE] = ImGui::IsKeyDown(ImGuiKey_Space);
-        in.keys[VK_CONTROL] = ImGui::IsKeyDown(ImGuiKey_LeftCtrl) || ImGui::IsKeyDown(ImGuiKey_RightCtrl);
+        in.keys[kKeyShift] = ImGui::IsKeyDown(ImGuiKey_LeftShift) || ImGui::IsKeyDown(ImGuiKey_RightShift);
+        in.keys[kKeySpace] = ImGui::IsKeyDown(ImGuiKey_Space);
+        in.keys[kKeyControl] = ImGui::IsKeyDown(ImGuiKey_LeftCtrl) || ImGui::IsKeyDown(ImGuiKey_RightCtrl);
     }
     // Rotate only when dragging on the render area (not over any UI element).
     const bool rotate = !io.WantCaptureMouse &&
@@ -2460,7 +3322,8 @@ void GuiApp::updateCamera(float dt) {
 }
 
 void GuiApp::captureScreenshotIntoStaging(VkCommandBuffer cmd) {
-    imageBarrier(cmd, composeImage_.image, composeLayout_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    imageBarrier(cmd, composeImage_.image, composeLayout_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                 sync::kFragment, sync::kSampled, sync::kCopy, sync::kTransferRead);
     VkBufferImageCopy region = {};
     region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     region.imageSubresource.layerCount = 1;
@@ -2468,7 +3331,8 @@ void GuiApp::captureScreenshotIntoStaging(VkCommandBuffer cmd) {
     vkCmdCopyImageToBuffer(cmd, composeImage_.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                            screenshotStaging_, 1, &region);
     imageBarrier(cmd, composeImage_.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                 sync::kCopy, sync::kTransferRead, sync::kFragment, sync::kSampled);
     composeLayout_ = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 }
 
@@ -2587,6 +3451,14 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     FrameResources& fr = frames_[slot];
     VkCommandBuffer cmd = fr.cmd;
 
+    // Frame-index driven scene animation (dynamic boxes / glTF clips), before
+    // any recording; no-op for static scenes.
+    scene_.advanceToFrame(frameIndex);
+    // CPU LOD selection for this frame's camera (GUI checkbox toggles it).
+    scene_.updateLodSelection(camera_.position, camera_.fovY, lodEnabled_);
+    // Background fine-mip streaming tick (no-op until a streamed scene loads).
+    scene_.updateTextureStreaming(ctx_, camera_.position);
+
     vkResetCommandBuffer(cmd, 0);
     VkCommandBufferBeginInfo begin = {};
     begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
@@ -2595,6 +3467,7 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
 
     timestamps_.resetForFrame(cmd, slot);
     timestamps_.frameBegin(cmd, slot);
+    profiler_.beginFrame(cmd, slot, frameIndex);
 
     const uint32_t dw = active_.displayW;
     const uint32_t dh = active_.displayH;
@@ -2651,7 +3524,10 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     // packed override order (the GUI sun may be prepended at index 0).  The
     // GT and SSAA paths sample the same map.  The "shadows" checkbox off
     // leaves shadow null (shadowParams.z = 0).
-    const std::vector<Light> lights = buildLightOverride();
+    // Phase 4b: shadow-casting spots are additionally scored by
+    // intensity/distance^2 and the top kShadowAtlasTiles get an atlas tile
+    // (selectSpotShadowLights writes shadowIndex into the override list).
+    std::vector<Light> lights = buildLightOverride();
     ShadowFrame shadowFrame;
     const ShadowFrame* shadow = nullptr;
     if (shadowsActive_ && shadowsEnabled_) {
@@ -2660,28 +3536,89 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                 DeferredCore::computeCascadeVPs(camera_, aspect, lights[i].positionOrDirection,
                                                 shadowFrame.cascadeVp, shadowFrame.splitDepth);
                 shadowFrame.lightIndex = static_cast<int32_t>(i);
-                shadowFrame.debugCascades = shadowDebugCascades_;
-                shadow = &shadowFrame;
                 break;
             }
         }
+        if (spotAtlasActive_) {
+            shadowFrame.atlasTileCount =
+                DeferredCore::selectSpotShadowLights(lights, camera_.position);
+            for (const Light& l : lights) {
+                if (l.shadowIndex >= 0)
+                    shadowFrame.atlasVp[l.shadowIndex] = DeferredCore::computeSpotShadowVp(l);
+            }
+        }
+        shadowFrame.debugCascades = shadowDebugCascades_;
+        shadowFrame.frameIndex = frameIndex;
+        if (shadowFrame.lightIndex >= 0 || shadowFrame.atlasTileCount > 0)
+            shadow = &shadowFrame;
     }
-    updateLightingUBO(fr.lightingUboGbMapped,
-                      Mat4::inverse(Mat4::multiply(projJittered, view)), lights, shadow);
+    updateLightingUBO(fr.lightingUboGbMapped, Mat4::multiply(projJittered, view), lights, shadow);
     if (mixedSpatial) {
-        updateLightingUBO(fr.lightingUboGbSpatialMapped, Mat4::inverse(Mat4::multiply(proj, view)),
+        updateLightingUBO(fr.lightingUboGbSpatialMapped, Mat4::multiply(proj, view),
                           lights, shadow);
     }
-    updateLightingUBO(fr.lightingUboGtMapped, Mat4::inverse(Mat4::multiply(projGt, viewGt)),
+    updateLightingUBO(fr.lightingUboGtMapped, Mat4::multiply(projGt, viewGt),
                       lights, shadow);
+    updateClusterLights(frameIndex, lights);
 
     auto transition = [&](VkImage image, VkImageLayout& current, VkImageLayout target,
+                          VkPipelineStageFlags2 srcStage, VkAccessFlags2 srcAccess,
+                          VkPipelineStageFlags2 dstStage, VkAccessFlags2 dstAccess,
                           VkImageAspectFlags aspect_) {
-        imageBarrier(cmd, image, current, target, aspect_);
+        imageBarrier(cmd, image, current, target, srcStage, srcAccess, dstStage, dstAccess,
+                     aspect_);
         current = target;
     };
     const Mat4 cullViewProj = Mat4::multiply(proj, view); // un-jittered (sub-pixel)
     const Mat4 cullViewProjGt = Mat4::multiply(projGt, viewGt);
+
+    // --- Phase 7a: candidate build + staged instance/command data -------------
+    // One CPU build (frustum + LOD, path-independent); each path's channel
+    // gets a copy of the same command list and zeroes its own occluded
+    // instanceCounts against its own Hi-Z chain.
+    cullCandidates_ =
+        deferred_.buildInstanceList(scene_, cullViewProj, instances_.capacity,
+                                    cullInstCpu_.data(), cullCmdCpu_.data(), cullRuns_);
+    if (cullCandidates_ > 0) {
+        std::memcpy(instances_.stagingMapped[slot], cullInstCpu_.data(),
+                    static_cast<size_t>(cullCandidates_) * sizeof(GpuInstance));
+        const size_t cmdBytes =
+            static_cast<size_t>(cullCandidates_) * sizeof(VkDrawIndexedIndirectCommand);
+        std::memcpy(gbCull_.cmdStagingMapped[slot], cullCmdCpu_.data(), cmdBytes);
+        std::memcpy(gtCull_.cmdStagingMapped[slot], cullCmdCpu_.data(), cmdBytes);
+        if (active_.gtSsaa)
+            std::memcpy(gtSsaaCull_.cmdStagingMapped[slot], cullCmdCpu_.data(), cmdBytes);
+    }
+    deferred_.recordInstanceUpload(cmd, slot, instances_, cullCandidates_);
+
+    // Phase 6b: same MB/DOF algorithm + parameters on every path; the blur
+    // clamps scale with path height so the display-space blur matches the GT.
+    auto recordPostFx = [&](PostFxTargets& fxTargets, VkImage color, VkImageLayout& colorLayout,
+                            const Mat4& pathProj, uint32_t pathH) {
+        SR_GPU_ZONE(profiler_, cmd, "postfx");
+        PostFxParams fx;
+        fx.depthM10 = pathProj.m[10];
+        fx.depthM14 = pathProj.m[14];
+        fx.farPlane = camera_.farPlane;
+        const float resScale = static_cast<float>(pathH) / 1080.f;
+        fx.maxBlurPx = std::max(8.f, kMotionBlurMaxPixels * resScale);
+        fx.maxCocPx = std::max(2.f, dofMaxBlur_ * resScale);
+        fx.aperture = kDofAperture * (kDofDefaultFstop / dofFstop_);
+        fx.focusDistance = dofFocus_;
+        fx.motionBlur = motionBlurEnabled_;
+        fx.dof = dofEnabled_;
+        deferred_.recordPostFxPass(cmd, fxTargets, color, colorLayout, fx, frameIndex);
+    };
+
+    // Phase 6a bloom on the lit HDR target, before the Phase 6b post-fx chain
+    // (same order as the viewer).  Per-frame pass skip; the color image is
+    // SHADER_READ_ONLY on entry and the helper hands it back the same way.
+    auto recordBloom = [&](BloomPyramid& pyramid, VkImage color, VkImageLayout& colorLayout,
+                           uint32_t pathW, uint32_t pathH) {
+        if (!bloomEnabled_) return;
+        SR_GPU_ZONE(profiler_, cmd, "bloom");
+        deferred_.recordBloomPyramidPass(cmd, pyramid, color, colorLayout, pathW, pathH);
+    };
 
     // --- Shadow pass (sun CSM, one 2048^2 layer per cascade) -------------------
     // Must run BEFORE any lighting pass: the LR lighting below samples the map
@@ -2691,34 +3628,80 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     // moves).  CompareApp/Renderer place this pass ahead of lighting for the
     // same reason.  It only needs scene geometry, so it runs before the GBuffer
     // pass and also covers the gbuffer-less (GT-only) configuration.
-    if (shadow) {
-        imageBarrier(cmd, shadow_.image, shadow_.layout,
-                     VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT,
-                     0, 1, 0, kShadowCascadeCount);
+    {
+        SR_GPU_ZONE(profiler_, cmd, "shadows");
+        if (shadow && shadow->lightIndex >= 0) {
+            SR_GPU_ZONE(profiler_, cmd, "shadow_csm");
+            imageBarrier(cmd, shadow_.image, shadow_.layout,
+                     VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, sync::kFragment,
+                     sync::kSampled, sync::kDepthTests, sync::kDepthReadWrite,
+                     VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, kShadowCascadeCount);
         shadow_.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
         deferred_.recordShadowPass(cmd, shadow_, scene_, shadow->cascadeVp, fr.sceneSetGb,
                                    textureSet_, materialStride_);
         imageBarrier(cmd, shadow_.image, shadow_.layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                     sync::kDepthTests, sync::kDepthWrite, sync::kFragment, sync::kSampled,
                      VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, kShadowCascadeCount);
         shadow_.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    }
+    // Spot shadow atlas (Phase 4b): one 1024^2 tile per selected spot, shared
+    // by all lighting paths like the CSM map.
+        if (shadow && shadow->atlasTileCount > 0) {
+            SR_GPU_ZONE(profiler_, cmd, "shadow_spot");
+            imageBarrier(cmd, spotAtlas_.image, spotAtlas_.layout,
+                     VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, sync::kFragment,
+                     sync::kSampled, sync::kDepthTests, sync::kDepthReadWrite,
+                     VK_IMAGE_ASPECT_DEPTH_BIT);
+        spotAtlas_.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        deferred_.recordSpotShadowPass(cmd, spotAtlas_, scene_, shadow->atlasVp,
+                                       shadow->atlasTileCount, fr.sceneSetGb, textureSet_,
+                                       materialStride_);
+        imageBarrier(cmd, spotAtlas_.image, spotAtlas_.layout,
+                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kDepthTests,
+                     sync::kDepthWrite, sync::kFragment, sync::kSampled,
+                     VK_IMAGE_ASPECT_DEPTH_BIT);
+        spotAtlas_.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        }
     }
 
     // --- 1) low-resolution GBuffer (jittered for temporal; extra unjittered
     //     pass when mixed with spatial plugins) --------------------------------
     timestamps_.sceneBegin(cmd, slot);
     auto recordLrDeferred = [&](VkDescriptorSet sceneSet, VkDescriptorSet lightingSet,
-                                VkDescriptorSet transparentSet, const Mat4& ssaoViewProj) {
+                                VkDescriptorSet transparentSet, VkDescriptorSet ssrSet,
+                                const Mat4& ssaoViewProj, const Mat4& projUsed,
+                                const char* tag) {
+        SR_GPU_ZONE(profiler_, cmd, tag);
+        // Phase 7a: upload this frame's commands and run the occlusion cull
+        // against the LR Hi-Z chain as it currently stands (previous frame's
+        // pyramid — or, in mixed mode's second record, this frame's spatial
+        // rebuild; gbCull_.prevViewProj always tracks the producing VP).
+        const bool cullActive = occlusionEnabled_ && gbCull_.prevValid && cullCandidates_ > 0;
+        {
+            SR_GPU_ZONE(profiler_, cmd, "occlusion_cull");
+            deferred_.recordCommandUpload(cmd, slot, gbCull_, cullCandidates_, cullActive);
+            if (cullActive)
+                deferred_.recordOcclusionCull(cmd, gbCull_, cullCandidates_, gbCull_.prevViewProj,
+                                              gbPyramid_.mipCount, renderWidth_, renderHeight_);
+        }
+        { SR_GPU_ZONE(profiler_, cmd, "gbuffer");
         transition(gbAlbedo_.image, gbAlbedoLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                   sync::kSampleStages, sync::kSampled, sync::kColorAttach, sync::kColorWrite,
                    VK_IMAGE_ASPECT_COLOR_BIT);
         transition(gbNormal_.image, gbNormalLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                   sync::kSampleStages, sync::kSampled, sync::kColorAttach, sync::kColorWrite,
                    VK_IMAGE_ASPECT_COLOR_BIT);
         transition(gbMaterial_.image, gbMaterialLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                   sync::kSampleStages, sync::kSampled, sync::kColorAttach, sync::kColorWrite,
                    VK_IMAGE_ASPECT_COLOR_BIT);
         transition(gbEmissive_.image, gbEmissiveLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                   sync::kSampleStages, sync::kSampled, sync::kColorAttach, sync::kColorWrite,
                    VK_IMAGE_ASPECT_COLOR_BIT);
         transition(gbMotion_.image, gbMotionLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                   sync::kSampleStages, sync::kSampled, sync::kColorAttach, sync::kColorWrite,
                    VK_IMAGE_ASPECT_COLOR_BIT);
         transition(gbDepth_.image, gbDepthLayout_, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                   sync::kSampleStages, sync::kSampled, sync::kDepthTests, sync::kDepthReadWrite,
                    VK_IMAGE_ASPECT_DEPTH_BIT);
         {
             VkRenderingAttachmentInfo colors[5] = {
@@ -2738,58 +3721,174 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
             beginRendering(cmd, renderWidth_, renderHeight_, 5, colors, &depth);
             deferred_.recordGBufferDraws(cmd, scene_, false, sceneSet, textureSet_,
                                          materialStride_, renderWidth_, renderHeight_,
-                                         cullViewProj);
+                                         cullViewProj, gbCull_, cullRuns_.data(),
+                                         static_cast<uint32_t>(cullRuns_.size()));
             vkCmdEndRendering(cmd);
         }
+        } // zone "gbuffer"
+        // dst scope includes compute: the opaque-SSR pass (ssr_opaque.comp)
+        // samples the GBuffer after the lighting fragment shader.
+        {
+            SR_GPU_ZONE(profiler_, cmd, "hiz");
         transition(gbAlbedo_.image, gbAlbedoLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                   sync::kColorAttach, sync::kColorWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
         transition(gbNormal_.image, gbNormalLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                   sync::kColorAttach, sync::kColorWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
         transition(gbMaterial_.image, gbMaterialLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                   sync::kColorAttach, sync::kColorWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
         transition(gbEmissive_.image, gbEmissiveLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                   sync::kColorAttach, sync::kColorWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
         transition(gbMotion_.image, gbMotionLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                   sync::kColorAttach, sync::kColorWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
         transition(gbDepth_.image, gbDepthLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                   sync::kDepthTests, sync::kDepthWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_DEPTH_BIT);
+        // Hi-Z pyramid for the SSR marchers (glass transparency + opaque-SSR
+        // compute; both LR lighting variants share the same GBuffer depth) and
+        // the occlusion cull (Phase 7a).  ssaoViewProj is the exact
+        // view-projection of the GBuffer record that fed this depth — the cull
+        // channel reprojects with it from the next record on.
+        if (hasTransparency_ || ssrEnabled_ || occlusionEnabled_) {
+            deferred_.recordDepthPyramidPass(cmd, gbPyramid_);
+            gbCull_.prevViewProj = ssaoViewProj;
+            gbCull_.prevValid = true;
+        }
+        } // zone "hiz"
 
-        transition(gbAoRaw_.image, gbAoRawLayout_, VK_IMAGE_LAYOUT_GENERAL,
-                   VK_IMAGE_ASPECT_COLOR_BIT);
-        deferred_.recordSsaoPass(cmd, ssaoSetGb_, ssaoViewProj, frameIndex, renderWidth_,
-                                 renderHeight_);
+        // GTAO: view-Z depth chain (sampled at per-step LODs) -> main pass ->
+        // temporal EMA -> denoise.  The chain is rebuilt every record.
+        const Mat4 invAoVp = Mat4::inverse(ssaoViewProj);
+        { SR_GPU_ZONE(profiler_, cmd, "gtao");
+        deferred_.recordDepthPyramidPass(cmd, gbPyramidAo_);
+        const float aoMaxLodGb = static_cast<float>(std::min(gbPyramidAo_.mipCount - 1, 4u));
+        { SR_GPU_ZONE(profiler_, cmd, "ao_main");
+        transition(gbAoRaw_.image, gbAoRawLayout_, VK_IMAGE_LAYOUT_GENERAL, sync::kCompute,
+                   sync::kSampled, sync::kCompute, sync::kStorageWrite, VK_IMAGE_ASPECT_COLOR_BIT);
+        deferred_.recordSsaoPass(cmd, ssaoSetGb_, invAoVp, frameIndex, camera_.nearPlane,
+                                 camera_.farPlane, aoMaxLodGb, renderWidth_, renderHeight_);
         transition(gbAoRaw_.image, gbAoRawLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                   sync::kCompute, sync::kStorageWrite, sync::kCompute, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
-        transition(gbAo_.image, gbAoLayout_, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT);
-        deferred_.recordSsaoBlurPass(cmd, ssaoBlurSetGb_, renderWidth_, renderHeight_);
+        }
+        const uint32_t aoWriteGb = aoFramesGb_ & 1u;
+        { SR_GPU_ZONE(profiler_, cmd, "ao_temporal");
+        deferred_.recordSsaoTemporalPass(cmd, gbAoHist_, aoWriteGb, invAoVp, prevAoViewProjGb_,
+                                         renderWidth_, renderHeight_, /*reset=*/aoFramesGb_ == 0);
+        }
+        prevAoViewProjGb_ = ssaoViewProj;
+        ++aoFramesGb_;
+        { SR_GPU_ZONE(profiler_, cmd, "ao_blur");
+        transition(gbAo_.image, gbAoLayout_, VK_IMAGE_LAYOUT_GENERAL, sync::kSampleStages,
+                   sync::kSampled, sync::kCompute, sync::kStorageWrite, VK_IMAGE_ASPECT_COLOR_BIT);
+        deferred_.recordSsaoBlurPass(cmd, gbAoHist_.blurSet[aoWriteGb], renderWidth_,
+                                     renderHeight_);
         transition(gbAo_.image, gbAoLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                   sync::kCompute, sync::kStorageWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
+        }
+        } // zone "gtao"
 
+        { SR_GPU_ZONE(profiler_, cmd, "lighting");
         transition(gbColor_.image, gbColorLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                   sync::kSampleStages, sync::kSampled, sync::kColorAttach, sync::kColorWrite,
                    VK_IMAGE_ASPECT_COLOR_BIT);
-        deferred_.recordLightingPass(cmd, lightingSet, gbColor_.view, renderWidth_, renderHeight_);
+        deferred_.recordLightingPass(cmd, lightingSet, gbCluster_, slot, view, projUsed,
+                                     gbColor_.view, renderWidth_, renderHeight_);
+        }
 
-        if (hasTransparency_) {
-            transition(gbColor_.image, gbColorLayout_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                       VK_IMAGE_ASPECT_COLOR_BIT);
-            transition(gbSsrSrc_.image, gbSsrSrcLayout_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                       VK_IMAGE_ASPECT_COLOR_BIT);
-            copyColorImage(cmd, gbColor_.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                           gbSsrSrc_.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, renderWidth_,
-                           renderHeight_);
-            transition(gbSsrSrc_.image, gbSsrSrcLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                       VK_IMAGE_ASPECT_COLOR_BIT);
+        // Froxel volumetric fog (Phase 5a): accumulate once per frame (mixed
+        // mode records LR lighting twice; the first record wins the guard),
+        // composite into the lit HDR target on every record.  Un-jittered
+        // matrices so the volume does not swim under TAA jitter.
+        if (volFogEnabled_ && fogParams_.enabled && gbFog_.injectImage != VK_NULL_HANDLE) {
+            SR_GPU_ZONE(profiler_, cmd, "volfog");
+            if (fogAccumFrameGb_ != frameIndex) {
+                SR_GPU_ZONE(profiler_, cmd, "fog_accumulate");
+                deferred_.recordVolFogAccumulate(cmd, gbFog_, gbCluster_, slot, view, proj,
+                                                 prevFogViewProjGb_, fogParams_, frameIndex,
+                                                 fogFramesGb_ & 1u, /*reset=*/fogFramesGb_ == 0);
+                prevFogViewProjGb_ = cullViewProj;
+                ++fogFramesGb_;
+                fogAccumFrameGb_ = frameIndex;
+            }
+            { SR_GPU_ZONE(profiler_, cmd, "fog_composite");
+            transition(gbColor_.image, gbColorLayout_, VK_IMAGE_LAYOUT_GENERAL,
+                       sync::kColorAttach, sync::kColorWrite, sync::kCompute,
+                       sync::kStorageReadWrite, VK_IMAGE_ASPECT_COLOR_BIT);
+            deferred_.recordVolFogComposite(cmd, gbFog_, proj, fogParams_.maxDistance,
+                                            renderWidth_, renderHeight_);
             transition(gbColor_.image, gbColorLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                       sync::kCompute, sync::kStorageWrite, sync::kColorAttach,
+                       sync::kColorReadWrite, VK_IMAGE_ASPECT_COLOR_BIT);
+            }
+        }
+
+        if (hasTransparency_ || ssrEnabled_) {
+            SR_GPU_ZONE(profiler_, cmd, "reflections");
+            // Color mip chain: mip 0 is the opaque HDR copy glass SSR used to
+            // make with a transfer; the chain stays GENERAL for life.  The
+            // opaque-SSR pass consumes the same chain, so it is built whenever
+            // either consumer runs.
+            { SR_GPU_ZONE(profiler_, cmd, "color_pyramid");
+            transition(gbColor_.image, gbColorLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                       sync::kColorAttach, sync::kColorWrite, sync::kCompute, sync::kSampled,
                        VK_IMAGE_ASPECT_COLOR_BIT);
+            deferred_.recordColorPyramidPass(cmd, gbColorPyramid_);
+            }
+            if (ssrEnabled_) {
+                // Opaque SSR, Phase 2d: trace into the LR RT, then temporal
+                // EMA + fused composite (in-place RMW on gbColor_).
+                { SR_GPU_ZONE(profiler_, cmd, "ssr_trace");
+                transition(gbSsrTrace_.image, gbSsrTraceLayout_, VK_IMAGE_LAYOUT_GENERAL,
+                           sync::kCompute, sync::kSampled, sync::kCompute,
+                           sync::kStorageWrite, VK_IMAGE_ASPECT_COLOR_BIT);
+                deferred_.recordSsrPass(cmd, ssrSet, ssaoViewProj, renderWidth_, renderHeight_,
+                                      ssrStrength_);
+                transition(gbSsrTrace_.image, gbSsrTraceLayout_,
+                           VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kCompute,
+                           sync::kStorageWrite, sync::kCompute, sync::kSampled,
+                           VK_IMAGE_ASPECT_COLOR_BIT);
+                }
+                { SR_GPU_ZONE(profiler_, cmd, "ssr_temporal");
+                transition(gbColor_.image, gbColorLayout_, VK_IMAGE_LAYOUT_GENERAL,
+                           sync::kCompute, sync::kSampled, sync::kCompute,
+                           sync::kStorageReadWrite, VK_IMAGE_ASPECT_COLOR_BIT);
+                deferred_.recordSsrTemporalPass(cmd, gbSsrHist_, ssrFramesGb_ & 1u, invAoVp,
+                                                prevSsrViewProjGb_, renderWidth_, renderHeight_,
+                                                /*reset=*/ssrFramesGb_ == 0);
+                prevSsrViewProjGb_ = ssaoViewProj;
+                ++ssrFramesGb_;
+                transition(gbColor_.image, gbColorLayout_,
+                           VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, sync::kCompute,
+                           sync::kStorageWrite, sync::kColorAttach, sync::kColorReadWrite,
+                           VK_IMAGE_ASPECT_COLOR_BIT);
+                }
+            } else {
+                transition(gbColor_.image, gbColorLayout_,
+                           VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, sync::kCompute,
+                           sync::kSampled, sync::kColorAttach, sync::kColorReadWrite,
+                           VK_IMAGE_ASPECT_COLOR_BIT);
+            }
         }
 
         if (hasTransparency_) {
+            SR_GPU_ZONE(profiler_, cmd, "transparent");
             transition(gbMotion_.image, gbMotionLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                       sync::kSampleStages, sync::kSampled, sync::kColorAttach, sync::kColorReadWrite,
                        VK_IMAGE_ASPECT_COLOR_BIT);
             transition(gbReactive_.image, gbReactiveLayout_,
-                       VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+                       VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, sync::kSampleStages,
+                       sync::kSampled, sync::kColorAttach, sync::kColorWrite,
+                       VK_IMAGE_ASPECT_COLOR_BIT);
             transition(gbDepth_.image, gbDepthLayout_,
-                       VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
+                       VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL, sync::kFragment,
+                       sync::kSampled, sync::kDepthTests, sync::kDepthRead,
+                       VK_IMAGE_ASPECT_DEPTH_BIT);
             {
                 VkRenderingAttachmentInfo tColors[3] = {
                     makeColorAttachment(gbColor_.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
@@ -2805,29 +3904,42 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                 beginRendering(cmd, renderWidth_, renderHeight_, 3, tColors, &tDepth);
                 deferred_.recordTransparentDraws(cmd, scene_, false, sceneSet, textureSet_,
                                                  transparentSet, materialStride_, renderWidth_,
-                                                 renderHeight_, cullViewProj, camera_.position);
+                                                 renderHeight_, cullViewProj, camera_.position,
+                                                 proj.m[14] / proj.m[10], fogParams_.maxDistance,
+                                                 volFogEnabled_ && fogParams_.enabled &&
+                                                     gbFog_.injectImage != VK_NULL_HANDLE);
                 vkCmdEndRendering(cmd);
             }
             transition(gbMotion_.image, gbMotionLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                       sync::kColorAttach, sync::kColorWrite, sync::kSampleStages, sync::kSampled,
                        VK_IMAGE_ASPECT_COLOR_BIT);
             transition(gbReactive_.image, gbReactiveLayout_,
-                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kColorAttach,
+                       sync::kColorWrite, sync::kSampleStages, sync::kSampled,
+                       VK_IMAGE_ASPECT_COLOR_BIT);
             transition(gbDepth_.image, gbDepthLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                       sync::kDepthTests, sync::kDepthRead, sync::kSampleStages, sync::kSampled,
                        VK_IMAGE_ASPECT_DEPTH_BIT);
         }
 
         transition(gbColor_.image, gbColorLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                   sync::kColorAttach, sync::kColorWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
+        recordBloom(gbBloom_, gbColor_.image, gbColorLayout_, renderWidth_, renderHeight_);
+        recordPostFx(gbPostFx_, gbColor_.image, gbColorLayout_, proj, renderHeight_);
     };
 
     if (gbuffer) {
         if (mixedSpatial) {
             recordLrDeferred(fr.sceneSetGbSpatial, fr.lightingSetGbSpatial,
-                             fr.transparentSetGbSpatial, Mat4::multiply(proj, view));
+                             fr.transparentSetGbSpatial, fr.ssrSetGbSpatial,
+                             Mat4::multiply(proj, view), proj, "lr_pass_spatial");
             transition(gbColor_.image, gbColorLayout_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       sync::kSampleStages, sync::kSampled, sync::kCopy, sync::kTransferRead,
                        VK_IMAGE_ASPECT_COLOR_BIT);
             transition(gbColorSpatial_.image, gbColorSpatialLayout_,
-                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, sync::kSampleStages, sync::kSampled,
+                       sync::kCopy, sync::kTransferWrite, VK_IMAGE_ASPECT_COLOR_BIT);
             VkImageCopy copy = {};
             copy.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
             copy.srcSubresource.layerCount = 1;
@@ -2836,15 +3948,48 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
             vkCmdCopyImage(cmd, gbColor_.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                            gbColorSpatial_.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
             transition(gbColorSpatial_.image, gbColorSpatialLayout_,
-                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kCopy, sync::kTransferWrite,
+                       sync::kSampleStages, sync::kSampled, VK_IMAGE_ASPECT_COLOR_BIT);
         }
-        recordLrDeferred(fr.sceneSetGb, fr.lightingSetGb, fr.transparentSetGb,
-                         Mat4::multiply(projJittered, view));
+        recordLrDeferred(fr.sceneSetGb, fr.lightingSetGb, fr.transparentSetGb, fr.ssrSetGb,
+                         Mat4::multiply(projJittered, view), projJittered, "lr_pass");
+        // Coverage mask conditioning: upscalers consume the 3x3-max dilated,
+        // motion-gated copy — the plateau covers samplers at the jittered
+        // coordinate, and static pixels keep their history weight
+        // (see reactive_dilate.comp).  gbMotion_ is already SHADER_READ_ONLY.
+        if (hasTransparency_) {
+            SR_GPU_ZONE(profiler_, cmd, "reactive_dilate");
+            transition(gbReactiveDilated_.image, gbReactiveDilatedLayout_, VK_IMAGE_LAYOUT_GENERAL,
+                       sync::kSampleStages, sync::kSampled, sync::kCompute, sync::kStorageWrite,
+                       VK_IMAGE_ASPECT_COLOR_BIT);
+            deferred_.recordReactiveDilatePass(cmd, reactiveDilateSet_, renderWidth_, renderHeight_);
+            transition(gbReactiveDilated_.image, gbReactiveDilatedLayout_,
+                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kCompute,
+                       sync::kStorageWrite, sync::kSampleStages, sync::kSampled,
+                       VK_IMAGE_ASPECT_COLOR_BIT);
+        }
+    }
+
+    // --- Auto exposure: LR histogram of this frame's lit HDR (gbColor_) --------
+    // Feeds the upscaler preExposure + the algorithm columns.  The applied
+    // value is the solve harvested kFramesInFlight frames ago (engine-style
+    // latency).  gbColor_ is SHADER_READ_ONLY here with compute in the
+    // sampled-dst scope.
+    if (gbuffer && autoExposureEnabled_) {
+        SR_GPU_ZONE(profiler_, cmd, "auto_exposure");
+        ExposureSolvePush solve;
+        solve.minEV = exposureMinEV_;
+        solve.maxEV = exposureMaxEV_;
+        solve.resetState = (frameIndex == 0 || autoExposureJustEnabled_) ? 1.f : 0.f;
+        deferred_.recordAutoExposurePass(cmd, lrExposure_.gpu, solve,
+                                         lrExposure_.staging[slot]);
+        lrExposure_.pending[slot] = true;
     }
 
     // --- 2) per-algorithm dispatch ---------------------------------------------
     if (gbuffer) {
         timestamps_.upscaleBegin(cmd, slot);
+        { SR_GPU_ZONE(profiler_, cmd, "upscale");
 
         CameraParams cam;
         std::memcpy(cam.view, view.m, sizeof(cam.view));
@@ -2864,12 +4009,16 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         FrameParams frame;
         frame.frameIndex = static_cast<int>(frameIndex);
         frame.deltaTime = 1.f / 60.f;
-        frame.preExposure = 1.f;
+        // Real exposure input (was hardcoded 1): the LR path's display
+        // exposure — see InputAdapter.h for the preExposure convention.
+        frame.preExposure = lrExposureNow();
         frame.resetHistory = (frameIndex == 0);
 
         for (AlgoColumn& algo : algos_) {
+            SR_GPU_ZONE(profiler_, cmd, algo.id.c_str());
             transition(algo.output.image, algo.outputLayout, VK_IMAGE_LAYOUT_GENERAL,
-                       VK_IMAGE_ASPECT_COLOR_BIT);
+                       sync::kSampleStages, sync::kSampled, sync::kSampleStages,
+                       sync::kStorageWrite, VK_IMAGE_ASPECT_COLOR_BIT);
 
             const bool spatialAlgo = !upscalerNeedsJitter(algo.upscaler.get());
             const bool useSpatialColor = mixedSpatial && spatialAlgo;
@@ -2881,22 +4030,25 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
             res.motion = gbMotion_.image;
             res.motionView = gbMotion_.view;
             if (hasTransparency_) {
-                res.reactive = gbReactive_.image;
-                res.reactiveView = gbReactive_.view;
+                res.reactive = gbReactiveDilated_.image;
+                res.reactiveView = gbReactiveDilated_.view;
             }
             res.output = algo.output.image;
             res.outputView = algo.output.view;
             algo.upscaler->dispatch(cmd, res, spatialAlgo ? camSpatial : cam, frame);
 
             transition(algo.output.image, algo.outputLayout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                       VK_IMAGE_ASPECT_COLOR_BIT);
+                       sync::kSampleStages, sync::kStorageWrite, sync::kSampleStages,
+                       sync::kSampled, VK_IMAGE_ASPECT_COLOR_BIT);
 
             algo.fgReady = false;
             if (algo.frameGen) {
+                SR_GPU_ZONE(profiler_, cmd, "frame_gen");
                 if (frame.resetHistory) algo.fgHistory = false;
                 if (algo.fgHistory) {
                     transition(algo.fgOutput.image, algo.fgOutputLayout, VK_IMAGE_LAYOUT_GENERAL,
-                               VK_IMAGE_ASPECT_COLOR_BIT);
+                               sync::kSampleStages, sync::kSampled, sync::kSampleStages,
+                               sync::kStorageWrite, VK_IMAGE_ASPECT_COLOR_BIT);
                     FrameGenResources fgRes;
                     fgRes.color = algo.output.image;
                     fgRes.colorView = algo.output.view;
@@ -2912,12 +4064,15 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                                             : (fps_ > 1.f ? 1.f / fps_ : 1.f / 30.f);
                     algo.frameGen->dispatch(cmd, fgRes, spatialAlgo ? camSpatial : cam, fgFrame);
                     transition(algo.fgOutput.image, algo.fgOutputLayout,
-                               VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+                               VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kSampleStages,
+                               sync::kStorageWrite, sync::kFragment, sync::kSampled,
+                               VK_IMAGE_ASPECT_COLOR_BIT);
                     algo.fgReady = true;
                 }
                 algo.fgHistory = true;
             }
         }
+        } // zone "upscale"
         timestamps_.upscaleEnd(cmd, slot);
     } else {
         // No upscaler pass: emit a zero-width range so every query slot is
@@ -2928,23 +4083,42 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
 
     // --- 3) native-resolution ground truth (no jitter) ---------------------------
     if (gtActive_ && active_.gtSsaa) {
+        SR_GPU_ZONE(profiler_, cmd, "gt_ssaa");
         // 200% SSAA: deferred render at 2x into gtSsaaColor_, then
         // box-downsample to display resolution (gtColor_), which stays the
         // metric/display ref.
         const uint32_t sw = dw * 2;
         const uint32_t sh = dh * 2;
+        // Phase 7a: SSAA-path occlusion cull against the 2x Hi-Z chain.
+        { SR_GPU_ZONE(profiler_, cmd, "occlusion_cull");
+        const bool cullActiveSsaa = occlusionEnabled_ && gtSsaaCull_.prevValid && cullCandidates_ > 0;
+        deferred_.recordCommandUpload(cmd, slot, gtSsaaCull_, cullCandidates_, cullActiveSsaa);
+        if (cullActiveSsaa)
+            deferred_.recordOcclusionCull(cmd, gtSsaaCull_, cullCandidates_,
+                                          gtSsaaCull_.prevViewProj, gtSsaaPyramid_.mipCount, sw, sh);
+        }
+        { SR_GPU_ZONE(profiler_, cmd, "gbuffer");
         transition(gtSsaaAlbedo_.image, gtSsaaAlbedoLayout_,
-                   VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+                   VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, sync::kSampleStages, sync::kSampled,
+                   sync::kColorAttach, sync::kColorWrite, VK_IMAGE_ASPECT_COLOR_BIT);
         transition(gtSsaaNormal_.image, gtSsaaNormalLayout_,
-                   VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+                   VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, sync::kSampleStages, sync::kSampled,
+                   sync::kColorAttach, sync::kColorWrite, VK_IMAGE_ASPECT_COLOR_BIT);
         transition(gtSsaaMaterial_.image, gtSsaaMaterialLayout_,
-                   VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+                   VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, sync::kSampleStages, sync::kSampled,
+                   sync::kColorAttach, sync::kColorWrite, VK_IMAGE_ASPECT_COLOR_BIT);
         transition(gtSsaaEmissive_.image, gtSsaaEmissiveLayout_,
-                   VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+                   VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, sync::kSampleStages, sync::kSampled,
+                   sync::kColorAttach, sync::kColorWrite, VK_IMAGE_ASPECT_COLOR_BIT);
+        transition(gtSsaaMotion_.image, gtSsaaMotionLayout_,
+                   VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, sync::kSampleStages, sync::kSampled,
+                   sync::kColorAttach, sync::kColorWrite, VK_IMAGE_ASPECT_COLOR_BIT);
         transition(gtSsaaDepth_.image, gtSsaaDepthLayout_,
-                   VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
+                   VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, sync::kSampleStages,
+                   sync::kSampled, sync::kDepthTests, sync::kDepthReadWrite,
+                   VK_IMAGE_ASPECT_DEPTH_BIT);
         {
-            VkRenderingAttachmentInfo colors[4] = {
+            VkRenderingAttachmentInfo colors[5] = {
                 makeColorAttachment(gtSsaaAlbedo_.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                                     VK_ATTACHMENT_LOAD_OP_CLEAR),
                 makeColorAttachment(gtSsaaNormal_.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
@@ -2952,61 +4126,160 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                 makeColorAttachment(gtSsaaMaterial_.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                                     VK_ATTACHMENT_LOAD_OP_CLEAR),
                 makeColorAttachment(gtSsaaEmissive_.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                    VK_ATTACHMENT_LOAD_OP_CLEAR),
+                makeColorAttachment(gtSsaaMotion_.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                                     VK_ATTACHMENT_LOAD_OP_CLEAR)};
             VkRenderingAttachmentInfo depth =
                 makeDepthAttachment(gtSsaaDepth_.view,
                                     VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
                                     VK_ATTACHMENT_LOAD_OP_CLEAR);
-            beginRendering(cmd, sw, sh, 4, colors, &depth);
+            beginRendering(cmd, sw, sh, 5, colors, &depth);
             deferred_.recordGBufferDraws(cmd, scene_, true, fr.sceneSetGt, textureSet_,
-                                         materialStride_, sw, sh, cullViewProjGt);
+                                         materialStride_, sw, sh, cullViewProjGt, gtSsaaCull_,
+                                         cullRuns_.data(), static_cast<uint32_t>(cullRuns_.size()));
             vkCmdEndRendering(cmd);
         }
+        } // zone "gbuffer"
+        // dst scope includes compute: the opaque-SSR pass samples the GBuffer.
+        { SR_GPU_ZONE(profiler_, cmd, "hiz");
         transition(gtSsaaAlbedo_.image, gtSsaaAlbedoLayout_,
-                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kColorAttach, sync::kColorWrite,
+                   sync::kSampleStages, sync::kSampled, VK_IMAGE_ASPECT_COLOR_BIT);
         transition(gtSsaaNormal_.image, gtSsaaNormalLayout_,
-                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kColorAttach, sync::kColorWrite,
+                   sync::kSampleStages, sync::kSampled, VK_IMAGE_ASPECT_COLOR_BIT);
         transition(gtSsaaMaterial_.image, gtSsaaMaterialLayout_,
-                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kColorAttach, sync::kColorWrite,
+                   sync::kSampleStages, sync::kSampled, VK_IMAGE_ASPECT_COLOR_BIT);
         transition(gtSsaaEmissive_.image, gtSsaaEmissiveLayout_,
-                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kColorAttach, sync::kColorWrite,
+                   sync::kSampleStages, sync::kSampled, VK_IMAGE_ASPECT_COLOR_BIT);
+        transition(gtSsaaMotion_.image, gtSsaaMotionLayout_,
+                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kColorAttach, sync::kColorWrite,
+                   sync::kSampleStages, sync::kSampled, VK_IMAGE_ASPECT_COLOR_BIT);
         transition(gtSsaaDepth_.image, gtSsaaDepthLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                   sync::kDepthTests, sync::kDepthWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_DEPTH_BIT);
+        if (hasTransparency_ || ssrEnabled_ || occlusionEnabled_) {
+            deferred_.recordDepthPyramidPass(cmd, gtSsaaPyramid_);
+            gtSsaaCull_.prevViewProj = cullViewProjGt; // GT paths never jitter
+            gtSsaaCull_.prevValid = true;
+        }
+        } // zone "hiz"
 
-        // SSAO for the 2x GT path (un-jittered view-projection).
-        transition(gtSsaaAoRaw_.image, gtSsaaAoRawLayout_, VK_IMAGE_LAYOUT_GENERAL,
-                   VK_IMAGE_ASPECT_COLOR_BIT);
-        deferred_.recordSsaoPass(cmd, ssaoSetSsaa_, cullViewProjGt, frameIndex, sw, sh);
+        // GTAO for the 2x GT path (un-jittered view-projection): view-Z depth
+        // chain -> main pass -> temporal EMA -> denoise.  The AO output is
+        // also sampled by the opaque-SSR compute pass.
+        const Mat4 invAoVpSsaa = Mat4::inverse(cullViewProjGt);
+        { SR_GPU_ZONE(profiler_, cmd, "gtao");
+        deferred_.recordDepthPyramidPass(cmd, gtSsaaPyramidAo_);
+        const float aoMaxLodSsaa =
+            static_cast<float>(std::min(gtSsaaPyramidAo_.mipCount - 1, 4u));
+        { SR_GPU_ZONE(profiler_, cmd, "ao_main");
+        transition(gtSsaaAoRaw_.image, gtSsaaAoRawLayout_, VK_IMAGE_LAYOUT_GENERAL, sync::kCompute,
+                   sync::kSampled, sync::kCompute, sync::kStorageWrite, VK_IMAGE_ASPECT_COLOR_BIT);
+        deferred_.recordSsaoPass(cmd, ssaoSetSsaa_, invAoVpSsaa, frameIndex, camera_.nearPlane,
+                                 camera_.farPlane, aoMaxLodSsaa, sw, sh);
         transition(gtSsaaAoRaw_.image, gtSsaaAoRawLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                   sync::kCompute, sync::kStorageWrite, sync::kCompute, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
-        transition(gtSsaaAo_.image, gtSsaaAoLayout_, VK_IMAGE_LAYOUT_GENERAL,
-                   VK_IMAGE_ASPECT_COLOR_BIT);
-        deferred_.recordSsaoBlurPass(cmd, ssaoBlurSetSsaa_, sw, sh);
+        }
+        const uint32_t aoWriteSsaa = aoFramesSsaa_ & 1u;
+        { SR_GPU_ZONE(profiler_, cmd, "ao_temporal");
+        deferred_.recordSsaoTemporalPass(cmd, gtSsaaAoHist_, aoWriteSsaa, invAoVpSsaa,
+                                         prevAoViewProjSsaa_, sw, sh,
+                                         /*reset=*/aoFramesSsaa_ == 0);
+        }
+        prevAoViewProjSsaa_ = cullViewProjGt;
+        ++aoFramesSsaa_;
+        { SR_GPU_ZONE(profiler_, cmd, "ao_blur");
+        transition(gtSsaaAo_.image, gtSsaaAoLayout_, VK_IMAGE_LAYOUT_GENERAL, sync::kSampleStages,
+                   sync::kSampled, sync::kCompute, sync::kStorageWrite, VK_IMAGE_ASPECT_COLOR_BIT);
+        deferred_.recordSsaoBlurPass(cmd, gtSsaaAoHist_.blurSet[aoWriteSsaa], sw, sh);
         transition(gtSsaaAo_.image, gtSsaaAoLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                   sync::kCompute, sync::kStorageWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
+        }
+        } // zone "gtao"
 
+        { SR_GPU_ZONE(profiler_, cmd, "lighting");
         transition(gtSsaaColor_.image, gtSsaaColorLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                   sync::kSampleStages, sync::kSampled, sync::kColorAttach, sync::kColorWrite,
                    VK_IMAGE_ASPECT_COLOR_BIT);
-        deferred_.recordLightingPass(cmd, fr.lightingSetSsaa, gtSsaaColor_.view, sw, sh);
+        deferred_.recordLightingPass(cmd, fr.lightingSetSsaa, gtSsaaCluster_, slot, viewGt, projGt,
+                                     gtSsaaColor_.view, sw, sh);
+        }
 
-        if (hasTransparency_) {
-            transition(gtSsaaColor_.image, gtSsaaColorLayout_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                       VK_IMAGE_ASPECT_COLOR_BIT);
-            transition(gtSsaaSsrSrc_.image, gtSsaaSsrSrcLayout_,
-                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
-            copyColorImage(cmd, gtSsaaColor_.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                           gtSsaaSsrSrc_.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, sw, sh);
-            transition(gtSsaaSsrSrc_.image, gtSsaaSsrSrcLayout_,
-                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+        // Froxel volumetric fog (Phase 5a) on the 2x GT path.
+        if (volFogEnabled_ && fogParams_.enabled && gtSsaaFog_.injectImage != VK_NULL_HANDLE) {
+            SR_GPU_ZONE(profiler_, cmd, "volfog");
+            if (fogAccumFrameSsaa_ != frameIndex) {
+                deferred_.recordVolFogAccumulate(cmd, gtSsaaFog_, gtSsaaCluster_, slot, viewGt,
+                                                 projGt, prevFogViewProjSsaa_, fogParams_,
+                                                 frameIndex, fogFramesSsaa_ & 1u,
+                                                 /*reset=*/fogFramesSsaa_ == 0);
+                prevFogViewProjSsaa_ = cullViewProjGt;
+                ++fogFramesSsaa_;
+                fogAccumFrameSsaa_ = frameIndex;
+            }
+            transition(gtSsaaColor_.image, gtSsaaColorLayout_, VK_IMAGE_LAYOUT_GENERAL,
+                       sync::kColorAttach, sync::kColorWrite, sync::kCompute,
+                       sync::kStorageReadWrite, VK_IMAGE_ASPECT_COLOR_BIT);
+            deferred_.recordVolFogComposite(cmd, gtSsaaFog_, projGt, fogParams_.maxDistance,
+                                            sw, sh);
             transition(gtSsaaColor_.image, gtSsaaColorLayout_,
-                       VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT);
+                       VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, sync::kCompute,
+                       sync::kStorageWrite, sync::kColorAttach, sync::kColorReadWrite,
+                       VK_IMAGE_ASPECT_COLOR_BIT);
+        }
+
+        if (hasTransparency_ || ssrEnabled_) {
+            SR_GPU_ZONE(profiler_, cmd, "reflections");
+            // Same color mip chain build as the GB path (GENERAL for life);
+            // the opaque-SSR pass consumes the same chain.
+            transition(gtSsaaColor_.image, gtSsaaColorLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                       sync::kColorAttach, sync::kColorWrite, sync::kCompute, sync::kSampled,
+                       VK_IMAGE_ASPECT_COLOR_BIT);
+            deferred_.recordColorPyramidPass(cmd, gtSsaaColorPyramid_);
+            if (ssrEnabled_) {
+                // Opaque SSR at 2x before the box downsample: trace into the
+                // SSAA RT, then temporal EMA + fused composite on gtSsaaColor_.
+                transition(gtSsaaSsrTrace_.image, gtSsaaSsrTraceLayout_, VK_IMAGE_LAYOUT_GENERAL,
+                           sync::kCompute, sync::kSampled, sync::kCompute,
+                           sync::kStorageWrite, VK_IMAGE_ASPECT_COLOR_BIT);
+                deferred_.recordSsrPass(cmd, fr.ssrSetSsaa, cullViewProjGt, sw, sh, ssrStrength_);
+                transition(gtSsaaSsrTrace_.image, gtSsaaSsrTraceLayout_,
+                           VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kCompute,
+                           sync::kStorageWrite, sync::kCompute, sync::kSampled,
+                           VK_IMAGE_ASPECT_COLOR_BIT);
+                transition(gtSsaaColor_.image, gtSsaaColorLayout_, VK_IMAGE_LAYOUT_GENERAL,
+                           sync::kCompute, sync::kSampled, sync::kCompute,
+                           sync::kStorageReadWrite, VK_IMAGE_ASPECT_COLOR_BIT);
+                deferred_.recordSsrTemporalPass(cmd, gtSsaaSsrHist_, ssrFramesSsaa_ & 1u,
+                                                invAoVpSsaa, prevSsrViewProjSsaa_, sw, sh,
+                                                /*reset=*/ssrFramesSsaa_ == 0);
+                prevSsrViewProjSsaa_ = cullViewProjGt;
+                ++ssrFramesSsaa_;
+                transition(gtSsaaColor_.image, gtSsaaColorLayout_,
+                           VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, sync::kCompute,
+                           sync::kStorageWrite, sync::kColorAttach, sync::kColorReadWrite,
+                           VK_IMAGE_ASPECT_COLOR_BIT);
+            } else {
+                transition(gtSsaaColor_.image, gtSsaaColorLayout_,
+                           VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, sync::kCompute,
+                           sync::kSampled, sync::kColorAttach, sync::kColorReadWrite,
+                           VK_IMAGE_ASPECT_COLOR_BIT);
+            }
         }
 
         // Transparency pass: alpha-blended surfaces over the lit scene (GT
         // path: color only, no motion/mask outputs).
         if (hasTransparency_) {
+            SR_GPU_ZONE(profiler_, cmd, "transparent");
             transition(gtSsaaDepth_.image, gtSsaaDepthLayout_,
-                       VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
+                       VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL, sync::kFragment,
+                       sync::kSampled, sync::kDepthTests, sync::kDepthRead,
+                       VK_IMAGE_ASPECT_DEPTH_BIT);
             {
                 VkRenderingAttachmentInfo tColor =
                     makeColorAttachment(gtSsaaColor_.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
@@ -3018,18 +4291,31 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                 beginRendering(cmd, sw, sh, 1, &tColor, &tDepth);
                 deferred_.recordTransparentDraws(cmd, scene_, true, fr.sceneSetGt, textureSet_,
                                                  fr.transparentSetSsaa, materialStride_, sw, sh,
-                                                 cullViewProjGt, gtCam.position);
+                                                 cullViewProjGt, gtCam.position,
+                                                 projGt.m[14] / projGt.m[10],
+                                                 fogParams_.maxDistance,
+                                                 volFogEnabled_ && fogParams_.enabled &&
+                                                     gtSsaaFog_.injectImage != VK_NULL_HANDLE);
                 vkCmdEndRendering(cmd);
             }
             transition(gtSsaaDepth_.image, gtSsaaDepthLayout_,
-                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
+                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kDepthTests,
+                       sync::kDepthRead, sync::kFragment, sync::kSampled, VK_IMAGE_ASPECT_DEPTH_BIT);
         }
 
         transition(gtSsaaColor_.image, gtSsaaColorLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                   sync::kColorAttach, sync::kColorWrite, sync::kFragment, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
 
+        // Phase 6a/6b: bloom, then MB/DOF in the 2x domain, before the box
+        // downsample.
+        recordBloom(gtSsaaBloom_, gtSsaaColor_.image, gtSsaaColorLayout_, sw, sh);
+        recordPostFx(gtSsaaPostFx_, gtSsaaColor_.image, gtSsaaColorLayout_, projGt, sh);
+
         transition(gtColor_.image, gtColorLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                   sync::kSampleStages, sync::kSampled, sync::kColorAttach, sync::kColorWrite,
                    VK_IMAGE_ASPECT_COLOR_BIT);
+        { SR_GPU_ZONE(profiler_, cmd, "ssaa_downsample");
         {
             VkRenderingAttachmentInfo color =
                 makeColorAttachment(gtColor_.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
@@ -3043,24 +4329,49 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
             vkCmdSetScissor(cmd, 0, 1, &scissor);
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, copyPipelineLayout_, 0, 1,
                                     &gtDownsampleSet_, 0, nullptr);
+            // Mode 0: passthrough — the downsample target is HDR linear, not
+            // the swapchain (copy.frag HDR branch is for presentation only).
+            const float copyPush[4] = {0.f, 0.f, 0.f, 0.f};
+            vkCmdPushConstants(cmd, copyPipelineLayout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                               sizeof(copyPush), copyPush);
             vkCmdDraw(cmd, 3, 1, 0, 0);
             vkCmdEndRendering(cmd);
         }
+        } // zone "ssaa_downsample"
         transition(gtColor_.image, gtColorLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                   sync::kColorAttach, sync::kColorWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
     } else if (gtActive_) {
+        SR_GPU_ZONE(profiler_, cmd, "gt");
+        // Phase 7a: GT-path occlusion cull against the 1x Hi-Z chain.
+        { SR_GPU_ZONE(profiler_, cmd, "occlusion_cull");
+        const bool cullActiveGt = occlusionEnabled_ && gtCull_.prevValid && cullCandidates_ > 0;
+        deferred_.recordCommandUpload(cmd, slot, gtCull_, cullCandidates_, cullActiveGt);
+        if (cullActiveGt)
+            deferred_.recordOcclusionCull(cmd, gtCull_, cullCandidates_, gtCull_.prevViewProj,
+                                          gtPyramid_.mipCount, gtW, gtH);
+        }
+        { SR_GPU_ZONE(profiler_, cmd, "gbuffer");
         transition(gtAlbedo_.image, gtAlbedoLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                   sync::kSampleStages, sync::kSampled, sync::kColorAttach, sync::kColorWrite,
                    VK_IMAGE_ASPECT_COLOR_BIT);
         transition(gtNormal_.image, gtNormalLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                   sync::kSampleStages, sync::kSampled, sync::kColorAttach, sync::kColorWrite,
                    VK_IMAGE_ASPECT_COLOR_BIT);
         transition(gtMaterial_.image, gtMaterialLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                   sync::kSampleStages, sync::kSampled, sync::kColorAttach, sync::kColorWrite,
                    VK_IMAGE_ASPECT_COLOR_BIT);
         transition(gtEmissive_.image, gtEmissiveLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                   sync::kSampleStages, sync::kSampled, sync::kColorAttach, sync::kColorWrite,
+                   VK_IMAGE_ASPECT_COLOR_BIT);
+        transition(gtMotion_.image, gtMotionLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                   sync::kSampleStages, sync::kSampled, sync::kColorAttach, sync::kColorWrite,
                    VK_IMAGE_ASPECT_COLOR_BIT);
         transition(gtDepth_.image, gtDepthLayout_, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                   sync::kSampleStages, sync::kSampled, sync::kDepthTests, sync::kDepthReadWrite,
                    VK_IMAGE_ASPECT_DEPTH_BIT);
         {
-            VkRenderingAttachmentInfo colors[4] = {
+            VkRenderingAttachmentInfo colors[5] = {
                 makeColorAttachment(gtAlbedo_.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                                     VK_ATTACHMENT_LOAD_OP_CLEAR),
                 makeColorAttachment(gtNormal_.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
@@ -3068,60 +4379,155 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                 makeColorAttachment(gtMaterial_.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                                     VK_ATTACHMENT_LOAD_OP_CLEAR),
                 makeColorAttachment(gtEmissive_.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                    VK_ATTACHMENT_LOAD_OP_CLEAR),
+                makeColorAttachment(gtMotion_.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                                     VK_ATTACHMENT_LOAD_OP_CLEAR)};
             VkRenderingAttachmentInfo depth =
                 makeDepthAttachment(gtDepth_.view, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
                                     VK_ATTACHMENT_LOAD_OP_CLEAR);
-            beginRendering(cmd, gtW, gtH, 4, colors, &depth);
+            beginRendering(cmd, gtW, gtH, 5, colors, &depth);
             deferred_.recordGBufferDraws(cmd, scene_, true, fr.sceneSetGt, textureSet_,
-                                         materialStride_, gtW, gtH, cullViewProjGt);
+                                         materialStride_, gtW, gtH, cullViewProjGt, gtCull_,
+                                         cullRuns_.data(), static_cast<uint32_t>(cullRuns_.size()));
             vkCmdEndRendering(cmd);
         }
+        } // zone "gbuffer"
+        // dst scope includes compute: the opaque-SSR pass samples the GBuffer.
+        { SR_GPU_ZONE(profiler_, cmd, "hiz");
         transition(gtAlbedo_.image, gtAlbedoLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                   sync::kColorAttach, sync::kColorWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
         transition(gtNormal_.image, gtNormalLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                   sync::kColorAttach, sync::kColorWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
         transition(gtMaterial_.image, gtMaterialLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                   sync::kColorAttach, sync::kColorWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
         transition(gtEmissive_.image, gtEmissiveLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                   sync::kColorAttach, sync::kColorWrite, sync::kSampleStages, sync::kSampled,
+                   VK_IMAGE_ASPECT_COLOR_BIT);
+        transition(gtMotion_.image, gtMotionLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                   sync::kColorAttach, sync::kColorWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
         transition(gtDepth_.image, gtDepthLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                   sync::kDepthTests, sync::kDepthWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_DEPTH_BIT);
+        if (hasTransparency_ || ssrEnabled_ || occlusionEnabled_) {
+            deferred_.recordDepthPyramidPass(cmd, gtPyramid_);
+            gtCull_.prevViewProj = cullViewProjGt; // GT paths never jitter
+            gtCull_.prevValid = true;
+        }
+        } // zone "hiz"
 
-        // SSAO for the 1x GT path (un-jittered view-projection).  In
-        // "GT (Apply scale)" mode gtW/gtH are the low input resolution.
-        transition(gtAoRaw_.image, gtAoRawLayout_, VK_IMAGE_LAYOUT_GENERAL,
-                   VK_IMAGE_ASPECT_COLOR_BIT);
-        deferred_.recordSsaoPass(cmd, ssaoSetGt_, cullViewProjGt, frameIndex, gtW, gtH);
+        // GTAO for the 1x GT path (un-jittered view-projection): view-Z depth
+        // chain -> main pass -> temporal EMA -> denoise.  In "GT (Apply
+        // scale)" mode gtW/gtH are the low input resolution.  The AO output
+        // is also sampled by the opaque-SSR compute pass.
+        const Mat4 invAoVpGt = Mat4::inverse(cullViewProjGt);
+        { SR_GPU_ZONE(profiler_, cmd, "gtao");
+        deferred_.recordDepthPyramidPass(cmd, gtPyramidAo_);
+        const float aoMaxLodGt = static_cast<float>(std::min(gtPyramidAo_.mipCount - 1, 4u));
+        { SR_GPU_ZONE(profiler_, cmd, "ao_main");
+        transition(gtAoRaw_.image, gtAoRawLayout_, VK_IMAGE_LAYOUT_GENERAL, sync::kCompute,
+                   sync::kSampled, sync::kCompute, sync::kStorageWrite, VK_IMAGE_ASPECT_COLOR_BIT);
+        deferred_.recordSsaoPass(cmd, ssaoSetGt_, invAoVpGt, frameIndex, camera_.nearPlane,
+                                 camera_.farPlane, aoMaxLodGt, gtW, gtH);
         transition(gtAoRaw_.image, gtAoRawLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                   sync::kCompute, sync::kStorageWrite, sync::kCompute, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
-        transition(gtAo_.image, gtAoLayout_, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT);
-        deferred_.recordSsaoBlurPass(cmd, ssaoBlurSetGt_, gtW, gtH);
+        }
+        const uint32_t aoWriteGt = aoFramesGt_ & 1u;
+        { SR_GPU_ZONE(profiler_, cmd, "ao_temporal");
+        deferred_.recordSsaoTemporalPass(cmd, gtAoHist_, aoWriteGt, invAoVpGt, prevAoViewProjGt_,
+                                         gtW, gtH, /*reset=*/aoFramesGt_ == 0);
+        }
+        prevAoViewProjGt_ = cullViewProjGt;
+        ++aoFramesGt_;
+        { SR_GPU_ZONE(profiler_, cmd, "ao_blur");
+        transition(gtAo_.image, gtAoLayout_, VK_IMAGE_LAYOUT_GENERAL, sync::kSampleStages,
+                   sync::kSampled, sync::kCompute, sync::kStorageWrite, VK_IMAGE_ASPECT_COLOR_BIT);
+        deferred_.recordSsaoBlurPass(cmd, gtAoHist_.blurSet[aoWriteGt], gtW, gtH);
         transition(gtAo_.image, gtAoLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                   sync::kCompute, sync::kStorageWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
+        }
+        } // zone "gtao"
 
+        { SR_GPU_ZONE(profiler_, cmd, "lighting");
         transition(gtColor_.image, gtColorLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                   sync::kSampleStages, sync::kSampled, sync::kColorAttach, sync::kColorWrite,
                    VK_IMAGE_ASPECT_COLOR_BIT);
-        deferred_.recordLightingPass(cmd, fr.lightingSetGt, gtColor_.view, gtW, gtH);
+        deferred_.recordLightingPass(cmd, fr.lightingSetGt, gtCluster_, slot, viewGt, projGt,
+                                     gtColor_.view, gtW, gtH);
+        }
 
-        if (hasTransparency_) {
-            transition(gtColor_.image, gtColorLayout_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                       VK_IMAGE_ASPECT_COLOR_BIT);
-            transition(gtSsrSrc_.image, gtSsrSrcLayout_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                       VK_IMAGE_ASPECT_COLOR_BIT);
-            copyColorImage(cmd, gtColor_.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                           gtSsrSrc_.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, gtW, gtH);
-            transition(gtSsrSrc_.image, gtSsrSrcLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                       VK_IMAGE_ASPECT_COLOR_BIT);
+        // Froxel volumetric fog (Phase 5a) on the 1x GT path.
+        if (volFogEnabled_ && fogParams_.enabled && gtFog_.injectImage != VK_NULL_HANDLE) {
+            SR_GPU_ZONE(profiler_, cmd, "volfog");
+            if (fogAccumFrameGt_ != frameIndex) {
+                deferred_.recordVolFogAccumulate(cmd, gtFog_, gtCluster_, slot, viewGt, projGt,
+                                                 prevFogViewProjGt_, fogParams_, frameIndex,
+                                                 fogFramesGt_ & 1u, /*reset=*/fogFramesGt_ == 0);
+                prevFogViewProjGt_ = cullViewProjGt;
+                ++fogFramesGt_;
+                fogAccumFrameGt_ = frameIndex;
+            }
+            transition(gtColor_.image, gtColorLayout_, VK_IMAGE_LAYOUT_GENERAL,
+                       sync::kColorAttach, sync::kColorWrite, sync::kCompute,
+                       sync::kStorageReadWrite, VK_IMAGE_ASPECT_COLOR_BIT);
+            deferred_.recordVolFogComposite(cmd, gtFog_, projGt, fogParams_.maxDistance, gtW, gtH);
             transition(gtColor_.image, gtColorLayout_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                       sync::kCompute, sync::kStorageWrite, sync::kColorAttach,
+                       sync::kColorReadWrite, VK_IMAGE_ASPECT_COLOR_BIT);
+        }
+
+        if (hasTransparency_ || ssrEnabled_) {
+            SR_GPU_ZONE(profiler_, cmd, "reflections");
+            // Same color mip chain build as the GB path (GENERAL for life);
+            // the opaque-SSR pass consumes the same chain.
+            transition(gtColor_.image, gtColorLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                       sync::kColorAttach, sync::kColorWrite, sync::kCompute, sync::kSampled,
                        VK_IMAGE_ASPECT_COLOR_BIT);
+            deferred_.recordColorPyramidPass(cmd, gtColorPyramid_);
+            if (ssrEnabled_) {
+                // Opaque SSR, Phase 2d: trace into the GT RT, then temporal
+                // EMA + fused composite (in-place RMW on gtColor_).
+                transition(gtSsrTrace_.image, gtSsrTraceLayout_, VK_IMAGE_LAYOUT_GENERAL,
+                           sync::kCompute, sync::kSampled, sync::kCompute,
+                           sync::kStorageWrite, VK_IMAGE_ASPECT_COLOR_BIT);
+                deferred_.recordSsrPass(cmd, fr.ssrSetGt, cullViewProjGt, gtW, gtH, ssrStrength_);
+                transition(gtSsrTrace_.image, gtSsrTraceLayout_,
+                           VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kCompute,
+                           sync::kStorageWrite, sync::kCompute, sync::kSampled,
+                           VK_IMAGE_ASPECT_COLOR_BIT);
+                transition(gtColor_.image, gtColorLayout_, VK_IMAGE_LAYOUT_GENERAL,
+                           sync::kCompute, sync::kSampled, sync::kCompute,
+                           sync::kStorageReadWrite, VK_IMAGE_ASPECT_COLOR_BIT);
+                deferred_.recordSsrTemporalPass(cmd, gtSsrHist_, ssrFramesGt_ & 1u, invAoVpGt,
+                                                prevSsrViewProjGt_, gtW, gtH,
+                                                /*reset=*/ssrFramesGt_ == 0);
+                prevSsrViewProjGt_ = cullViewProjGt;
+                ++ssrFramesGt_;
+                transition(gtColor_.image, gtColorLayout_,
+                           VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, sync::kCompute,
+                           sync::kStorageWrite, sync::kColorAttach, sync::kColorReadWrite,
+                           VK_IMAGE_ASPECT_COLOR_BIT);
+            } else {
+                transition(gtColor_.image, gtColorLayout_,
+                           VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, sync::kCompute,
+                           sync::kSampled, sync::kColorAttach, sync::kColorReadWrite,
+                           VK_IMAGE_ASPECT_COLOR_BIT);
+            }
         }
 
         // Transparency pass: alpha-blended surfaces over the lit scene (GT
         // path: color only, no motion/mask outputs).
         if (hasTransparency_) {
+            SR_GPU_ZONE(profiler_, cmd, "transparent");
             transition(gtDepth_.image, gtDepthLayout_,
-                       VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
+                       VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL, sync::kFragment,
+                       sync::kSampled, sync::kDepthTests, sync::kDepthRead,
+                       VK_IMAGE_ASPECT_DEPTH_BIT);
             {
                 VkRenderingAttachmentInfo tColor =
                     makeColorAttachment(gtColor_.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
@@ -3133,16 +4539,39 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                 beginRendering(cmd, gtW, gtH, 1, &tColor, &tDepth);
                 deferred_.recordTransparentDraws(cmd, scene_, true, fr.sceneSetGt, textureSet_,
                                                  fr.transparentSetGt, materialStride_, gtW, gtH,
-                                                 cullViewProjGt, gtCam.position);
+                                                 cullViewProjGt, gtCam.position,
+                                                 projGt.m[14] / projGt.m[10],
+                                                 fogParams_.maxDistance,
+                                                 volFogEnabled_ && fogParams_.enabled &&
+                                                     gtFog_.injectImage != VK_NULL_HANDLE);
                 vkCmdEndRendering(cmd);
             }
             transition(gtDepth_.image, gtDepthLayout_,
-                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_DEPTH_BIT);
+                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kDepthTests,
+                       sync::kDepthRead, sync::kFragment, sync::kSampled, VK_IMAGE_ASPECT_DEPTH_BIT);
         }
 
         transition(gtColor_.image, gtColorLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                   sync::kColorAttach, sync::kColorWrite, sync::kSampleStages, sync::kSampled,
                    VK_IMAGE_ASPECT_COLOR_BIT);
+        // Phase 6a/6b: bloom, then MB/DOF on the 1x GT HDR.
+        recordBloom(gtBloom_, gtColor_.image, gtColorLayout_, gtW, gtH);
+        recordPostFx(gtPostFx_, gtColor_.image, gtColorLayout_, projGt, gtH);
     }
+    // --- Auto exposure: GT histogram (own HDR source; gtSsaa uses its 2x HDR) --
+    // The GT column solves independently of the LR path — separate pipelines,
+    // so differing column exposures are the correct engine behaviour.
+    if (gtActive_ && autoExposureEnabled_) {
+        SR_GPU_ZONE(profiler_, cmd, "auto_exposure_gt");
+        ExposureSolvePush solve;
+        solve.minEV = exposureMinEV_;
+        solve.maxEV = exposureMaxEV_;
+        solve.resetState = (frameIndex == 0 || autoExposureJustEnabled_) ? 1.f : 0.f;
+        deferred_.recordAutoExposurePass(cmd, gtExposure_.gpu, solve,
+                                         gtExposure_.staging[slot]);
+        gtExposure_.pending[slot] = true;
+    }
+    autoExposureJustEnabled_ = false;
     timestamps_.sceneEnd(cmd, slot);
 
     // --- 4) GPU metric reduction (compare only, every kMetricInterval frames) ----
@@ -3162,6 +4591,7 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     const uint32_t regBlocksPerRow = (regW + 7) / 8;
     const uint32_t regBlockCount = regBlocksPerRow * ((regH + 7) / 8);
     if (compareMode && !algos_.empty() && frameIndex % kMetricInterval == 0) {
+        SR_GPU_ZONE(profiler_, cmd, "metrics");
         uint32_t mask = 0;
         uint32_t algoIndex = 0;
         for (AlgoColumn& algo : algos_) {
@@ -3190,7 +4620,11 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
             push.y2 = active_.gtApplyScale ? 1u : 0u;
             push.z2 = dw;
             push.w2 = dh;
-            push.exposure = exposure_;
+            // Each image is tonemapped with its own path's exposure (test =
+            // LR, ref = GT): with auto exposure the PSNR/SSIM numbers include
+            // the exposure difference the user actually sees between columns.
+            push.exposureTest = lrExposureNow();
+            push.exposureRef = gtExposureNow();
             vkCmdPushConstants(cmd, metricPipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                                sizeof(push), &push);
             vkCmdDispatch(cmd, regBlocksPerRow, (regH + 7) / 8, 1);
@@ -3238,6 +4672,7 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     }
 
     timestamps_.frameEnd(cmd, slot);
+    profiler_.endFrame();
     vkEndCommandBuffer(cmd);
 
     prevViewProj_ = Mat4::multiply(proj, view);
@@ -3255,9 +4690,11 @@ void GuiApp::recordComposePresent(VkCommandBuffer cmd, uint32_t swapchainIndex,
     const uint32_t colW = (dw - layoutX0) / numColumns;
 
     imageBarrier(cmd, composeImage_.image, composeLayout_,
-                 VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+                 VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                 sync::kFragment, sync::kSampled, sync::kColorAttach, sync::kColorWrite);
     composeLayout_ = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     {
+        SR_GPU_ZONE(profiler_, cmd, "compose");
         VkRenderingAttachmentInfo color =
             makeColorAttachment(composeImage_.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                                 VK_ATTACHMENT_LOAD_OP_CLEAR);
@@ -3313,21 +4750,45 @@ void GuiApp::recordComposePresent(VkCommandBuffer cmd, uint32_t swapchainIndex,
             push.srcSize[0] = srcW;
             push.srcSize[1] = srcH;
             const float srcRegionW = rect[2] * (srcW / static_cast<float>(dw));
-            push.nearest = (static_cast<float>(w) >= srcRegionW) ? 1.f : 0.f;
-            push.exposure = exposure_;
+            // Nearest only above 1:1 magnification (see CompareApp); at
+            // exactly 1:1 linear sampling hits texel centers anyway and the
+            // lens chain stays active.
+            push.nearest = (static_cast<float>(w) > srcRegionW) ? 1.f : 0.f;
+            // Per-column exposure: GT column uses the GT path's solver,
+            // algorithm columns the LR path's (manual mode shares the slider).
+            push.exposure = isGtColumn ? gtExposureNow() : lrExposureNow();
+            // Terminal lens chain (Phase 6a): per-frame push constants, same
+            // strengths for every column (each column presents independently).
+            push.lensA[0] = lensCaEnabled_ ? kLensCaStrength : 0.f;
+            push.lensA[1] = lensVignetteEnabled_ ? kLensVignetteStrength : 0.f;
+            push.lensA[2] = lensGrainEnabled_ ? kLensGrainStrength : 0.f;
+            push.lensA[3] = static_cast<float>(renderFrameIndex_);
+            // Grading (Phase 6c): shared sliders, identical for every column.
+            const Vec3 wb = whiteBalanceForTemperatureTint(gradeTemperatureK_, gradeTint_);
+            push.gradeA[0] = gradeContrast_;
+            push.gradeA[1] = gradeSaturation_;
+            push.gradeA[2] = 0.f;
+            push.gradeA[3] = 0.f;
+            push.gradeB[0] = wb.x;
+            push.gradeB[1] = wb.y;
+            push.gradeB[2] = wb.z;
+            push.gradeB[3] = 17.f; // makeIdentityLut() default edge length
             vkCmdPushConstants(cmd, composePipelineLayout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                                sizeof(push), &push);
             vkCmdDraw(cmd, 3, 1, 0, 0);
         }
         vkCmdEndRendering(cmd);
     }
-    imageBarrier(cmd, composeImage_.image, composeLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    imageBarrier(cmd, composeImage_.image, composeLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                 sync::kColorAttach, sync::kColorWrite, sync::kFragment, sync::kSampled);
     composeLayout_ = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
     const VkImage swapImage = swapchain_.image(swapchainIndex);
     const VkImageView swapView = swapchain_.view(swapchainIndex);
-    imageBarrier(cmd, swapImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    imageBarrier(cmd, swapImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                 sync::kColorAttach, sync::kColorWrite, sync::kColorAttach, sync::kColorWrite);
     {
+        SR_GPU_ZONE(profiler_, cmd, "present");
         VkRenderingAttachmentInfo color =
             makeColorAttachment(swapView, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                                 VK_ATTACHMENT_LOAD_OP_CLEAR);
@@ -3341,12 +4802,18 @@ void GuiApp::recordComposePresent(VkCommandBuffer cmd, uint32_t swapchainIndex,
         vkCmdSetScissor(cmd, 0, 1, &scissor);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, copyPipelineLayout_, 0, 1,
                                 &copySet_, 0, nullptr);
+        // HDR swapchain (Phase 6c): re-linearize the SDR composite and encode
+        // (SDR content in an HDR container; paper white 203 nits, BT.2408).
+        const float copyPush[4] = {static_cast<float>(swapchain_.hdrMode()), 203.f, 0.f, 0.f};
+        vkCmdPushConstants(cmd, copyPipelineLayout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                           sizeof(copyPush), copyPush);
         vkCmdDraw(cmd, 3, 1, 0, 0);
         ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cmd);
         vkCmdEndRendering(cmd);
     }
     imageBarrier(cmd, swapImage, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                 VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+                 VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                 sync::kColorAttach, sync::kColorWrite, VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE);
 }
 
 void GuiApp::recordViewerTruePresent(uint32_t uiSlot, uint32_t swapchainIndex) {
@@ -3378,8 +4845,18 @@ bool GuiApp::guiAllowMailbox() const {
 bool GuiApp::recreateGuiSwapchain() {
     swapchainVsync_ = guiWantVsync();
     swapchainMailbox_ = guiAllowMailbox();
-    if (!swapchain_.create(ctx_, active_.displayW, active_.displayH, swapchainVsync_,
-                           swapchainMailbox_))
+    // The swapchain extent follows the actual window client size (border
+    // drag-resize, fullscreen switches, output-resolution Apply); the
+    // fixed output-resolution composite is scaled to it by the present
+    // copy pass.  A minimized window reports 0 — keep the configured size
+    // then (the acquire/present OUT_OF_DATE loop retries on restore).
+    uint32_t w = active_.displayW;
+    uint32_t h = active_.displayH;
+    if (window_.width() > 0 && window_.height() > 0) {
+        w = static_cast<uint32_t>(window_.width());
+        h = static_cast<uint32_t>(window_.height());
+    }
+    if (!swapchain_.create(ctx_, w, h, swapchainVsync_, swapchainMailbox_, hdrEnabled_))
         return false;
     ensurePresentSemaphores();
     return true;
@@ -3416,7 +4893,8 @@ void GuiApp::captureUiScreenshotIntoStaging(VkCommandBuffer cmd) {
     const uint32_t dh = active_.displayH;
 
     imageBarrier(cmd, uiShotImage_.image, uiShotLayout_,
-                 VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+                 VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                 sync::kCopy, sync::kTransferRead, sync::kColorAttach, sync::kColorWrite);
     uiShotLayout_ = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     {
         VkRenderingAttachmentInfo color =
@@ -3430,11 +4908,17 @@ void GuiApp::captureUiScreenshotIntoStaging(VkCommandBuffer cmd) {
         vkCmdSetScissor(cmd, 0, 1, &scissor);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, copyPipelineLayout_, 0, 1,
                                 &copySet_, 0, nullptr);
+        // Same encode as the real present (the UI-shot target uses the
+        // swapchain format).
+        const float copyPush[4] = {static_cast<float>(swapchain_.hdrMode()), 203.f, 0.f, 0.f};
+        vkCmdPushConstants(cmd, copyPipelineLayout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                           sizeof(copyPush), copyPush);
         vkCmdDraw(cmd, 3, 1, 0, 0);
         ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cmd);
         vkCmdEndRendering(cmd);
     }
-    imageBarrier(cmd, uiShotImage_.image, uiShotLayout_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    imageBarrier(cmd, uiShotImage_.image, uiShotLayout_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                 sync::kColorAttach, sync::kColorWrite, sync::kCopy, sync::kTransferRead);
     uiShotLayout_ = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
     VkBufferImageCopy region = {};
     region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -3520,7 +5004,11 @@ void GuiApp::exportFrameTimesCsv(const char* path) {
     }
     const MemoryBudgetInfo budget = queryMemoryBudget(ctx_);
     VkDeviceSize heapTotal = 0;
-    for (uint32_t i = 0; i < budget.heapCount; ++i) heapTotal += budget.heapUsage[i];
+    VkDeviceSize vmaTotal = 0;
+    for (uint32_t i = 0; i < budget.heapCount; ++i) {
+        heapTotal += budget.heapUsage[i];
+        vmaTotal += budget.vmaAllocationBytes[i];
+    }
     uint64_t algoBytes = 0;
     for (const AlgoColumn& algo : algos_) algoBytes += algo.upscaler->gpuMemoryBytes();
 
@@ -3529,10 +5017,11 @@ void GuiApp::exportFrameTimesCsv(const char* path) {
         statusLine_ = std::string("frame-times CSV: cannot open ") + path;
         return;
     }
-    csv << "frame,frameMs,sceneMs,upscaleMs,vramAlgoBytes,vramTotalBytes\n";
+    csv << "frame,frameMs,sceneMs,upscaleMs,vramAlgoBytes,vramTotalBytes,vramVmaBytes\n";
     for (size_t i = 0; i < frameTimesLog_.size(); ++i) {
         csv << i << ',' << frameTimesLog_[i].frameMs << ',' << frameTimesLog_[i].sceneMs << ','
-            << frameTimesLog_[i].upscaleMs << ',' << algoBytes << ',' << heapTotal << '\n';
+            << frameTimesLog_[i].upscaleMs << ',' << algoBytes << ',' << heapTotal << ','
+            << vmaTotal << '\n';
     }
     char buf[320];
     std::snprintf(buf, sizeof(buf), "frame-times: %zu frames -> %s", frameTimesLog_.size(), path);
@@ -3577,6 +5066,32 @@ void GuiApp::pumpInputFile() {
             std::string path;
             ss >> path;
             if (!path.empty()) saveScreenshot(path.c_str());
+        } else if (cmd == "graph") {
+            graphWindow_.open = !graphWindow_.open; // Render Graph editor window
+        } else if (cmd == "profiler") {
+            profilerWindow_.open = !profilerWindow_.open; // GPU profiler window
+        } else if (cmd == "pass") {
+            // pass <name> <0|1>: toggle a runtime-switchable pass by its
+            // PassToggle shorthand (same path as the graph node checkbox).
+            std::string name;
+            int on = 0;
+            ss >> name >> on;
+            rg::PassToggle t = rg::PassToggle::None;
+            if (name == "shadows") t = rg::PassToggle::Shadows;
+            else if (name == "contact") t = rg::PassToggle::ContactShadows;
+            else if (name == "ssr") t = rg::PassToggle::Ssr;
+            else if (name == "volfog") t = rg::PassToggle::VolFog;
+            else if (name == "occlusion") t = rg::PassToggle::Occlusion;
+            else if (name == "bloom") t = rg::PassToggle::Bloom;
+            else if (name == "mb") t = rg::PassToggle::MotionBlur;
+            else if (name == "dof") t = rg::PassToggle::Dof;
+            else if (name == "autoexp") t = rg::PassToggle::AutoExposure;
+            if (t != rg::PassToggle::None) applyPassToggle(t, on != 0);
+        } else if (cmd == "fullscreen") {
+            // fullscreen <0|1>: borderless fullscreen (same as the checkbox).
+            int on = 0;
+            ss >> on;
+            setFullscreenEnabled(on != 0);
         } // "wait" and unknown commands just consume the frame
         if (dbgInputEnabled())
             std::fprintf(stderr, "[inputfile] line %llu: %s\n",
@@ -3592,6 +5107,14 @@ void GuiApp::run() {
     auto lastTime = std::chrono::steady_clock::now();
 
     while (window_.poll()) {
+        // Track the windowed client size (border drags, output-resolution
+        // Applies, fullscreen-exit snap) for the engine.toml width/height
+        // memory; while fullscreen the window holds the desktop size, which
+        // must not overwrite the remembered windowed size.
+        if (!fullscreenEnabled_ && window_.width() > 0 && window_.height() > 0) {
+            windowedW_ = window_.width();
+            windowedH_ = window_.height();
+        }
         ensureGuiSwapchainMode();
         const int lockN = std::max(15, std::min(120, ui_.lockFpsTarget));
         if (currentTab_ != 2 && ui_.lockFps) {
@@ -3644,14 +5167,22 @@ void GuiApp::run() {
 
         updateCamera(dt);
 
+        // engine.toml hot reload: ~1 s mtime poll, per-frame options only.
+        pollEngineConfig();
+        // engine.toml auto-save: debounced write of UI-side changes.
+        pollEngineConfigAutoSave();
+
         // Debug hook (SR_GUI_DEBUG_INPUT=1): heartbeat to correlate input
-        // message dispatch with the frame loop during automation tests.
+        // event dispatch with the frame loop during automation tests.
         if (dbgInputEnabled() && renderFrameIndex_ % 120 == 0)
-            std::fprintf(stderr, "[run] frame=%u tick=%llu\n", renderFrameIndex_,
-                         static_cast<unsigned long long>(GetTickCount64()));
+            std::fprintf(stderr, "[run] frame=%u ms=%llu\n", renderFrameIndex_,
+                         static_cast<unsigned long long>(
+                             std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 now.time_since_epoch())
+                                 .count()));
 
         ImGui_ImplVulkan_NewFrame();
-        ImGui_ImplWin32_NewFrame();
+        ImGui_ImplSDL3_NewFrame();
         pumpInputFile(); // debug automation: queued after backend events
         ImGui::NewFrame();
         drawUi();
@@ -3727,6 +5258,7 @@ void GuiApp::run() {
         // complete; harvest GPU timings + metric readback before reuse.
         if (frameIndex >= kFramesInFlight) {
             lastTimings_ = timestamps_.read(ctx_, slot);
+            profiler_.harvest(ctx_, slot); // per-pass GPU zones for the profiler panel
             frameTimesLog_.push_back(lastTimings_);
             // Cap the log but keep the most recent half, so a CSV export never
             // loses the entire history when the runaway guard fires.
@@ -3742,6 +5274,10 @@ void GuiApp::run() {
             harvestMetrics(slot);
             metricPending_[slot] = false;
         }
+        // Same completion event: harvest the auto-exposure solves recorded in
+        // that frame (2 frames of latency, engine-style).
+        deferred_.harvestExposureChannel(lrExposure_, slot);
+        deferred_.harvestExposureChannel(gtExposure_, slot);
 
         uint32_t swapIndex = 0;
         VkResult acq = swapchain_.acquireNext(ctx_, frames_[slot].imageAvailable, swapIndex);
@@ -3762,7 +5298,16 @@ void GuiApp::run() {
             static_cast<int>(frameIndex) == opts_.frames - 1 && !screenshotPending_)
             saveScreenshot(opts_.screenshotPath.c_str());
 
+        // The profiler panel's open flag is the profiler's enable switch: a
+        // closed panel records no timestamps (near-zero overhead).  The
+        // Render Graph window shows per-pass timings too, so it enables the
+        // profiler the same way while open.
+        profiler_.setEnabled(profilerWindow_.open || graphWindow_.open);
+        const auto recordStart = std::chrono::steady_clock::now();
         recordFrame(frameIndex, swapIndex);
+        cpuRecordMs_ = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() -
+                                                                recordStart)
+                           .count();
 
         VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
         VkSubmitInfo submit = {};
@@ -4008,6 +5553,44 @@ void GuiApp::drawSharedControls() {
         ImGui::TextDisabled("%zu keyframes%s", path_.size(),
                             pathPlaying_ ? " (playing)" : " (paused)");
     }
+
+    // Color grading (Phase 6c): log domain, pre-ACES; identical parameters on
+    // every column (GT included) so compare stays fair.  Per-frame push
+    // constants — no rebuild.
+    ImGui::Separator();
+    ImGui::Text("color grading");
+    ImGui::SliderFloat("temperature", &gradeTemperatureK_, 3000.f, 10000.f, "%.0f K");
+    ImGui::SliderFloat("tint", &gradeTint_, -1.f, 1.f, "%.2f");
+    ImGui::SliderFloat("contrast", &gradeContrast_, 0.5f, 2.f, "%.2f");
+    ImGui::SliderFloat("saturation", &gradeSaturation_, 0.f, 2.f, "%.2f");
+    if (ImGui::Button("reset grading")) {
+        gradeTemperatureK_ = 6500.f;
+        gradeTint_ = 0.f;
+        gradeContrast_ = 1.f;
+        gradeSaturation_ = 1.f;
+    }
+
+    // HDR output (Phase 6c): gated on surface support; toggling re-creates
+    // the swapchain + copy pipeline + ImGui backend.  The composite is SDR
+    // display-encoded, so this is an HDR-container compatibility mode here —
+    // true scene-HDR headroom is viewer-only (--hdr).
+    const bool hdrAny = hdrSupportHdr10_ || hdrSupportScRgb_;
+    if (!hdrAny) ImGui::BeginDisabled();
+    if (ImGui::Checkbox("hdr output", &hdrEnabled_)) setHdrEnabled(hdrEnabled_);
+    if (!hdrAny) ImGui::EndDisabled();
+    if (hdrAny) {
+        ImGui::TextDisabled("%s%s (sdr content in hdr container)",
+                            hdrSupportHdr10_ ? "hdr10" : "",
+                            hdrSupportScRgb_ ? (hdrSupportHdr10_ ? " + scrgb" : "scrgb") : "");
+    }
+    // Borderless fullscreen (desktop mode; [window] fullscreen in
+    // engine.toml, hot-reloadable).  The render resolution stays the
+    // configured output size; the swapchain is recreated through the normal
+    // OUT_OF_DATE path on the mode switch.
+    {
+        bool fs = fullscreenEnabled_;
+        if (ImGui::Checkbox("fullscreen (borderless)", &fs)) setFullscreenEnabled(fs);
+    }
 }
 
 void GuiApp::drawViewerTab() {
@@ -4041,12 +5624,39 @@ void GuiApp::drawViewerTab() {
     ImGui::Checkbox("sun", &sunEnabled_);
     if (!sunEnabled_) ImGui::BeginDisabled();
     ImGui::SliderFloat("elevation", &sunElevationDeg_, 5.f, 90.f, "%.0f deg");
+    bool sunMoved = ImGui::IsItemDeactivatedAfterEdit();
     ImGui::SliderFloat("azimuth", &sunAzimuthDeg_, 0.f, 360.f, "%.0f deg");
+    sunMoved = sunMoved || ImGui::IsItemDeactivatedAfterEdit();
+    // Sky atmosphere follows the sun (Phase 5b); the IBL re-render is a
+    // blocking one-shot, so it runs on slider release only, atmosphere mode.
+    if (sunMoved) updateSkyFromUiSun();
     ImGui::SliderFloat("intensity", &sunIntensity_, 0.f, 10.f, "%.2f");
     if (!sunEnabled_) ImGui::EndDisabled();
     ImGui::Checkbox("fill light", &fillEnabled_);
     ImGui::SliderFloat("IBL intensity", &iblIntensity_, 0.f, 3.f, "%.2f");
-    ImGui::SliderFloat("exposure", &exposure_, 0.1f, 4.f, "%.2f");
+    // Auto exposure: histogram-based EV solver (UE4 AutoExposure style),
+    // per-frame parameters — no rebuild.  The manual slider applies when the
+    // checkbox is off; switching back to manual keeps the current auto value.
+    {
+        // Routed through applyPassToggle so the Render Graph editor's node
+        // checkbox applies the identical side effects.
+        bool autoExposure = autoExposureEnabled_;
+        if (ImGui::Checkbox("auto exposure", &autoExposure))
+            applyPassToggle(rg::PassToggle::AutoExposure, autoExposure);
+    }
+    if (autoExposureEnabled_) {
+        ImGui::SliderFloat("min EV", &exposureMinEV_, -16.f, 16.f, "%.1f");
+        ImGui::SliderFloat("max EV", &exposureMaxEV_, -16.f, 16.f, "%.1f");
+        exposureMinEV_ = std::min(exposureMinEV_, exposureMaxEV_);
+        exposureMaxEV_ = std::max(exposureMinEV_, exposureMaxEV_);
+        ImGui::Text("exposure  lr %.2f  gt %.2f (auto)", static_cast<double>(lrExposure_.value),
+                    static_cast<double>(gtExposure_.value));
+        ImGui::BeginDisabled();
+        ImGui::SliderFloat("exposure", &exposure_, 0.1f, 4.f, "%.2f");
+        ImGui::EndDisabled();
+    } else {
+        ImGui::SliderFloat("exposure", &exposure_, 0.1f, 4.f, "%.2f");
+    }
     if (ImGui::Button("golden hour")) applyLightingPreset(goldenHourPreset());
     ImGui::SameLine();
     if (ImGui::Button("scene default"))
@@ -4057,13 +5667,64 @@ void GuiApp::drawViewerTab() {
     ImGui::Checkbox("shadows", &shadowsEnabled_);
     if (!shadowsEnabled_) ImGui::BeginDisabled();
     ImGui::Checkbox("cascade debug", &shadowDebugCascades_);
+    // Screen-space contact shadows (sun only): per-frame UBO flag, no rebuild.
+    ImGui::Checkbox("contact shadows", &contactShadowsEnabled_);
     if (!shadowsEnabled_) ImGui::EndDisabled();
     if (!shadowsActive_) ImGui::EndDisabled();
+    // Opaque SSR: per-frame pass skip (no rebuild), all deferred paths.
+    // CLI/engine.toml-only switch (--ssr / [effects] ssr) — the GUI checkbox
+    // is locked and only displays the current state (kept visible so a
+    // toml/CLI-enabled SSR is not hidden).
+    ImGui::BeginDisabled();
+    ImGui::Checkbox("ssr (opaque)", &ssrEnabled_);
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("CLI only: --ssr (or engine.toml [effects] ssr)");
+    if (!ssrEnabled_) ImGui::BeginDisabled();
+    // Global SSR weight: scales the trace-stage hit confidence; below 1 the
+    // composite leans on the IBL fallback (rough ground reads less greasy).
+    ImGui::SliderFloat("ssr strength", &ssrStrength_, 0.f, 1.f, "%.2f");
+    if (!ssrEnabled_) ImGui::EndDisabled();
+    // Froxel volumetric fog: per-frame pass skip; re-enabling restarts the
+    // temporal history so stale frames do not bleed in.
+    if (!fogParams_.enabled || gbFog_.injectImage == VK_NULL_HANDLE) ImGui::BeginDisabled();
+    {
+        // Same applyPassToggle routing as "auto exposure" above.
+        bool volFog = volFogEnabled_;
+        if (ImGui::Checkbox("volumetric fog", &volFog))
+            applyPassToggle(rg::PassToggle::VolFog, volFog);
+    }
+    if (!fogParams_.enabled || gbFog_.injectImage == VK_NULL_HANDLE) ImGui::EndDisabled();
+    // Screen-size LOD + small-object cull: per-frame CPU selection, no rebuild.
+    ImGui::Checkbox("lod", &lodEnabled_);
+    // GPU Hi-Z occlusion culling (Phase 7a): per-frame pass skip, no rebuild.
+    ImGui::Checkbox("occlusion cull", &occlusionEnabled_);
+    // HDR bloom (Phase 6a pyramid): per-frame pass skip like SSR, no rebuild —
+    // the per-path chains stay allocated either way.
+    ImGui::Checkbox("bloom", &bloomEnabled_);
+    // Motion blur + DOF (Phase 6b): per-frame pass skip, no temporal state.
+    ImGui::Checkbox("motion blur", &motionBlurEnabled_);
+    ImGui::Checkbox("depth of field", &dofEnabled_);
+    // DOF tuning: per-frame push constants, no rebuild.  Focus 0 = auto-focus
+    // on the screen-centre depth texel.
+    if (!dofEnabled_) ImGui::BeginDisabled();
+    ImGui::SliderFloat("dof focus (m)", &dofFocus_, 0.f, 60.f, "%.1f (0 = auto)");
+    ImGui::SliderFloat("dof f-stop", &dofFstop_, 0.7f, 22.f, "f/%.1f");
+    ImGui::SliderFloat("dof max blur (px)", &dofMaxBlur_, 1.f, 32.f, "%.0f");
+    if (!dofEnabled_) ImGui::EndDisabled();
+    // Terminal lens-effects chain (Phase 6a, compare_compose.frag; per-frame
+    // push constants, no rebuild).  Lens dirt stays viewer-only: the compose
+    // pass has no dirt binding to modulate with the bloom pyramid.
+    ImGui::Text("lens fx");
+    ImGui::Checkbox("chromatic aberration", &lensCaEnabled_);
+    ImGui::Checkbox("vignette", &lensVignetteEnabled_);
+    ImGui::Checkbox("film grain", &lensGrainEnabled_);
     ImGui::Separator();
 
     // Live performance readout.
     {
-        const float dispMs = fps_ > 1.f ? 1000.f / fps_ : lastTimings_.frameMs;
+        const float dispMs =
+            fps_ > 1.f ? 1000.f / fps_ : static_cast<float>(lastTimings_.frameMs);
         ImGui::Text("display %6.2f ms  (%5.1f FPS)", static_cast<double>(dispMs),
                     static_cast<double>(fps_));
     }
@@ -4386,12 +6047,70 @@ void GuiApp::drawCameraPose() {
     ImGui::End();
 }
 
+bool GuiApp::passToggleValue(rg::PassToggle t) const {
+    switch (t) {
+    case rg::PassToggle::Shadows: return shadowsEnabled_;
+    case rg::PassToggle::ContactShadows: return contactShadowsEnabled_;
+    case rg::PassToggle::Ssr: return ssrEnabled_;
+    case rg::PassToggle::VolFog: return volFogEnabled_;
+    case rg::PassToggle::Occlusion: return occlusionEnabled_;
+    case rg::PassToggle::Bloom: return bloomEnabled_;
+    case rg::PassToggle::MotionBlur: return motionBlurEnabled_;
+    case rg::PassToggle::Dof: return dofEnabled_;
+    case rg::PassToggle::AutoExposure: return autoExposureEnabled_;
+    case rg::PassToggle::LensCa: return lensCaEnabled_;
+    case rg::PassToggle::LensVignette: return lensVignetteEnabled_;
+    case rg::PassToggle::LensGrain: return lensGrainEnabled_;
+    case rg::PassToggle::None: break;
+    }
+    return true;
+}
+
+void GuiApp::applyPassToggle(rg::PassToggle t, bool value) {
+    switch (t) {
+    case rg::PassToggle::Shadows: shadowsEnabled_ = value; break;
+    case rg::PassToggle::ContactShadows: contactShadowsEnabled_ = value; break;
+    case rg::PassToggle::Ssr: ssrEnabled_ = value; break;
+    case rg::PassToggle::VolFog:
+        volFogEnabled_ = value;
+        // Same side effect as the panel checkbox: restart the temporal
+        // history so stale frames do not bleed in.
+        fogFramesGb_ = fogFramesGt_ = fogFramesSsaa_ = 0;
+        fogAccumFrameGb_ = fogAccumFrameGt_ = fogAccumFrameSsaa_ = ~0u;
+        break;
+    case rg::PassToggle::Occlusion: occlusionEnabled_ = value; break;
+    case rg::PassToggle::Bloom: bloomEnabled_ = value; break;
+    case rg::PassToggle::MotionBlur: motionBlurEnabled_ = value; break;
+    case rg::PassToggle::Dof: dofEnabled_ = value; break;
+    case rg::PassToggle::AutoExposure:
+        autoExposureEnabled_ = value;
+        // Same side effect as the panel checkbox: snap the solver when
+        // re-enabling, keep the current look when switching to manual.
+        if (value)
+            autoExposureJustEnabled_ = true;
+        else
+            exposure_ = lrExposure_.value;
+        break;
+    case rg::PassToggle::LensCa: lensCaEnabled_ = value; break;
+    case rg::PassToggle::LensVignette: lensVignetteEnabled_ = value; break;
+    case rg::PassToggle::LensGrain: lensGrainEnabled_ = value; break;
+    case rg::PassToggle::None: break;
+    }
+}
+
 void GuiApp::drawUi() {
     const ImGuiIO& io = ImGui::GetIO();
 
     // F1 toggles the side panel (same as View > Hide side panel).
     if (ImGui::IsKeyPressed(ImGuiKey_F1, false) && !io.WantTextInput)
         panelCollapsed_ = !panelCollapsed_;
+
+    // Independent floating profiler panel (default closed, anchored top-right
+    // on first open); drawn in both panel states.
+    profilerWindow_.draw(profiler_, cpuRecordMs_);
+    // Render Graph editor window (default closed); same both-states rule.
+    graphWindow_.draw(profiler_, [this](rg::PassToggle t) { return passToggleValue(t); },
+                      [this](rg::PassToggle t, bool v) { applyPassToggle(t, v); });
 
     if (panelCollapsed_) {
         // Slim strip with just an expand button; the render columns span the
@@ -4426,9 +6145,26 @@ void GuiApp::drawUi() {
     if (ImGui::SmallButton("<<")) panelCollapsed_ = true;
     ImGui::SameLine();
     ImGui::TextDisabled("hide panel (F1)");
+    ImGui::SameLine();
+    ImGui::Checkbox("gpu profiler", &profilerWindow_.open);
+    ImGui::SameLine();
+    ImGui::Checkbox("render graph", &graphWindow_.open);
 
     // Global reference selector, shared by all three tabs.
     drawReferenceSection();
+
+    // The tab area lives in a child window so a long (scrollable) tab can
+    // never push the footer — status line + Exit — past the bottom edge.
+    // The footer height is measured from the wrapped status text so long
+    // paths cannot push the Exit button out of the clickable area.
+    const float wrapW =
+        ImGui::GetWindowWidth() - 2.f * ImGui::GetStyle().WindowPadding.x;
+    const ImVec2 statusSize =
+        ImGui::CalcTextSize(statusLine_.c_str(), nullptr, false, wrapW);
+    const float footerH = ImGui::GetFrameHeightWithSpacing() + // Exit button
+                          ImGui::GetStyle().ItemSpacing.y * 2.f +
+                          std::max(statusSize.y, ImGui::GetTextLineHeight());
+    ImGui::BeginChild("##tabarea", ImVec2(0.f, -footerH));
 
     int newTab = currentTab_;
     if (ImGui::BeginTabBar("modes")) {
@@ -4457,6 +6193,7 @@ void GuiApp::drawUi() {
         }
         ImGui::EndTabBar();
     }
+    ImGui::EndChild();
 
     // Tab switches between Viewer/Compare rebuild the render stack with the
     // target tab's stored settings.
@@ -4469,6 +6206,9 @@ void GuiApp::drawUi() {
 
     ImGui::Separator();
     ImGui::TextWrapped("%s", statusLine_.c_str());
+    // Exit through the normal window-close path: the next Window::poll()
+    // returns false and run()/shutdown() destroy the Vulkan stack as usual.
+    if (ImGui::Button("Exit", ImVec2(-1.f, 0.f))) window_.requestClose();
     ImGui::End();
 
     drawCameraPose();

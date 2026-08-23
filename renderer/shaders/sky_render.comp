@@ -1,0 +1,123 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// Sky render into the environment cubemap (mip 0, one invocation per texel
+// per face) from the precomputed transmittance + multi-scatter LUTs.  This is
+// the "sky view" step of Hillaire 2020 rendered straight into the IBL chain's
+// env cube (replacing the static equirect -> cube conversion): single
+// scattering + multi-scatter LUT + Lambertian ground bounce + sun disk.
+// Deterministic: fixed 32-step march, analytic sun disk, no random sampling.
+
+#include "atmosphere.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D transmittanceLut;
+layout(set = 0, binding = 1) uniform sampler2D multiScatterLut;
+layout(set = 0, binding = 2, rgba16f) uniform writeonly image2DArray dstCube;
+
+layout(push_constant) uniform Push {
+    vec4 sunDirAndIlluminance; // xyz = unit direction towards the sun, w = sun illuminance
+};
+
+const int SAMPLE_COUNT = 32;
+const float VIEW_HEIGHT = 0.2; // km above ground for the IBL capture
+
+// Sun disk: 0.505 deg diameter (reference GetSunLuminance), luminance kept
+// well below the fp16 ceiling (65504) so the cube mip chain stays finite;
+// bloom picks the disk up from the HDR target downstream.  Scales with the
+// sun illuminance (the reference value pairs with kSunIlluminance = 30).
+const float SUN_DISK_HALF_ANGLE = 0.5 * 0.505 * ATM_PI / 180.0;
+const float SUN_DISK_LUMINANCE = 30000.0;
+const float SUN_DISK_REF_ILLUMINANCE = 30.0;
+const float FP16_SAFE_MAX = 60000.0;
+
+// Vulkan cube-face direction, uv in [-1,1] (same layout as ibl_equirect).
+vec3 cubeDir(uint face, vec2 uv) {
+    switch (face) {
+    case 0u: return vec3(1.0, -uv.y, -uv.x);   // +X
+    case 1u: return vec3(-1.0, -uv.y, uv.x);   // -X
+    case 2u: return vec3(uv.x, 1.0, uv.y);     // +Y
+    case 3u: return vec3(uv.x, -1.0, -uv.y);   // -Y
+    case 4u: return vec3(uv.x, -uv.y, 1.0);    // +Z
+    default: return vec3(-uv.x, -uv.y, -1.0);  // -Z
+    }
+}
+
+void main() {
+    ivec3 size = imageSize(dstCube);
+    ivec3 id = ivec3(gl_GlobalInvocationID);
+    if (id.x >= size.x || id.y >= size.y) return;
+
+    vec3 sunDir = sunDirAndIlluminance.xyz;
+    float sunIlluminance = sunDirAndIlluminance.w;
+
+    vec2 uv = (vec2(id.xy) + 0.5) / vec2(size.xy) * 2.0 - 1.0;
+    vec3 dir = normalize(cubeDir(uint(id.z), uv));
+    // World Y-up: capture point just above the ground, up = +Y.
+    vec3 pos = vec3(0.0, ATM_BOTTOM_RADIUS + VIEW_HEIGHT, 0.0);
+
+    float tGround = atmRaySphereNearest(pos, dir, ATM_BOTTOM_RADIUS);
+    float tTop = atmRaySphereNearest(pos, dir, ATM_TOP_RADIUS);
+    float tMax = tGround >= 0.0 ? min(tGround, tTop) : tTop;
+
+    float cosTheta = dot(dir, sunDir);
+    float phaseRay = atmRayleighPhase(cosTheta);
+    float phaseMie = atmMiePhase(cosTheta);
+
+    // Single + multi scattering march (reference IntegrateScatteredLuminance,
+    // fixed sample count, MieRayPhase = true, MULTISCATAPPROX enabled).
+    vec3 lum = vec3(0.0);
+    vec3 throughput = vec3(1.0);
+    float tPrev = 0.0;
+    for (int s = 0; s < SAMPLE_COUNT; ++s) {
+        float t = tMax * (float(s) + 0.3) / float(SAMPLE_COUNT);
+        float dt = t - tPrev;
+        tPrev = t;
+        vec3 p = pos + t * dir;
+
+        vec3 sigmaSRay, sigmaSMie, sigmaT;
+        atmSampleMedium(p, sigmaSRay, sigmaSMie, sigmaT);
+        vec3 sampleTransmittance = exp(-sigmaT * dt);
+
+        float shadow = atmEarthShadow(p, sunDir);
+        vec3 transmittanceToSun = atmTransmittanceToSun(transmittanceLut, p, sunDir);
+        vec3 multiScattered = atmMultiScattering(multiScatterLut, p, sunDir);
+
+        vec3 phaseTimesScattering = sigmaSMie * phaseMie + sigmaSRay * phaseRay;
+        vec3 S = sunIlluminance *
+                 (shadow * transmittanceToSun * phaseTimesScattering +
+                  multiScattered * (sigmaSRay + sigmaSMie));
+        vec3 sInt = (S - S * sampleTransmittance) / sigmaT;
+        lum += throughput * sInt;
+        throughput *= sampleTransmittance;
+    }
+
+    if (tGround >= 0.0) {
+        // Ground hemisphere: sunlit Lambertian ground seen through the
+        // atmosphere (feeds the lower half of the IBL maps).
+        vec3 p = pos + tGround * dir;
+        vec3 up = p / length(p);
+        float ndl = clamp(dot(up, sunDir), 0.0, 1.0);
+        vec3 transmittanceToSun = atmTransmittanceToSun(transmittanceLut, p, sunDir);
+        lum += sunIlluminance * transmittanceToSun * throughput * ndl *
+               ATM_GROUND_ALBEDO / ATM_PI;
+    } else {
+        // Sun disk: constant luminance attenuated by the view-ray
+        // transmittance (reddens and dims towards the horizon), with a
+        // ~texel-wide soft edge against aliasing.
+        float cosA = dot(dir, sunDir);
+        float cosHalf = cos(SUN_DISK_HALF_ANGLE);
+        float cosOuter = cos(SUN_DISK_HALF_ANGLE * 1.3);
+        float disk = smoothstep(cosOuter, cosHalf, cosA);
+        if (disk > 0.0) {
+            float mu = dot(dir, normalize(pos));
+            vec3 tView = textureLod(transmittanceLut,
+                                    atmLutTransmittanceParamsToUv(length(pos), mu), 0.0)
+                             .rgb;
+            lum += disk * SUN_DISK_LUMINANCE *
+                   (sunIlluminance / SUN_DISK_REF_ILLUMINANCE) * tView;
+        }
+    }
+
+    imageStore(dstCube, id, vec4(min(lum, vec3(FP16_SAFE_MAX)), 1.0));
+}

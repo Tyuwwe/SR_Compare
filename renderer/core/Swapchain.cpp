@@ -3,15 +3,41 @@
 #include "renderer/core/VkUtil.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <vector>
 
 namespace sr {
 
 namespace {
 
-VkSurfaceFormatKHR chooseFormat(const std::vector<VkSurfaceFormatKHR>& formats) {
-    if (formats.size() == 1 && formats[0].format == VK_FORMAT_UNDEFINED)
+// HDR10 (A2B10G10R10 + ST2084 PQ, ITU-R BT.2100) first, then scRGB (RGBA16F
+// + extended linear sRGB, 1.0 = 80 nits), then the existing SDR BGRA8.  The
+// HDR encodes live in grading.glsl (present.frag).
+VkSurfaceFormatKHR chooseFormat(const std::vector<VkSurfaceFormatKHR>& formats, bool preferHdr,
+                                HdrMode& mode) {
+    if (formats.size() == 1 && formats[0].format == VK_FORMAT_UNDEFINED) {
+        mode = HdrMode::Sdr;
         return {VK_FORMAT_B8G8R8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR};
+    }
+    if (preferHdr) {
+        for (const auto& f : formats) {
+            if (f.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 &&
+                f.colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT) {
+                mode = HdrMode::Hdr10;
+                return f;
+            }
+        }
+        for (const auto& f : formats) {
+            if (f.format == VK_FORMAT_R16G16B16A16_SFLOAT &&
+                f.colorSpace == VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT) {
+                mode = HdrMode::ScRgb;
+                return f;
+            }
+        }
+        std::fprintf(stderr, "swapchain: HDR requested but the surface exposes neither HDR10 nor"
+                             " scRGB; falling back to SDR\n");
+    }
+    mode = HdrMode::Sdr;
     for (const auto& f : formats) {
         if (f.format == VK_FORMAT_B8G8R8A8_UNORM && f.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
             return f;
@@ -36,7 +62,7 @@ VkPresentModeKHR choosePresentMode(const std::vector<VkPresentModeKHR>& modes, b
 } // namespace
 
 bool Swapchain::create(const VulkanContext& ctx, uint32_t width, uint32_t height, bool vsync,
-                       bool allowMailbox) {
+                       bool allowMailbox, bool preferHdr) {
     VkSurfaceCapabilitiesKHR caps;
     if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(ctx.physicalDevice, ctx.surface, &caps) != VK_SUCCESS)
         return false;
@@ -51,8 +77,9 @@ bool Swapchain::create(const VulkanContext& ctx, uint32_t width, uint32_t height
     std::vector<VkPresentModeKHR> modes(modeCount);
     vkGetPhysicalDeviceSurfacePresentModesKHR(ctx.physicalDevice, ctx.surface, &modeCount, modes.data());
 
-    const VkSurfaceFormatKHR format = chooseFormat(formats);
+    const VkSurfaceFormatKHR format = chooseFormat(formats, preferHdr, hdrMode_);
     format_ = format.format;
+    colorSpace_ = format.colorSpace;
 
     extent_.width = std::clamp(width, caps.minImageExtent.width, caps.maxImageExtent.width);
     extent_.height = std::clamp(height, caps.minImageExtent.height, caps.maxImageExtent.height);
@@ -107,6 +134,24 @@ void Swapchain::destroy(const VulkanContext& ctx) {
     images_.clear();
     if (swapchain_) vkDestroySwapchainKHR(ctx.device, swapchain_, nullptr);
     swapchain_ = VK_NULL_HANDLE;
+}
+
+void Swapchain::queryHdrSupport(const VulkanContext& ctx, bool& hdr10, bool& scRgb) {
+    hdr10 = false;
+    scRgb = false;
+    uint32_t formatCount = 0;
+    vkGetPhysicalDeviceSurfaceFormatsKHR(ctx.physicalDevice, ctx.surface, &formatCount, nullptr);
+    std::vector<VkSurfaceFormatKHR> formats(formatCount);
+    vkGetPhysicalDeviceSurfaceFormatsKHR(ctx.physicalDevice, ctx.surface, &formatCount,
+                                         formats.data());
+    for (const auto& f : formats) {
+        if (f.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 &&
+            f.colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT)
+            hdr10 = true;
+        if (f.format == VK_FORMAT_R16G16B16A16_SFLOAT &&
+            f.colorSpace == VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT)
+            scRgb = true;
+    }
 }
 
 VkResult Swapchain::acquireNext(const VulkanContext& ctx, VkSemaphore signal, uint32_t& imageIndex) {

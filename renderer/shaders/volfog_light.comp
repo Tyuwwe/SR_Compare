@@ -1,0 +1,200 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "volfog.glsl"
+// Per-froxel light accumulation (Frostbite 2015; UE4.16 Volumetric Fog):
+// converts the injected media density into inscattered radiance per metre
+// (rgb) + extinction sigma_t (a) for the ray-march pass.
+//
+// Light sources:
+//  - the CSM sun (directional, LightingUBO slot viewForward.w), shadowed by
+//    the shared cascade maps -> volumetric god rays;
+//  - every point/spot light of this froxel's cluster, reusing the Phase 4a
+//    cluster assignment SSBOs (froxel -> cluster mapping below), with the
+//    spot shadow atlas where the light has a tile;
+//  - a flat isotropic ambient term (preset scalar x IBL intensity).
+// Single scattering only; Schlick phase function (volfog.glsl).
+//
+// Shadow sampling: ONE hardware bilinear comparison tap (vs the 16-tap PCF
+// of lighting.frag).  Fog is a low-frequency signal sampled at 12px froxels
+// and EMA-filtered over ~8 frames, so the bilinear footprint already
+// out-resolves the volume; the saved bandwidth pays for the light loop.
+//
+// bindings: 0 = LightingUBO (identical layout to lighting.frag — keep in
+//               sync; only the light/shadow/cluster fields are read)
+//           1 = cluster lights SSBO (all point/spot lights)
+//           2 = cluster grid SSBO (per-cluster light index lists)
+//           3 = CSM shadow map array (comparison sampler)
+//           4 = spot shadow atlas (comparison sampler)
+//           5 = inject volume (sampler3D, same grid: texelFetch)
+//           6 = lit volume out (rgba16f storage image3D)
+
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+
+// GPU mirror of scene::Light; must match LightGPU in DeferredCore.h.
+struct LightGPU {
+    vec4 posOrDir; // xyz = position (point/spot) / direction-to-light (directional), w = type
+    vec4 color;    // rgb + w = intensity (PI-scaled on the CPU)
+    vec4 params;   // x = range (0 = infinite), y = castShadow,
+                   // z = shadowIndex (spot atlas tile, -1 = unshadowed), w = spot cos(inner)
+    vec4 spotDir;  // xyz = spot cone direction (unit, world), w = spot cos(outer)
+};
+
+// Identical std140 layout to the LightingUBO in lighting.frag.
+layout(set = 0, binding = 0) uniform LightingUBO {
+    mat4 invViewProj;
+    vec4 cameraPos;
+    LightGPU lights[16]; // must match kMaxLights in DeferredCore.h
+    vec4 lightCounts;
+    vec4 ambient;
+    vec4 iblParams;     // x = env intensity
+    mat4 cascadeVp[4];
+    vec4 cascadeSplits;
+    vec4 shadowParams;  // z = shadows enabled
+    vec4 viewForward;   // xyz = camera forward (world); w = shadowed sun light index (-1 = none)
+    vec4 clusterDepth;  // x = near, y = far (exponential cluster slicing)
+    mat4 shadowTileVp[16];
+    vec4 shadowAtlasParams; // x = tiles rendered this frame, y = 1/atlasSize
+    mat4 viewProj;
+} u;
+
+layout(std430, set = 0, binding = 1) readonly buffer ClusterLightsSSBO {
+    uvec4 header;    // x = packed point/spot light count
+    LightGPU lights[];
+} clusterLights;
+layout(std430, set = 0, binding = 2) readonly buffer ClusterGridSSBO {
+    uvec4 gridHeader; // gridX, gridY, gridZ, maxPerCluster
+    uint data[];      // counts[N] then indices[N * maxPerCluster]
+} clusterGrid;
+
+layout(set = 0, binding = 3) uniform sampler2DArrayShadow shadowMap;
+layout(set = 0, binding = 4) uniform sampler2DShadow shadowAtlas;
+layout(set = 0, binding = 5) uniform sampler3D injectVolume;
+layout(set = 0, binding = 6, rgba16f) uniform writeonly image3D outLit;
+
+// Must match VolFogLightPush in DeferredCore.h.
+layout(push_constant) uniform Push {
+    mat4 invView;    // view inverse (un-jittered, both paths)
+    vec4 projParams; // x = proj[0][0], y = proj[1][1], z = near, w = fog far
+    vec4 fogA;       // x = anisotropy g, y = ambient scale, zw unused
+    uvec4 grid;      // dimX, dimY, dimZ, unused
+    uvec4 misc;      // screenW, screenH, cluster tile size, unused
+} pc;
+
+// Receiver-side epsilon, mirrors lighting.frag.
+const float kShadowDepthEpsilon = 0.0002;
+
+// CSM cascade selection + single bilinear comparison tap (see the header
+// comment for the no-PCF rationale).  No per-frame cascade dither: the
+// volume's own temporal filter absorbs the transition.
+float sunShadowVol(vec3 worldPos, float viewDepth) {
+    int c = 3;
+    for (int i = 0; i < 4; ++i)
+        if (viewDepth <= u.cascadeSplits[i]) { c = i; break; }
+    const vec4 sc = u.cascadeVp[c] * vec4(worldPos, 1.0);
+    const vec3 p = sc.xyz / sc.w;
+    const vec2 uv = p.xy * 0.5 + 0.5; // y-flipped NDC -> UV (same as lighting.frag)
+    return texture(shadowMap, vec4(uv, float(c), p.z - kShadowDepthEpsilon));
+}
+
+// Spot atlas tile lookup (tile-local UV clamped with the same 2-texel inset
+// as lighting.frag; single bilinear comparison tap).
+float spotShadowVol(int tile, vec3 worldPos) {
+    const vec4 sc = u.shadowTileVp[tile] * vec4(worldPos, 1.0);
+    const vec3 p = sc.xyz / sc.w;
+    if (p.z <= 0.0 || p.z >= 1.0) return 1.0;
+    vec2 ndc = p.xy * 0.5 + 0.5;
+    if (any(lessThan(ndc, vec2(0.0))) || any(greaterThan(ndc, vec2(1.0)))) return 1.0;
+    const float inset = 2.0 / 1024.0;
+    ndc = clamp(ndc, vec2(inset), vec2(1.0 - inset));
+    const vec2 tileMin = vec2(float(tile % 4), float(tile / 4)) * 0.25;
+    const vec2 uv = tileMin + ndc * 0.25;
+    return texture(shadowAtlas, vec3(uv, p.z - kShadowDepthEpsilon));
+}
+
+void main() {
+    const uvec3 c = gl_GlobalInvocationID;
+    if (any(greaterThanEqual(c, pc.grid.xyz))) return;
+
+    const vec4 media = texelFetch(injectVolume, ivec3(c), 0);
+    const float density = media.a; // extinction sigma_t (1/m)
+    const vec3 albedo = media.rgb; // scattering albedo
+
+    const vec3 worldPos = froxelWorldPos(c, vec3(pc.grid.xyz), pc.projParams, pc.invView);
+    const vec3 viewVec = worldPos - u.cameraPos.xyz;
+    const float viewDepth = dot(viewVec, u.viewForward.xyz);
+    const vec3 viewDir = viewVec / max(length(viewVec), 1e-5);
+    const float g = pc.fogA.x;
+
+    // Flat isotropic ambient: preset scalar x IBL intensity (no phase term —
+    // the integral of a constant radiance over the sphere is the radiance).
+    vec3 lightSum = vec3(pc.fogA.y * u.iblParams.x);
+
+    // --- CSM sun (produces the god rays through the shadow maps) -----------
+    const int sunIndex = int(floor(u.viewForward.w + 0.5));
+    if (sunIndex >= 0 && sunIndex < 16) {
+        const LightGPU sun = u.lights[sunIndex];
+        if (sun.posOrDir.w < 0.5) { // directional
+            float shadow = 1.0;
+            if (u.shadowParams.z > 0.5) shadow = sunShadowVol(worldPos, viewDepth);
+            const float ph = volFogPhase(g, dot(viewDir, sun.posOrDir.xyz));
+            lightSum += sun.color.rgb * sun.color.w * (shadow * ph);
+        }
+    }
+
+    // --- Clustered point/spot lights (Phase 4a data reuse) ------------------
+    // Froxel -> cluster mapping: the cluster covering the froxel CENTRE in
+    // screen space plus the cluster slice of the froxel's centre depth.  The
+    // cluster assignment is conservative per 64px tile / 24-slice AABB; a
+    // small light touching a froxel but not its centre cluster can be missed
+    // (accepted: the misses are edge texels of a 12px/64-slice volume, and
+    // the temporal filter + ray integration smear them below visibility).
+    {
+        const uvec3 gridDim = clusterGrid.gridHeader.xyz;
+        const uint maxPerCluster = clusterGrid.gridHeader.w;
+        const uint clusterCount = gridDim.x * gridDim.y * gridDim.z;
+        // Froxel centre in pixels (froxel grid is screen-aligned).
+        const vec2 centrePx = (vec2(c.xy) + 0.5) / vec2(pc.grid.xy) * vec2(pc.misc.xy);
+        const uvec2 tile = min(uvec2(centrePx) / pc.misc.z, gridDim.xy - 1);
+        const float nearZ = u.clusterDepth.x;
+        const float sliceF = log(max(viewDepth, nearZ) / nearZ) *
+                             float(gridDim.z) / log(u.clusterDepth.y / nearZ);
+        const uint slice = min(uint(max(sliceF, 0.0)), gridDim.z - 1);
+        const uint clusterIdx = tile.x + tile.y * gridDim.x + slice * gridDim.x * gridDim.y;
+        const uint count = clusterGrid.data[clusterIdx];
+        const uint base = clusterCount + clusterIdx * maxPerCluster;
+        for (uint j = 0; j < count; ++j) {
+            const LightGPU l = clusterLights.lights[clusterGrid.data[base + j]];
+            // Same attenuation model as lighting.frag's shadeLight:
+            // inverse-square + Frostbite range window + spot cone ramp.
+            const vec3 toLight = l.posOrDir.xyz - worldPos;
+            const float dist = length(toLight);
+            const vec3 L = toLight / max(dist, 1e-5);
+            const float range = l.params.x;
+            float atten = 1.0 / max(dist * dist, 1e-4);
+            if (range > 0.0) {
+                const float w = clamp(1.0 - pow(dist / range, 4.0), 0.0, 1.0);
+                atten *= w * w;
+            }
+            if (l.posOrDir.w > 1.5) { // spot cone
+                const float cosTheta = dot(-L, l.spotDir.xyz);
+                const float cone = clamp((cosTheta - l.spotDir.w) /
+                                             max(l.params.w - l.spotDir.w, 1e-5),
+                                         0.0, 1.0);
+                atten *= cone * cone;
+            }
+            if (atten <= 0.0) continue;
+            float shadow = 1.0;
+            const int tile2 = int(floor(l.params.z + 0.5));
+            if (u.shadowParams.z > 0.5 && tile2 >= 0 &&
+                tile2 < int(floor(u.shadowAtlasParams.x + 0.5)))
+                shadow = spotShadowVol(tile2, worldPos);
+            const float ph = volFogPhase(g, dot(viewDir, L));
+            lightSum += l.color.rgb * l.color.w * (atten * shadow * ph);
+        }
+    }
+
+    // Single scattering: inscatter per metre = sigma_s * sum(L_in * phase),
+    // with sigma_s = albedo * sigma_t (absorption folds into sigma_t).
+    const vec3 inscatter = (density * albedo) * lightSum;
+    imageStore(outLit, ivec3(c), vec4(inscatter, density));
+}

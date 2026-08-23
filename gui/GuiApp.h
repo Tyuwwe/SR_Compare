@@ -24,7 +24,7 @@
 //
 // Settings that change resolution/scale/scene/algorithm set/env map require
 // an "Apply" rebuild: the whole render stack is destroyed and recreated (the
-// Win32 window, Vulkan device and ImGui backend persist).  Apply is
+// SDL window, Vulkan device and ImGui backend persist).  Apply is
 // asynchronous: a worker thread loads the new scene and initializes the
 // upscalers while the old stack keeps rendering under a progress overlay, and
 // the new stack is swapped in at a device-idle safe point (see the
@@ -32,6 +32,11 @@
 // is synchronous.
 // ============================================================================
 #include "gui/BenchRunner.h"
+#include "gui/GpuProfilerWindow.h"
+#include "gui/RenderGraphEditor.h"
+#include "renderer/ColorGrading.h"
+#include "renderer/core/EngineConfig.h"
+#include "renderer/core/GpuProfiler.h"
 #include "renderer/core/Swapchain.h"
 #include "renderer/core/TimestampQuery.h"
 #include "renderer/core/VulkanContext.h"
@@ -73,8 +78,12 @@ struct GuiOptions {
     std::string screenshotPath;
     float compareZoom = 0.f;   // > 0: preset compare-tab zoom (automation)
     bool compareGtSsaa = false; // preset the compare-tab GT SSAA checkbox
-    std::string envMapPath;    // empty = kDefaultEnvMapPath
+    std::string envMapPath;    // empty = procedural sky atmosphere (default)
     float exposure = 0.f;      // > 0 overrides the scene lighting preset
+    // engine.toml contents (loaded by main before init; empty optionals when
+    // absent) + the explicit-CLI mask for precedence — see EngineConfig.h.
+    EngineConfig engineCfg;
+    uint64_t engineCfgCli = cli::kNone;
 };
 
 class GuiApp {
@@ -98,7 +107,7 @@ private:
 
     struct ImageResource {
         VkImage image = VK_NULL_HANDLE;
-        VkDeviceMemory memory = VK_NULL_HANDLE;
+        VmaAllocation memory = VK_NULL_HANDLE;
         VkImageView view = VK_NULL_HANDLE;
         VkFormat format = VK_FORMAT_UNDEFINED;
         uint32_t width = 0;
@@ -111,22 +120,22 @@ private:
         VkFence fence = VK_NULL_HANDLE;
         VkSemaphore imageAvailable = VK_NULL_HANDLE;
         VkBuffer uboGb = VK_NULL_HANDLE; // jittered scene UBO (GBuffer pass)
-        VkDeviceMemory uboGbMemory = VK_NULL_HANDLE;
+        VmaAllocation uboGbMemory = VK_NULL_HANDLE;
         void* uboGbMapped = nullptr;
         VkBuffer uboGbSpatial = VK_NULL_HANDLE; // unjittered LR scene UBO (spatial plugins)
-        VkDeviceMemory uboGbSpatialMemory = VK_NULL_HANDLE;
+        VmaAllocation uboGbSpatialMemory = VK_NULL_HANDLE;
         void* uboGbSpatialMapped = nullptr;
         VkBuffer uboGt = VK_NULL_HANDLE; // un-jittered scene UBO (GT pass)
-        VkDeviceMemory uboGtMemory = VK_NULL_HANDLE;
+        VmaAllocation uboGtMemory = VK_NULL_HANDLE;
         void* uboGtMapped = nullptr;
         VkBuffer lightingUboGb = VK_NULL_HANDLE; // lighting UBO (jittered invViewProj)
-        VkDeviceMemory lightingUboGbMemory = VK_NULL_HANDLE;
+        VmaAllocation lightingUboGbMemory = VK_NULL_HANDLE;
         void* lightingUboGbMapped = nullptr;
         VkBuffer lightingUboGbSpatial = VK_NULL_HANDLE; // lighting UBO (unjittered LR)
-        VkDeviceMemory lightingUboGbSpatialMemory = VK_NULL_HANDLE;
+        VmaAllocation lightingUboGbSpatialMemory = VK_NULL_HANDLE;
         void* lightingUboGbSpatialMapped = nullptr;
         VkBuffer lightingUboGt = VK_NULL_HANDLE; // lighting UBO (un-jittered invViewProj)
-        VkDeviceMemory lightingUboGtMemory = VK_NULL_HANDLE;
+        VmaAllocation lightingUboGtMemory = VK_NULL_HANDLE;
         void* lightingUboGtMapped = nullptr;
         VkDescriptorSet sceneSetGb = VK_NULL_HANDLE;
         VkDescriptorSet sceneSetGbSpatial = VK_NULL_HANDLE;
@@ -140,6 +149,11 @@ private:
         VkDescriptorSet transparentSetGbSpatial = VK_NULL_HANDLE;
         VkDescriptorSet transparentSetGt = VK_NULL_HANDLE;
         VkDescriptorSet transparentSetSsaa = VK_NULL_HANDLE; // gtSsaa only
+        // Opaque-SSR compute sets (bind the same per-path lighting UBOs).
+        VkDescriptorSet ssrSetGb = VK_NULL_HANDLE;
+        VkDescriptorSet ssrSetGbSpatial = VK_NULL_HANDLE;
+        VkDescriptorSet ssrSetGt = VK_NULL_HANDLE;
+        VkDescriptorSet ssrSetSsaa = VK_NULL_HANDLE; // gtSsaa only
     };
 
     struct AlgoColumn {
@@ -155,7 +169,7 @@ private:
         bool fgHistory = false;
         bool fgReady = false;
         VkBuffer blocksBuffer = VK_NULL_HANDLE;
-        VkDeviceMemory blocksMemory = VK_NULL_HANDLE;
+        VmaAllocation blocksMemory = VK_NULL_HANDLE;
         VkDescriptorSet metricSet = VK_NULL_HANDLE;
         VkDescriptorSet composeSet = VK_NULL_HANDLE;
         float psnr = 0.f;
@@ -222,6 +236,9 @@ private:
     // --- core (window/context/swapchain/imgui), created once ----------------
     bool initImGui();
     void shutdownImGui();
+    // Vulkan backend half of initImGui; re-run by setHdrEnabled after the
+    // swapchain format changes (Phase 6c).
+    bool initImGuiVulkanBackend();
     bool createUiSync();
     void destroyUiSync();
     void recordUiOnlyFrame(uint32_t slot, uint32_t swapchainIndex);
@@ -265,6 +282,21 @@ private:
     bool loadShader(const char* name, VkShaderModule& out);
     bool createShaders();
     bool createDescriptors();
+    // Auto-exposure channels + sets (needs the descriptor pool; called from
+    // createDescriptors once it exists).
+    bool createAutoExposureResources();
+    // Phase 7a cull resources (instance SSBO + per-path cull channels; needs
+    // the pool, the depth pyramids and the allocated scene sets).
+    bool createCullResources();
+    void destroyCullResources();
+    // Per-path display exposure: harvested auto value, or the manual slider
+    // value when auto exposure is off.
+    float lrExposureNow() const {
+        return autoExposureEnabled_ ? lrExposure_.value : exposure_;
+    }
+    float gtExposureNow() const {
+        return autoExposureEnabled_ ? gtExposure_.value : exposure_;
+    }
     bool createPipelines();
     bool createSyncResources();
     bool createScreenshotStaging();
@@ -274,14 +306,18 @@ private:
     void updateSceneUBO(void* mapped, bool jitter, uint32_t renderW, uint32_t renderH,
                         const Mat4& view, const Mat4& proj, const Mat4& projJittered,
                         const Mat4& prevViewProj);
-    void updateLightingUBO(void* mapped, const Mat4& invViewProj,
+    void updateLightingUBO(void* mapped, const Mat4& viewProj,
                            const std::vector<Light>& lights, const ShadowFrame* shadow);
+    void updateClusterLights(uint32_t frameIndex, const std::vector<Light>& lights);
     // The Viewer-tab lighting section's override light list (sun direction/
     // intensity from the UI; scene_.lights untouched).  Also the source of
     // the CSM shadowed-sun index, so it is built once per frame in
     // recordFrame and shared by both lighting UBOs.
     std::vector<Light> buildLightOverride() const;
     void applyLightingPreset(const LightingPreset& p);
+    // Re-renders the sky-atmosphere env + IBL maps from the current sun
+    // sliders (no-op in static-env mode or while a load is in flight).
+    void updateSkyFromUiSun();
     void updateCamera(float dt);
     void recordFrame(uint32_t frameIndex, uint32_t swapchainIndex);
     // Compose columns into composeImage_ and copy to the swapchain with ImGui.
@@ -292,6 +328,12 @@ private:
     bool guiAllowMailbox() const;
     bool recreateGuiSwapchain();
     void ensureGuiSwapchainMode();
+    // HDR checkbox handler (Phase 6c): re-creates the swapchain, copy pipeline
+    // and ImGui backend for the new surface format (all at device idle).
+    void setHdrEnabled(bool enabled);
+    // Swapchain-format-dependent fullscreen copy pipeline (created by
+    // createPipelines, re-created by setHdrEnabled).
+    bool createCopyPipeline();
     void waitUntil(std::chrono::steady_clock::time_point t);
     void noteDisplayPresents(int nPres, std::chrono::steady_clock::time_point frameStart);
     void captureScreenshotIntoStaging(VkCommandBuffer cmd);
@@ -310,7 +352,10 @@ private:
     // frame from the file and inject it into the ImGui IO queue directly,
     // bypassing OS focus/cursor state (deterministic on attended machines).
     // Commands: "pos x y", "wheel f", "down n" / "up n" (0=left, 2=middle),
-    // "key F1" / "keyup F1", "shot path.png", "wait" (one frame gap).
+    // "key F1" / "keyup F1", "shot path.png", "graph" (toggle the Render
+    // Graph editor window), "profiler" (toggle the GPU profiler window), "pass <name> <0|1>" (toggle a runtime pass
+    // switch: shadows/contact/ssr/volfog/occlusion/bloom/mb/dof/autoexp),
+    // "fullscreen <0|1>" (borderless fullscreen), "wait" (one frame gap).
     void pumpInputFile();
     // Column layout origin: while the side panel is visible the render
     // columns start right of it; collapsed, they span the full window (the
@@ -370,6 +415,29 @@ private:
     void discardLoadResult();              // main thread: free worker products
     void drawLoadOverlay();                // progress bar + stage text
     void applyLaunchOptions();
+    // engine.toml application (renderer/core/EngineConfig.h).  applyEngineConfigHot
+    // sets only per-frame state (effects/DOF/grading/sun sliders, exposure,
+    // occlusion/lod, HDR swapchain toggle, window fullscreen) — no rebuild —
+    // and is used both for the initial defaults and for hot reloads.
+    // pollEngineConfig() stats the file once per second in run() and
+    // re-applies on modification; resolution/scale/env-map/scene/LUT changes
+    // need an Apply rebuild and are ignored (scale/env-map do land in the UI
+    // fields, so the auto-save never clobbers an external edit).
+    void applyEngineConfigHot(const EngineConfig& cfg, EngineConfigLog& log);
+    void pollEngineConfig();
+    // engine.toml auto-create/auto-save (the GUI owns the file — see
+    // EngineConfig.h).  currentEngineConfig snapshots every file key from the
+    // UI state; pollEngineConfigAutoSave diffs the canonical serialization
+    // once per frame and writes (atomic temp+replace) after ~1.5 s without
+    // further changes.  A deleted file is re-created with the hot parameters
+    // reset to defaults (resetEngineConfigDefaults) by pollEngineConfig.
+    EngineConfig currentEngineConfig() const;
+    void saveEngineConfigNow();
+    void pollEngineConfigAutoSave();
+    void resetEngineConfigDefaults();
+    // Borderless fullscreen switch (panel checkbox, toml hot path, input-file
+    // automation); forwards to Window::setFullscreen.
+    void setFullscreenEnabled(bool enabled);
     void loadCameraPathFromUi();
     void saveScreenshot(const char* path);
     void drawScreenshotBusy(); // animated in-flight indicator next to the save buttons
@@ -460,10 +528,97 @@ private:
     Vec3 sunColor_{1.f, 0.95f, 0.85f};
     bool fillEnabled_ = true;       // defaultLights() blue point fill
     float iblIntensity_ = 1.f;
-    float exposure_ = 1.f;          // display-domain ACES input multiplier
+    float exposure_ = 1.f;          // manual display exposure (ACES input multiplier);
+                                    // also the seed value for auto exposure
+    // Histogram-based auto exposure (UE4 AutoExposure style; per-frame params,
+    // no rebuild — the solver state lives in the ExposureChannels below and is
+    // re-seeded on stack rebuilds from exposure_).  CLI --exposure starts the
+    // app in manual mode.  LR and GT paths solve independently.
+    bool autoExposureEnabled_ = true;
+    float exposureMinEV_ = -8.f;    // EV clamp range (GUI sliders)
+    float exposureMaxEV_ = 8.f;
+    bool autoExposureJustEnabled_ = false; // snap the solver next frame
+    ExposureChannel lrExposure_;    // gbColor_ -> upscaler preExposure + algo columns
+    ExposureChannel gtExposure_;    // gtColor_ / gtSsaaColor_ -> GT column + metric ref
     // CSM sun shadows (Viewer-tab lighting section, per-frame, no rebuild).
     bool shadowsEnabled_ = true;
     bool shadowDebugCascades_ = false; // tint pixels per shadow cascade
+    // Screen-space contact shadows for the CSM sun (per-frame UBO flag; needs
+    // shadows on — rides the CSM sun selection).
+    bool contactShadowsEnabled_ = true;
+    // Opaque screen-space reflections (per-frame pass skip, no rebuild).
+    // Off by default — the probe/env fallback carries the specular term.
+    // CLI/engine.toml-only switch: the panel checkbox and the graph node are
+    // locked; applyPassToggle(Ssr) is reached only from applyEngineConfigHot
+    // and the SR_GUI_INPUT_FILE debug hook.
+    bool ssrEnabled_ = false;
+    // Global SSR weight scale (trace-stage confidence multiplier, 0..1).
+    float ssrStrength_ = 0.6f;
+    // Froxel volumetric fog (per-frame pass skip; params from the scene
+    // lighting preset, toggling resets the temporal history).
+    bool volFogEnabled_ = true;
+    VolFogParams fogParams_;
+    // Screen-size LOD switching + distance cull (per-frame CPU selection).
+    bool lodEnabled_ = lodEnabledByDefault();
+    // GPU Hi-Z occlusion culling (Phase 7a, per-frame pass skip; SR_OCCLUSION=0
+    // default-off, checkbox overrides interactively).  Indirect draws stay live
+    // either way — off means "all candidates visible".
+    bool occlusionEnabled_ = occlusionEnabledByDefault();
+    // Terminal lens-effects chain (Phase 6a, compose push constants; lens
+    // dirt stays viewer-only — the compose pass has no dirt binding, though
+    // the bloom pyramid it modulates is now built per path).  Strengths are
+    // the shared DeferredCore defaults (kLens*Strength).
+    bool lensCaEnabled_ = true;
+    bool lensVignetteEnabled_ = true;
+    bool lensGrainEnabled_ = true;
+    // HDR bloom (Phase 6a pyramid): per-frame pass skip like SSR, no rebuild —
+    // the per-path chains stay allocated either way.  Off by default in every
+    // mode (CLI --bloom / engine.toml [effects] bloom opt in).
+    bool bloomEnabled_ = false;
+    // Motion blur + depth of field (Phase 6b, per-frame pass skip, no temporal
+    // state — no history reset needed).  Off by default in every mode (same
+    // default policy as the viewer/compare CLI); when enabled the same
+    // algorithm + parameters run on every path so the GT column blurs
+    // identically.
+    bool motionBlurEnabled_ = false;
+    bool dofEnabled_ = false;
+    // DOF tuning (Phase 6b; sliders in the viewer tab, applied per-frame via
+    // PostFxParams — no rebuild, no temporal state).  focus 0 = auto-focus on
+    // the screen-centre texel; f-stop maps to the aperture scale as
+    // kDofAperture * (kDofDefaultFstop / fstop); max blur is the CoC radius
+    // clamp in display px at 1080p, scaled by path height.
+    float dofFocus_ = 0.f;
+    float dofFstop_ = kDofDefaultFstop;
+    float dofMaxBlur_ = kDofMaxCoC;
+    // Log-domain color grading (Phase 6c, compose push constants; identical
+    // parameters for every column — sliders in the shared controls).  The LUT
+    // is the procedural identity (no LUT file UI); the GUI is the interactive
+    // grading front end.
+    float gradeTemperatureK_ = 6500.f;
+    float gradeTint_ = 0.f;
+    float gradeContrast_ = 1.f;
+    float gradeSaturation_ = 1.f;
+    GradingLutGpu gradingLut_; // procedural identity, created once in init
+    // HDR swapchain output (Phase 6c): checkbox gated on surface support
+    // (probed once at init).  Toggling re-creates the swapchain, the copy
+    // pipeline and the ImGui backend (all bake the swapchain format).  The
+    // composite stays the SDR display-encoded image — copy.frag re-linearizes
+    // and PQ/scRGB-encodes it (SDR content in an HDR container; true scene
+    // HDR headroom is viewer-only, see present.frag).
+    bool hdrEnabled_ = false;
+    bool hdrSupportHdr10_ = false;
+    bool hdrSupportScRgb_ = false;
+    // Borderless (desktop) fullscreen ([window] fullscreen in engine.toml;
+    // hot-reloadable, no CLI flag).  The render resolution stays the
+    // configured output size; the swapchain is recreated through the normal
+    // OUT_OF_DATE path on the mode switch.
+    bool fullscreenEnabled_ = false;
+    // Windowed client size ([window] width/height in engine.toml): remembered
+    // across runs, tracked from resize events while not fullscreen and saved
+    // back by the debounced auto-save.  0 = not initialized yet (init seeds
+    // it from the toml value or the output resolution).
+    int windowedW_ = 0;
+    int windowedH_ = 0;
 
     ImageResource gbColor_;
     ImageResource gbColorSpatial_; // unjittered LR HDR copy for spatial upscalers
@@ -473,18 +628,26 @@ private:
     ImageResource gbEmissive_;
     ImageResource gbMotion_;
     ImageResource gbReactive_; // translucent coverage mask (reactive/TC input)
+    // 3x3-max dilated + motion-gated copy of gbReactive_
+    // (reactive_dilate.comp): the plateau absorbs jittered-coordinate
+    // sampling; static coverage is gated to zero so it keeps its history
+    // weight.  Fed to the upscalers.
+    ImageResource gbReactiveDilated_;
+    VkDescriptorSet reactiveDilateSet_ = VK_NULL_HANDLE;
     ImageResource gbDepth_;
     ImageResource gtColor_;
     ImageResource gtAlbedo_;
     ImageResource gtNormal_;
     ImageResource gtMaterial_;
     ImageResource gtEmissive_;
+    ImageResource gtMotion_; // GT-path motion vectors (Phase 6b MB/DOF)
     ImageResource gtDepth_;
     ImageResource gtSsaaColor_; // 2x GT render target (compare GT SSAA only)
     ImageResource gtSsaaAlbedo_;
     ImageResource gtSsaaNormal_;
     ImageResource gtSsaaMaterial_;
     ImageResource gtSsaaEmissive_;
+    ImageResource gtSsaaMotion_; // 2x GT motion RT (Phase 6b)
     ImageResource gtSsaaDepth_;
     // GTAO working target (RG16F: AO + view Z) and filtered R16F, path res.
     ImageResource gbAoRaw_;
@@ -493,9 +656,92 @@ private:
     ImageResource gtAo_;
     ImageResource gtSsaaAoRaw_; // compare GT SSAA only
     ImageResource gtSsaaAo_;
-    ImageResource gbSsrSrc_;
-    ImageResource gtSsrSrc_;
-    ImageResource gtSsaaSsrSrc_;
+    // HDR color mip chains (lit opaque color, box-filtered) for
+    // roughness-aware SSR; same GENERAL-for-life resource model as the
+    // depth pyramids.  Deliberately separate from the Phase 6a bloom pyramid
+    // (box-average reflection LOD vs thresholded extract — see DeferredCore).
+    ColorPyramid gbColorPyramid_;
+    ColorPyramid gtColorPyramid_;
+    ColorPyramid gtSsaaColorPyramid_; // compare GT SSAA only
+    // Clustered shading grids (per-path resolution, per-slot buffers).
+    ClusterGrid gbCluster_;
+    ClusterGrid gtCluster_;
+    ClusterGrid gtSsaaCluster_; // compare GT SSAA only
+    // Hi-Z depth pyramids for the SSR march (LR / GT / GT-SSAA paths); general
+    // DeferredCore resource, later reused by GTAO/contact shadows/culling.
+    DepthPyramid gbPyramid_;
+    DepthPyramid gtPyramid_;
+    DepthPyramid gtSsaaPyramid_; // compare GT SSAA only
+    // GPU occlusion culling + indirect GBuffer draws (Phase 7a): shared
+    // instance SSBO + one cull channel per path (LR / GT / GT-SSAA), each
+    // bound to that path's Hi-Z chain.  occlusionEnabled_ = opt-out; when
+    // false the cull pass is skipped (the indirect path stays live).
+    InstanceBuffer instances_;
+    CullChannel gbCull_;
+    CullChannel gtCull_;
+    CullChannel gtSsaaCull_; // compare GT SSAA only
+    std::vector<CullDrawRun> cullRuns_;
+    std::vector<GpuInstance> cullInstCpu_; // build scratch (capacity-sized)
+    std::vector<VkDrawIndexedIndirectCommand> cullCmdCpu_;
+    uint32_t cullCandidates_ = 0;
+    // GTAO view-Z depth chains (XeGTAO DepthMIPFilter) + temporal accumulation
+    // ping-pong state, one per path.  Per-path previous-frame view-projection
+    // (jittered for LR) and frame counters drive the temporal pass; a zero
+    // counter resets (bypasses) the history.
+    DepthPyramid gbPyramidAo_;
+    DepthPyramid gtPyramidAo_;
+    DepthPyramid gtSsaaPyramidAo_; // compare GT SSAA only
+    AoHistory gbAoHist_;
+    AoHistory gtAoHist_;
+    AoHistory gtSsaaAoHist_; // compare GT SSAA only
+    Mat4 prevAoViewProjGb_ = Mat4::identity();
+    Mat4 prevAoViewProjGt_ = Mat4::identity();
+    Mat4 prevAoViewProjSsaa_ = Mat4::identity();
+    uint32_t aoFramesGb_ = 0;
+    uint32_t aoFramesGt_ = 0;
+    uint32_t aoFramesSsaa_ = 0;
+    // Opaque SSR temporal state (Phase 2d), one per path: full-res trace
+    // target (rgb = composite delta, a = view |z|) + RGBA16F ping-pong
+    // history; per-path previous-frame view-projection and frame counters
+    // drive the temporal pass (zero counter = reset).  Same conventions as
+    // the GTAO temporal state above.
+    ImageResource gbSsrTrace_;
+    ImageResource gtSsrTrace_;
+    ImageResource gtSsaaSsrTrace_; // compare GT SSAA only
+    SsrHistory gbSsrHist_;
+    SsrHistory gtSsrHist_;
+    SsrHistory gtSsaaSsrHist_; // compare GT SSAA only
+    Mat4 prevSsrViewProjGb_ = Mat4::identity();
+    Mat4 prevSsrViewProjGt_ = Mat4::identity();
+    Mat4 prevSsrViewProjSsaa_ = Mat4::identity();
+    uint32_t ssrFramesGb_ = 0;
+    uint32_t ssrFramesGt_ = 0;
+    uint32_t ssrFramesSsaa_ = 0;
+    // Froxel volumetric fog volumes + temporal state (Phase 5a), one per
+    // path.  Accumulate runs once per frame per path (fogAccumFrame* guard,
+    // mixed mode records LR lighting twice); composite runs in every record.
+    VolFogVolume gbFog_;
+    VolFogVolume gtFog_;
+    VolFogVolume gtSsaaFog_; // compare GT SSAA only
+    Mat4 prevFogViewProjGb_ = Mat4::identity();
+    Mat4 prevFogViewProjGt_ = Mat4::identity();
+    Mat4 prevFogViewProjSsaa_ = Mat4::identity();
+    uint32_t fogFramesGb_ = 0;
+    uint32_t fogFramesGt_ = 0;
+    uint32_t fogFramesSsaa_ = 0;
+    uint32_t fogAccumFrameGb_ = ~0u;
+    uint32_t fogAccumFrameGt_ = ~0u;
+    uint32_t fogAccumFrameSsaa_ = ~0u;
+    // Motion blur + depth of field working sets (Phase 6b), one per path.
+    PostFxTargets gbPostFx_;
+    PostFxTargets gtPostFx_;
+    PostFxTargets gtSsaaPostFx_; // compare GT SSAA only
+    // HDR bloom pyramids (Phase 6a), one per path; same host-owned
+    // GENERAL-for-life resource model as the post-fx targets.  The runtime
+    // checkbox skips the pass; the chains stay allocated either way.
+    BloomPyramid gbBloom_;
+    BloomPyramid gtBloom_;
+    BloomPyramid gtSsaaBloom_; // compare GT SSAA only
     ImageResource composeImage_; // RGBA8 composite; presentation + screenshot source
     ImageResource uiShotImage_;  // BGRA8 debug screenshot target incl. ImGui
     VkImageLayout uiShotLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -510,6 +756,10 @@ private:
     // (creation failed) degrades to no shadows.
     ShadowTargets shadow_;
     bool shadowsActive_ = false;
+    // Spot light shadow atlas (Phase 4b, fixed 4096^2): same lifetime and
+    // sharing as the CSM targets.
+    ShadowAtlas spotAtlas_;
+    bool spotAtlasActive_ = false;
 
     VkDescriptorSetLayout composeSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout copySetLayout_ = VK_NULL_HANDLE;
@@ -539,12 +789,10 @@ private:
     VkDescriptorSet gtComposeSet_ = VK_NULL_HANDLE;
     VkDescriptorSet gtDownsampleSet_ = VK_NULL_HANDLE; // 2x GT source (SSAA)
     // SSAO descriptor sets (static: the referenced textures never change).
+    // The blur sets live inside AoHistory (one per ping-pong buffer).
     VkDescriptorSet ssaoSetGb_ = VK_NULL_HANDLE;
-    VkDescriptorSet ssaoBlurSetGb_ = VK_NULL_HANDLE;
     VkDescriptorSet ssaoSetGt_ = VK_NULL_HANDLE;
-    VkDescriptorSet ssaoBlurSetGt_ = VK_NULL_HANDLE;
     VkDescriptorSet ssaoSetSsaa_ = VK_NULL_HANDLE;     // gtSsaa only
-    VkDescriptorSet ssaoBlurSetSsaa_ = VK_NULL_HANDLE; // gtSsaa only
     VkSampler linearSampler_ = VK_NULL_HANDLE;
     VkSampler fontSampler_ = VK_NULL_HANDLE;
 
@@ -556,18 +804,21 @@ private:
     VkImageLayout gbEmissiveLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gbMotionLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gbReactiveLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageLayout gbReactiveDilatedLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gbDepthLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gtColorLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gtAlbedoLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gtNormalLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gtMaterialLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gtEmissiveLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageLayout gtMotionLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gtDepthLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gtSsaaColorLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gtSsaaAlbedoLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gtSsaaNormalLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gtSsaaMaterialLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gtSsaaEmissiveLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageLayout gtSsaaMotionLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gtSsaaDepthLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gbAoRawLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gbAoLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -575,32 +826,46 @@ private:
     VkImageLayout gtAoLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gtSsaaAoRawLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gtSsaaAoLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
-    VkImageLayout gbSsrSrcLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
-    VkImageLayout gtSsrSrcLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
-    VkImageLayout gtSsaaSsrSrcLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageLayout gbSsrTraceLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageLayout gtSsrTraceLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageLayout gtSsaaSsrTraceLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout composeLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
 
     VkBuffer materialUbo_ = VK_NULL_HANDLE;
-    VkDeviceMemory materialUboMemory_ = VK_NULL_HANDLE;
+    VmaAllocation materialUboMemory_ = VK_NULL_HANDLE;
     uint32_t materialStride_ = 0;
 
     VkBuffer textUbo_ = VK_NULL_HANDLE; // packed ASCII overlay text (all columns)
-    VkDeviceMemory textUboMemory_ = VK_NULL_HANDLE;
+    VmaAllocation textUboMemory_ = VK_NULL_HANDLE;
     void* textUboMapped_ = nullptr;
 
     VkBuffer metricResultBuf_ = VK_NULL_HANDLE;
-    VkDeviceMemory metricResultMemory_ = VK_NULL_HANDLE;
+    VmaAllocation metricResultMemory_ = VK_NULL_HANDLE;
     VkBuffer metricStaging_[kFramesInFlight] = {};
-    VkDeviceMemory metricStagingMemory_[kFramesInFlight] = {};
+    VmaAllocation metricStagingMemory_[kFramesInFlight] = {};
     void* metricStagingMapped_[kFramesInFlight] = {};
     bool metricPending_[kFramesInFlight] = {};
     uint32_t metricMask_[kFramesInFlight] = {};
 
     VkBuffer screenshotStaging_ = VK_NULL_HANDLE;
-    VkDeviceMemory screenshotStagingMemory_ = VK_NULL_HANDLE;
+    VmaAllocation screenshotStagingMemory_ = VK_NULL_HANDLE;
     void* screenshotMapped_ = nullptr;
 
     TimestampQuery timestamps_;
+    // Per-pass GPU timestamp zones + the ImGui profiler panel.  The window's
+    // `open` flag drives profiler_.setEnabled in the run loop, so a closed
+    // panel records no timestamps at all.
+    GpuProfiler profiler_;
+    GpuProfilerWindow profilerWindow_;
+    // "Render Graph" ImNodes editor window: visualizes the PassRegistry
+    // mirror of recordFrame; node toggles go through applyPassToggle.
+    RenderGraphEditor graphWindow_;
+    // Resolve/apply a PassToggle (shared by the panel checkboxes and the
+    // graph editor nodes; applyPassToggle carries the checkbox side effects
+    // like the fog history reset).
+    bool passToggleValue(rg::PassToggle t) const;
+    void applyPassToggle(rg::PassToggle t, bool value);
+    float cpuRecordMs_ = 0.f; // CPU duration of the last recordFrame
 
     // --- runtime/UI state ----------------------------------------------------------
     UiState ui_;
@@ -656,6 +921,17 @@ private:
     GuiOptions opts_;
     std::string inputFile_;    // SR_GUI_INPUT_FILE automation (empty = off)
     uint64_t inputFileLine_ = 0; // lines consumed so far
+    // engine.toml hot-reload watch (path captured at init; ~1 s stat interval)
+    // + auto-save state (debounced write of the canonical serialization).
+    std::string engineCfgPath_;
+    int64_t engineCfgMtime_ = 0;
+    std::chrono::steady_clock::time_point engineCfgNextPoll_{};
+    std::string engineCfgBaseline_;     // canonical toml of the saved/loaded state
+    std::string engineCfgPendingText_;  // dirty snapshot awaiting the debounce
+    std::chrono::steady_clock::time_point engineCfgDirtyAt_{};
+    bool engineCfgDirty_ = false;
+    std::string lutCarry_; // [grading] lut passthrough (viewer-only key the GUI
+                           // does not edit but must not clobber on auto-save)
     bool benchAutoRun_ = false;
     bool benchStarted_ = false;
     // Quit deadline after an auto bench finishes (time-based: ImGui-only

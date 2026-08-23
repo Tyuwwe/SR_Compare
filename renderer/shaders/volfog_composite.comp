@@ -1,0 +1,64 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "volfog.glsl"
+// Volumetric fog composite (Frostbite 2015; UE4.16 Volumetric Fog apply).
+// One invocation per pixel of the lit HDR target: locates the pixel's view
+// depth in the froxel volume, samples the ray-integrated inscatter /
+// transmittance trilinearly, and applies
+//     out.rgb = color.rgb * transmittance + inscatter
+//     out.a   = transmittance   (consumed by ssr_temporal.comp; see there)
+// in place (same per-texel RMW contract as ssr_temporal.comp — no feedback
+// hazard).  Runs after the deferred lighting pass, before tonemapping.
+//
+// Only OPAQUE depth participates (the composite runs before the
+// transparency pass): alpha-blended surfaces are fogged separately — the
+// transparency fragment shaders sample this same integrated volume at the
+// fragment's view depth (volumetric fog on translucency, matching UE4.16).
+//
+// Sky pixels (depth == 1) clamp to the fog far range, i.e. the fully
+// integrated column: the sky behind the fog is attenuated and tinted.
+//
+// bindings: 0 = lit HDR scene colour (rgba16f storage image2D, RMW)
+//           1 = GBuffer depth of this path (NDC, SHADER_READ_ONLY)
+//           2 = ray-integrated froxel volume (sampler3D, trilinear)
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, rgba16f) uniform image2D sceneColor;
+layout(set = 0, binding = 1) uniform sampler2D gbDepth;
+layout(set = 0, binding = 2) uniform sampler3D integratedVolume;
+
+// Must match VolFogCompositePush in DeferredCore.h.
+layout(push_constant) uniform Push {
+    vec4 depthParams; // x = proj[2][2] (m10), y = proj[3][2] (m14),
+                      // z = near, w = fog far
+} pc;
+
+void main() {
+    const ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    const ivec2 size = imageSize(sceneColor);
+    if (pix.x >= size.x || pix.y >= size.y) return;
+
+    const float depth = texelFetch(gbDepth, pix, 0).r;
+    // NDC depth -> view Z for this path's perspective projection:
+    // ndc = m14 / viewZ - m10  =>  viewZ = m14 / (ndc + m10)  (m10/m14 < 0).
+    // Sky keeps the full fog column.
+    const float viewZ =
+        depth >= 1.0 ? pc.depthParams.w : pc.depthParams.y / (depth + pc.depthParams.x);
+    if (viewZ <= pc.depthParams.z) return; // nearer than the first froxel
+
+    const vec2 uv = (vec2(pix) + 0.5) / vec2(size);
+    const float w = froxelW(viewZ, pc.depthParams.z, pc.depthParams.w);
+    const vec4 fog = texture(integratedVolume, vec3(uv, w));
+
+    const vec4 color = imageLoad(sceneColor, pix);
+    // Transmittance goes into the alpha channel: the opaque-SSR temporal pass
+    // (ssr_temporal.comp) composites its trace delta AFTER this pass, and the
+    // delta replaces the PRE-fog specIbl term — without the scale it would
+    // subtract conf*specIbl that fog already attenuated to t*specIbl, going
+    // negative whenever conf > t (distant fogged ground turned black).  Alpha
+    // is unused downstream (present / bloom / TAA read .rgb only), so it is a
+    // free per-pixel carrier; lighting.frag writes 1.0, which is exactly the
+    // no-fog scale.
+    imageStore(sceneColor, pix, vec4(color.rgb * fog.a + fog.rgb, fog.a));
+}

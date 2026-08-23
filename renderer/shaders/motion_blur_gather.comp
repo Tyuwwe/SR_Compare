@@ -1,0 +1,111 @@
+#version 450
+// Motion blur gather pass (Phase 6b), HDR domain, full path resolution.
+// Reconstruction-filter motion blur (McGuire et al., HPG 2012): each pixel
+// gathers N taps along the dominant local velocity (its own velocity vs the
+// dilated tile max — the tile term is what lets fast foreground smear over
+// static background) and weights every tap by
+//   * coverage:  the tap's own speed must reach back across the distance to
+//     this pixel (cylinder model, soft 1 px edge);
+//   * depth:     nearer taps win (foreground velocity has priority), so
+//     background does not wash over a moving foreground edge;
+//   * velocity difference: taps moving very differently from the dominant
+//     velocity contribute less (reduces unrelated smearing).
+// The tap pattern is a line of kTaps stratified positions with a small
+// perpendicular Poisson jitter, rotated per pixel by interleaved-gradient
+// noise keyed on the frame index — deterministic, no wall clock.
+//
+//   binding 0 = lit HDR color (sampler, SHADER_READ_ONLY)
+//   binding 1 = motion RT (sampler, pixel units, no jitter)
+//   binding 2 = neighbourhood max (sampler, tile grid)
+//   binding 3 = depth (sampler, D32; only relative ordering is used)
+//   binding 4 = blurred color out (RGBA16F storage, full res)
+//
+// Ref: McGuire et al., "A Fast and Stable Feature-Aware Motion Blur Filter",
+//      HPG 2012; DOOM Eternal motion blur (SIGGRAPH 2020).
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D color;
+layout(set = 0, binding = 1) uniform sampler2D motion;
+layout(set = 0, binding = 2) uniform sampler2D neighborMax;
+layout(set = 0, binding = 3) uniform sampler2D depth;
+layout(set = 0, binding = 4, rgba16f) uniform writeonly image2D outColor;
+
+layout(push_constant) uniform Push {
+    vec4 params;  // x = shutter (0.5 = 180-degree), y = max blur (px),
+                  // z = frame index, w = tile size
+    vec4 params2; // xy = full-res size, zw unused
+} pc;
+
+const int kTaps = 12;
+
+// Interleaved gradient noise (Jimenez, "Next Generation Post Processing in
+// Call of Duty", SIGGRAPH 2014): deterministic per (pixel, frame).
+float ign(ivec2 p, float frame) {
+    return fract(52.9829189 * fract(0.06711056 * float(p.x) + 0.00583715 * float(p.y) +
+                                    0.00623 * frame));
+}
+
+void main() {
+    const ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    const ivec2 size = ivec2(pc.params2.xy);
+    if (pix.x >= size.x || pix.y >= size.y) return;
+
+    const vec2 texel = 1.0 / pc.params2.xy;
+    const vec2 uv = (vec2(pix) + 0.5) * texel;
+    const float shutter = pc.params.x;
+
+    const vec3 centerColor = texelFetch(color, pix, 0).rgb;
+    const vec2 centerVel = texelFetch(motion, pix, 0).xy * shutter;
+    const float centerDepth = texelFetch(depth, pix, 0).r;
+    const ivec2 tile = min(pix / int(pc.params.w), textureSize(neighborMax, 0) - 1);
+    const vec2 tileVel = texelFetch(neighborMax, tile, 0).xy * shutter;
+
+    const float centerLen = length(centerVel);
+    const float tileLen = length(tileVel);
+    const float blurLen = min(max(centerLen, tileLen), pc.params.y);
+    if (blurLen < 0.5) { // sub-pixel motion: nothing to gather
+        imageStore(outColor, pix, vec4(centerColor, 1.0));
+        return;
+    }
+    // Gather along the dominant velocity: the tile max when it exceeds the
+    // pixel's own velocity (fast neighbour sweeping over us), else our own.
+    const vec2 dir = (tileLen >= centerLen ? tileVel : centerVel) / max(max(centerLen, tileLen), 1e-4);
+    const vec2 perp = vec2(-dir.y, dir.x);
+
+    const float noise = ign(pix, pc.params.z);
+    const float angle = noise * 6.2831853;
+    const vec2 rot = vec2(cos(angle), sin(angle)); // rotates the jitter disk
+
+    vec3 sum = centerColor;
+    float wsum = 1.0;
+    for (int k = 0; k < kTaps; ++k) {
+        // Stratified position along the blur line, [-1, 1].
+        const float t = (float(k) + noise) / float(kTaps) * 2.0 - 1.0;
+        // Small perpendicular jitter (quarter texel amplitude), frame-rotated.
+        const float jr = (ign(pix + ivec2(17, 31) * k, pc.params.z + 1.0) - 0.5) * 0.75;
+        const vec2 off = dir * (t * blurLen) + perp * jr * rot.x + vec2(-perp.y, perp.x) * jr * rot.y;
+        const vec2 suv = uv + off * texel;
+
+        const vec3 sColor = texture(color, suv).rgb;
+        const vec2 sVel = texture(motion, suv).xy * shutter;
+        const float sDepth = texture(depth, suv).r;
+        const float sLen = length(sVel);
+
+        // Coverage: the tap's velocity must span the distance to this pixel.
+        const float dist = abs(t) * blurLen;
+        float w = clamp(sLen - dist + 0.5, 0.0, 1.0);
+        // Depth occlusion: nearer taps (smaller depth = closer, non-reversed)
+        // have priority; background taps are attenuated, not rejected, so
+        // soft edges remain.
+        const bool nearer = sDepth <= centerDepth;
+        w *= nearer ? 1.0 : 0.25;
+        // Velocity similarity with the dominant direction.
+        const float domLen = max(centerLen, tileLen);
+        w *= clamp(1.0 - abs(sLen - domLen) / max(domLen, 1.0), 0.0, 1.0) * 0.75 + 0.25;
+
+        sum += sColor * w;
+        wsum += w;
+    }
+    imageStore(outColor, pix, vec4(sum / wsum, 1.0));
+}

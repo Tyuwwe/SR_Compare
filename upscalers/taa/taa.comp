@@ -1,8 +1,26 @@
 #version 450
-// TAAU resolve.  Reads render-resolution color/motion (and depth, reserved for
-// future depth-aware clamping) plus the previous display-resolution history,
-// and writes the resolved display-resolution image to both the renderer output
-// and the next history slot.
+// TAAU resolve (2020-era form).  Reads render-resolution color/motion/depth
+// plus the previous display-resolution history color and history depth, and
+// writes the resolved display-resolution image to an intermediate (sharpened
+// by taa_cas.comp afterwards) and the next history slots.
+//
+// Upgrades over the original linear-HDR clamp:
+//  1. History validation and blending run in YCoCg instead of linear HDR RGB.
+//     Per-channel clipping in RGB drags hue/saturation towards the
+//     neighborhood box and lets HDR outliers through, which shows up as
+//     fireflies and chroma ghosting.  YCoCg separates luma from chroma so the
+//     clip box follows luminance contrast (UE4 TAA; Playdead INSIDE TAA).
+//     The alternative — Karis 2014 (SIGGRAPH "High Quality Temporal
+//     Supersampling") tonemap-domain weighting (1/(1+luma)) — mainly fights
+//     flicker from HDR brights; YCoCg clipping was chosen because it fixes
+//     the color-space problem at the root, and the depth rejection below
+//     covers the residual firefly cases Karis targets.
+//  2. Depth-based disocclusion: the reprojected history depth (ping-ponged
+//     like history color) is compared against the current depth; mismatches
+//     scale the history weight to zero so newly revealed pixels do not smear.
+//  3. Velocity-adaptive history weight replaces the fixed alpha (UE4 TAA
+//     "current frame weight" idea): fast motion lowers confidence in the
+//     reprojection, so the blend moves towards the current frame.
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
@@ -10,18 +28,35 @@ layout(set = 0, binding = 0) uniform sampler2D uColor;
 layout(set = 0, binding = 1) uniform sampler2D uMotion;
 layout(set = 0, binding = 2) uniform sampler2D uDepth;
 layout(set = 0, binding = 3) uniform sampler2D uHistory;
-layout(rgba16f, set = 0, binding = 4) uniform image2D uOutput;
+layout(rgba16f, set = 0, binding = 4) uniform image2D uResolved;
 layout(rgba16f, set = 0, binding = 5) uniform image2D uHistoryWrite;
 // Translucent coverage mask (R16_SFLOAT, render resolution).  Only sampled
 // when pc.params.z > 0.5; otherwise an arbitrary valid view is bound.
 layout(set = 0, binding = 6) uniform sampler2D uReactive;
+// Previous-frame depth at display resolution (point-sampled; bilinear depth
+// filtering invents edge values that would falsely reject valid history).
+layout(set = 0, binding = 7) uniform sampler2D uHistoryDepth;
+layout(r32f, set = 0, binding = 8) uniform image2D uHistoryDepthWrite;
 
 layout(push_constant) uniform Push {
     vec4 sizes;  // xy = render size (pixels), zw = display size (pixels)
-    vec4 params; // x = history alpha, y = resetHistory (1 = yes),
+    vec4 params; // x = base history alpha, y = resetHistory (1 = yes),
                  // z = reactive mask enabled (1 = yes)
     vec4 jitter; // xy = current-frame sub-pixel jitter (render pixels)
 } pc;
+
+// ITU-R BT.601-style YCoCg as used by UE4 TAA: luma in x, orange/green
+// chroma in y/z.  Not exact RGB<->luma, but cheap and lossless.
+vec3 rgbToYcocg(vec3 c) {
+    return vec3(0.25 * c.r + 0.5 * c.g + 0.25 * c.b,
+                0.5 * c.r - 0.5 * c.b,
+                -0.25 * c.r + 0.5 * c.g - 0.25 * c.b);
+}
+
+vec3 ycocgToRgb(vec3 yc) {
+    float tmp = yc.x - yc.z;
+    return vec3(tmp + yc.y, yc.x + yc.z, tmp - yc.y);
+}
 
 vec3 sampleColor(vec2 uv) {
     return texture(uColor, uv).rgb;
@@ -40,10 +75,12 @@ void main() {
     // high-contrast edges (e.g. shadow boundaries) wobble frame to frame.
     vec2 juv = pc.jitter.xy / pc.sizes.xy;
     vec3 current = sampleColor(uv + juv);
+    float currentDepth = texture(uDepth, uv + juv).r;
 
     if (pc.params.y > 0.5) {
-        imageStore(uOutput, px, vec4(current, 1.0));
+        imageStore(uResolved, px, vec4(current, 1.0));
         imageStore(uHistoryWrite, px, vec4(current, 1.0));
+        imageStore(uHistoryDepthWrite, px, vec4(currentDepth, 0.0, 0.0, 0.0));
         return;
     }
 
@@ -53,19 +90,19 @@ void main() {
 
     vec3 history = texture(uHistory, historyUV).rgb;
 
-    // Variance clipping of the 3x3 neighborhood (gamma-clamp).  On heavily
+    // Variance clipping of the 3x3 neighborhood in YCoCg.  On heavily
     // aliased inputs a single jitter phase's min/max box is much narrower
     // than the multi-phase average, so a plain min/max clamp drags the
-    // history into each frame's current and the 0.9 history weight never
+    // history into each frame's current and the history weight never
     // materializes (visible shimmer).  Mean +/- gamma*sigma keeps the
     // history anchored to the local average instead.
     vec2 renderRcp = 1.0 / pc.sizes.xy;
-    vec3 mean = current;
-    vec3 sq = current * current;
+    vec3 mean = rgbToYcocg(current);
+    vec3 sq = mean * mean;
     for (int dy = -1; dy <= 1; ++dy) {
         for (int dx = -1; dx <= 1; ++dx) {
             if (dx == 0 && dy == 0) continue;
-            vec3 c = sampleColor(uv + juv + vec2(dx, dy) * renderRcp);
+            vec3 c = rgbToYcocg(sampleColor(uv + juv + vec2(dx, dy) * renderRcp));
             mean += c;
             sq += c * c;
         }
@@ -74,17 +111,50 @@ void main() {
     sq *= 1.0 / 9.0;
     vec3 sigma = sqrt(max(sq - mean * mean, vec3(0.0)));
     const float gamma = 1.25;
-    history = clamp(history, mean - gamma * sigma, mean + gamma * sigma);
+    vec3 historyY = clamp(rgbToYcocg(history), mean - gamma * sigma, mean + gamma * sigma);
 
-    float alpha = clamp(pc.params.x, 0.0, 1.0);
+    // --- history confidence -------------------------------------------------
+    float baseAlpha = clamp(pc.params.x, 0.0, 1.0);
+
+    // Velocity-adaptive weight: reprojection error grows with motion, so
+    // confidence falls linearly to zero over ~4 display pixels of motion and
+    // the blend moves from baseAlpha towards a 0.5 floor (UE4 TAA applies the
+    // same idea via its velocity-dependent current-frame weight).
+    float speed = length(motionPx * scale);
+    float motionConf = 1.0 - clamp(speed * 0.25, 0.0, 1.0);
+    float alpha = mix(0.5, baseAlpha, motionConf);
+
+    // Depth disocclusion: compare the current depth against the reprojected
+    // previous depth.  Depth is hyperbolic (1 = near plane here), so the
+    // tolerance combines an absolute floor with slack relative to the current
+    // value; confidence ramps down smoothly over 1x..4x the tolerance instead
+    // of hard-switching, which avoids edge flicker at tolerance boundaries.
+    if (historyUV != clamp(historyUV, vec2(0.0), vec2(1.0))) {
+        alpha = 0.0; // reprojection left the screen: no valid history at all
+    } else {
+        float historyDepth = texture(uHistoryDepth, historyUV).r;
+        float depthTol = 0.001 + 0.01 * currentDepth;
+        float depthConf = 1.0 - smoothstep(depthTol, depthTol * 4.0,
+                                           abs(currentDepth - historyDepth));
+        alpha *= depthConf;
+    }
+
     // Translucent coverage: history under translucent geometry does not
     // reproject with opaque motion, so scale the blend weight down to zero
-    // as coverage approaches 1.
+    // as coverage approaches 1.  The renderer feeds the 3x3-max dilated,
+    // MOTION-GATED copy (reactive_dilate.comp): coverage on (near-)static
+    // pixels is gated to zero — reprojection is exact there, and dropping
+    // history would pass the phase-flipping aliased current frame through
+    // unfiltered (shimmer around glass).
     if (pc.params.z > 0.5) {
         float mask = clamp(texture(uReactive, uv).r, 0.0, 1.0);
         alpha *= 1.0 - mask;
     }
-    vec3 result = mix(current, history, alpha);
-    imageStore(uOutput, px, vec4(result, 1.0));
+
+    // Blend in YCoCg so the history weight interpolates luma and chroma
+    // independently; the RGB round-trip is exact for the weights used here.
+    vec3 result = ycocgToRgb(mix(rgbToYcocg(current), historyY, clamp(alpha, 0.0, 1.0)));
+    imageStore(uResolved, px, vec4(result, 1.0));
     imageStore(uHistoryWrite, px, vec4(result, 1.0));
+    imageStore(uHistoryDepthWrite, px, vec4(currentDepth, 0.0, 0.0, 0.0));
 }

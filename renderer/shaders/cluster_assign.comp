@@ -1,0 +1,107 @@
+#version 450
+// Clustered shading light assignment (Olsson et al., "Clustered Deferred and
+// Forward Shading", HPG 2012; id Software, DOOM 2016 / DOOM Eternal SIGGRAPH
+// course).  One invocation per cluster: builds the cluster's view-space AABB
+// from the tile NDC corners at its exponential slice depths and tests every
+// point/spot light's bounding sphere against it (directional lights bypass
+// the clusters; the sun stays a direct pass-through in lighting.frag).
+// Each cluster's list is written in SSBO light order with no atomics, so the
+// result is bit-deterministic frame to frame.
+layout(local_size_x = 64) in;
+
+// Must match LightGPU in DeferredCore.h.
+struct LightGPU {
+    vec4 posOrDir; // xyz = position, w = type (0 = dir, 1 = point, 2 = spot)
+    vec4 color;    // rgb + w = intensity (PI-scaled on the CPU)
+    vec4 params;   // x = range (0 = infinite), y = castShadow, z = shadowIndex, w = cos(inner)
+    vec4 spotDir;  // xyz = cone direction (unit, world), w = cos(outer)
+};
+
+layout(std430, set = 0, binding = 0) readonly buffer LightsSSBO {
+    uvec4 header;    // x = packed point/spot light count
+    LightGPU lights[];
+} lightsBuf;
+
+layout(std430, set = 0, binding = 1) buffer ClusterGridSSBO {
+    uvec4 gridHeader; // written once by the CPU: gridX, gridY, gridZ, maxPerCluster
+    uint data[];      // [0..N) = per-cluster counts,
+                      // [N .. N + N*maxPerCluster) = per-cluster light indices
+} grid;
+
+layout(push_constant) uniform Push {
+    mat4 view;
+    vec4 projParams; // x = proj[0][0], y = proj[1][1], z = near, w = far
+    uvec4 grid;      // gridX, gridY, gridZ, maxPerCluster
+    uvec4 misc;      // screenW, screenH, tileSize, unused
+} pc;
+
+bool sphereHitsAabb(vec3 c, float r, vec3 bmin, vec3 bmax) {
+    vec3 q = clamp(c, bmin, bmax);
+    vec3 d = q - c;
+    return dot(d, d) <= r * r;
+}
+
+void main() {
+    uint clusterIdx = gl_GlobalInvocationID.x;
+    uint clusterCount = pc.grid.x * pc.grid.y * pc.grid.z;
+    if (clusterIdx >= clusterCount) return;
+
+    uint cz = clusterIdx / (pc.grid.x * pc.grid.y);
+    uint rem = clusterIdx - cz * pc.grid.x * pc.grid.y;
+    uint cy = rem / pc.grid.x;
+    uint cx = rem - cy * pc.grid.x;
+
+    // Tile NDC range (y down), clamped at the right/bottom screen edge.
+    float x0 = float(cx * pc.misc.z) / float(pc.misc.x) * 2.0 - 1.0;
+    float x1 = min(float((cx + 1) * pc.misc.z) / float(pc.misc.x), 1.0) * 2.0 - 1.0;
+    float y0 = float(cy * pc.misc.z) / float(pc.misc.y) * 2.0 - 1.0;
+    float y1 = min(float((cy + 1) * pc.misc.z) / float(pc.misc.y), 1.0) * 2.0 - 1.0;
+
+    // Exponential depth slices (DOOM Eternal: 24 slices, ratio = far/near):
+    // slice k covers viewZ in [near * r^(k/Z), near * r^((k+1)/Z)].
+    float ratio = pc.projParams.w / pc.projParams.z;
+    float sliceNear = pc.projParams.z * pow(ratio, float(cz) / float(pc.grid.z));
+    float sliceFar = pc.projParams.z * pow(ratio, float(cz + 1) / float(pc.grid.z));
+
+    // View-space AABB of the cluster frustum piece: unproject the tile corners
+    // at both slice depths (the camera looks down -Z; proj[1][1] carries the
+    // Vulkan y-flip sign, which the min/max absorbs).
+    vec3 bmin = vec3(1e30);
+    vec3 bmax = vec3(-1e30);
+    for (int i = 0; i < 8; ++i) {
+        float ndcX = (i & 1) == 0 ? x0 : x1;
+        float ndcY = (i & 2) == 0 ? y0 : y1;
+        float d = (i & 4) == 0 ? sliceNear : sliceFar;
+        vec3 p = vec3(ndcX * d / pc.projParams.x, ndcY * d / pc.projParams.y, -d);
+        bmin = min(bmin, p);
+        bmax = max(bmax, p);
+    }
+
+    uint count = 0;
+    const uint base = clusterCount + clusterIdx * pc.grid.w;
+    const uint lightCount = lightsBuf.header.x;
+    for (uint i = 0; i < lightCount && count < pc.grid.w; ++i) {
+        LightGPU l = lightsBuf.lights[i];
+        bool hit = true; // range == 0 (infinite): touches every cluster
+        if (l.params.x > 0.0) {
+            // Conservative bounding sphere of the light's influence: radius
+            // `range` at the position for points; for spots, the cone (height
+            // range, half-angle outer) bounded by the sphere centred halfway
+            // along the axis with radius range / (2 * cos(outer)).
+            vec3 centerV = (pc.view * vec4(l.posOrDir.xyz, 1.0)).xyz;
+            float radius = l.params.x;
+            if (l.posOrDir.w > 1.5) {
+                vec3 dirV = normalize((pc.view * vec4(l.spotDir.xyz, 0.0)).xyz);
+                float cosOuter = max(l.spotDir.w, 0.05); // guard near-90-degree cones
+                centerV += dirV * (l.params.x * 0.5);
+                radius = l.params.x * 0.5 / cosOuter;
+            }
+            hit = sphereHitsAabb(centerV, radius, bmin, bmax);
+        }
+        if (hit) {
+            grid.data[base + count] = i;
+            ++count;
+        }
+    }
+    grid.data[clusterIdx] = count;
+}

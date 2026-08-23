@@ -31,7 +31,7 @@ TMP = THIRD_PARTY / ".tmp"
 
 UA = {"User-Agent": "sr_compare-fetch-sdks/1.0 (python-urllib)"}
 
-ALL_TASKS = ["fsr", "xess", "streamline", "sgsr", "nss", "sponza"]
+ALL_TASKS = ["fsr", "xess", "streamline", "sgsr", "nss", "sponza", "sdl3"]
 
 # --------------------------------------------------------------------------- #
 # pinned versions
@@ -56,6 +56,8 @@ SGSR_REF = "d926f074bcb9d714e179f1ce0fcb9ee2eeb5074e"
 NSS_SDK_REF = "aba0d109ffcfb97e380ac0a68fb11683e5561c6e"
 NSS_MODELS_REF = "3dd6c4f054827a3d018330d5dfcd0b92e7d37974"
 NSS_EMULATION_REF = "00e9d81f8545bd6a4c3662909e42370708adfac1"
+#   SDL3_TAG          libsdl-org/SDL release tag (windowing/input layer).
+SDL3_TAG = "release-3.4.14"
 
 
 # --------------------------------------------------------------------------- #
@@ -498,6 +500,40 @@ def task_nss(force: bool = False) -> dict:
     return _done("nss", dest, "see subdirs", "ok")
 
 
+def task_sdl3(force: bool = False) -> dict:
+    dest = THIRD_PARTY / "sdl3"
+    marker = dest / "lib" / "x64" / "SDL3.lib"
+    if marker.exists() and not force:
+        log("[sdl3] already present, skip")
+        return _done("sdl3", dest, SDL3_TAG, "skipped (present)")
+
+    repo = "libsdl-org/SDL"
+    tag, asset = find_asset(repo, tag=SDL3_TAG, name_regex=r"SDL3-devel-.*-VC\.zip")
+    zip_path = TMP / "sdl3.zip"
+    log(f"[sdl3] downloading {asset['name']} ({human(asset['size'])}) from {repo} {tag}")
+    download(asset["browser_download_url"], zip_path)
+    log("[sdl3] extracting include + lib/x64 + docs ...")
+    n = extract_zip_selected(
+        zip_path,
+        dest,
+        include_res=[r"^include/", r"^lib/x64/", r"^cmake/"],
+        extra_root_files=[r"^LICENSE\.txt$", r"^README\.md$"],
+    )
+    zip_path.unlink(missing_ok=True)
+    log(f"[sdl3] extracted {n} files")
+    report_verify(
+        "sdl3",
+        dest,
+        [
+            "include/SDL3/SDL.h",
+            "include/SDL3/SDL_vulkan.h",
+            "lib/x64/SDL3.lib",
+            "lib/x64/SDL3.dll",
+        ],
+    )
+    return _done("sdl3", dest, tag, "ok", n_files=n)
+
+
 def task_sponza(force: bool = False) -> dict:
     dest = ASSETS / "sponza"
     marker = dest / "Sponza.gltf"
@@ -598,6 +634,7 @@ def main() -> int:
                 "sgsr": task_sgsr,
                 "nss": task_nss,
                 "sponza": task_sponza,
+                "sdl3": task_sdl3,
             }[name]
             results.append(fn(force=args.force))
         except Exception as exc:  # noqa: BLE001 - keep going on other tasks

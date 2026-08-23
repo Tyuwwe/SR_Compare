@@ -11,6 +11,7 @@
 // overlay computed on the GPU (two-pass compute reduction, read back every N
 // frames).
 // ============================================================================
+#include "renderer/ColorGrading.h"
 #include "renderer/core/Swapchain.h"
 #include "renderer/core/VulkanContext.h"
 #include "renderer/core/Window.h"
@@ -41,12 +42,54 @@ struct CompareOptions {
     bool gtSsaa = false;                // render GT at 2x and downsample to 1080p
     bool shadows = true;                // CSM sun shadows (all paths share one map)
     bool shadowDebug = false;           // tint pixels per shadow cascade
-    bool bloom = true;                  // HDR bloom before upscale
+    bool bloom = false;                 // HDR bloom before upscale (default off; unused —
+                                        // the compare paths have no bloom chain)
+    // Terminal lens-effects chain in the column compose (chromatic
+    // aberration / vignette / film grain; same strengths as the viewer
+    // present pass).  CLI: --no-lens-fx.  Lens dirt is viewer-only (the
+    // compare paths have no HDR bloom chain for it to modulate).
+    bool lensFx = true;
+    // Opaque screen-space reflections; off by default (probes/env fallback),
+    // CLI: --ssr opts in, --no-ssr accepted for compatibility.
+    bool ssr = false;
+    // Global SSR weight scale applied to the hit confidence (CLI:
+    // --ssr-strength 0..1); below 1 the composite leans on the IBL fallback.
+    float ssrStrength = 0.6f;
+    // Screen-space contact shadows for the CSM sun (CLI: --no-contact-shadows);
+    // needs shadows on (rides the CSM sun selection).
+    bool contactShadows = true;
+    bool volFog = true;                 // froxel volumetric fog (CLI: --no-volfog)
+    // Motion blur + depth of field (Phase 6b), HDR domain on every path (LR
+    // at render res before upscale, GT at native res, GT-SSAA at 2x before
+    // the downsample) with identical algorithm + parameters; CLI:
+    // --motion-blur / --dof to enable (--no-motion-blur / --no-dof accepted
+    // for compatibility).  Off by default; when enabled the GT column runs
+    // the same post chain as the algorithm columns, so the metrics stay
+    // fair — MB/DOF change the pixel content of EVERY column's input by
+    // design.
+    bool motionBlur = false;
+    bool dof = false;
+    // DOF tuning (CLI: --dof-focus/--dof-fstop/--dof-max-blur); applied to
+    // every path identically, so GT and algorithm columns blur the same.
+    // focus 0 = auto-focus on the screen-centre texel; f-stop maps to the
+    // aperture scale as kDofAperture * (kDofDefaultFstop / fstop); max blur is
+    // the CoC radius clamp in display px at 1080p, scaled by path height.
+    float dofFocus = 0.f;
+    float dofFstop = kDofDefaultFstop;
+    float dofMaxBlurPx = kDofMaxCoC;
     float zoom = 1.f;                   // compare-view zoom (1..16)
     float zoomCenterU = 0.5f;           // zoom window center, normalized source UV
     float zoomCenterV = 0.5f;
-    std::string envMapPath = kDefaultEnvMapPath; // equirect HDR for IBL/skybox
-    float exposure = 1.f;                       // display-domain ACES input multiplier
+    std::string envMapPath; // equirect HDR for IBL/skybox; empty = sky atmosphere (default)
+    float exposure = 1.f;                       // manual display exposure (ACES input);
+                                                // also the seed value for auto exposure
+    // Histogram-based auto exposure (UE4 AutoExposure style; see DeferredCore's
+    // AutoExposure).  On by default; CLI --exposure switches to manual mode.
+    // Each path (LR / GT) auto-exposes from its own HDR target, so compare
+    // columns legitimately use different exposures (independent pipelines).
+    bool autoExposure = true;
+    float exposureMinEV = -8.f;                 // auto-exposure EV clamp range
+    float exposureMaxEV = 8.f;
 };
 
 class CompareApp {
@@ -64,7 +107,7 @@ private:
 
     struct ImageResource {
         VkImage image = VK_NULL_HANDLE;
-        VkDeviceMemory memory = VK_NULL_HANDLE;
+        VmaAllocation memory = VK_NULL_HANDLE;
         VkImageView view = VK_NULL_HANDLE;
         VkFormat format = VK_FORMAT_UNDEFINED;
         uint32_t width = 0;
@@ -77,22 +120,22 @@ private:
         VkFence fence = VK_NULL_HANDLE;
         VkSemaphore imageAvailable = VK_NULL_HANDLE;
         VkBuffer uboGb = VK_NULL_HANDLE;       // jittered scene UBO (GBuffer pass)
-        VkDeviceMemory uboGbMemory = VK_NULL_HANDLE;
+        VmaAllocation uboGbMemory = VK_NULL_HANDLE;
         void* uboGbMapped = nullptr;
         VkBuffer uboGbSpatial = VK_NULL_HANDLE; // unjittered LR scene UBO (spatial plugins)
-        VkDeviceMemory uboGbSpatialMemory = VK_NULL_HANDLE;
+        VmaAllocation uboGbSpatialMemory = VK_NULL_HANDLE;
         void* uboGbSpatialMapped = nullptr;
         VkBuffer uboGt = VK_NULL_HANDLE;       // un-jittered scene UBO (GT pass)
-        VkDeviceMemory uboGtMemory = VK_NULL_HANDLE;
+        VmaAllocation uboGtMemory = VK_NULL_HANDLE;
         void* uboGtMapped = nullptr;
         VkBuffer lightingUboGb = VK_NULL_HANDLE; // lighting UBO (jittered invViewProj)
-        VkDeviceMemory lightingUboGbMemory = VK_NULL_HANDLE;
+        VmaAllocation lightingUboGbMemory = VK_NULL_HANDLE;
         void* lightingUboGbMapped = nullptr;
         VkBuffer lightingUboGbSpatial = VK_NULL_HANDLE; // lighting UBO (unjittered LR)
-        VkDeviceMemory lightingUboGbSpatialMemory = VK_NULL_HANDLE;
+        VmaAllocation lightingUboGbSpatialMemory = VK_NULL_HANDLE;
         void* lightingUboGbSpatialMapped = nullptr;
         VkBuffer lightingUboGt = VK_NULL_HANDLE; // lighting UBO (un-jittered invViewProj)
-        VkDeviceMemory lightingUboGtMemory = VK_NULL_HANDLE;
+        VmaAllocation lightingUboGtMemory = VK_NULL_HANDLE;
         void* lightingUboGtMapped = nullptr;
         VkDescriptorSet sceneSetGb = VK_NULL_HANDLE;
         VkDescriptorSet sceneSetGbSpatial = VK_NULL_HANDLE;
@@ -106,6 +149,11 @@ private:
         VkDescriptorSet transparentSetGbSpatial = VK_NULL_HANDLE;
         VkDescriptorSet transparentSetGt = VK_NULL_HANDLE;
         VkDescriptorSet transparentSetSsaa = VK_NULL_HANDLE; // gtSsaa only
+        // Opaque-SSR compute sets (bind the same per-path lighting UBOs).
+        VkDescriptorSet ssrSetGb = VK_NULL_HANDLE;
+        VkDescriptorSet ssrSetGbSpatial = VK_NULL_HANDLE;
+        VkDescriptorSet ssrSetGt = VK_NULL_HANDLE;
+        VkDescriptorSet ssrSetSsaa = VK_NULL_HANDLE; // gtSsaa only
     };
 
     struct AlgoColumn {
@@ -114,7 +162,7 @@ private:
         ImageResource output; // display-resolution RGBA16F
         VkImageLayout outputLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         VkBuffer blocksBuffer = VK_NULL_HANDLE; // per-block metric records
-        VkDeviceMemory blocksMemory = VK_NULL_HANDLE;
+        VmaAllocation blocksMemory = VK_NULL_HANDLE;
         VkDescriptorSet metricSet = VK_NULL_HANDLE;
         VkDescriptorSet composeSet = VK_NULL_HANDLE;
         float psnr = 0.f;
@@ -162,6 +210,9 @@ private:
     ImageResource gbEmissive_;
     ImageResource gtColor_;
     ImageResource gtDepth_;
+    // GT-path motion RT (Phase 6b): the GT GBuffer writes per-object motion so
+    // the GT column's motion blur matches the LR path.
+    ImageResource gtMotion_;
     // Deferred GBuffer attachments of the native-res GT pass.
     ImageResource gtAlbedo_;
     ImageResource gtNormal_;
@@ -169,6 +220,7 @@ private:
     ImageResource gtEmissive_;
     ImageResource gtSsaaColor_; // 2x GT render target (gtSsaa only)
     ImageResource gtSsaaDepth_;
+    ImageResource gtSsaaMotion_; // 2x GT motion RT (Phase 6b, gtSsaa only)
     // Deferred GBuffer attachments of the 2x GT pass (gtSsaa only).
     ImageResource gtSsaaAlbedo_;
     ImageResource gtSsaaNormal_;
@@ -181,17 +233,102 @@ private:
     ImageResource gtAo_;
     ImageResource gtSsaaAoRaw_; // gtSsaa only
     ImageResource gtSsaaAo_;
-    ImageResource gbBloomA_;
-    ImageResource gbBloomB_;
-    ImageResource gtBloomA_;
-    ImageResource gtBloomB_;
-    ImageResource gtSsaaBloomA_;
-    ImageResource gtSsaaBloomB_;
-    ImageResource gbSsrSrc_;
-    ImageResource gtSsrSrc_;
-    ImageResource gtSsaaSsrSrc_;
+    // HDR color mip chains (lit opaque color, box-filtered) for
+    // roughness-aware SSR; same GENERAL-for-life resource model as the
+    // depth pyramids.  Deliberately separate from the Phase 6a bloom pyramid
+    // (box-average reflection LOD vs thresholded extract — see DeferredCore).
+    ColorPyramid gbColorPyramid_;
+    ColorPyramid gtColorPyramid_;
+    ColorPyramid gtSsaaColorPyramid_; // gtSsaa only
+    // Clustered shading grids (per-path resolution, per-slot buffers).
+    ClusterGrid gbCluster_;
+    ClusterGrid gtCluster_;
+    ClusterGrid gtSsaaCluster_; // gtSsaa only
+
+    // GPU occlusion culling + indirect GBuffer draws (Phase 7a): shared
+    // instance SSBO + one cull channel per path (LR / GT / GT-SSAA), each
+    // bound to that path's Hi-Z chain.  occlusion_ = SR_OCCLUSION opt-out;
+    // when false the cull pass is skipped (indirect path stays live).
+    InstanceBuffer instances_;
+    CullChannel gbCull_;
+    CullChannel gtCull_;
+    CullChannel gtSsaaCull_; // gtSsaa only
+    std::vector<CullDrawRun> cullRuns_;
+    std::vector<GpuInstance> cullInstCpu_; // build scratch (capacity-sized)
+    std::vector<VkDrawIndexedIndirectCommand> cullCmdCpu_;
+    uint32_t cullCandidates_ = 0;
+    bool occlusion_ = true;
+    // Hi-Z depth pyramids for the SSR march (LR / GT / GT-SSAA paths); general
+    // DeferredCore resource, later reused by GTAO/contact shadows/culling.
+    DepthPyramid gbPyramid_;
+    DepthPyramid gtPyramid_;
+    DepthPyramid gtSsaaPyramid_; // gtSsaa only
+    // GTAO view-Z depth chains (XeGTAO DepthMIPFilter) + temporal accumulation
+    // ping-pong state, one per path.  Per-path previous-frame view-projection
+    // (jittered for LR) and frame counters drive the temporal pass; a zero
+    // counter resets (bypasses) the history.  In mixed temporal+spatial
+    // column mode the LR lighting runs twice per frame and the LR counter
+    // advances twice — history stays consistent (each record reprojects from
+    // the previous record's exact view-projection).
+    DepthPyramid gbPyramidAo_;
+    DepthPyramid gtPyramidAo_;
+    DepthPyramid gtSsaaPyramidAo_; // gtSsaa only
+    AoHistory gbAoHist_;
+    AoHistory gtAoHist_;
+    AoHistory gtSsaaAoHist_; // gtSsaa only
+    Mat4 prevAoViewProjGb_ = Mat4::identity();
+    Mat4 prevAoViewProjGt_ = Mat4::identity();
+    Mat4 prevAoViewProjSsaa_ = Mat4::identity();
+    uint32_t aoFramesGb_ = 0;
+    uint32_t aoFramesGt_ = 0;
+    uint32_t aoFramesSsaa_ = 0;
+    // Opaque SSR temporal state (Phase 2d), one per path: full-res trace
+    // target (rgb = composite delta, a = view |z|) + RGBA16F ping-pong
+    // history; per-path previous-frame view-projection and frame counters
+    // drive the temporal pass (zero counter = reset).  Same conventions as
+    // the GTAO temporal state above, including the mixed-mode LR double run.
+    ImageResource gbSsrTrace_;
+    ImageResource gtSsrTrace_;
+    ImageResource gtSsaaSsrTrace_; // gtSsaa only
+    SsrHistory gbSsrHist_;
+    SsrHistory gtSsrHist_;
+    SsrHistory gtSsaaSsrHist_; // gtSsaa only
+    Mat4 prevSsrViewProjGb_ = Mat4::identity();
+    Mat4 prevSsrViewProjGt_ = Mat4::identity();
+    Mat4 prevSsrViewProjSsaa_ = Mat4::identity();
+    uint32_t ssrFramesGb_ = 0;
+    uint32_t ssrFramesGt_ = 0;
+    uint32_t ssrFramesSsaa_ = 0;
+    // Froxel volumetric fog (Phase 5a), one volume set per path.  Temporal
+    // history reprojects with the un-jittered view-projection on all paths
+    // (fog must not swim with the TAA jitter).  Unlike AO/SSR the accumulate
+    // step runs once per frame per path even in mixed mode (fogAccumFrame*
+    // guards), while the composite runs inside every lighting record.
+    VolFogVolume gbFog_;
+    VolFogVolume gtFog_;
+    VolFogVolume gtSsaaFog_; // gtSsaa only
+    Mat4 prevFogViewProjGb_ = Mat4::identity();
+    Mat4 prevFogViewProjGt_ = Mat4::identity();
+    Mat4 prevFogViewProjSsaa_ = Mat4::identity();
+    uint32_t fogFramesGb_ = 0;
+    uint32_t fogFramesGt_ = 0;
+    uint32_t fogFramesSsaa_ = 0;
+    uint32_t fogAccumFrameGb_ = ~0u;
+    uint32_t fogAccumFrameGt_ = ~0u;
+    uint32_t fogAccumFrameSsaa_ = ~0u;
+    VolFogParams fogParams_;
+    bool volFogActive_ = false;
+    // Motion-blur + DOF working targets (Phase 6b), one per path (SSAA only
+    // when gtSsaa); same host-owned GENERAL-for-life model as the pyramids.
+    PostFxTargets gbPostFx_;
+    PostFxTargets gtPostFx_;
+    PostFxTargets gtSsaaPostFx_; // gtSsaa only
     ImageResource composeImage_; // RGBA8, tonemapped columns + overlay
     ImageResource fontAtlas_;
+    // Log-domain grading LUT (Phase 6c): procedural identity — compare columns
+    // share the neutral grading set (compare output stays SDR).
+    GradingLutGpu gradingLut_;
+    ColorGrading grading_;
 
     // Shared deferred pipeline (shaders/layouts/pipelines/samplers + IBL maps).
     DeferredCore deferred_;
@@ -200,6 +337,9 @@ private:
     // degrades to no shadows (bindings stay unwritten, sampling stays off).
     ShadowTargets shadow_;
     bool shadowsActive_ = false;
+    // Spot light shadow atlas (Phase 4b, fixed 4096^2, shared by all paths).
+    ShadowAtlas spotAtlas_;
+    bool spotAtlasActive_ = false;
     float iblIntensity_ = 1.f; // from lightingPresetForScene
 
     VkDescriptorSetLayout composeSetLayout_ = VK_NULL_HANDLE;
@@ -227,24 +367,10 @@ private:
     VkDescriptorSet gtComposeSet_ = VK_NULL_HANDLE;
     VkDescriptorSet gtDownsampleSet_ = VK_NULL_HANDLE; // 2x GT source (SSAA)
     // SSAO descriptor sets (static: the referenced textures never change).
+    // The blur sets live inside AoHistory (one per ping-pong buffer).
     VkDescriptorSet ssaoSetGb_ = VK_NULL_HANDLE;
-    VkDescriptorSet ssaoBlurSetGb_ = VK_NULL_HANDLE;
     VkDescriptorSet ssaoSetGt_ = VK_NULL_HANDLE;
-    VkDescriptorSet ssaoBlurSetGt_ = VK_NULL_HANDLE;
     VkDescriptorSet ssaoSetSsaa_ = VK_NULL_HANDLE;     // gtSsaa only
-    VkDescriptorSet ssaoBlurSetSsaa_ = VK_NULL_HANDLE; // gtSsaa only
-    VkDescriptorSet bloomExtractGb_ = VK_NULL_HANDLE;
-    VkDescriptorSet bloomBlurHGb_ = VK_NULL_HANDLE;
-    VkDescriptorSet bloomBlurVGb_ = VK_NULL_HANDLE;
-    VkDescriptorSet bloomCompGb_ = VK_NULL_HANDLE;
-    VkDescriptorSet bloomExtractGt_ = VK_NULL_HANDLE;
-    VkDescriptorSet bloomBlurHGt_ = VK_NULL_HANDLE;
-    VkDescriptorSet bloomBlurVGt_ = VK_NULL_HANDLE;
-    VkDescriptorSet bloomCompGt_ = VK_NULL_HANDLE;
-    VkDescriptorSet bloomExtractSsaa_ = VK_NULL_HANDLE;
-    VkDescriptorSet bloomBlurHSsaa_ = VK_NULL_HANDLE;
-    VkDescriptorSet bloomBlurVSsaa_ = VK_NULL_HANDLE;
-    VkDescriptorSet bloomCompSsaa_ = VK_NULL_HANDLE;
     VkSampler linearSampler_ = VK_NULL_HANDLE;
     VkSampler fontSampler_ = VK_NULL_HANDLE;
 
@@ -259,51 +385,56 @@ private:
     VkImageLayout gbEmissiveLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gtColorLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gtDepthLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageLayout gtMotionLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gtAlbedoLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gtNormalLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gtMaterialLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gtEmissiveLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gtSsaaColorLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gtSsaaDepthLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageLayout gtSsaaMotionLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gtSsaaAlbedoLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gtSsaaNormalLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gtSsaaMaterialLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gtSsaaEmissiveLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gbAoRawLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gbAoLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
-    VkImageLayout gbBloomALayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
-    VkImageLayout gbBloomBLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
-    VkImageLayout gbSsrSrcLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
-    VkImageLayout gtSsrSrcLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
-    VkImageLayout gtSsaaSsrSrcLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
-    VkImageLayout gtBloomALayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
-    VkImageLayout gtBloomBLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
-    VkImageLayout gtSsaaBloomALayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
-    VkImageLayout gtSsaaBloomBLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gtAoRawLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gtAoLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gtSsaaAoRawLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout gtSsaaAoLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageLayout gbSsrTraceLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageLayout gtSsrTraceLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageLayout gtSsaaSsrTraceLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout composeLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
 
     VkBuffer materialUbo_ = VK_NULL_HANDLE;
-    VkDeviceMemory materialUboMemory_ = VK_NULL_HANDLE;
+    VmaAllocation materialUboMemory_ = VK_NULL_HANDLE;
     uint32_t materialStride_ = 0;
 
     VkBuffer textUbo_ = VK_NULL_HANDLE; // packed ASCII overlay text (all columns)
-    VkDeviceMemory textUboMemory_ = VK_NULL_HANDLE;
+    VmaAllocation textUboMemory_ = VK_NULL_HANDLE;
     void* textUboMapped_ = nullptr;
 
     VkBuffer metricResultBuf_ = VK_NULL_HANDLE; // kMaxAlgos * kMetricFloats floats
-    VkDeviceMemory metricResultMemory_ = VK_NULL_HANDLE;
+    VmaAllocation metricResultMemory_ = VK_NULL_HANDLE;
     VkBuffer metricStaging_[kFramesInFlight] = {};
-    VkDeviceMemory metricStagingMemory_[kFramesInFlight] = {};
+    VmaAllocation metricStagingMemory_[kFramesInFlight] = {};
     void* metricStagingMapped_[kFramesInFlight] = {};
     bool metricPending_[kFramesInFlight] = {};
 
     VkBuffer screenshotStaging_ = VK_NULL_HANDLE;
-    VkDeviceMemory screenshotStagingMemory_ = VK_NULL_HANDLE;
+    VmaAllocation screenshotStagingMemory_ = VK_NULL_HANDLE;
     void* screenshotMapped_ = nullptr;
+
+    // Auto exposure: the LR path (gbColor_) feeds the upscaler preExposure and
+    // the algorithm columns; the GT path (gtSsaaColor_ when gtSsaa, else
+    // gtColor_) feeds the GT column + metric reference.  Two independent
+    // solvers — each column is its own render pipeline (engine behaviour), so
+    // per-column exposures may differ.  Harvested values lag the GPU by
+    // kFramesInFlight frames; see ExposureChannel.
+    ExposureChannel lrExposure_;
+    ExposureChannel gtExposure_;
 
     bool initAlgorithms();
     bool createRenderTargets();
@@ -315,10 +446,26 @@ private:
     bool createFontAtlas();
     bool createMetricResources();
     bool createScreenshotStaging();
+    // Auto-exposure channels + sets (needs the descriptor pool; called from
+    // createDescriptors once the pool exists).
+    bool createAutoExposureResources();
+    // Phase 7a: instance SSBO + per-path cull channels (needs the descriptor
+    // pool + allocated scene sets, so runs after createDescriptors).
+    bool createCullResources();
+    // Per-path display exposure: harvested auto value, or the manual
+    // --exposure override when auto exposure is off.
+    float lrExposure() const {
+        return opts_.autoExposure ? lrExposure_.value : opts_.exposure;
+    }
+    float gtExposure() const {
+        return opts_.autoExposure ? gtExposure_.value : opts_.exposure;
+    }
     void updateSceneUBO(void* mapped, bool jitter, uint32_t renderW, uint32_t renderH,
                         const Mat4& view, const Mat4& proj, const Mat4& projJittered,
                         const Mat4& prevViewProj);
-    void updateLightingUBO(void* mapped, const Mat4& invViewProj, const ShadowFrame* shadow);
+    void updateLightingUBO(void* mapped, const Mat4& viewProj, const ShadowFrame* shadow,
+                           const std::vector<Light>* overrideLights);
+    void updateClusterLights(uint32_t frameIndex, const std::vector<Light>& lights);
     void updateCamera(uint32_t frameIndex, float dt);
     void recordFrame(uint32_t frameIndex, uint32_t swapchainIndex);
     void captureScreenshotIntoStaging(VkCommandBuffer cmd);

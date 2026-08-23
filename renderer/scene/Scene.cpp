@@ -1,6 +1,7 @@
 #include "renderer/scene/Scene.h"
 
 #include "renderer/core/VkUtil.h"
+#include "renderer/core/Vma.h"
 
 #include <algorithm>
 #include <cstring>
@@ -10,35 +11,33 @@ namespace sr {
 namespace {
 
 bool createStagedBuffer(const VulkanContext& ctx, const void* data, VkDeviceSize size,
-                        VkBufferUsageFlags usage, VkBuffer& buffer, VkDeviceMemory& memory,
+                        VkBufferUsageFlags usage, VkBuffer& buffer, VmaAllocation& memory,
                         VkCommandPool pool) {
     VkBuffer staging = VK_NULL_HANDLE;
-    VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
+    VmaAllocation stagingMemory = VK_NULL_HANDLE;
     if (createBuffer(ctx, size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                      staging, stagingMemory) != VK_SUCCESS)
         return false;
 
     void* mapped = nullptr;
-    vkMapMemory(ctx.device, stagingMemory, 0, size, 0, &mapped);
+    vmaMapMemory(ctx.allocator, stagingMemory, &mapped);
     std::memcpy(mapped, data, static_cast<size_t>(size));
-    vkUnmapMemory(ctx.device, stagingMemory);
+    vmaUnmapMemory(ctx.allocator, stagingMemory);
 
     if (createBuffer(ctx, size, usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, buffer, memory) != VK_SUCCESS) {
-        vkDestroyBuffer(ctx.device, staging, nullptr);
-        vkFreeMemory(ctx.device, stagingMemory, nullptr);
+        vmaDestroyBuffer(ctx.allocator, staging, stagingMemory);
         return false;
     }
 
     VkBufferCopy region = {};
     region.size = size;
-    submitOneShot(ctx, [&](VkCommandBuffer cmd) {
+    submitUploadOneShot(ctx, [&](VkCommandBuffer cmd) {
         vkCmdCopyBuffer(cmd, staging, buffer, 1, &region);
-    }, pool);
+    }, {}, pool);
 
-    vkDestroyBuffer(ctx.device, staging, nullptr);
-    vkFreeMemory(ctx.device, stagingMemory, nullptr);
+    vmaDestroyBuffer(ctx.allocator, staging, stagingMemory);
     return true;
 }
 
@@ -79,6 +78,43 @@ bool Scene::uploadMesh(const VulkanContext& ctx, const std::vector<Vertex>& vert
 
     out.indexCount = static_cast<uint32_t>(indices.size());
     out.indexType = VK_INDEX_TYPE_UINT32;
+    out.lods[0] = {out.firstIndex, out.indexCount, out.vertexOffset};
+    out.lodCount = 1;
+    return true;
+}
+
+bool Scene::uploadSkinnedMesh(const VulkanContext& ctx, const std::vector<SkinnedVertex>& vertices,
+                              const std::vector<uint32_t>& indices, Mesh& out, VkCommandPool pool) {
+    if (vertices.empty() || indices.empty()) return false;
+
+    const VkDeviceSize vbSize = vertices.size() * sizeof(SkinnedVertex);
+    const VkDeviceSize ibSize = indices.size() * sizeof(uint32_t);
+
+    // Own buffers, deliberately NOT accumulated into the merged scene buffers:
+    // the vertex format differs and skinned meshes are rare, so the merged
+    // draw path (which binds one vertex buffer per pass) cannot serve them.
+    if (!createStagedBuffer(ctx, vertices.data(), vbSize, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                            out.vertexBuffer, out.vertexMemory, pool))
+        return false;
+    if (!createStagedBuffer(ctx, indices.data(), ibSize, VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                            out.indexBuffer, out.indexMemory, pool))
+        return false;
+
+    Vec3 lo = vertices[0].position, hi = vertices[0].position;
+    for (const auto& v : vertices) {
+        lo.x = std::min(lo.x, v.position.x); lo.y = std::min(lo.y, v.position.y);
+        lo.z = std::min(lo.z, v.position.z);
+        hi.x = std::max(hi.x, v.position.x); hi.y = std::max(hi.y, v.position.y);
+        hi.z = std::max(hi.z, v.position.z);
+    }
+    out.aabbMin = lo;
+    out.aabbMax = hi;
+    out.firstIndex = 0;
+    out.vertexOffset = 0;
+    out.indexCount = static_cast<uint32_t>(indices.size());
+    out.indexType = VK_INDEX_TYPE_UINT32;
+    out.lods[0] = {0, out.indexCount, 0};
+    out.lodCount = 1;
     return true;
 }
 
@@ -100,8 +136,11 @@ void Scene::finalizeInstances() {
     for (auto& inst : instances) {
         inst.normalModel = Mat4::transpose(Mat4::inverse(inst.model));
         // Transform the 8 local-AABB corners; the result is conservative for
-        // any affine model matrix.
-        const Mesh& mesh = meshes[inst.meshIndex];
+        // any affine model matrix.  Skinned instances index skinnedMeshes and
+        // their bounds are overwritten by computeAnimatedBounds() anyway (the
+        // bind-pose result here is only a placeholder).
+        const Mesh& mesh = inst.skinIndex >= 0 ? skinnedMeshes[inst.meshIndex]
+                                               : meshes[inst.meshIndex];
         Vec3 lo, hi;
         for (int c = 0; c < 8; ++c) {
             const Vec3 corner{(c & 1) ? mesh.aabbMax.x : mesh.aabbMin.x,
@@ -142,26 +181,31 @@ bool Scene::uploadTexture(const VulkanContext& ctx, uint32_t width, uint32_t hei
 
     const VkDeviceSize size = static_cast<VkDeviceSize>(width) * height * 4;
     VkBuffer staging = VK_NULL_HANDLE;
-    VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
+    VmaAllocation stagingMemory = VK_NULL_HANDLE;
     if (createBuffer(ctx, size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                      staging, stagingMemory) != VK_SUCCESS) {
-        vkDestroyImage(ctx.device, out.image, nullptr);
-        vkFreeMemory(ctx.device, out.memory, nullptr);
+        vmaDestroyImage(ctx.allocator, out.image, out.memory);
         out.image = VK_NULL_HANDLE;
         out.memory = VK_NULL_HANDLE;
         return false;
     }
 
     void* mapped = nullptr;
-    vkMapMemory(ctx.device, stagingMemory, 0, size, 0, &mapped);
+    vmaMapMemory(ctx.allocator, stagingMemory, &mapped);
     std::memcpy(mapped, rgba8, static_cast<size_t>(size));
-    vkUnmapMemory(ctx.device, stagingMemory);
+    vmaUnmapMemory(ctx.allocator, stagingMemory);
 
+    // Mip blits are not legal on transfer-only queues, so uncompressed
+    // uploads stay on the graphics queue (the KTX2 path needs no blits and
+    // does use the transfer queue via uploadKtx2Levels).
     submitOneShot(ctx, [&](VkCommandBuffer cmd) {
         // Level 0: UNDEFINED -> TRANSFER_DST, upload, -> TRANSFER_SRC.
         imageBarrier(cmd, out.image, VK_IMAGE_LAYOUT_UNDEFINED,
-                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, 0, 1);
+                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                     VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+                     VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                     VK_IMAGE_ASPECT_COLOR_BIT, 0, 1);
         VkBufferImageCopy region = {};
         region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         region.imageSubresource.layerCount = 1;
@@ -169,12 +213,18 @@ bool Scene::uploadTexture(const VulkanContext& ctx, uint32_t width, uint32_t hei
         vkCmdCopyBufferToImage(cmd, staging, out.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
                                &region);
         imageBarrier(cmd, out.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, 0, 1);
+                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                     VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                     VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+                     VK_IMAGE_ASPECT_COLOR_BIT, 0, 1);
 
         // Downsample level by level; each finished level goes SHADER_READ_ONLY.
         for (uint32_t level = 1; level < mipLevels; ++level) {
             imageBarrier(cmd, out.image, VK_IMAGE_LAYOUT_UNDEFINED,
-                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, level, 1);
+                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                         VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+                         VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                         VK_IMAGE_ASPECT_COLOR_BIT, level, 1);
             VkImageBlit blit = {};
             blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level - 1, 0, 1};
             blit.srcOffsets[0] = {0, 0, 0};
@@ -186,20 +236,28 @@ bool Scene::uploadTexture(const VulkanContext& ctx, uint32_t width, uint32_t hei
                                   static_cast<int32_t>(std::max(1u, height >> level)), 1};
             vkCmdBlitImage(cmd, out.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, out.image,
                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+            // Finished levels are sampled by the GBuffer/transparent fragment shaders.
             imageBarrier(cmd, out.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT,
+                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                         VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+                         VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                         VK_ACCESS_2_SHADER_SAMPLED_READ_BIT, VK_IMAGE_ASPECT_COLOR_BIT,
                          level - 1, 1);
             // The new level becomes the source for the next blit.
             imageBarrier(cmd, out.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, level, 1);
+                         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                         VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                         VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+                         VK_IMAGE_ASPECT_COLOR_BIT, level, 1);
         }
         imageBarrier(cmd, out.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT,
-                     mipLevels - 1, 1);
+                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                     VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+                     VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                     VK_IMAGE_ASPECT_COLOR_BIT, mipLevels - 1, 1);
     }, pool);
 
-    vkDestroyBuffer(ctx.device, staging, nullptr);
-    vkFreeMemory(ctx.device, stagingMemory, nullptr);
+    vmaDestroyBuffer(ctx.allocator, staging, stagingMemory);
 
     out.view = createImageView(ctx, out.image, format, VK_IMAGE_ASPECT_COLOR_BIT, 0, mipLevels);
     out.width = width;
@@ -209,25 +267,49 @@ bool Scene::uploadTexture(const VulkanContext& ctx, uint32_t width, uint32_t hei
 }
 
 void Scene::destroy(const VulkanContext& ctx) {
+    // The streaming worker references texture images; join it first.
+    stopTextureStreaming();
+
     for (auto& m : meshes) {
-        if (m.vertexBuffer) vkDestroyBuffer(ctx.device, m.vertexBuffer, nullptr);
-        if (m.vertexMemory) vkFreeMemory(ctx.device, m.vertexMemory, nullptr);
-        if (m.indexBuffer) vkDestroyBuffer(ctx.device, m.indexBuffer, nullptr);
-        if (m.indexMemory) vkFreeMemory(ctx.device, m.indexMemory, nullptr);
+        if (m.vertexBuffer) vmaDestroyBuffer(ctx.allocator, m.vertexBuffer, m.vertexMemory);
+        if (m.indexBuffer) vmaDestroyBuffer(ctx.allocator, m.indexBuffer, m.indexMemory);
     }
     meshes.clear();
 
+    for (auto& m : skinnedMeshes) {
+        if (m.vertexBuffer) vmaDestroyBuffer(ctx.allocator, m.vertexBuffer, m.vertexMemory);
+        if (m.indexBuffer) vmaDestroyBuffer(ctx.allocator, m.indexBuffer, m.indexMemory);
+    }
+    skinnedMeshes.clear();
+
+    for (uint32_t slot = 0; slot < kSkinPaletteSlots; ++slot) {
+        if (skinPaletteBuffer[slot]) {
+            if (skinPaletteMapped[slot]) {
+                vmaUnmapMemory(ctx.allocator, skinPaletteMemory[slot]);
+                skinPaletteMapped[slot] = nullptr;
+            }
+            vmaDestroyBuffer(ctx.allocator, skinPaletteBuffer[slot], skinPaletteMemory[slot]);
+            skinPaletteBuffer[slot] = VK_NULL_HANDLE;
+            skinPaletteMemory[slot] = VK_NULL_HANDLE;
+        }
+    }
+    skinPaletteJointCount = 0;
+    skins.clear();
+    nodes.clear();
+    nodeTopoOrder.clear();
+    animSamplers.clear();
+    animChannels.clear();
+    animDuration = 0.f;
+    dynamicDrivers.clear();
+
     for (auto& t : textures) {
         if (t.view) vkDestroyImageView(ctx.device, t.view, nullptr);
-        if (t.image) vkDestroyImage(ctx.device, t.image, nullptr);
-        if (t.memory) vkFreeMemory(ctx.device, t.memory, nullptr);
+        if (t.image) vmaDestroyImage(ctx.allocator, t.image, t.memory);
     }
     textures.clear();
 
-    if (mergedVertexBuffer) vkDestroyBuffer(ctx.device, mergedVertexBuffer, nullptr);
-    if (mergedVertexMemory) vkFreeMemory(ctx.device, mergedVertexMemory, nullptr);
-    if (mergedIndexBuffer) vkDestroyBuffer(ctx.device, mergedIndexBuffer, nullptr);
-    if (mergedIndexMemory) vkFreeMemory(ctx.device, mergedIndexMemory, nullptr);
+    if (mergedVertexBuffer) vmaDestroyBuffer(ctx.allocator, mergedVertexBuffer, mergedVertexMemory);
+    if (mergedIndexBuffer) vmaDestroyBuffer(ctx.allocator, mergedIndexBuffer, mergedIndexMemory);
     mergedVertexBuffer = VK_NULL_HANDLE;
     mergedVertexMemory = VK_NULL_HANDLE;
     mergedIndexBuffer = VK_NULL_HANDLE;

@@ -56,7 +56,8 @@ uint8_t toByte(float v) {
 } // namespace
 
 bool savePngFromHalfRgba(const char* path, const uint8_t* halfRgba, uint32_t width,
-                         uint32_t height, float exposure) {
+                         uint32_t height, float exposure, const ColorGrading& grading,
+                         const ColorLut* lut) {
     if (!path || !halfRgba || width == 0 || height == 0) return false;
     ensureParentDir(path);
 
@@ -68,8 +69,11 @@ bool savePngFromHalfRgba(const char* path, const uint8_t* halfRgba, uint32_t wid
         std::memcpy(&r, src, 2);
         std::memcpy(&g, src + 2, 2);
         std::memcpy(&b, src + 4, 2);
-        const Vec3 ldr =
-            tonemapToDisplay({halfToFloat(r), halfToFloat(g), halfToFloat(b)}, exposure);
+        // Same order as present.frag: log-domain grading, then the display
+        // transform (ACES + gamma 2.2).
+        const Vec3 graded =
+            applyColorGrading({halfToFloat(r), halfToFloat(g), halfToFloat(b)}, grading, lut);
+        const Vec3 ldr = tonemapToDisplay(graded, exposure);
         rgba[i * 4 + 0] = toByte(ldr.x);
         rgba[i * 4 + 1] = toByte(ldr.y);
         rgba[i * 4 + 2] = toByte(ldr.z);

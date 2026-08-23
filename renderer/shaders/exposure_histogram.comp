@@ -1,0 +1,51 @@
+#version 450
+// Auto exposure, pass 1: 256-bin log2-luminance histogram of the lit HDR
+// scene color (UE4 AutoExposure / "Moving Frostbite to PBR" style).
+//
+// The source is sampled at half resolution (one texel per 2x2 block): the
+// histogram is a statistical quantity, so spatial downsampling only costs a
+// little noise, which the EV smoothing absorbs.
+//
+// Determinism: the bin assignment of a texel does not depend on the
+// invocation order, and atomic adds commute, so the histogram contents are
+// bit-exact for a given frame regardless of GPU scheduling.
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D srcColor; // lit HDR, SHADER_READ_ONLY
+layout(std430, set = 0, binding = 1) buffer Histogram { uint bins[]; } uHistogram;
+// binding 2 (exposure state SSBO) belongs to the solve pass; both passes share
+// one descriptor set layout.
+
+layout(push_constant) uniform Push {
+    ivec2 sampleDims; // half-resolution sample grid (ceil(src / 2))
+} pc;
+
+// Fixed log2-luminance range: covers 1.5e-5 .. 65536 (the R16F/B10G11R11
+// ceiling).  Must match exposure_solve.comp.
+const float kMinLogLum = -16.0;
+const float kLogLumRange = 32.0;
+const int kBinCount = 256;
+
+shared uint sBins[kBinCount];
+
+void main() {
+    const uint lane = gl_LocalInvocationIndex; // 0..255, one bin per thread
+    sBins[lane] = 0u;
+    barrier();
+
+    const ivec2 samplePos = ivec2(gl_GlobalInvocationID.xy);
+    if (samplePos.x < pc.sampleDims.x && samplePos.y < pc.sampleDims.y) {
+        const vec3 c = texelFetch(srcColor, samplePos * 2, 0).rgb;
+        const float lum = dot(c, vec3(0.2126, 0.7152, 0.0722));
+        // Skip black/NaN texels: log2(0) would pin the average to -inf.
+        if (lum > 0.0) {
+            const float t = (log2(lum) - kMinLogLum) / kLogLumRange;
+            const int bin = clamp(int(t * float(kBinCount)), 0, kBinCount - 1);
+            atomicAdd(sBins[bin], 1u);
+        }
+    }
+    barrier();
+
+    atomicAdd(uHistogram.bins[lane], sBins[lane]);
+}

@@ -1,0 +1,45 @@
+#version 450
+// Motion blur tile-max pass (Phase 6b): reduces the full-res motion RT
+// (RG16F, pixel units, no jitter) into one max-magnitude velocity per
+// kTileSize x kTileSize tile.  This is the "tile max" stage of McGuire et
+// al.'s reconstruction filter (and of DOOM Eternal's / UE's motion blur):
+// the gather pass (motion_blur_gather.comp) consults the neighbourhood max
+// to know how far a pixel must search for geometry moving over it.
+//
+// Ref: McGuire et al., "A Fast and Stable Feature-Aware Motion Blur Filter",
+//      HPG 2012 (tile max + neighbourhood max + gather)
+//      DOOM Eternal motion blur (Siggraph 2020 "DOOM Eternal Rendering
+//      Challenges"), same tile-max/gather structure.
+//
+//   binding 0 = motion RT (sampler, full res; texelFetch ignores the sampler)
+//   binding 1 = tile-max out (RG16F storage, ceil(w/T) x ceil(h/T))
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D motion;
+layout(set = 0, binding = 1, rg16f) uniform writeonly image2D tileMax;
+
+layout(push_constant) uniform Push {
+    ivec4 params; // xy = full-res motion size, z = tile size, w unused
+} pc;
+
+void main() {
+    const ivec2 tile = ivec2(gl_GlobalInvocationID.xy);
+    if (tile.x >= imageSize(tileMax).x || tile.y >= imageSize(tileMax).y) return;
+
+    const ivec2 begin = tile * pc.params.z;
+    const ivec2 end = min(begin + pc.params.z, pc.params.xy);
+    vec2 best = vec2(0.0);
+    float bestLen2 = -1.0;
+    for (int y = begin.y; y < end.y; ++y) {
+        for (int x = begin.x; x < end.x; ++x) {
+            const vec2 v = texelFetch(motion, ivec2(x, y), 0).xy;
+            const float len2 = dot(v, v);
+            if (len2 > bestLen2) {
+                bestLen2 = len2;
+                best = v;
+            }
+        }
+    }
+    imageStore(tileMax, tile, vec4(best, 0.0, 0.0));
+}

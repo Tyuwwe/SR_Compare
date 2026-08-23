@@ -1,0 +1,51 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "volfog.glsl"
+// Froxel density injection (Frostbite 2015 unified participating media;
+// UE4.16 Volumetric Fog).  One invocation per froxel writes the media
+// properties: rgb = scattering albedo (fog colour), a = extinction sigma_t
+// (1/m).  Density = exponential height fog (Wronski 2014) modulated by
+// static 3D value noise; the noise domain is offset by the frame index so
+// each frame contributes a fresh deterministic realisation that the
+// temporal pass (volfog_temporal.comp) smooths.
+//
+// bindings: 0 = inject volume (rgba16f storage image3D, GENERAL)
+
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+
+layout(set = 0, binding = 0, rgba16f) uniform writeonly image3D outVolume;
+
+// Must match VolFogInjectPush in DeferredCore.h.
+layout(push_constant) uniform Push {
+    mat4 invView;    // view inverse (un-jittered, both paths)
+    vec4 projParams; // x = proj[0][0], y = proj[1][1], z = near, w = fog far
+    vec4 fogA;       // x = base density (1/m), y = height falloff (1/m),
+                     // z = base height (m, world Y), w = noise scale (1/m)
+    vec4 fogAlbedo;  // rgb = scattering albedo, w = noise strength (0..1)
+    vec4 fogB;       // x = frame index, yzw unused
+    uvec4 grid;      // dimX, dimY, dimZ, unused
+} pc;
+
+void main() {
+    const uvec3 c = gl_GlobalInvocationID;
+    if (any(greaterThanEqual(c, pc.grid.xyz))) return;
+
+    const vec3 worldPos = froxelWorldPos(c, vec3(pc.grid.xyz), pc.projParams, pc.invView);
+
+    // Height fog: exponential falloff above the base height.
+    float density = pc.fogA.x * exp(-max(worldPos.y - pc.fogA.z, 0.0) * pc.fogA.y);
+
+    // Static 3D noise modulation, frame-index domain offset (deterministic;
+    // no wall clock, no wind).  Two octaves, remapped to a [1-s, 1+s]
+    // multiplicative modulation.
+    if (pc.fogAlbedo.w > 0.0) {
+        const float fi = pc.fogB.x;
+        const vec3 offs =
+            vec3(fract(fi * 0.7548777), fract(fi * 0.5698403), fract(fi * 0.4384913)) * 61.0;
+        const vec3 np = worldPos * pc.fogA.w + offs;
+        const float n = volFogNoise3(np) * 0.65 + volFogNoise3(np * 2.13 + 17.0) * 0.35;
+        density *= mix(1.0, n * 2.0, pc.fogAlbedo.w);
+    }
+
+    imageStore(outVolume, ivec3(c), vec4(pc.fogAlbedo.rgb, max(density, 0.0)));
+}

@@ -1,7 +1,9 @@
 #version 450
 // Deferred GBuffer fragment shader for the native ground-truth path.
-// Identical to gbuffer.frag except it has no motion output (the GT GBuffer has
-// four color attachments), which keeps dynamic rendering validation clean.
+// Identical to gbuffer.frag; Phase 6b added the motion output (RT4) so the GT
+// path runs the same motion-blur post pass as the LR path (per-object motion
+// of dynamic objects must blur the GT identically, or the compare metrics
+// would fault the upscalers for a post effect only one side has).
 
 layout(set = 0, binding = 1) uniform MaterialUBO {
     vec4 baseColor;
@@ -13,16 +15,27 @@ layout(set = 0, binding = 1) uniform MaterialUBO {
 
 layout(set = 1, binding = 0) uniform sampler2D uTextures[1024];
 
+// Vertex-stage SceneUBO, also visible to the fragment stage (see gbuffer.frag).
+layout(set = 0, binding = 0) uniform SceneUBO {
+    mat4 viewProj;
+    mat4 viewProjNoJitter;
+    mat4 prevViewProj;
+    vec4 cameraPos;
+    vec4 ambient;
+    vec4 renderSizeJitter;
+} scene;
+
 layout(location = 0) in vec3 vWorldPos;
 layout(location = 1) in vec3 vNormal;
 layout(location = 2) in vec2 vUV;
 layout(location = 3) in vec4 vTangent;
-layout(location = 4) in vec2 vMotion; // unused (GT has no motion attachment)
+layout(location = 4) in vec2 vMotion;
 
 layout(location = 0) out vec4 outAlbedo;
 layout(location = 1) out vec4 outNormal;
 layout(location = 2) out vec4 outMaterial;
 layout(location = 3) out vec3 outEmissive; // B10G11R11_UFLOAT: no alpha channel
+layout(location = 4) out vec2 outMotion;   // RG16F, pixel units, no jitter
 
 int texIndex(float f) { return int(floor(f + 0.5)); }
 
@@ -49,6 +62,10 @@ void main() {
     }
 
     vec3 N = normalize(vNormal);
+    // Cull mode is NONE: flip the geometric normal toward the viewer before
+    // normal mapping so backfaces store viewer-facing normals (see
+    // gbuffer.frag for why this must happen here, not in lighting.frag).
+    if (dot(N, scene.cameraPos.xyz - vWorldPos) < 0.0) N = -N;
     const int normalTex = texIndex(material.tex0.y);
     if (normalTex >= 0) {
         vec3 T = normalize(vTangent.xyz - N * dot(N, vTangent.xyz));
@@ -66,4 +83,5 @@ void main() {
     outMaterial = vec4(clamp(metallic, 0.0, 1.0), clamp(roughness, 0.0, 1.0),
                        clamp(ao, 0.0, 1.0), 1.0);
     outEmissive = emissive;
+    outMotion = vMotion;
 }

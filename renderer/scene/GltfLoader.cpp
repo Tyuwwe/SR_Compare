@@ -1,10 +1,15 @@
 #include "renderer/scene/Scene.h"
 
 #include "renderer/core/VkUtil.h"
+#include "renderer/scene/LodBuilder.h"
 #include "renderer/scene/SceneRegistry.h"
 
+#include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
 #include <set>
 #include <string>
 #include <utility>
@@ -101,6 +106,97 @@ std::string dirOfPath(const char* path) {
     return slash == std::string::npos ? std::string() : p.substr(0, slash + 1);
 }
 
+// Mirror-mode glass: panes that must read as opaque mirrors instead of
+// transmissive glass (user feedback: the BistroExterior café storefront did
+// not look like a mirror).  The transparency pass shades these with
+// transmission disabled and alpha = 1 (Material::mirror).
+//
+// Classification is scene + exact material name, kept deliberately narrow:
+// a broad "glass" substring would wrongly catch small-item glass that must
+// stay transmissive (MenuSign_02_Glass, Vespa_Odometer_Glass,
+// Spotlight_Glass_Emissive, Paris_LiquorBottle_*_Glass tableware) and the
+// dirty upper-floor panes (MASTER_Glass_Dirty[_MASKED]).  The two storefront
+// materials: MASTER_Frosted_Glass is the boulangerie/patisserie storefront
+// (paris_building_04, the default exterior camera target), MASTER_Glass_Exterior
+// the restaurant ground floor (paris_building_01_bottom).  Both are gated to
+// the EXTERIOR scene only — BistroInterior reuses MASTER_Glass_Exterior for
+// windows seen from inside, which keep the transmissive path there.
+const char* const kMirrorGlassScenes[] = {"bistroexterior"};
+const char* const kMirrorGlassMaterials[] = {"MASTER_Glass_Exterior", "MASTER_Frosted_Glass"};
+
+bool isMirrorGlass(const char* path, const char* materialName) {
+    if (!materialName) return false;
+    std::string lower(path);
+    for (char& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    bool sceneHit = false;
+    for (const char* s : kMirrorGlassScenes)
+        if (lower.find(s) != std::string::npos) { sceneHit = true; break; }
+    if (!sceneHit) return false;
+    for (const char* m : kMirrorGlassMaterials)
+        if (std::strcmp(materialName, m) == 0) return true;
+    return false;
+}
+
+// cgltf keeps unparsed extensions as raw JSON (name + data); MSFT_lod carries
+// {"ids":[n0,n1,...]} — nodes that are the next-coarser LODs of this node.
+std::vector<int32_t> parseMsftLodIds(const cgltf_node* node, cgltf_size nodeCount) {
+    std::vector<int32_t> ids;
+    for (size_t e = 0; e < node->extensions_count; ++e) {
+        const cgltf_extension& ext = node->extensions[e];
+        if (!ext.name || std::strcmp(ext.name, "MSFT_lod") != 0 || !ext.data) continue;
+        const char* p = std::strstr(ext.data, "\"ids\"");
+        if (!p) continue;
+        p = std::strchr(p, '[');
+        if (!p) continue;
+        ++p;
+        while (*p && *p != ']') {
+            while (*p && *p != ']' && (std::isspace(static_cast<unsigned char>(*p)) || *p == ','))
+                ++p;
+            if (!*p || *p == ']') break;
+            char* end = nullptr;
+            const long v = std::strtol(p, &end, 10);
+            if (end == p) break; // malformed: stop instead of looping forever
+            p = end;
+            if (v >= 0 && static_cast<cgltf_size>(v) < nodeCount)
+                ids.push_back(static_cast<int32_t>(v));
+        }
+    }
+    return ids;
+}
+
+// Splits a node's baked matrix into TRS so animation channels can override
+// individual components.  Translation = column 3; scale = column lengths
+// (sign from the determinant); rotation = orthonormalized basis -> quaternion.
+void decomposeMatrix(const cgltf_float m[16], Vec3& t, Vec4& q, Vec3& s) {
+    t = {m[12], m[13], m[14]};
+    const Vec3 c0{m[0], m[1], m[2]}, c1{m[4], m[5], m[6]}, c2{m[8], m[9], m[10]};
+    s = {length(c0), length(c1), length(c2)};
+    const float det = dot(c0, cross(c1, c2));
+    if (det < 0.f) s.x = -s.x;
+    const float r00 = c0.x / s.x, r10 = c0.y / s.x, r20 = c0.z / s.x;
+    const float r01 = c1.x / s.y, r11 = c1.y / s.y, r21 = c1.z / s.y;
+    const float r02 = c2.x / s.z, r12 = c2.y / s.z, r22 = c2.z / s.z;
+    // Standard trace-based matrix->quaternion (largest-component branch).
+    const float trace = r00 + r11 + r22;
+    if (trace > 0.f) {
+        const float w = std::sqrt(trace + 1.f) * 0.5f;
+        const float inv = 0.25f / w;
+        q = {(r21 - r12) * inv, (r02 - r20) * inv, (r10 - r01) * inv, w};
+    } else if (r00 > r11 && r00 > r22) {
+        const float x = std::sqrt(1.f + r00 - r11 - r22) * 0.5f;
+        const float inv = 0.25f / x;
+        q = {x, (r01 + r10) * inv, (r02 + r20) * inv, (r21 - r12) * inv};
+    } else if (r11 > r22) {
+        const float y = std::sqrt(1.f + r11 - r00 - r22) * 0.5f;
+        const float inv = 0.25f / y;
+        q = {(r01 + r10) * inv, y, (r12 + r21) * inv, (r02 - r20) * inv};
+    } else {
+        const float z = std::sqrt(1.f + r22 - r00 - r11) * 0.5f;
+        const float inv = 0.25f / z;
+        q = {(r02 + r20) * inv, (r12 + r21) * inv, z, (r10 - r01) * inv};
+    }
+}
+
 } // namespace
 
 bool Scene::loadGltf(const VulkanContext& ctx, const char* path, VkCommandPool pool,
@@ -173,6 +269,25 @@ bool Scene::loadGltf(const VulkanContext& ctx, const char* path, VkCommandPool p
         return true;
     };
 
+    // Resolves the sibling .ktx2 for URI-backed images (buffer-view / data-URI
+    // embedded images have no file to sit next to).  Only path resolution
+    // here; the file is parsed at upload time.
+    auto findImageKtx2 = [&](int i, std::string& out) -> bool {
+        const cgltf_image* img = &data->images[i];
+        if (img->buffer_view || !img->uri || img->uri[0] == '\0') return false;
+        if (std::string(img->uri).rfind("data:", 0) == 0) return false;
+        std::string p = dir + img->uri;
+        const size_t dot = p.find_last_of('.');
+        const size_t slash = p.find_last_of("/\\");
+        if (dot == std::string::npos || (slash != std::string::npos && dot < slash))
+            return false;
+        p.replace(dot, std::string::npos, ".ktx2");
+        std::ifstream f(p, std::ios::binary);
+        if (!f.good()) return false;
+        out = std::move(p);
+        return true;
+    };
+
     // Returns the Scene texture index for `image` in the requested color
     // space, uploading it on first use; -1 on failure.
     auto textureFor = [&](const cgltf_texture* tex, bool srgb) -> int32_t {
@@ -187,6 +302,21 @@ bool Scene::loadGltf(const VulkanContext& ctx, const char* path, VkCommandPool p
             texAttempted[attemptIdx] = 1;
             ++texUploadsDone;
             report(LoadStage::Textures, texUploadsDone, totalTexUploads);
+        }
+        // Prefer a pre-baked BC7 sibling (foo.ktx2 next to foo.png, produced
+        // by scripts/transcode_textures.py); fall back to the PNG/JPG path
+        // unchanged when absent.
+        std::string ktx2Path;
+        if (findImageKtx2(imgIdx, ktx2Path)) {
+            Ktx2Image ktx;
+            if (loadKtx2File(ktx2Path.c_str(), ktx)) {
+                Texture t;
+                if (!uploadTextureCompressed(ctx, ktx, srgb, t, ktx2Path.c_str(), pool))
+                    return -1;
+                textures.push_back(t);
+                slot = static_cast<int32_t>(textures.size() - 1);
+                return slot;
+            }
         }
         if (!loadImagePixels(imgIdx)) return -1;
         Texture t;
@@ -233,11 +363,149 @@ bool Scene::loadGltf(const VulkanContext& ctx, const char* path, VkCommandPool p
         }
         if (m->alpha_mode == cgltf_alpha_mode_mask) mat.alphaCutoff = m->alpha_cutoff;
         if (m->alpha_mode == cgltf_alpha_mode_blend) mat.blend = true;
+        if (mat.blend) mat.mirror = isMirrorGlass(path, m->name);
         materials.push_back(mat);
         materialRemap[i] = static_cast<int32_t>(materials.size() - 1);
     }
 
+    // --- node tree / animations / skins -----------------------------------------
+    // Kept only when the file actually uses them; static files (Sponza,
+    // Bistro) take the old bake-the-world-matrix path untouched.
+    const bool keepNodes = data->animations_count > 0 || data->skins_count > 0;
+    std::vector<int32_t> skinRemap;
+    if (keepNodes) {
+        const size_t nodeCount = data->nodes_count;
+        nodes.resize(nodeCount);
+        for (size_t i = 0; i < nodeCount; ++i) {
+            const cgltf_node* node = &data->nodes[i];
+            SceneNode& sn = nodes[i];
+            if (node->has_matrix) {
+                decomposeMatrix(node->matrix, sn.translation, sn.rotation, sn.scale);
+            } else {
+                sn.translation = {node->translation[0], node->translation[1], node->translation[2]};
+                sn.rotation = {node->rotation[0], node->rotation[1], node->rotation[2],
+                               node->rotation[3]};
+                sn.scale = {node->scale[0], node->scale[1], node->scale[2]};
+            }
+        }
+        for (size_t i = 0; i < nodeCount; ++i) {
+            for (size_t c = 0; c < data->nodes[i].children_count; ++c) {
+                const size_t child = static_cast<size_t>(data->nodes[i].children[c] - data->nodes);
+                nodes[child].parent = static_cast<int32_t>(i);
+            }
+        }
+        // Parents-before-children order for the per-frame global evaluation.
+        for (size_t i = 0; i < nodeCount; ++i) {
+            if (nodes[i].parent < 0) nodeTopoOrder.push_back(static_cast<uint32_t>(i));
+        }
+        for (size_t cursor = 0; cursor < nodeTopoOrder.size(); ++cursor) {
+            const int32_t cur = static_cast<int32_t>(nodeTopoOrder[cursor]);
+            for (size_t i = 0; i < nodeCount; ++i) {
+                if (nodes[i].parent == cur) nodeTopoOrder.push_back(static_cast<uint32_t>(i));
+            }
+        }
+
+        // Only the first animation is played (no multi-clip blending).
+        if (data->animations_count > 0) {
+            const cgltf_animation* anim = &data->animations[0];
+            for (size_t s = 0; s < anim->samplers_count; ++s) {
+                const cgltf_animation_sampler* cs = &anim->samplers[s];
+                AnimSampler smp;
+                smp.step = cs->interpolation == cgltf_interpolation_type_step;
+                // CUBICSPLINE carries 3 values per key (in-tangent, point,
+                // out-tangent); keep the points and lerp between them.
+                const size_t stride = cs->interpolation == cgltf_interpolation_type_cubic_spline
+                                          ? 3
+                                          : 1;
+                const size_t comps = cs->output->type == cgltf_type_vec4 ? 4 : 3;
+                const size_t keyCount = cs->input->count;
+                smp.times.resize(keyCount);
+                smp.values.resize(keyCount);
+                for (size_t k = 0; k < keyCount; ++k) {
+                    float t = 0.f;
+                    cgltf_accessor_read_float(cs->input, k, &t, 1);
+                    smp.times[k] = t;
+                    float f[4] = {0.f, 0.f, 0.f, 1.f};
+                    cgltf_accessor_read_float(cs->output, k * stride, f, comps);
+                    smp.values[k] = {f[0], f[1], f[2], f[3]};
+                }
+                if (!smp.times.empty()) animDuration = std::max(animDuration, smp.times.back());
+                animSamplers.push_back(std::move(smp));
+            }
+            for (size_t c = 0; c < anim->channels_count; ++c) {
+                const cgltf_animation_channel* cc = &anim->channels[c];
+                if (!cc->target_node || !cc->sampler) continue;
+                AnimChannel ch;
+                ch.node = static_cast<uint32_t>(cc->target_node - data->nodes);
+                ch.sampler = static_cast<uint32_t>(cc->sampler - anim->samplers);
+                switch (cc->target_path) {
+                case cgltf_animation_path_type_rotation: ch.path = AnimPath::Rotation; break;
+                case cgltf_animation_path_type_scale: ch.path = AnimPath::Scale; break;
+                default: ch.path = AnimPath::Translation; break;
+                }
+                animChannels.push_back(ch);
+            }
+        }
+
+        skinRemap.assign(data->skins_count, -1);
+        for (size_t s = 0; s < data->skins_count; ++s) {
+            const cgltf_skin* cs = &data->skins[s];
+            Skin skin;
+            skin.joints.resize(cs->joints_count);
+            skin.inverseBind.resize(cs->joints_count, Mat4::identity());
+            for (size_t j = 0; j < cs->joints_count; ++j) {
+                skin.joints[j] = static_cast<uint32_t>(cs->joints[j] - data->nodes);
+                if (cs->inverse_bind_matrices) {
+                    cgltf_accessor_read_float(cs->inverse_bind_matrices, j,
+                                              skin.inverseBind[j].m, 16);
+                }
+            }
+            skinRemap[s] = static_cast<int32_t>(skins.size());
+            skins.push_back(std::move(skin));
+        }
+    }
+
     // Meshes: each primitive becomes a Mesh + one instance per node that uses it.
+    // Skinned primitives (node has a skin AND the primitive has JOINTS_0 /
+    // WEIGHTS_0) become a SkinnedVertex mesh instead; dedup maps keep both
+    // variants shared across nodes referencing the same primitive.
+    std::vector<std::vector<int32_t>> skinnedMeshIdx;
+    if (keepNodes) {
+        skinnedMeshIdx.resize(data->meshes_count);
+        for (size_t m = 0; m < data->meshes_count; ++m)
+            skinnedMeshIdx[m].assign(data->meshes[m].primitives_count, -1);
+    }
+
+    // (mesh, primitive) -> scene mesh index for static uploads, needed to
+    // resolve MSFT_lod chains whose LOD nodes may be processed later.
+    std::vector<std::vector<int32_t>> staticMeshIdx(data->meshes_count);
+    for (size_t m = 0; m < data->meshes_count; ++m)
+        staticMeshIdx[m].assign(data->meshes[m].primitives_count, -1);
+
+    // MSFT_lod: nodes referenced by another node's "ids" are LOD variants of
+    // it; they get no own instance, the master instance switches to their
+    // meshes instead.  Skinned masters keep a single level (see Scene.h).
+    std::vector<char> lodAuxNode(data->nodes_count, 0);
+    std::vector<std::vector<int32_t>> lodIdsPerNode(data->nodes_count);
+    for (size_t n = 0; n < data->nodes_count; ++n) {
+        const cgltf_node* node = &data->nodes[n];
+        if (!node->mesh || node->skin) continue;
+        lodIdsPerNode[n] = parseMsftLodIds(node, data->nodes_count);
+        for (const int32_t id : lodIdsPerNode[n]) {
+            if (data->nodes[id].mesh) lodAuxNode[static_cast<size_t>(id)] = 1;
+        }
+    }
+    // Instances whose authored chain must be resolved after ALL meshes are
+    // uploaded (LOD nodes can reference meshes later in the file).
+    struct PendingLodChain {
+        uint32_t instanceIndex;
+        uint32_t node;
+        uint32_t prim;
+    };
+    std::vector<PendingLodChain> pendingLodChains;
+    // CPU geometry stash for runtime LOD generation (moved, not copied).
+    std::vector<LodSourceMesh> lodSources;
+
     size_t totalPrims = 0;
     for (int m = 0; m < static_cast<int>(data->meshes_count); ++m)
         totalPrims += data->meshes[m].primitives_count;
@@ -253,6 +521,8 @@ bool Scene::loadGltf(const VulkanContext& ctx, const char* path, VkCommandPool p
             const cgltf_accessor* normal = nullptr;
             const cgltf_accessor* uv = nullptr;
             const cgltf_accessor* tangent = nullptr;
+            const cgltf_accessor* jointsAcc = nullptr;
+            const cgltf_accessor* weightsAcc = nullptr;
             const cgltf_accessor* indices = prim->indices;
             for (int a = 0; a < static_cast<int>(prim->attributes_count); ++a) {
                 const cgltf_attribute& attr = prim->attributes[a];
@@ -260,69 +530,177 @@ bool Scene::loadGltf(const VulkanContext& ctx, const char* path, VkCommandPool p
                 else if (attr.type == cgltf_attribute_type_normal) normal = attr.data;
                 else if (attr.type == cgltf_attribute_type_texcoord && attr.index == 0) uv = attr.data;
                 else if (attr.type == cgltf_attribute_type_tangent) tangent = attr.data;
+                else if (attr.type == cgltf_attribute_type_joints && attr.index == 0) jointsAcc = attr.data;
+                else if (attr.type == cgltf_attribute_type_weights && attr.index == 0) weightsAcc = attr.data;
             }
             if (!pos) continue;
 
             const size_t vertexCount = pos->count;
-            std::vector<Vertex> verts(vertexCount);
-            for (size_t v = 0; v < vertexCount; ++v) {
-                Vec3 n{0.f, 1.f, 0.f};
-                Vec2 t{0.f, 0.f};
-                readVec3(pos, v, verts[v].position);
-                if (normal) readVec3(normal, v, n);
-                if (uv) readVec2(uv, v, t);
-                verts[v].normal = n;
-                verts[v].uv = t;
-                if (tangent) readVec4(tangent, v, verts[v].tangent);
-            }
-
-            std::vector<uint32_t> idx;
-            if (indices) {
-                idx.resize(indices->count);
-                for (size_t i = 0; i < indices->count; ++i) {
-                    idx[i] = static_cast<uint32_t>(cgltf_accessor_read_index(indices, i));
-                }
-            } else {
-                idx.resize(vertexCount);
-                for (size_t i = 0; i < vertexCount; ++i) idx[i] = static_cast<uint32_t>(i);
-            }
-
-            if (!tangent && uv) computeTangents(verts, idx);
-
-            Mesh out;
-            if (!uploadMesh(ctx, verts, idx, out, pool)) continue;
-            meshes.push_back(out);
-            const uint32_t meshIndex = static_cast<uint32_t>(meshes.size() - 1);
 
             int32_t matIdx = -1;
             const int32_t cgltfMat = findMaterialIndex(data, prim->material);
             if (cgltfMat >= 0) matIdx = materialRemap[cgltfMat];
 
+            // A primitive is drawn skinned for a node only when that node has
+            // a skin AND the primitive actually carries JOINTS_0/WEIGHTS_0.
+            const bool canSkin = keepNodes && jointsAcc && weightsAcc;
+            bool needStatic = true;
+            if (canSkin) {
+                needStatic = false;
+                for (int n = 0; n < static_cast<int>(data->nodes_count); ++n) {
+                    const cgltf_node* node = &data->nodes[n];
+                    if (node->mesh == mesh && !node->skin) needStatic = true;
+                }
+            }
+
+            uint32_t meshIndex = 0;
+            if (needStatic) {
+                std::vector<Vertex> verts(vertexCount);
+                for (size_t v = 0; v < vertexCount; ++v) {
+                    Vec3 n{0.f, 1.f, 0.f};
+                    Vec2 t{0.f, 0.f};
+                    readVec3(pos, v, verts[v].position);
+                    if (normal) readVec3(normal, v, n);
+                    if (uv) readVec2(uv, v, t);
+                    verts[v].normal = n;
+                    verts[v].uv = t;
+                    if (tangent) readVec4(tangent, v, verts[v].tangent);
+                }
+
+                std::vector<uint32_t> idx;
+                if (indices) {
+                    idx.resize(indices->count);
+                    for (size_t i = 0; i < indices->count; ++i) {
+                        idx[i] = static_cast<uint32_t>(cgltf_accessor_read_index(indices, i));
+                    }
+                } else {
+                    idx.resize(vertexCount);
+                    for (size_t i = 0; i < vertexCount; ++i) idx[i] = static_cast<uint32_t>(i);
+                }
+
+                if (!tangent && uv) computeTangents(verts, idx);
+
+                Mesh out;
+                if (!uploadMesh(ctx, verts, idx, out, pool)) continue;
+                meshes.push_back(out);
+                meshIndex = static_cast<uint32_t>(meshes.size() - 1);
+                staticMeshIdx[static_cast<size_t>(m)][static_cast<size_t>(p)] =
+                    static_cast<int32_t>(meshIndex);
+                // Stash the CPU copy for LOD generation (move: uploadMesh
+                // already fed the merged buffers, so this costs nothing).
+                lodSources.push_back({meshIndex, std::move(verts), std::move(idx)});
+            }
+
             // Instances come from nodes that reference this mesh.
             for (int n = 0; n < static_cast<int>(data->nodes_count); ++n) {
                 const cgltf_node* node = &data->nodes[n];
                 if (node->mesh != mesh) continue;
-                cgltf_float world[16];
-                cgltf_node_transform_world(node, world);
+                if (lodAuxNode[static_cast<size_t>(n)]) continue; // drawn via the LOD master
 
                 MeshInstance inst;
-                inst.meshIndex = meshIndex;
                 inst.materialIndex = matIdx >= 0 ? static_cast<uint32_t>(matIdx) : 0;
+
+                if (canSkin && node->skin) {
+                    // Skinned instance: positions come from the joint palette,
+                    // so the per-instance model stays identity (glTF spec: a
+                    // skinned mesh ignores its node's own transform).
+                    int32_t& sidx = skinnedMeshIdx[static_cast<size_t>(m)][static_cast<size_t>(p)];
+                    if (sidx < 0) {
+                        std::vector<SkinnedVertex> sverts(vertexCount);
+                        for (size_t v = 0; v < vertexCount; ++v) {
+                            Vec3 nrm{0.f, 1.f, 0.f};
+                            Vec2 t{0.f, 0.f};
+                            readVec3(pos, v, sverts[v].position);
+                            if (normal) readVec3(normal, v, nrm);
+                            if (uv) readVec2(uv, v, t);
+                            sverts[v].normal = nrm;
+                            sverts[v].uv = t;
+                            if (tangent) readVec4(tangent, v, sverts[v].tangent);
+                            cgltf_uint j[4] = {0, 0, 0, 0};
+                            cgltf_accessor_read_uint(jointsAcc, v, j, 4);
+                            for (int k = 0; k < 4; ++k)
+                                sverts[v].joints[k] = static_cast<uint16_t>(j[k]);
+                            Vec4 w{1.f, 0.f, 0.f, 0.f};
+                            readVec4(weightsAcc, v, w);
+                            const float sum = w.x + w.y + w.z + w.w;
+                            if (sum > 1e-6f) {
+                                const float inv = 1.f / sum;
+                                w = {w.x * inv, w.y * inv, w.z * inv, w.w * inv};
+                            }
+                            sverts[v].weights = w;
+                        }
+                        std::vector<uint32_t> sidxBuf;
+                        if (indices) {
+                            sidxBuf.resize(indices->count);
+                            for (size_t i = 0; i < indices->count; ++i)
+                                sidxBuf[i] = static_cast<uint32_t>(cgltf_accessor_read_index(indices, i));
+                        } else {
+                            sidxBuf.resize(vertexCount);
+                            for (size_t i = 0; i < vertexCount; ++i)
+                                sidxBuf[i] = static_cast<uint32_t>(i);
+                        }
+                        Mesh sout;
+                        if (!uploadSkinnedMesh(ctx, sverts, sidxBuf, sout, pool)) break;
+                        skinnedMeshes.push_back(sout);
+                        sidx = static_cast<int32_t>(skinnedMeshes.size() - 1);
+                    }
+                    inst.meshIndex = static_cast<uint32_t>(sidx);
+                    inst.skinIndex = skinRemap[static_cast<size_t>(node->skin - data->skins)];
+                    inst.model = Mat4::identity();
+                    inst.prevModel = Mat4::identity();
+                    instances.push_back(inst);
+                    continue;
+                }
+
+                cgltf_float world[16];
+                cgltf_node_transform_world(node, world);
+                inst.meshIndex = meshIndex;
                 std::memcpy(inst.model.m, world, sizeof(world));
                 inst.prevModel = inst.model;
+                if (keepNodes) inst.nodeIndex = n; // per-frame advance rewrites model/prevModel
                 instances.push_back(inst);
+                if (!lodIdsPerNode[static_cast<size_t>(n)].empty()) {
+                    pendingLodChains.push_back({static_cast<uint32_t>(instances.size() - 1),
+                                                static_cast<uint32_t>(n), static_cast<uint32_t>(p)});
+                }
             }
         }
     }
 
+    // Resolve authored MSFT_lod chains now that every mesh exists.  Chain
+    // members are excluded from runtime simplification (authored wins).
+    std::vector<char> lodSkipMeshes;
+    if (!pendingLodChains.empty()) lodSkipMeshes.assign(meshes.size(), 0);
+    for (const PendingLodChain& pc : pendingLodChains) {
+        MeshInstance& inst = instances[pc.instanceIndex];
+        uint32_t cnt = 0;
+        inst.authoredLodMeshes[cnt++] = inst.meshIndex;
+        for (const int32_t id : lodIdsPerNode[pc.node]) {
+            if (cnt >= kMaxMeshLods) break;
+            const cgltf_node* aux = &data->nodes[static_cast<size_t>(id)];
+            if (!aux->mesh) continue;
+            const size_t am = static_cast<size_t>(aux->mesh - data->meshes);
+            // LOD meshes are expected to mirror the master's primitive count;
+            // clamp so a shorter aux mesh still yields a usable level.
+            const size_t ap = std::min<size_t>(pc.prim, aux->mesh->primitives_count - 1);
+            const int32_t mi = staticMeshIdx[am][ap];
+            if (mi < 0) continue;
+            inst.authoredLodMeshes[cnt++] = static_cast<uint32_t>(mi);
+        }
+        inst.authoredLodCount = cnt;
+        if (cnt > 1) {
+            for (uint32_t k = 0; k < cnt; ++k) lodSkipMeshes[inst.authoredLodMeshes[k]] = 1;
+        } else {
+            inst.authoredLodCount = 0; // no usable aux mesh: fall back to generated LODs
+        }
+    }
+
     // KHR_lights_punctual: cgltf exposes data->lights via node->light.
-    // Directional and point lights are supported; spot lights are skipped
-    // (no cone attenuation in the engine yet).
+    // Directional, point and spot lights are supported.
     for (int n = 0; n < static_cast<int>(data->nodes_count); ++n) {
         const cgltf_node* node = &data->nodes[n];
         if (!node->light) continue;
         const cgltf_light* gl = node->light;
-        if (gl->type == cgltf_light_type_spot) continue;
 
         cgltf_float world[16];
         cgltf_node_transform_world(node, world);
@@ -343,12 +721,27 @@ bool Scene::loadGltf(const VulkanContext& ctx, const char* path, VkCommandPool p
             // the IBL environment brightness.
             l.intensity = gl->intensity / 10000.f;
         } else {
-            l.type = LightType::Point;
+            l.type = gl->type == cgltf_light_type_spot ? LightType::Spot : LightType::Point;
             l.positionOrDirection = transformPoint(worldMat, Vec3{0.f, 0.f, 0.f});
-            // glTF point intensity is in candela, which maps 1:1 onto the
+            // glTF point/spot intensity is in candela, which maps 1:1 onto the
             // engine's inverse-square point-light units.
             l.intensity = gl->intensity;
             l.range = gl->range; // 0 = infinite in both glTF and the engine
+            if (l.type == LightType::Spot) {
+                // The cone shines along the node's local -Z (same convention
+                // as directional, opposite sign).  cgltf fills
+                // inner/outer_cone_angle with the spec defaults (0 / pi/4);
+                // clamp so cos(inner) > cos(outer) keeps a non-zero penumbra
+                // band in the shader's smoothstep.
+                l.spotDirection =
+                    normalize(transformDirection(worldMat, Vec3{0.f, 0.f, -1.f}));
+                l.innerConeAngle = gl->spot_inner_cone_angle;
+                l.outerConeAngle = std::max(gl->spot_outer_cone_angle, gl->spot_inner_cone_angle + 1e-3f);
+                // Authored spots are shadow-casting by default (DCC authoring
+                // intent); the Phase 4b atlas selection caps how many actually
+                // render a map per frame.  Points stay non-casting this phase.
+                l.castShadow = true;
+            }
         }
         lights.push_back(l);
     }
@@ -385,8 +778,15 @@ bool Scene::loadGltf(const VulkanContext& ctx, const char* path, VkCommandPool p
     report(LoadStage::Finalize, 0, 0); // indeterminate
     updatePrevTransforms();
     finalizeInstances();
+    if (keepNodes) computeAnimatedBounds();
+    // Runtime LOD generation (cached next to the glTF) + per-instance draw
+    // tables; must run after the merged index accumulation is complete and
+    // before it is uploaded.
+    generateMeshLods(*this, lodSources, path, lodSkipMeshes);
+    buildLodDraws();
     buildMergedBuffers(ctx, pool);
-    return !meshes.empty();
+    if (keepNodes && !skins.empty() && !createSkinPalettes(ctx)) return false;
+    return !meshes.empty() || !skinnedMeshes.empty();
 }
 
 } // namespace sr

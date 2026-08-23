@@ -1,5 +1,6 @@
 #version 450
-// Add half-res bloom back onto full-res linear HDR (in-place storage).
+// Add the accumulated bloom pyramid mip 0 (thresholded extract + 4 down/up
+// levels) onto the full-res linear HDR target (in-place storage RMW).
 // Same BloomPush layout as bloom_extract.comp; params.x = strength.
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;

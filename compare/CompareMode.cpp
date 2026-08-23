@@ -2,6 +2,7 @@
 #include "compare/CompareMode.h"
 
 #include "compare/CompareApp.h"
+#include "renderer/core/EngineConfig.h"
 #include "renderer/scene/SceneRegistry.h"
 #include "upscalers/UpscalerFactory.h"
 
@@ -27,9 +28,27 @@ void printCompareUsage() {
                  "  --metric-interval <N>          frames between metric readbacks (default 15)\n"
                  "  --gt-ssaa                      GT rendered at 2x, downsampled to output res\n"
                  "  --no-shadows                   disable CSM sun shadows\n"
+                 "  --ssr                          enable opaque screen-space reflections (default off;\n"
+                 "                               --no-ssr accepted for compatibility)\n"
+                 "  --ssr-strength <0..1>          global SSR weight scale (default 0.6)\n"
+                 "  --no-contact-shadows           disable screen-space contact shadows (sun)\n"
+                 "  --no-volfog                    disable froxel volumetric fog\n"
+                 "  --motion-blur                  enable motion blur (default off, all paths;\n"
+                 "                               --no-motion-blur accepted for compatibility)\n"
+                 "  --dof                          enable depth of field (default off, all paths;\n"
+                 "                               --no-dof accepted for compatibility)\n"
+                 "  --dof-focus <m>                DOF focus distance in metres (0 = auto-focus on the\n"
+                 "                               screen centre; default 0; all paths)\n"
+                 "  --dof-fstop <f>                DOF aperture f-stop 0.5..64 (default 4; smaller =\n"
+                 "                               wider bokeh; all paths)\n"
+                 "  --dof-max-blur <px>            DOF max bokeh radius at 1080p, 1..64 (default 12;\n"
+                 "                               all paths)\n"
+                 "  --no-lens-fx                   disable the compose lens chain (CA/vignette/grain)\n"
+                 "                                 (grading is the neutral default set; HDR output is\n"
+                 "                                 viewer/GUI-only — compare/bench stay SDR)\n"
                  "  --shadow-debug                 tint pixels per shadow cascade\n"
-                 "  --env-map <hdr>                IBL environment map (default san_giuseppe_bridge)\n"
-                 "  --exposure <f>                 display exposure (default 1; ACES input)\n"
+                 "  --env-map <hdr>                static IBL environment map (default: sky atmosphere)\n"
+                 "  --exposure <f>                 manual display exposure (disables auto exposure)\n"
                  "  --zoom <f>                     compare-view zoom 1..16 (default 1)\n"
                  "  --zoom-center <u,v>            zoom window center, normalized (default 0.5,0.5)\n"
                  "  --list-upscalers               print registered upscalers and exit\n");
@@ -39,6 +58,7 @@ void printCompareUsage() {
 
 int runCompareMode(int argc, char** argv) {
     CompareOptions opts;
+    uint64_t cliMask = cli::kNone; // explicit-CLI mask: engine.toml never overrides these
     for (int i = 0; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--scene") {
@@ -54,12 +74,14 @@ int runCompareMode(int argc, char** argv) {
                 std::fprintf(stderr, "invalid --render-scale value\n");
                 return 1;
             }
+            cliMask |= cli::kRenderScale;
         } else if (a == "--output") {
             if (!parseResolution(nextArg(i, argc, argv, "--output"),
                                  opts.displayWidth, opts.displayHeight)) {
                 std::fprintf(stderr, "invalid --output resolution\n");
                 return 1;
             }
+            cliMask |= cli::kOutput;
         } else if (a == "--camera-path") {
             opts.cameraPath = nextArg(i, argc, argv, "--camera-path");
         } else if (a == "--frames") {
@@ -72,15 +94,71 @@ int runCompareMode(int argc, char** argv) {
             opts.gtSsaa = true;
         } else if (a == "--no-shadows") {
             opts.shadows = false;
+            cliMask |= cli::kShadows;
+        } else if (a == "--ssr") {
+            opts.ssr = true;
+            cliMask |= cli::kSsr;
+        } else if (a == "--no-ssr") {
+            opts.ssr = false;
+            cliMask |= cli::kSsr;
+        } else if (a == "--ssr-strength") {
+            if (!parseUnitInterval(nextArg(i, argc, argv, "--ssr-strength"), opts.ssrStrength)) {
+                std::fprintf(stderr, "invalid --ssr-strength value\n");
+                return 1;
+            }
+            cliMask |= cli::kSsrStrength;
+        } else if (a == "--no-contact-shadows") {
+            opts.contactShadows = false;
+            cliMask |= cli::kContactShadows;
+        } else if (a == "--no-volfog") {
+            opts.volFog = false;
+            cliMask |= cli::kVolFog;
+        } else if (a == "--motion-blur") {
+            opts.motionBlur = true;
+            cliMask |= cli::kMotionBlur;
+        } else if (a == "--no-motion-blur") {
+            opts.motionBlur = false;
+            cliMask |= cli::kMotionBlur;
+        } else if (a == "--dof") {
+            opts.dof = true;
+            cliMask |= cli::kDof;
+        } else if (a == "--no-dof") {
+            opts.dof = false;
+            cliMask |= cli::kDof;
+        } else if (a == "--dof-focus") {
+            if (!parseDofFocus(nextArg(i, argc, argv, "--dof-focus"), opts.dofFocus)) {
+                std::fprintf(stderr, "invalid --dof-focus value\n");
+                return 1;
+            }
+            cliMask |= cli::kDofFocus;
+        } else if (a == "--dof-fstop") {
+            if (!parseDofFstop(nextArg(i, argc, argv, "--dof-fstop"), opts.dofFstop)) {
+                std::fprintf(stderr, "invalid --dof-fstop value\n");
+                return 1;
+            }
+            cliMask |= cli::kDofFstop;
+        } else if (a == "--dof-max-blur") {
+            if (!parseDofMaxBlur(nextArg(i, argc, argv, "--dof-max-blur"), opts.dofMaxBlurPx)) {
+                std::fprintf(stderr, "invalid --dof-max-blur value\n");
+                return 1;
+            }
+            cliMask |= cli::kDofMaxBlur;
+        } else if (a == "--no-lens-fx") {
+            opts.lensFx = false;
+            cliMask |= cli::kLensFx;
         } else if (a == "--shadow-debug") {
             opts.shadowDebug = true;
         } else if (a == "--env-map") {
             opts.envMapPath = nextArg(i, argc, argv, "--env-map");
+            cliMask |= cli::kEnvMap;
         } else if (a == "--exposure") {
+            // Manual override: a given value switches off auto exposure.
             if (!parseExposure(nextArg(i, argc, argv, "--exposure"), opts.exposure)) {
                 std::fprintf(stderr, "invalid --exposure value\n");
                 return 1;
             }
+            opts.autoExposure = false;
+            cliMask |= cli::kExposure;
         } else if (a == "--zoom") {
             opts.zoom = static_cast<float>(std::atof(nextArg(i, argc, argv, "--zoom")));
         } else if (a == "--zoom-center") {
@@ -96,6 +174,45 @@ int runCompareMode(int argc, char** argv) {
             std::fprintf(stderr, "unknown compare option: %s\n", a.c_str());
             printCompareUsage();
             return 1;
+        }
+    }
+
+    // engine.toml (exe-relative) fills every option the CLI did not set
+    // explicitly; a missing file leaves the code defaults untouched.
+    {
+        EngineConfig cfg;
+        if (loadEngineConfig(cfg)) {
+            EngineConfigLog log;
+            cfgTake(opts.renderScale, cfg.renderScale, cliMask, cli::kRenderScale, "render_scale",
+                    log);
+            cfgTake(opts.shadows, cfg.shadows, cliMask, cli::kShadows, "shadows", log);
+            cfgTake(opts.ssr, cfg.ssr, cliMask, cli::kSsr, "ssr", log);
+            cfgTake(opts.ssrStrength, cfg.ssrStrength, cliMask, cli::kSsrStrength, "ssr_strength",
+                    log);
+            cfgTake(opts.contactShadows, cfg.contactShadows, cliMask, cli::kContactShadows,
+                    "contact_shadows", log);
+            cfgTake(opts.volFog, cfg.volFog, cliMask, cli::kVolFog, "volfog", log);
+            cfgTake(opts.bloom, cfg.bloom, cliMask, cli::kBloom, "bloom", log);
+            cfgTake(opts.motionBlur, cfg.motionBlur, cliMask, cli::kMotionBlur, "motion_blur",
+                    log);
+            cfgTake(opts.dof, cfg.dof, cliMask, cli::kDof, "dof", log);
+            cfgTake(opts.dofFocus, cfg.dofFocus, cliMask, cli::kDofFocus, "dof_focus", log);
+            cfgTake(opts.dofFstop, cfg.dofFstop, cliMask, cli::kDofFstop, "dof_fstop", log);
+            cfgTake(opts.dofMaxBlurPx, cfg.dofMaxBlur, cliMask, cli::kDofMaxBlur, "dof_max_blur",
+                    log);
+            cfgTake(opts.lensFx, cfg.lensFx, cliMask, cli::kLensFx, "lens_fx", log);
+            cfgTake(opts.envMapPath, cfg.envMap, cliMask, cli::kEnvMap, "env_map", log);
+            if (cfg.exposure && (cliMask & cli::kExposure) == 0) {
+                // Same semantics as CLI --exposure: manual value, auto exposure off.
+                opts.exposure = *cfg.exposure;
+                opts.autoExposure = false;
+                log.add("exposure", opts.exposure);
+            }
+            cfgTake(opts.exposureMinEV, cfg.exposureMinEV, cliMask, cli::kExposure,
+                    "exposure_min_ev", log);
+            cfgTake(opts.exposureMaxEV, cfg.exposureMaxEV, cliMask, cli::kExposure,
+                    "exposure_max_ev", log);
+            log.flush(" compare:");
         }
     }
 

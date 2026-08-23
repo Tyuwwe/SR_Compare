@@ -44,7 +44,7 @@ void Camera::updateFreeFly(const Window::Input& input, float dt) {
     const Vec3 worldUp{0.f, 1.f, 0.f};
     const Vec3 right = normalize(cross(forward, worldUp));
 
-    const bool fast = input.keys[VK_SHIFT] != 0;
+    const bool fast = input.keys[kKeyShift] != 0;
     const float speed = fast ? 16.f : 4.f;
 
     Vec3 move{0.f, 0.f, 0.f};
@@ -52,8 +52,8 @@ void Camera::updateFreeFly(const Window::Input& input, float dt) {
     if (input.keys['S']) move -= forward;
     if (input.keys['D']) move += right;
     if (input.keys['A']) move -= right;
-    if (input.keys['Q'] || input.keys[VK_SPACE]) move += worldUp;
-    if (input.keys['E'] || input.keys[VK_CONTROL]) move -= worldUp;
+    if (input.keys['Q'] || input.keys[kKeySpace]) move += worldUp;
+    if (input.keys['E'] || input.keys[kKeyControl]) move -= worldUp;
     if (dot(move, move) > 1e-6f) move = normalize(move);
     position += move * (speed * dt);
 }

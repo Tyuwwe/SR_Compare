@@ -29,14 +29,18 @@ layout(push_constant) uniform Push {
              // y  = 1 => uRef is low-res (GT Apply scale): sample via
              //      normalized UVs instead of texelFetch
              // zw = test image full size (px), for the normalized UVs
-    vec4 exposure; // x = display exposure (must match compose / present)
+    vec4 exposure; // x = test image exposure (upscaler column / LR path),
+                   // y = reference exposure (GT column / GT path).
+                   // With auto exposure the two paths solve independently, so
+                   // each image is tonemapped with its own path's value — the
+                   // metrics then include the on-screen exposure difference.
 } pc;
 
 const float C1 = 0.01 * 0.01;
 const float C2 = 0.03 * 0.03;
 
 // Shared display transform -> [0,1], same as present.frag / savePngFromHalfRgba.
-vec3 metricDomain(vec3 hdr) { return tonemapToDisplay(hdr, pc.exposure.x); }
+vec3 metricDomain(vec3 hdr, float exposure) { return tonemapToDisplay(hdr, exposure); }
 
 shared vec3 sX[64];
 shared vec3 sY[64];
@@ -55,14 +59,14 @@ void main() {
     vec3 x = vec3(0.0);
     vec3 y = vec3(0.0);
     if (valid) {
-        x = metricDomain(texelFetch(uTest, px, 0).rgb);
+        x = metricDomain(texelFetch(uTest, px, 0).rgb, pc.exposure.x);
         if (pc.q.y != 0u) {
             // Low-res GT reference: bilinear-sample at the matching
             // normalized position in test-image space.
             const vec2 uv = (vec2(px) + 0.5) / vec2(pc.q.zw);
-            y = metricDomain(texture(uRef, uv).rgb);
+            y = metricDomain(texture(uRef, uv).rgb, pc.exposure.y);
         } else {
-            y = metricDomain(texelFetch(uRef, px, 0).rgb);
+            y = metricDomain(texelFetch(uRef, px, 0).rgb, pc.exposure.y);
         }
     }
 

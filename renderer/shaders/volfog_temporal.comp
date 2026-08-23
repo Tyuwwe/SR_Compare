@@ -1,0 +1,62 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "volfog.glsl"
+// Temporal reprojection filter for the lit froxel volume (UE4.16 Volumetric
+// Fog temporal filter; same EMA pattern as ssao_temporal.comp /
+// ssr_temporal.comp).
+//
+// Volumes reproject cleanly: each froxel's world position (rebuilt from its
+// grid coordinate with the CURRENT frame's un-jittered view) is projected
+// with the PREVIOUS frame's un-jittered view-projection, and the history
+// volume is sampled trilinearly at (prevUV, prevSliceW).  There is no depth
+// rejection — a froxel column has no single surface depth to reject against
+// (unlike GTAO/SSR); out-of-frustum / behind-camera reprojections and the
+// first frame fall back to the unblended current frame.  Both matrices are
+// jitter-free so the fog does not swim under TAA jitter.  Deterministic:
+// everything derives from the frame index.
+//
+// bindings: 0 = raw lit volume (this frame, texelFetch — same grid)
+//           1 = history read (the OTHER ping-pong buffer, trilinear sample)
+//           2 = history write (this frame's buffer, rgba16f storage image3D)
+
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+
+layout(set = 0, binding = 0) uniform sampler3D rawVolume;
+layout(set = 0, binding = 1) uniform sampler3D history;
+layout(set = 0, binding = 2, rgba16f) uniform writeonly image3D outHistory;
+
+// Must match VolFogTemporalPush in DeferredCore.h.
+layout(push_constant) uniform Push {
+    mat4 invView;      // current frame (un-jittered)
+    mat4 prevViewProj; // previous frame (un-jittered)
+    vec4 projParams;   // x = proj[0][0], y = proj[1][1], z = near, w = fog far
+    vec4 params;       // x = EMA blend weight, y = reset (1 = pass-through)
+    uvec4 grid;        // dimX, dimY, dimZ, unused
+} pc;
+
+void main() {
+    const uvec3 c = gl_GlobalInvocationID;
+    if (any(greaterThanEqual(c, pc.grid.xyz))) return;
+
+    const vec4 cur = texelFetch(rawVolume, ivec3(c), 0);
+    if (pc.params.y > 0.5) {
+        imageStore(outHistory, ivec3(c), cur);
+        return;
+    }
+
+    const vec3 worldPos = froxelWorldPos(c, vec3(pc.grid.xyz), pc.projParams, pc.invView);
+    const vec4 prevClip = pc.prevViewProj * vec4(worldPos, 1.0);
+
+    vec4 result = cur;
+    // clip.w = view-space distance (perspective row 3); reject behind-camera
+    // and out-of-frustum reprojections.
+    if (prevClip.w > pc.projParams.z) {
+        const vec2 prevUv = prevClip.xy / prevClip.w * 0.5 + 0.5;
+        if (all(greaterThan(prevUv, vec2(0.0))) && all(lessThan(prevUv, vec2(1.0)))) {
+            const float w = froxelW(prevClip.w, pc.projParams.z, pc.projParams.w);
+            const vec4 hist = texture(history, vec3(prevUv, w));
+            result = mix(hist, cur, pc.params.x);
+        }
+    }
+    imageStore(outHistory, ivec3(c), result);
+}

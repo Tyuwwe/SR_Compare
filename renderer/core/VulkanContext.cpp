@@ -1,7 +1,11 @@
 #include "renderer/core/VulkanContext.h"
 
+#include "renderer/core/PathUtil.h"
+#include "renderer/core/Vma.h"
 #include "renderer/core/Window.h"
 #include "upscalers/UpscalerFactory.h"
+
+#include <SDL3/SDL_vulkan.h>
 
 #include <algorithm>
 #include <cstdio>
@@ -23,8 +27,18 @@ bool isDiscrete(VkPhysicalDeviceType type) {
 } // namespace
 
 bool VulkanContext::create(Window& window) {
-    std::vector<const char*> instanceExt = {VK_KHR_SURFACE_EXTENSION_NAME,
-                                            VK_KHR_WIN32_SURFACE_EXTENSION_NAME};
+    // Surface extensions come from SDL (VK_KHR_surface + the platform one).
+    std::vector<const char*> instanceExt;
+    {
+        uint32_t count = 0;
+        const char* const* sdlExts = SDL_Vulkan_GetInstanceExtensions(&count);
+        if (sdlExts == nullptr || count == 0) {
+            std::fprintf(stderr, "vulkan: SDL_Vulkan_GetInstanceExtensions failed: %s\n",
+                         SDL_GetError());
+            return false;
+        }
+        instanceExt.assign(sdlExts, sdlExts + count);
+    }
 
     // Optional validation layer (only if the loader actually provides it).
     const char* validationLayer = "VK_LAYER_KHRONOS_validation";
@@ -41,7 +55,27 @@ bool VulkanContext::create(Window& window) {
     }
     if (std::getenv("SR_NO_VALIDATION")) useValidation = false;  // opt-out for end users
     std::vector<const char*> enabledLayers;
-    if (useValidation) enabledLayers.push_back(validationLayer);
+    if (useValidation) {
+        enabledLayers.push_back(validationLayer);
+        // Needed for the stderr debug messenger created after instance creation.
+        instanceExt.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+    }
+
+    // HDR swapchain color spaces (HDR10 ST2084 / extended sRGB, Phase 6c)
+    // require VK_EXT_swapchain_colorspace (instance-level, near-universal on
+    // desktop; the HDR probe simply finds no HDR formats without it).
+    {
+        uint32_t extCount = 0;
+        vkEnumerateInstanceExtensionProperties(nullptr, &extCount, nullptr);
+        std::vector<VkExtensionProperties> exts(extCount);
+        vkEnumerateInstanceExtensionProperties(nullptr, &extCount, exts.data());
+        for (const auto& e : exts) {
+            if (std::strcmp(e.extensionName, VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME) == 0) {
+                instanceExt.push_back(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME);
+                break;
+            }
+        }
+    }
 
     // Plugin-declared instance requirements (registered via
     // SR_REGISTER_VULKAN_DEVICE_NEEDS): instance extensions and layers.
@@ -113,11 +147,36 @@ bool VulkanContext::create(Window& window) {
     ici.ppEnabledLayerNames = enabledLayers.empty() ? nullptr : enabledLayers.data();
     if (vkCreateInstance(&ici, nullptr, &instance) != VK_SUCCESS) return false;
 
-    VkWin32SurfaceCreateInfoKHR sci = {};
-    sci.sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR;
-    sci.hwnd = window.hwnd();
-    sci.hinstance = window.hinstance();
-    if (vkCreateWin32SurfaceKHR(instance, &sci, nullptr, &surface) != VK_SUCCESS) {
+    // Route validation messages to stderr (the layer alone is silent without a
+    // messenger; bench/smoke runs depend on seeing these).
+    if (useValidation) {
+        auto createMessenger =
+            reinterpret_cast<PFN_vkCreateDebugUtilsMessengerEXT>(
+                vkGetInstanceProcAddr(instance, "vkCreateDebugUtilsMessengerEXT"));
+        if (createMessenger) {
+            VkDebugUtilsMessengerCreateInfoEXT mci = {};
+            mci.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT;
+            mci.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
+                                  VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
+            mci.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
+                              VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
+                              VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
+            mci.pfnUserCallback = +[](VkDebugUtilsMessageSeverityFlagBitsEXT severity,
+                                      VkDebugUtilsMessageTypeFlagsEXT,
+                                      const VkDebugUtilsMessengerCallbackDataEXT* data,
+                                      void*) -> VkBool32 {
+                std::fprintf(stderr, "[vulkan-%s] %s\n",
+                             severity == VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT ? "error"
+                                                                                       : "warn",
+                             data->pMessage);
+                return VK_FALSE;
+            };
+            createMessenger(instance, &mci, nullptr, &debugMessenger);
+        }
+    }
+
+    if (!SDL_Vulkan_CreateSurface(window.sdlWindow(), instance, nullptr, &surface)) {
+        std::fprintf(stderr, "vulkan: SDL_Vulkan_CreateSurface failed: %s\n", SDL_GetError());
         destroy();
         return false;
     }
@@ -131,6 +190,7 @@ bool VulkanContext::create(Window& window) {
 
     int chosen = -1;
     VkPhysicalDeviceProperties chosenProps{};
+    uint32_t chosenTransfer = 0xFFFFFFFFu;
     for (uint32_t i = 0; i < deviceCount; ++i) {
         VkPhysicalDeviceProperties props;
         vkGetPhysicalDeviceProperties(devices[i], &props);
@@ -150,17 +210,31 @@ bool VulkanContext::create(Window& window) {
         }
         if (gfx == 0xFFFFFFFFu || present == 0xFFFFFFFFu) continue;
 
+        // Dedicated transfer engine: TRANSFER without GRAPHICS (so the family
+        // always differs from gfx), preferring one also without COMPUTE (the
+        // pure DMA engine on discrete GPUs).  Absent on some iGPUs — uploads
+        // then stay on the graphics queue.
+        uint32_t transfer = 0xFFFFFFFFu;
+        for (uint32_t q = 0; q < qfCount; ++q) {
+            const VkQueueFlags f = qfs[q].queueFlags;
+            if (!(f & VK_QUEUE_TRANSFER_BIT) || (f & VK_QUEUE_GRAPHICS_BIT)) continue;
+            if (transfer == 0xFFFFFFFFu || !(f & VK_QUEUE_COMPUTE_BIT)) transfer = q;
+            if (!(f & VK_QUEUE_COMPUTE_BIT)) break;
+        }
+
         // Prefer discrete GPUs, fall back to any suitable one.
         if (chosen == -1 || (isDiscrete(props.deviceType) && !isDiscrete(chosenProps.deviceType))) {
             chosen = static_cast<int>(i);
             chosenProps = props;
             graphicsQueueFamily = gfx;
             presentQueueFamily = present;
+            chosenTransfer = transfer;
         }
         if (isDiscrete(props.deviceType)) break;
     }
     if (chosen < 0) { destroy(); return false; }
     physicalDevice = devices[static_cast<uint32_t>(chosen)];
+    transferQueueFamily = chosenTransfer;
 
     vkGetPhysicalDeviceProperties(physicalDevice, &properties);
     vkGetPhysicalDeviceFeatures(physicalDevice, &features);
@@ -195,6 +269,13 @@ bool VulkanContext::create(Window& window) {
     features2.features.samplerAnisotropy = features.samplerAnisotropy;
     features2.features.shaderStorageImageWriteWithoutFormat = VK_TRUE;  // XeSS
     features2.features.independentBlend = features.independentBlend;    // transparency pass (per-attachment blend)
+    // Reflection-probe cube arrays (Phase 4c-2); core since Vulkan 1.1 and
+    // universally supported on desktop GPUs targeted by this tool.
+    features2.features.imageCubeArray = VK_TRUE;
+    // Phase 7a indirect GBuffer draws: batched vkCmdDrawIndexedIndirect.  Core
+    // since 1.0 and near-universal; when absent, maxDrawIndirectCount is 1 and
+    // the recorder emits single-draw calls, which are legal without it.
+    features2.features.multiDrawIndirect = features.multiDrawIndirect;
 
     // Vulkan 1.2 features shared by plugins (each sType may appear only once
     // in the chain, so plugins must not add their own v12/v13 nodes).
@@ -251,10 +332,11 @@ bool VulkanContext::create(Window& window) {
     }
 
     float queuePriority = 1.f;
-    const bool sameFamily = graphicsQueueFamily == presentQueueFamily;
+    const bool hasTransferFamily = transferQueueFamily != 0xFFFFFFFFu;
     std::vector<VkDeviceQueueCreateInfo> qcis;
     std::vector<uint32_t> uniqueFamilies = {graphicsQueueFamily};
-    if (!sameFamily) uniqueFamilies.push_back(presentQueueFamily);
+    if (presentQueueFamily != graphicsQueueFamily) uniqueFamilies.push_back(presentQueueFamily);
+    if (hasTransferFamily) uniqueFamilies.push_back(transferQueueFamily);
     for (uint32_t f : uniqueFamilies) {
         VkDeviceQueueCreateInfo q = {};
         q.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
@@ -279,6 +361,8 @@ bool VulkanContext::create(Window& window) {
 
     vkGetDeviceQueue(device, graphicsQueueFamily, 0, &graphicsQueue);
     vkGetDeviceQueue(device, presentQueueFamily, 0, &presentQueue);
+    if (hasTransferFamily)
+        vkGetDeviceQueue(device, transferQueueFamily, 0, &transferQueue);
 
     VkCommandPoolCreateInfo pool = {};
     pool.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
@@ -286,6 +370,51 @@ bool VulkanContext::create(Window& window) {
     pool.queueFamilyIndex = graphicsQueueFamily;
     vkCreateCommandPool(device, &pool, nullptr, &oneShotPool);
     vkCreateCommandPool(device, &pool, nullptr, &framePool);
+    if (hasTransferFamily) {
+        pool.queueFamilyIndex = transferQueueFamily;
+        vkCreateCommandPool(device, &pool, nullptr, &transferPool);
+        pool.queueFamilyIndex = graphicsQueueFamily;
+    }
+
+    VmaAllocatorCreateInfo allocatorInfo = {};
+    allocatorInfo.physicalDevice = physicalDevice;
+    allocatorInfo.device = device;
+    allocatorInfo.instance = instance;
+    allocatorInfo.vulkanApiVersion = kApiVersion;
+    if (vmaCreateAllocator(&allocatorInfo, &allocator) != VK_SUCCESS) {
+        destroy();
+        return false;
+    }
+
+    // Persistent pipeline cache next to the exe.  Incompatible or corrupt
+    // initial data is silently discarded by the driver (empty cache).
+    {
+        const std::string cachePath = exeDir() + "/pipeline.cache";
+        std::vector<char> initialData;
+        if (FILE* f = std::fopen(cachePath.c_str(), "rb")) {
+            std::fseek(f, 0, SEEK_END);
+            const long len = std::ftell(f);
+            std::fseek(f, 0, SEEK_SET);
+            if (len > 0) {
+                initialData.resize(static_cast<size_t>(len));
+                const size_t got = std::fread(initialData.data(), 1, initialData.size(), f);
+                initialData.resize(got);
+            }
+            std::fclose(f);
+        }
+        VkPipelineCacheCreateInfo cacheCi = {};
+        cacheCi.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+        cacheCi.initialDataSize = initialData.size();
+        cacheCi.pInitialData = initialData.empty() ? nullptr : initialData.data();
+        if (vkCreatePipelineCache(device, &cacheCi, nullptr, &pipelineCache) != VK_SUCCESS)
+            std::fprintf(stderr, "warning: vkCreatePipelineCache failed, caching disabled\n");
+    }
+
+    std::fprintf(stderr, "queues: graphics=%u present=%u%s\n", graphicsQueueFamily,
+                 presentQueueFamily,
+                 transferQueue != VK_NULL_HANDLE
+                     ? " transfer=dedicated"
+                     : " transfer=none (uploads on graphics queue)");
 
     return true;
 }
@@ -294,14 +423,45 @@ void VulkanContext::destroy() {
     if (!device) {
         // Instance-only partial state.
         if (surface) { vkDestroySurfaceKHR(instance, surface, nullptr); surface = VK_NULL_HANDLE; }
+        if (debugMessenger) {
+            auto f = reinterpret_cast<PFN_vkDestroyDebugUtilsMessengerEXT>(
+                vkGetInstanceProcAddr(instance, "vkDestroyDebugUtilsMessengerEXT"));
+            if (f) f(instance, debugMessenger, nullptr);
+            debugMessenger = VK_NULL_HANDLE;
+        }
         if (instance) { vkDestroyInstance(instance, nullptr); instance = VK_NULL_HANDLE; }
         return;
     }
     if (oneShotPool) { vkDestroyCommandPool(device, oneShotPool, nullptr); oneShotPool = VK_NULL_HANDLE; }
     if (framePool) { vkDestroyCommandPool(device, framePool, nullptr); framePool = VK_NULL_HANDLE; }
+    if (transferPool) { vkDestroyCommandPool(device, transferPool, nullptr); transferPool = VK_NULL_HANDLE; }
+    if (pipelineCache) {
+        // Persist the merged cache next to the exe for the next run.
+        std::lock_guard<std::mutex> lk(pipelineMutex);
+        size_t size = 0;
+        if (vkGetPipelineCacheData(device, pipelineCache, &size, nullptr) == VK_SUCCESS && size > 0) {
+            std::vector<char> data(size);
+            if (vkGetPipelineCacheData(device, pipelineCache, &size, data.data()) == VK_SUCCESS) {
+                const std::string cachePath = exeDir() + "/pipeline.cache";
+                if (FILE* f = std::fopen(cachePath.c_str(), "wb")) {
+                    std::fwrite(data.data(), 1, size, f);
+                    std::fclose(f);
+                }
+            }
+        }
+        vkDestroyPipelineCache(device, pipelineCache, nullptr);
+        pipelineCache = VK_NULL_HANDLE;
+    }
+    if (allocator) { vmaDestroyAllocator(allocator); allocator = VK_NULL_HANDLE; }
     vkDestroyDevice(device, nullptr);
     device = VK_NULL_HANDLE;
     if (surface) { vkDestroySurfaceKHR(instance, surface, nullptr); surface = VK_NULL_HANDLE; }
+    if (debugMessenger) {
+        auto f = reinterpret_cast<PFN_vkDestroyDebugUtilsMessengerEXT>(
+            vkGetInstanceProcAddr(instance, "vkDestroyDebugUtilsMessengerEXT"));
+        if (f) f(instance, debugMessenger, nullptr);
+        debugMessenger = VK_NULL_HANDLE;
+    }
     if (instance) { vkDestroyInstance(instance, nullptr); instance = VK_NULL_HANDLE; }
 }
 

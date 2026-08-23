@@ -2,6 +2,7 @@
 #extension GL_GOOGLE_include_directive : require
 #include "brdf.glsl"
 #include "ssr.glsl"
+#include "volfog.glsl"
 // GT-path transparency fragment shader: identical shading to transparent.frag
 // but only the blended color output (the GT path has no motion/mask targets).
 // Keep the bodies in sync.
@@ -28,9 +29,11 @@ layout(set = 1, binding = 0) uniform sampler2D uTextures[1024];
 // IBL + light inputs; the UBO matches LightingUBO in DeferredCore.h.  Same
 // LightGPU layout as lighting.frag.
 struct LightGPU {
-    vec4 posOrDir; // xyz = position (point) / direction-to-light (directional), w = type (0 = dir, 1 = point)
+    vec4 posOrDir; // xyz = position (point/spot) / direction-to-light (directional), w = type (0 = dir, 1 = point, 2 = spot)
     vec4 color;    // rgb + w = intensity (PI-scaled on the CPU)
-    vec4 params;   // x = range (0 = infinite), y = castShadow (reserved, C2), zw = reserved
+    vec4 params;   // x = range (0 = infinite), y = castShadow,
+                   // z = shadowIndex (spot atlas tile, -1 = unshadowed), w = spot cos(inner)
+    vec4 spotDir;  // xyz = spot cone direction (unit, world), w = spot cos(outer)
 };
 layout(set = 2, binding = 0) uniform LightingUBO {
     mat4 invViewProj;
@@ -44,15 +47,34 @@ layout(set = 2, binding = 0) uniform LightingUBO {
     vec4 shadowParams;  // x = rasterizer constant bias, y = slope bias, z = shadows enabled,
                         // w = debug cascade tint
     vec4 viewForward;   // xyz = camera forward (world); w = shadowed sun light index (-1 = none)
+    vec4 clusterDepth;  // clustered shading slicing range (unused in this pass)
+    // Spot shadow atlas state (Phase 4b), declared for layout parity with
+    // lighting.frag; the forward pass does not sample spot shadows.
+    mat4 shadowTileVp[16];
+    vec4 shadowAtlasParams;
+    // Forward view-projection for the lighting pass's contact-shadow march
+    // (Phase 4c); layout parity, unused here.
+    mat4 viewProj;
 } lighting;
 layout(set = 2, binding = 1) uniform samplerCube iblIrradiance;
 layout(set = 2, binding = 2) uniform samplerCube iblPrefilter;
 layout(set = 2, binding = 3) uniform sampler2D iblBrdfLut;
-// Screen-space AO (R16F, same resolution as this path's GBuffer).
+// Screen-space AO (R16F, same resolution as this path's GBuffer).  Bound for
+// layout parity but deliberately NOT sampled (see transparent.frag).
 layout(set = 2, binding = 4) uniform sampler2D ssaoTex;
 layout(set = 2, binding = 5) uniform sampler2DArrayShadow shadowMap; // CSM, comparison sampler
-layout(set = 2, binding = 6) uniform sampler2D ssrColor;
-layout(set = 2, binding = 7) uniform sampler2D ssrDepth;
+layout(set = 2, binding = 6) uniform sampler2D ssrColor; // opaque HDR color mip chain (RGBA16F)
+layout(set = 2, binding = 7) uniform sampler2D ssrHiZ; // opaque depth pyramid (Hi-Z, R32F)
+// Ray-integrated froxel volume (same as transparent.frag — keep in sync).
+layout(set = 2, binding = 8) uniform sampler3D fogVolume;
+
+// Fragment-stage push block.  Member offsets in SPIR-V are ABSOLUTE within
+// the pipeline's push-constant memory, so params sits explicitly at byte 208,
+// right after the vertex-stage SkinnedScenePush range
+// (sizeof(SkinnedScenePush), see DeferredCore::createPipelines).
+layout(push_constant) uniform TransparentFogPush {
+    layout(offset = 208) vec4 params; // x = near, y = fog far, z = enabled (1/0), w unused
+} fogPc;
 
 layout(location = 0) in vec3 vWorldPos;
 layout(location = 1) in vec3 vNormal;
@@ -69,7 +91,8 @@ int texIndex(float f) { return int(floor(f + 0.5)); }
 // whose energy does not depend on transmission (opacity), while the diffuse
 // lobe approximates the transmitted/tinted term and scales with opacity.
 // Directional lights have no falloff; point lights use the windowed
-// inverse-square falloff of lighting.frag (range = 0 -> pure inverse-square).
+// inverse-square falloff of lighting.frag (range = 0 -> pure inverse-square);
+// spots add the same smoothed cone ramp (cos(inner) -> cos(outer)).
 void shadeLight(vec3 N, vec3 V, vec3 worldPos, vec3 albedo, float metallic,
                 float roughness, vec3 F0, LightGPU light,
                 out vec3 diffuse, out vec3 specular) {
@@ -89,6 +112,13 @@ void shadeLight(vec3 N, vec3 V, vec3 worldPos, vec3 albedo, float metallic,
         if (range > 0.0) {
             float w = clamp(1.0 - pow(dist / range, 4.0), 0.0, 1.0);
             atten *= w * w;
+        }
+        if (light.posOrDir.w > 1.5) {
+            float cosTheta = dot(-L, light.spotDir.xyz);
+            float cone = clamp((cosTheta - light.spotDir.w) /
+                                   max(light.params.w - light.spotDir.w, 1e-5),
+                               0.0, 1.0);
+            atten *= cone * cone;
         }
         radiance *= atten;
     }
@@ -178,6 +208,12 @@ void main() {
         roughness = min(roughness, 0.05);
         F0 = mix(vec3(0.04), vec3(0.22), 0.75);
     }
+    // Mirror-mode panes (same as transparent.frag — keep in sync).
+    const bool mirror = material.emissive.w > 0.5;
+    if (mirror) {
+        roughness = min(roughness, 0.04);
+        F0 = vec3(0.30);
+    }
 
     vec3 lightDiffuse = vec3(0.0);
     vec3 lightSpecular = vec3(0.0);
@@ -204,31 +240,50 @@ void main() {
     vec3 R = reflect(-V, N);
     vec3 prefiltered = textureLod(iblPrefilter, R, roughness * lighting.iblParams.y).rgb;
     vec2 brdf = texture(iblBrdfLut, vec2(NdV, roughness)).rg;
-    vec3 envBrdf = F * brdf.x + brdf.y;
+    vec3 envBrdf = specularIblMultiScatter(F, F0, brdf); // same as transparent.frag
     vec3 specularIbl = prefiltered * envBrdf;
 
-    float ssao = texelFetch(ssaoTex, ivec2(gl_FragCoord.xy), 0).r;
-    float ambientScale = ao * ssao * lighting.iblParams.x;
+    // No SSAO on translucency (same as transparent.frag — keep in sync):
+    // ssaoTex describes the opaque surface behind the pane, not the glass.
+    float ambientScale = ao * lighting.iblParams.x;
 
     // Dielectric shop-window model (same as transparent.frag — keep in sync).
     vec3 Fg = F_Schlick(NdV, F0);
 
     vec3 specSsr = specularIbl * ambientScale;
-    float ssrHit = 0.0;
-    if (roughness < 0.45) {
-        vec4 ssr = traceSsr(ssrColor, ssrDepth, ubo.viewProj, lighting.invViewProj,
-                            ubo.cameraPos.xyz, vWorldPos, N, R, ubo.renderSizeJitter.xy);
-        ssrHit = clamp(ssr.a, 0.0, 1.0);
-        specSsr = mix(specSsr, ssr.rgb * mix(envBrdf, vec3(1.0), ssrHit * 0.8), ssrHit);
-    }
+    // Full roughness range (same as transparent.frag — keep in sync): the hit
+    // colour comes from the colour mip chain at lod = roughness * (mips - 1).
+    // Single-frame on purpose: only the opaque path accumulates SSR temporally
+    // (Phase 2d) — see the note in transparent.frag.
+    vec4 ssr = traceSsr(ssrColor, textureQueryLevels(ssrColor), ssrHiZ,
+                        textureQueryLevels(ssrHiZ), ubo.viewProj,
+                        lighting.invViewProj, ubo.cameraPos.xyz, vWorldPos, N, R, roughness,
+                        ubo.renderSizeJitter.xy, 4);
+    float ssrHit = clamp(ssr.a, 0.0, 1.0);
+    specSsr = mix(specSsr, ssr.rgb * mix(envBrdf, vec3(1.0), ssrHit * 0.8), ssrHit);
 
     float alpha = clamp(max(base.a, max(Fg.r, ssrHit * 0.88)), 0.0, 1.0);
     if (shopGlass && ssrHit < 0.35)
         alpha = max(alpha, mix(0.84, 1.0, Fg.r));
     float transmit = base.a * (1.0 - max(ssrHit, shopGlass ? 0.75 : 0.0) * 0.92);
+    if (mirror) {
+        // Pure mirror (same as transparent.frag — keep in sync).
+        alpha = 1.0;
+        transmit = 0.0;
+    }
 
     vec3 glassColor = (lightDiffuse + emissive + kd * diffuseIbl * ambientScale) * transmit +
                       lightSpecular + specSsr;
+
+    // Volumetric fog on translucency (same as transparent.frag — keep in
+    // sync): fog the glass contribution with the ray-integrated volume at the
+    // fragment's view depth; the background was fogged by volfog_composite.
+    if (fogPc.params.z > 0.5 && viewDepth > fogPc.params.x) {
+        const vec2 fuv = gl_FragCoord.xy / ubo.renderSizeJitter.xy;
+        const vec4 fog = texture(fogVolume, vec3(fuv, froxelW(viewDepth, fogPc.params.x,
+                                                              fogPc.params.y)));
+        glassColor = glassColor * fog.a + fog.rgb;
+    }
 
     outColor = vec4(glassColor, alpha);
 }

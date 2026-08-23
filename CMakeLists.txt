@@ -20,6 +20,20 @@ find_package(Vulkan REQUIRED)
 # SDK 根目录（scripts/fetch_sdks.py 下载至此）
 set(SR_THIRD_PARTY_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
 
+# SDL3 windowing/input layer (fetch_sdks.py task "sdl3": headers + prebuilt
+# VC x64 import lib + runtime DLL under third_party/sdl3).
+if(NOT EXISTS "${SR_THIRD_PARTY_DIR}/sdl3/lib/x64/SDL3.lib")
+    message(FATAL_ERROR
+        "SDL3 not found under third_party/sdl3 -- fetch it first:\n"
+        "  python scripts/fetch_sdks.py --only sdl3")
+endif()
+add_library(SDL3::SDL3 SHARED IMPORTED GLOBAL)
+set_target_properties(SDL3::SDL3 PROPERTIES
+    IMPORTED_LOCATION "${SR_THIRD_PARTY_DIR}/sdl3/lib/x64/SDL3.dll"
+    IMPORTED_IMPLIB "${SR_THIRD_PARTY_DIR}/sdl3/lib/x64/SDL3.lib"
+    INTERFACE_INCLUDE_DIRECTORIES "${SR_THIRD_PARTY_DIR}/sdl3/include"
+    INTERFACE_SYSTEM_INCLUDE_DIRECTORIES "${SR_THIRD_PARTY_DIR}/sdl3/include")
+
 # GLSL -> SPIR-V 编译辅助（renderer / upscalers 共用）
 include(cmake/ShaderCompile.cmake)
 

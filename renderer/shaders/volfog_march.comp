@@ -1,0 +1,62 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "volfog.glsl"
+// Front-to-back ray integration of the temporally filtered froxel volume
+// (Frostbite 2015; UE4 FinalIntegration).  One invocation per froxel COLUMN
+// (x, y) marches all Z slices and stores, per slice, the accumulated
+// inscatter (rgb) and the transmittance UP TO AND INCLUDING that slice (a).
+// The composite pass then needs a single trilinear sample per pixel.
+//
+// Per slice the medium is treated as constant, so the integral is analytic:
+//   sliceInscatter = S * (1 - T_slice) / sigma_t      (L'Hopital: S*dt at 0)
+//   T_slice        = exp(-sigma_t * dt)
+// The slice thickness dt is measured along the view ray: the froxel grid is
+// frustum-aligned, so off-axis columns cross a longer path per slice
+// (dt = dViewZ / cos(ray, forward)).
+//
+// bindings: 0 = filtered lit volume (sampler3D, texelFetch — same grid)
+//           1 = integrated volume out (rgba16f storage image3D)
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler3D filteredVolume;
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image3D outIntegrated;
+
+// Must match VolFogMarchPush in DeferredCore.h.
+layout(push_constant) uniform Push {
+    mat4 invView;    // view inverse (un-jittered, both paths)
+    vec4 projParams; // x = proj[0][0], y = proj[1][1], z = near, w = fog far
+    uvec4 grid;      // dimX, dimY, dimZ, unused
+} pc;
+
+void main() {
+    const uvec2 col = gl_GlobalInvocationID.xy;
+    if (any(greaterThanEqual(col, pc.grid.xy))) return;
+
+    // Column-centre ray direction (world) and its cosine against the camera
+    // forward, for the oblique slice thickness.
+    const vec2 ndc = (vec2(col) + 0.5) / vec2(pc.grid.xy) * 2.0 - 1.0;
+    const vec3 viewFwd = normalize((pc.invView * vec4(0.0, 0.0, -1.0, 0.0)).xyz);
+    const vec3 rayDir = normalize(
+        (pc.invView * vec4(ndc.x / pc.projParams.x, ndc.y / pc.projParams.y, -1.0, 0.0)).xyz);
+    const float cosAngle = max(dot(rayDir, viewFwd), 0.05);
+
+    const float gridZ = float(pc.grid.z);
+    const float nearZ = pc.projParams.z;
+    const float farZ = pc.projParams.w;
+
+    float transmittance = 1.0;
+    vec3 inscatter = vec3(0.0);
+    for (uint z = 0; z < pc.grid.z; ++z) {
+        const vec4 m = texelFetch(filteredVolume, ivec3(col, z), 0);
+        const float sigma = max(m.a, 0.0);
+        const float z0 = froxelViewZ(float(z), gridZ, nearZ, farZ);
+        const float z1 = froxelViewZ(float(z) + 1.0, gridZ, nearZ, farZ);
+        const float dt = (z1 - z0) / cosAngle;
+        const float sliceT = exp(-sigma * dt);
+        const vec3 sliceInscatter = m.rgb * ((1.0 - sliceT) / max(sigma, 1e-6));
+        inscatter += transmittance * sliceInscatter;
+        transmittance *= sliceT;
+        imageStore(outIntegrated, ivec3(col, z), vec4(inscatter, transmittance));
+    }
+}

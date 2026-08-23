@@ -1,0 +1,68 @@
+#version 450
+// Depth-of-field CoC pass (Phase 6b), half resolution: computes the signed
+// circle-of-confusion per pixel and packs it with the downsampled HDR color
+// for the scatter-as-gather bokeh pass (dof_gather.comp).
+//
+// Thin-lens style CoC (UE4 depth-of-field, "Unreal Engine 4 Post Processing",
+// Abashov / Sousa GDC talks): coc = aperture * |focus - z| / z, signed by
+// which side of the focal plane the pixel is on (positive = foreground,
+// nearer than the focus distance; negative = background), clamped to the
+// max bokeh radius.  The focus distance is either the manual push-constant
+// value or, when that is <= 0, auto-focused on the screen-centre depth texel
+// (same texel for every invocation -> deterministic, no CPU readback); a sky
+// centre (far plane) falls back to a fixed distance.
+//
+//   binding 0 = lit HDR color (sampler, full res)
+//   binding 1 = depth (sampler, full res; nearest of the 2x2 quad is used)
+//   binding 2 = half-res RGBA16F out: rgb = color, a = signed CoC in [-1,1]
+//               (multiply by the max radius to get half-res pixels)
+//
+// Ref: UE4 DOF (Guertin et al., "Depth of Field" GDC 2013 / UE4 docs);
+//      McGuire-style half-res foreground/background layer decomposition.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D color;
+layout(set = 0, binding = 1) uniform sampler2D depth;
+layout(set = 0, binding = 2, rgba16f) uniform writeonly image2D cocColor;
+
+layout(push_constant) uniform Push {
+    vec4 depthParams; // x = proj m[10], y = proj m[14], z = far, w = max CoC
+                      // (half-res px)
+    vec4 params;      // x = aperture scale, y = sky-centre focus fallback (m),
+                      // z = manual focus distance (m; <= 0 = auto-focus on the
+                      // screen centre), w unused
+} pc;
+
+// Non-reversed Vulkan depth: viewZ = m14 / (ndc + m10) (m10/m14 < 0).
+float viewZ(float ndc) { return pc.depthParams.y / (ndc + pc.depthParams.x); }
+
+void main() {
+    const ivec2 hp = ivec2(gl_GlobalInvocationID.xy);
+    const ivec2 halfSize = imageSize(cocColor);
+    if (hp.x >= halfSize.x || hp.y >= halfSize.y) return;
+
+    const ivec2 fullSize = textureSize(depth, 0);
+    const ivec2 base = min(hp * 2, fullSize - 2);
+
+    // Nearest of the 2x2 full-res quad: keeps thin foreground objects blurred
+    // instead of averaging them into the background depth.
+    float z = 1e9;
+    for (int dy = 0; dy < 2; ++dy)
+        for (int dx = 0; dx < 2; ++dx)
+            z = min(z, viewZ(texelFetch(depth, base + ivec2(dx, dy), 0).r));
+
+    // Manual focus distance, or auto-focus on the screen centre (this frame's
+    // depth; deterministic).
+    const float centerZ = viewZ(texelFetch(depth, fullSize / 2, 0).r);
+    const float far = pc.depthParams.z;
+    const float autoFocus = (centerZ >= 0.98 * far) ? pc.params.y : centerZ;
+    const float focus = (pc.params.z > 0.0) ? pc.params.z : autoFocus;
+
+    const float maxCoc = pc.depthParams.w;
+    const float coc = clamp(pc.params.x * (focus - z) / z, -maxCoc, maxCoc);
+
+    const vec2 uv = (vec2(hp) + 0.5) / vec2(halfSize);
+    const vec3 c = texture(color, uv).rgb;
+    imageStore(cocColor, hp, vec4(c, coc / maxCoc));
+}

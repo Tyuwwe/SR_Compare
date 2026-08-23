@@ -18,6 +18,18 @@ layout(set = 0, binding = 1) uniform MaterialUBO {
 
 layout(set = 1, binding = 0) uniform sampler2D uTextures[1024];
 
+// Vertex-stage SceneUBO, also visible to the fragment stage (the set layout
+// marks binding 0 VERTEX|FRAGMENT); needed for cameraPos to orient the
+// geometric normal toward the viewer (see below).
+layout(set = 0, binding = 0) uniform SceneUBO {
+    mat4 viewProj;
+    mat4 viewProjNoJitter;
+    mat4 prevViewProj;
+    vec4 cameraPos;
+    vec4 ambient;
+    vec4 renderSizeJitter;
+} scene;
+
 layout(location = 0) in vec3 vWorldPos;
 layout(location = 1) in vec3 vNormal;
 layout(location = 2) in vec2 vUV;
@@ -57,6 +69,14 @@ void main() {
     }
 
     vec3 N = normalize(vNormal);
+    // Cull mode is NONE, so backfaces rasterize with away-facing geometric
+    // normals.  Flip the GEOMETRIC normal toward the viewer before the
+    // tangent-space normal mapping: downstream (lighting/ssao/ssr) only sees
+    // the stored normal and cannot tell an inverted backface normal from a
+    // normal-mapped normal tilted past 90 deg on a front face.  Doing the
+    // flip here keeps that distinction; lighting.frag only has to clamp the
+    // residual over-tilt case to grazing.
+    if (dot(N, scene.cameraPos.xyz - vWorldPos) < 0.0) N = -N;
     const int normalTex = texIndex(material.tex0.y);
     if (normalTex >= 0) {
         vec3 T = normalize(vTangent.xyz - N * dot(N, vTangent.xyz));

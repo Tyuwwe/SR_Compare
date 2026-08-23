@@ -8,22 +8,32 @@ add_library(imgui STATIC
     ${IMGUI_DIR}/imgui_tables.cpp
     ${IMGUI_DIR}/imgui_widgets.cpp
     ${IMGUI_DIR}/imgui_demo.cpp
-    ${IMGUI_DIR}/backends/imgui_impl_win32.cpp
+    ${IMGUI_DIR}/backends/imgui_impl_sdl3.cpp
     ${IMGUI_DIR}/backends/imgui_impl_vulkan.cpp
 )
 target_include_directories(imgui SYSTEM PUBLIC ${IMGUI_DIR} ${IMGUI_DIR}/backends)
 if(Vulkan_INCLUDE_DIRS)
     target_include_directories(imgui SYSTEM PUBLIC ${Vulkan_INCLUDE_DIRS})
 endif()
-target_link_libraries(imgui PUBLIC Vulkan::Vulkan)
+target_link_libraries(imgui PUBLIC Vulkan::Vulkan SDL3::SDL3)
 if(MSVC)
     target_compile_options(imgui PRIVATE /W0 /utf-8)
 endif()
 
+# imnodes (node editor on top of imgui) from third_party/imnodes, same
+# treatment as imgui: third-party code, warnings silenced.
+add_library(imnodes STATIC ${SR_THIRD_PARTY_DIR}/imnodes/imnodes.cpp)
+target_include_directories(imnodes SYSTEM PUBLIC ${SR_THIRD_PARTY_DIR}/imnodes)
+target_link_libraries(imnodes PUBLIC imgui)
+if(MSVC)
+    target_compile_options(imnodes PRIVATE /W0 /utf-8)
+endif()
+
 # Interactive GUI mode (`sr_compare gui`).  Rendering is organized like
 # compare mode and reuses its shaders (compare_shaders) plus the renderer's.
-add_library(gui STATIC GuiApp.cpp BenchRunner.cpp)
+add_library(gui STATIC GuiApp.cpp BenchRunner.cpp GpuProfilerWindow.cpp RenderGraphEditor.cpp
+                       PassRegistry.cpp)
 sr_common_setup(gui)
 target_compile_definitions(gui PRIVATE SR_SHADER_DIR="${SR_SHADER_OUT_DIR}/")
-target_link_libraries(gui PUBLIC renderer upscalers imgui)
+target_link_libraries(gui PUBLIC renderer upscalers imgui imnodes)
 add_dependencies(gui renderer_shaders compare_shaders)

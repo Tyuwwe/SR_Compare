@@ -80,6 +80,12 @@ if [[ "${1:-}" == "--fg-only" ]]; then
     emit_jobs OF_SHADERS opticalflow
     emit_jobs FI_SHADERS frameinterpolation
 else
+    # sr_test patch: the SDK declares FSR1's UAVs rgba32f but the host binds
+    # R16G16B16A16_SFLOAT images (validation format-mismatch + undefined
+    # stores).  third_party/ is not committed, so apply the rgba16f fix
+    # idempotently here before compiling instead of editing the SDK checkout.
+    sed -i 's/binding = \(FSR1_BIND_UAV_[A-Z_]*\), rgba32f/binding = \1, rgba16f/' \
+        "$GPU/fsr1/ffx_fsr1_callbacks_glsl.h"
     emit_jobs FSR1_SHADERS fsr1
     emit_jobs FSR2_SHADERS fsr2
     emit_jobs FSR3_SHADERS fsr3upscaler

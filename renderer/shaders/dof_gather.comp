@@ -1,0 +1,84 @@
+#version 450
+// Depth-of-field bokeh gather pass (Phase 6b), half resolution:
+// scatter-as-gather over a Poisson disk (UE4 DOF style; McGuire's
+// reconstruction-filter idea applied to the CoC instead of velocity).  Every
+// tap contributes to a pixel when its own CoC radius reaches across the tap
+// distance (cylinder coverage, soft 1 px edge).  Foreground (coc > 0) and
+// background (coc < 0) accumulate into separate premultiplied layers so the
+// composite pass can lay sharp-focus content behind the background blur and
+// cover it with the foreground blur (foreground bleed over focused edges).
+//
+//   binding 0 = half-res cocColor (sampler; rgb = color, a = signed CoC
+//               normalized by the max radius)
+//   binding 1 = background layer out (RGBA16F: rgb = sum(c*w), a = sum(w))
+//   binding 2 = foreground layer out (same layout)
+//
+// The disk rotation keys off the frame index (interleaved gradient noise) —
+// deterministic.  Output alpha is the raw weight sum; dof_composite.comp
+// normalizes by kTaps.
+//
+// Ref: Guertin et al., "Dynamic Lighting & Post-Processing" (UE4 DOF), GDC
+//      2013; Sousa, "Crysis 3 / CryENGINE 3 DOF", SIGGRAPH 2013.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D cocColor;
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D bgLayer;
+layout(set = 0, binding = 2, rgba16f) uniform writeonly image2D fgLayer;
+
+layout(push_constant) uniform Push {
+    vec4 params; // x = max CoC (half-res px), y = frame index, zw unused
+} pc;
+
+const int kTaps = 24;
+
+// Interleaved gradient noise (Jimenez 2014), deterministic per (pixel, frame).
+float ign(ivec2 p, float frame) {
+    return fract(52.9829189 * fract(0.06711056 * float(p.x) + 0.00583715 * float(p.y) +
+                                    0.00623 * frame));
+}
+
+// 24-tap Poisson-ish disk (golden-angle spiral, deterministic).
+vec2 diskTap(int k, float rotCos, float rotSin) {
+    const float golden = 2.3999632;
+    const float r = sqrt((float(k) + 0.5) / float(kTaps));
+    const float a = float(k) * golden;
+    const vec2 v = vec2(cos(a), sin(a)) * r;
+    return vec2(v.x * rotCos - v.y * rotSin, v.x * rotSin + v.y * rotCos);
+}
+
+void main() {
+    const ivec2 hp = ivec2(gl_GlobalInvocationID.xy);
+    if (hp.x >= imageSize(bgLayer).x || hp.y >= imageSize(bgLayer).y) return;
+
+    const float maxCoc = pc.params.x;
+    const vec2 halfTexel = 1.0 / vec2(imageSize(bgLayer));
+    const vec2 uv = (vec2(hp) + 0.5) * halfTexel;
+
+    const float noise = ign(hp, pc.params.y);
+    const float angle = noise * 6.2831853;
+    const float rotCos = cos(angle);
+    const float rotSin = sin(angle);
+
+    vec3 bgSum = vec3(0.0);
+    float bgW = 0.0;
+    vec3 fgSum = vec3(0.0);
+    float fgW = 0.0;
+    for (int k = 0; k < kTaps; ++k) {
+        const vec2 off = diskTap(k, rotCos, rotSin) * maxCoc;
+        const vec4 s = texture(cocColor, uv + off * halfTexel);
+        const float sCoc = s.a * maxCoc; // signed, half-res px
+        const float dist = length(off);
+        // Cylinder coverage: the tap's CoC disk must reach this pixel.
+        const float cover = clamp(abs(sCoc) - dist + 0.5, 0.0, 1.0);
+        if (sCoc < 0.0) {
+            bgSum += s.rgb * cover;
+            bgW += cover;
+        } else if (sCoc > 0.0) {
+            fgSum += s.rgb * cover;
+            fgW += cover;
+        }
+    }
+    imageStore(bgLayer, hp, vec4(bgSum, bgW));
+    imageStore(fgLayer, hp, vec4(fgSum, fgW));
+}

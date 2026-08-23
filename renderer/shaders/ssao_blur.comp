@@ -1,8 +1,9 @@
 #version 450
-// GTAO denoise: 5×5 depth-aware bilateral over the working target (R = AO,
-// G = view-space |z|).  Matches XeGTAO's "rely on a spatial filter, TAA does
-// the temporal part" split; we stay spatial-only so FSR1 / SGSR1 do not
-// shimmer.  Output is R16F visibility for lighting.frag / transparent.frag.
+// GTAO denoise: 5x5 depth-aware bilateral over the TEMPORALLY ACCUMULATED AO
+// buffer (AoHistory ping-pong, R = AO, G = view-space |z|; written by
+// ssao_temporal.comp and sampled here from GENERAL).  The temporal pass does
+// the history part XeGTAO delegates to TAA; this filter stays the spatial
+// complement.  Output is R16F visibility for lighting.frag / transparent.frag.
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 

@@ -1,0 +1,73 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_samplerless_texture_functions : require
+
+// FidelityFX CAS post-resolve sharpening (RCAS).  Runs after taa.comp on the
+// resolved display-resolution image to recover the high-frequency detail that
+// temporal accumulation smooths away.
+//
+// Glue is modeled on the SDK's own
+// src/backends/vk/shaders/cas/ffx_cas_sharpen_pass.glsl, but the resource
+// callbacks are project-local: edge-clamped loads (the SDK shader relies on
+// driver behaviour for out-of-bounds texelFetch) and guarded stores at tile
+// edges.  Sharpen-only, 32-bit path, linear HDR in/out (no color-space
+// conversion).  Sharpness is fixed and baked into const1 by the host
+// (TaaUpscaler.cpp, mirrors ffxCasSetup from cas/ffx_cas.h).
+//
+// Ref: GPUOpen FidelityFX CAS — https://gpuopen.com/fidelityfx-cas/
+
+#define FFX_GPU 1
+#define FFX_GLSL 1
+#define FFX_HALF 0
+#define FFX_CAS_OPTION_SHARPEN_ONLY 1     // input == output resolution
+#define FFX_CAS_COLOR_SPACE_CONVERSION 0  // already linear; keep HDR as-is
+
+#include "ffx_core.h"
+
+layout(set = 0, binding = 0) uniform texture2D r_input_color;
+layout(rgba16f, set = 0, binding = 1) uniform image2D rw_output_color;
+layout(set = 0, binding = 2, std140) uniform CbCas {
+    uvec4 const0;
+    uvec4 const1;
+};
+
+FfxUInt32x4 Const0() { return const0; }
+FfxUInt32x4 Const1() { return const1; }
+
+FfxFloat32x3 casLoad(FFX_PARAMETER_IN FfxInt32x2 position) {
+    FfxInt32x2 sz = textureSize(r_input_color, 0);
+    return texelFetch(r_input_color, clamp(position, FfxInt32x2(0, 0), sz - 1), 0).rgb;
+}
+
+void casInput(FFX_PARAMETER_INOUT FfxFloat32 red, FFX_PARAMETER_INOUT FfxFloat32 green,
+              FFX_PARAMETER_INOUT FfxFloat32 blue) {
+    // CAS is an LDR algorithm: its contrast adaption and output saturate
+    // assume [0, 1].  Our resolve output is linear HDR, so scale into [0, 1]
+    // by a fixed factor (and back in casOutput); 1/16 covers this renderer's
+    // HDR range, and a linear scale preserves the sharpening ratio.
+    red *= FfxFloat32(1.0 / 16.0);
+    green *= FfxFloat32(1.0 / 16.0);
+    blue *= FfxFloat32(1.0 / 16.0);
+}
+
+void casOutput(FFX_PARAMETER_INOUT FfxFloat32 red, FFX_PARAMETER_INOUT FfxFloat32 green,
+               FFX_PARAMETER_INOUT FfxFloat32 blue) {
+    red *= FfxFloat32(16.0);
+    green *= FfxFloat32(16.0);
+    blue *= FfxFloat32(16.0);
+}
+
+void casStoreOutput(FfxInt32x2 iPxPos, FfxFloat32x4 fColor) {
+    if (iPxPos.x < imageSize(rw_output_color).x && iPxPos.y < imageSize(rw_output_color).y)
+        imageStore(rw_output_color, iPxPos, fColor);
+}
+
+#include "cas/ffx_cas_sharpen.h"
+
+// Sharpen() remaps a 64-thread workgroup over a 16x16 tile (4 pixels per
+// thread on the 32-bit path), so dispatch ceil(w/16) x ceil(h/16) groups.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    Sharpen(gl_LocalInvocationID.xyz, gl_WorkGroupID.xyz, gl_GlobalInvocationID.xyz);
+}

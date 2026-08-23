@@ -3,6 +3,10 @@ build-nss-emu/
 out/
 third_party/*/
 !third_party/.gitkeep
+!third_party/vma/
+!third_party/meshoptimizer/
+!third_party/imnodes/
+!third_party/tomlplusplus/
 assets/*/
 !assets/.gitkeep
 metrics/venv/
@@ -13,3 +17,5 @@ metrics/selftest_out/
 *.pyc
 output/
 captures/
+*.probes
+VISUAL_ACCEPTANCE.md

@@ -3,6 +3,7 @@
 // SgsrCommon — small Vulkan helpers shared by the SGSR1 / SGSR2 plugins.
 // ============================================================================
 #include "upscalers/IUpscaler.h"
+#include "upscalers/VkHelpers.h"
 
 #include <cstdio>
 #include <fstream>
@@ -158,7 +159,7 @@ inline void computeBarrier(VkCommandBuffer cmd) {
                          nullptr);
 }
 
-inline VkPipeline createComputePipeline(VkDevice device, VkPipelineLayout layout,
+inline VkPipeline createComputePipeline(const VulkanEnv& env, VkPipelineLayout layout,
                                         VkShaderModule module) {
     VkComputePipelineCreateInfo ci = {};
     ci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
@@ -168,7 +169,7 @@ inline VkPipeline createComputePipeline(VkDevice device, VkPipelineLayout layout
     ci.stage.pName = "main";
     ci.layout = layout;
     VkPipeline pipeline = VK_NULL_HANDLE;
-    if (vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &ci, nullptr, &pipeline) != VK_SUCCESS)
+    if (sr::createComputePipeline(env, ci, pipeline) != VK_SUCCESS)
         return VK_NULL_HANDLE;
     return pipeline;
 }

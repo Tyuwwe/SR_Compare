@@ -1,0 +1,19 @@
+#version 450
+// Motion-blur copy-back pass (Phase 6b), full path resolution: writes the MB
+// gather result (mbOut) back into the lit HDR target.  Only runs when motion
+// blur is on and depth of field is off — with DOF on, dof_composite.comp
+// already composites mbOut back into the lit target.
+//
+//   binding 0 = blurred HDR color (storage image, read)
+//   binding 1 = lit HDR color out (storage image, write)
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, rgba16f) uniform readonly image2D blurred;
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D outColor;
+
+void main() {
+    const ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    if (pix.x >= imageSize(outColor).x || pix.y >= imageSize(outColor).y) return;
+    imageStore(outColor, pix, imageLoad(blurred, pix));
+}

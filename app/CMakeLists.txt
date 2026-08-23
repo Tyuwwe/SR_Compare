@@ -5,6 +5,7 @@ target_link_libraries(sr_compare PRIVATE renderer upscalers compare bench gui)
 # ---------------------------------------------------------------------------
 # Packaged layout next to the exe (so the app runs when copied elsewhere):
 #   sr_compare.exe
+#   SDL3.dll                    (windowing/input runtime)
 #   *.dll                       (upscaler runtimes, copied by their modules)
 #   ngsdk_windows_x64.dll       (Arm NSS runtime)
 #   nss-emu/graph|tensor/       (Arm ML emulation layer for PC)
@@ -21,6 +22,18 @@ add_custom_command(TARGET sr_compare POST_BUILD
 add_custom_command(TARGET sr_compare POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_SOURCE_DIR}/cmake/run_gui.bat" "${SR_EXE_DIR}/sr_run_gui.bat")
+
+# Annotated runtime-config template next to the exe (copy to engine.toml to
+# activate; a missing engine.toml keeps the built-in defaults).
+add_custom_command(TARGET sr_compare POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_SOURCE_DIR}/engine.toml.example" "${SR_EXE_DIR}/engine.toml.example")
+
+# SDL3 runtime next to the exe (windowing/input for every mode).
+add_custom_command(TARGET sr_compare POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${SR_THIRD_PARTY_DIR}/sdl3/lib/x64/SDL3.dll"
+        "${SR_EXE_DIR}/SDL3.dll")
 
 if(EXISTS "${SR_THIRD_PARTY_DIR}/arm-nss/prebuilt_binaries/ngsdk_windows_x64.dll")
     add_custom_command(TARGET sr_compare POST_BUILD

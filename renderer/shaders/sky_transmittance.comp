@@ -1,0 +1,48 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// Transmittance LUT bake (Hillaire 2020 / UE4 SkyAtmosphere TransmittanceLut).
+// One texel = ray from (viewHeight, viewZenithCos) to the top of the
+// atmosphere; stores exp(-optical depth).  Deterministic: fixed 64-step
+// midpoint march, no random sampling.  40 steps suffice per the paper; 64
+// keeps horizon grazing rays clean.
+
+#include "atmosphere.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, rgba16f) uniform writeonly image2D dstLut;
+
+const int SAMPLE_COUNT = 64;
+
+void main() {
+    ivec2 size = imageSize(dstLut);
+    ivec2 id = ivec2(gl_GlobalInvocationID.xy);
+    if (id.x >= size.x || id.y >= size.y) return;
+
+    vec2 uv = (vec2(id) + 0.5) / vec2(size);
+    float r, mu;
+    atmUvToLutTransmittanceParams(uv, r, mu);
+
+    // Planet frame with up = +Z (self-contained; any consistent frame works).
+    vec3 pos = vec3(0.0, 0.0, r);
+    vec3 dir = vec3(0.0, sqrt(1.0 - mu * mu), mu);
+    float tMax = atmRaySphereNearest(pos, dir, ATM_TOP_RADIUS);
+    if (tMax < 0.0) {
+        imageStore(dstLut, id, vec4(1.0, 1.0, 1.0, 1.0));
+        return;
+    }
+
+    // Midpoint march: exact segment lengths so the optical depth sum is the
+    // same regardless of the sample offset within the segment.
+    vec3 opticalDepth = vec3(0.0);
+    float tPrev = 0.0;
+    for (int i = 0; i < SAMPLE_COUNT; ++i) {
+        float t = tMax * (float(i) + 0.5) / float(SAMPLE_COUNT);
+        float dt = t - tPrev;
+        tPrev = t;
+        vec3 sigmaSRay, sigmaSMie, sigmaT;
+        atmSampleMedium(pos + t * dir, sigmaSRay, sigmaSMie, sigmaT);
+        opticalDepth += sigmaT * dt;
+    }
+    imageStore(dstLut, id, vec4(exp(-opticalDepth), 1.0));
+}

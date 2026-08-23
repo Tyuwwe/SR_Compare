@@ -32,9 +32,16 @@
 // Reactive mask (UpscalerResources::reactive/reactiveView) convention:
 //   * R16_SFLOAT, render resolution, per-pixel accumulated translucent alpha
 //     coverage (0 = fully opaque / no translucency; can exceed 1, consumers
-//     clamp to [0,1]).  SHADER_READ_ONLY_OPTIMAL at dispatch; VK_NULL_HANDLE
+//     clamp to [0,1]).  The renderer feeds the 3x3-max DILATED +
+//     MOTION-GATED copy (reactive_dilate.comp): the plateau absorbs the
+//     sub-pixel straddle of consumers that sample it at the jittered
+//     coordinate (FSR2/3), and coverage on (near-)static pixels is gated to
+//     zero — reprojection is exact there, so dropping history would only
+//     pass the phase-flipping aliased current frame through unfiltered
+//     (shimmer).  SHADER_READ_ONLY_OPTIMAL at dispatch; VK_NULL_HANDLE
 //     when the scene has no translucency.
-//   * Semantics: pixels under translucency must not trust reprojected history.
+//   * Semantics: pixels under MOVING translucency must not trust reprojected
+//     history; static coverage keeps full history weight.
 //   * Consumers:
 //       TAA    : scales the history blend weight by (1 - clamp(mask,0,1))
 //                (own shader; binding 6 + useReactive push flag).
@@ -49,6 +56,18 @@
 //                output/outputTm1 + scalars (ffx-api/include/ffx_api/ffx_nss.h).
 //       SGSR2  : fixed shader inputs (color/depth/velocity/history), no mask
 //                concept in the reference shaders.
+// FrameParams::preExposure convention:
+//   The input color (UpscalerResources::color) is un-exposed scene-linear HDR.
+//   preExposure is the display exposure multiplier (ACES input scale) that the
+//   host applies to this frame's image at present/compose time.  With auto
+//   exposure (UE4-style histogram + EV solver, see DeferredCore) it is the
+//   latest CPU-harvested solver output — i.e. the value solved
+//   kFramesInFlight frames ago (engine-style: earlier frames' luminance
+//   drives the current frame's exposure; FSR2/DLSS expect the current or
+//   previous frame's exposure here, both conventions are this value within
+//   one frame).  Manual mode (--exposure) feeds the fixed override instead.
+//   Deterministic: the solver smooths with a fixed 1/60 step per frame, so a
+//   fixed camera path reproduces the same preExposure per frame index.
 // ============================================================================
 #include <cstdint>
 

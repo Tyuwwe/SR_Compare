@@ -1,15 +1,23 @@
 # third_party/ — SDK 说明
 
-本目录由 `scripts/fetch_sdks.py` 生成（不入 git，见仓库根 `.gitignore` 的
-`third_party/*/`）。下表为每个 SDK 的版本、来源与许可证。
+本目录大部分由 `scripts/fetch_sdks.py` 生成（不入 git，见仓库根 `.gitignore` 的
+`third_party/*/`）；例外：`vma/` 与 `meshoptimizer/` 为随源码 vendor 的精简拷贝，
+已入 git；`compressonator/` 由 `scripts/transcode_textures.py` 首次运行时下载。
+下表为每个 SDK 的版本、来源与许可证。
 
 | 子目录 | 名称 | 实际版本 | 许可证 |
 |---|---|---|---|
 | `fidelityfx/` | AMD FidelityFX SDK（FSR 1/2/3 全源码） | **v1.1.4** | MIT |
+| `sdl3/` | SDL3 窗口/输入库（预编译 VC x64 包：`include/` + `lib/x64/SDL3.lib/.dll` + `cmake/`） | **3.4.14**（`release-3.4.14`） | zlib |
 | `xess/` | Intel XeSS SDK（闭源 DLL） | **v3.0.2**（latest） | Intel Simplified Software License (Oct 2022) |
 | `streamline/` | NVIDIA Streamline SDK（框架 + DLSS DLL） | **v2.12.0**（latest） | 框架 MIT + `nvngx_dlss.dll` NVIDIA RTX SDKs LICENSE |
 | `snapdragon-gsr/` | Snapdragon SGSR 1/2（shader 源码） | git `d926f07`（main，浅克隆） | BSD-3-Clause |
 | `arm-nss/` | Arm Neural Super Sampling（SDK + 模型 + Vulkan ML 模拟层） | 见下 | SDK MIT + 模型 Arm AI Model Community License |
+| `meshoptimizer/` | zeux meshoptimizer（仅 `meshoptimizer.h` + `simplifier.cpp` + `allocator.cpp`，LOD 简化用） | **v0.25** | MIT |
+| `vma/` | GPUOpen Vulkan Memory Allocator（仅 `vk_mem_alloc.h` 单头文件） | **v3.4.0** | MIT |
+| `imnodes/` | Nelarius imnodes（Dear ImGui 节点编辑器，GUI "Render Graph" 窗口用；`imnodes.h/.cpp` + `imnodes_internal.h`） | git `eb36902`（master） | MIT |
+| `tomlplusplus/` | marzer toml++（TOML 解析，仅单头 `toml.hpp`，`engine.toml` 运行时配置用；随源码 vendor，不经 fetch_sdks.py） | **v3.4.0** | MIT |
+| `compressonator/` | AMD CompressonatorCLI（BC7 KTX2 离线转码用，见 `scripts/transcode_textures.py`） | **v4.5.52**（win64 命令行包） | MIT |
 | `../assets/sponza/` | Sponza glTF 测试场景 | Khronos glTF-Sample-Assets `main` | 模型文件 Cryengine Limited License Agreement；文档 CC-BY-4.0 |
 | `../assets/bistro/` | Amazon Lumberyard Bistro | NVIDIA ORCA 2017（FBX 转 glTF） | CC-BY 4.0 |
 
@@ -36,6 +44,23 @@
 - shader 头文件（GPU）：`include/FidelityFX/gpu/fsr1/`、`fsr2/`、`fsr3/`、`fsr3upscaler/`
 - 源码：`src/components/fsr1/`、`fsr2/`、`fsr3/`、`fsr3upscaler/`，公共部分在
   `src/shared/` 与 `src/backends/`
+
+---
+
+## SDL3 — `sdl3/`
+
+- 来源：https://github.com/libsdl-org/SDL
+- release 资产：`SDL3-devel-3.4.14-VC.zip`（tag `release-3.4.14`）
+- 许可证：zlib（`sdl3/LICENSE.txt`）
+- 预编译 VC 开发包，抽取 `include/`、`lib/x64/`（`SDL3.lib` + `SDL3.dll`）与
+  `cmake/`；窗口/事件/Vulkan surface（`SDL_Vulkan_*`）全部由它提供
+  （`renderer/core/Window`），ImGui 后端为 `imgui_impl_sdl3`。
+  构建时 `SDL3.dll` 被拷到 exe 旁（见 `app/CMakeLists.txt`）。
+
+关键路径：
+
+- 头文件：`include/SDL3/SDL.h`、`include/SDL3/SDL_vulkan.h`
+- 库：`lib/x64/SDL3.lib`（导入库）、`lib/x64/SDL3.dll`（运行时）
 
 ---
 
@@ -172,6 +197,34 @@
   的 Scenes / Bistro 一节。
 - 可加载入口：`assets/bistro/BistroExterior.gltf`、
   `assets/bistro/BistroInterior.gltf`
+
+---
+
+## Vulkan Memory Allocator — `vma/`
+
+- 来源：https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator
+- 版本：v3.4.0（头文件内 `VMA_VERSION`），只保留 `vk_mem_alloc.h` 单头文件（随源码 vendor，不经 fetch_sdks.py）
+- 许可证：MIT
+
+---
+
+## toml++ — `tomlplusplus/`
+
+- 来源：https://github.com/marzer/tomlplusplus
+- 版本：v3.4.0（tag `v3.4.0` 仓库根的 amalgamated 单头 `toml.hpp`，随源码 vendor，不经 fetch_sdks.py）
+- 许可证：MIT（见 `tomlplusplus/LICENSE`）
+- 用途：`engine.toml` 运行时配置解析（`renderer/core/EngineConfig.cpp`，见仓库根 `engine.toml.example`）
+
+---
+
+## AMD Compressonator — `compressonator/`
+
+- 来源：https://github.com/GPUOpen-Tools/compressonator 的 release 资产
+  `compressonatorcli-4.5.52-win64.zip`（版本在 `scripts/transcode_textures.py`
+  中 pin 住，首次运行转码脚本时自动下载解压到本目录，不经 fetch_sdks.py）
+- 许可证：MIT（见包内 license）
+- 用途：把 `assets/` 下的 PNG/JPG 离线转码为 BC7 KTX2（含完整 mip 链），渲染器
+  的 glTF 加载器优先读同名 `.ktx2`。步骤见仓库根 `README.md` 渲染器小节。
 
 ---
 

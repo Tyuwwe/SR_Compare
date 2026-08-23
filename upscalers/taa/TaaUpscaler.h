@@ -1,8 +1,9 @@
 #pragma once
 // ============================================================================
-// TAAU — the self-authored temporal baseline.  Standard history clamp
-// (3x3 min/max) + resolve from render-resolution HDR/depth/motion inputs to
-// display resolution.  Implements sr::IUpscaler.
+// TAAU — the self-authored temporal baseline.  YCoCg-space variance clipping
+// + depth disocclusion rejection + velocity-adaptive history weight, resolved
+// from render-resolution HDR/depth/motion inputs to display resolution, then
+// FidelityFX CAS (RCAS) sharpening.  Implements sr::IUpscaler.
 // ============================================================================
 #include "upscalers/IUpscaler.h"
 

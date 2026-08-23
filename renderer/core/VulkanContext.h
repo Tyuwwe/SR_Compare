@@ -15,22 +15,50 @@ class Window;
 
 struct VulkanContext {
     VkInstance instance = VK_NULL_HANDLE;
+    VkDebugUtilsMessengerEXT debugMessenger = VK_NULL_HANDLE; // only when validation is on
     VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
     VkDevice device = VK_NULL_HANDLE;
     VkQueue graphicsQueue = VK_NULL_HANDLE;
     uint32_t graphicsQueueFamily = 0;
     VkQueue presentQueue = VK_NULL_HANDLE;
     uint32_t presentQueueFamily = 0;
+    // Dedicated transfer queue (family without GRAPHICS, prefer without
+    // COMPUTE — the DMA engine).  VK_NULL_HANDLE when the device has no such
+    // family; upload helpers then fall back to the graphics queue.
+    VkQueue transferQueue = VK_NULL_HANDLE;
+    uint32_t transferQueueFamily = 0;
     VkSurfaceKHR surface = VK_NULL_HANDLE;
 
     VkCommandPool oneShotPool = VK_NULL_HANDLE;  // one-time submits (upscalers)
     VkCommandPool framePool = VK_NULL_HANDLE;    // per-frame recording
+    // Transfer-family pool shared by submitUploadOneShot across threads;
+    // all pool access (alloc/record/free) is serialized through
+    // transferPoolMutex, queue submits through transferQueueMutex.
+    VkCommandPool transferPool = VK_NULL_HANDLE;
+
+    // VMA allocator — all device memory owned by VkUtil helpers goes through
+    // this instead of per-resource vkAllocateMemory (Bistro's texture count
+    // otherwise approaches the driver's allocation limit).
+    VmaAllocator allocator = VK_NULL_HANDLE;
+
+    // Persistent pipeline cache (exe-dir pipeline.cache, read on startup and
+    // written back on destroy).  The mutex guards it because the GUI async
+    // loader creates pipelines on a worker thread while the main thread keeps
+    // rendering; Vulkan requires external sync for concurrent cache use.
+    VkPipelineCache pipelineCache = VK_NULL_HANDLE;
+    mutable std::mutex pipelineMutex;
 
     // Guards every host access to graphicsQueue/presentQueue (submit, present,
     // queue-wait-idle).  The GUI async loader submits uploads from a worker
     // thread while the main thread keeps rendering, so queue access needs
     // external synchronization; command pools stay per-thread instead.
     mutable std::mutex queueMutex;
+
+    // Same for the dedicated transfer queue and its shared command pool
+    // (submitUploadOneShot may run on the main thread, the texture streamer
+    // and the GUI load worker concurrently).
+    mutable std::mutex transferQueueMutex;
+    mutable std::mutex transferPoolMutex;
 
     VkPhysicalDeviceProperties properties{};
     VkPhysicalDeviceFeatures features{};
@@ -53,6 +81,8 @@ struct VulkanContext {
         env.graphicsQueueFamily = graphicsQueueFamily;
         env.commandPool = oneShotPool;
         env.queueMutex = &queueMutex;
+        env.pipelineCache = pipelineCache;
+        env.pipelineMutex = &pipelineMutex;
         env.getInstanceProcAddr = vkGetInstanceProcAddr;
         return env;
     }
