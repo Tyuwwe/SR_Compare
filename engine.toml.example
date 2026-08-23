@@ -9,9 +9,10 @@
 # All modes (viewer / compare / bench / gui) read this file at startup; bench
 # child viewer processes read it too (same exe directory).  The GUI also
 # hot-reloads it (~1 s poll): the per-frame options ([effects], [dof],
-# [grading], [sun], [exposure], [culling], hdr, [window] fullscreen) apply
-# instantly; render_scale, output resolution, env_map, scene and lut need an
-# Apply rebuild / restart and are NOT picked up by the hot reload.
+# [grading], [sun], [exposure], [culling], hdr, [window] fullscreen/width/
+# height) apply instantly; render_scale, output resolution, env_map, scene
+# and lut need an Apply rebuild / restart and are NOT picked up by the hot
+# reload.
 #
 # The GUI owns the file: it auto-creates a missing engine.toml from the
 # effective values (defaults + CLI overrides), rewrites it (debounced,
@@ -23,6 +24,13 @@
 # Borderless (desktop) fullscreen at startup, GUI only (the panel has a
 # "fullscreen (borderless)" checkbox; hot-reloadable).  Not exclusive mode.
 # fullscreen = false
+
+# Windowed client size, GUI only (hot-reloadable).  The GUI remembers the
+# window size across runs (rewritten by the debounced auto-save when the
+# window is resized); absent keys fall back to the output resolution.
+# 64..16384.
+# width = 1920
+# height = 1080
 
 [renderer]
 # Render resolution scale, (0, 1]  (CLI: --render-scale).  Needs rebuild.

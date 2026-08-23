@@ -33,6 +33,12 @@ void EngineConfigLog::add(const char* key, bool v) {
     text += v ? "=true" : "=false";
 }
 
+void EngineConfigLog::add(const char* key, int32_t v) {
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), " %s=%d", key, static_cast<int>(v));
+    text += buf;
+}
+
 void EngineConfigLog::add(const char* key, float v) {
     char buf[96];
     std::snprintf(buf, sizeof(buf), " %s=%.4g", key, static_cast<double>(v));
@@ -69,6 +75,20 @@ std::optional<float> getFloat(const toml::table& t, const char* key) {
         if (const auto v = n->value<double>()) return static_cast<float>(*v);
         if (const auto v = n->value<int64_t>()) return static_cast<float>(*v);
         std::fprintf(stderr, "[engine.toml] ignoring %s: expected number\n", key);
+    }
+    return std::nullopt;
+}
+
+// Integer keys (window size): int64 only, range-gated like clampCheck.
+std::optional<int32_t> getInt(const toml::table& t, const char* key, int32_t lo, int32_t hi) {
+    if (const toml::node* n = t.get(key)) {
+        if (const auto v = n->value<int64_t>()) {
+            if (*v >= lo && *v <= hi) return static_cast<int32_t>(*v);
+            std::fprintf(stderr, "[engine.toml] ignoring %s: value %lld out of range\n", key,
+                         static_cast<long long>(*v));
+            return std::nullopt;
+        }
+        std::fprintf(stderr, "[engine.toml] ignoring %s: expected integer\n", key);
     }
     return std::nullopt;
 }
@@ -116,6 +136,8 @@ bool loadEngineConfig(const std::string& path, EngineConfig& out) {
 
     if (const toml::table* t = section(root, "window")) {
         out.fullscreen = getBool(*t, "fullscreen");
+        out.width = getInt(*t, "width", 64, 16384);
+        out.height = getInt(*t, "height", 64, 16384);
     }
     if (const toml::table* t = section(root, "renderer")) {
         out.renderScale = clampCheck(getFloat(*t, "render_scale"), 0.f, 1.f, true, "render_scale");
@@ -226,6 +248,12 @@ void putBool(std::string& out, const char* key, bool v) {
     out += v ? " = true\n" : " = false\n";
 }
 
+void putInt(std::string& out, const char* key, int32_t v) {
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "%s = %d\n", key, static_cast<int>(v));
+    out += buf;
+}
+
 // TOML literal string (single quotes): Windows paths keep their backslashes.
 void putString(std::string& out, const char* key, const std::string& v) {
     out += key;
@@ -246,9 +274,11 @@ std::string engineConfigToToml(const EngineConfig& cfg) {
         "# comments and formatting added by hand are not preserved.\n"
         "# ============================================================================\n"
         "\n";
-    if (cfg.fullscreen) {
+    if (cfg.fullscreen || cfg.width || cfg.height) {
         out += "[window]\n";
-        putBool(out, "fullscreen", *cfg.fullscreen);
+        if (cfg.fullscreen) putBool(out, "fullscreen", *cfg.fullscreen);
+        if (cfg.width) putInt(out, "width", *cfg.width);
+        if (cfg.height) putInt(out, "height", *cfg.height);
         out += "\n";
     }
     out += "[renderer]\n";

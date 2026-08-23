@@ -613,6 +613,12 @@ private:
     // configured output size; the swapchain is recreated through the normal
     // OUT_OF_DATE path on the mode switch.
     bool fullscreenEnabled_ = false;
+    // Windowed client size ([window] width/height in engine.toml): remembered
+    // across runs, tracked from resize events while not fullscreen and saved
+    // back by the debounced auto-save.  0 = not initialized yet (init seeds
+    // it from the toml value or the output resolution).
+    int windowedW_ = 0;
+    int windowedH_ = 0;
 
     ImageResource gbColor_;
     ImageResource gbColorSpatial_; // unjittered LR HDR copy for spatial upscalers

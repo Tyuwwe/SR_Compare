@@ -16,7 +16,7 @@
 // Modes: viewer/compare/bench/gui all load it once at startup.  The GUI
 // additionally hot-reloads on file modification (~1 s stat interval):
 // per-frame parameters (effects toggles, DOF/grading/sun sliders, exposure,
-// occlusion/lod, HDR, window fullscreen) apply immediately; resolution/scale/
+// occlusion/lod, HDR, window fullscreen, windowed size) apply immediately; resolution/scale/
 // env-map/scene/LUT changes need an Apply rebuild or a restart and are
 // ignored by the reload.
 //
@@ -68,6 +68,8 @@ inline constexpr uint64_t kOutput = 1ull << 23;
 struct EngineConfig {
     // [window]
     std::optional<bool> fullscreen;        // borderless (desktop) fullscreen (GUI)
+    std::optional<int32_t> width;          // windowed client size remembered by the GUI
+    std::optional<int32_t> height;         // (64..16384; absent = output resolution)
     // [renderer]
     std::optional<float> renderScale;      // (0, 1]
     std::optional<bool> hdr;               // HDR swapchain (viewer/gui)
@@ -146,6 +148,7 @@ int64_t engineConfigWriteTime(const std::string& path);
 struct EngineConfigLog {
     std::string text;
     void add(const char* key, bool v);
+    void add(const char* key, int32_t v);
     void add(const char* key, float v);
     void add(const char* key, const std::string& v);
     bool empty() const { return text.empty(); }

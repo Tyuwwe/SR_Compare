@@ -46,8 +46,10 @@ public:
 
     // GUI integration: optional hook (e.g. ImGui_ImplSDL3_ProcessEvent)
     // invoked for every event before the default handling; returning true
-    // consumes the event.  clickToCapture=false disables the viewer's
-    // left-click mouse capture so UI clicks keep the cursor free.
+    // suppresses only the app-level input handling (keys/mouse below) —
+    // window lifecycle events (resize, close) are always processed.
+    // clickToCapture=false disables the viewer's left-click mouse capture so
+    // UI clicks keep the cursor free.
     using EventHook = bool (*)(const SDL_Event& event);
     void setEventHook(EventHook hook) { eventHook_ = hook; }
     void setClickToCaptureEnabled(bool enabled) { clickToCapture_ = enabled; }
@@ -56,10 +58,12 @@ public:
     void setClientSize(int width, int height);
 
     // Borderless (desktop) fullscreen toggle — SDL_SetWindowFullscreen's
-    // non-exclusive mode: the desktop resolution is kept and the windowed
-    // size/position are restored on the way back.  The resize events it
-    // generates flow through the normal poll() path (swapchain OUT_OF_DATE
-    // handling covers the mode switch).
+    // non-exclusive mode: the desktop resolution is kept.  On the way back to
+    // windowed the decorations/resizable frame are restored explicitly and
+    // the window is snapped to 1920x1080 (clamped to the display's usable
+    // bounds, centered) instead of whatever size it had before.  The resize
+    // events it generates flow through the normal poll() path (swapchain
+    // OUT_OF_DATE handling covers the mode switch).
     void setFullscreen(bool enabled);
     bool isFullscreen() const { return fullscreen_; }
 

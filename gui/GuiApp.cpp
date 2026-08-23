@@ -296,8 +296,15 @@ bool GuiApp::init(const GuiOptions& opts) {
     active_.displayW = kOutputResolutions[ui_.outputResIndex][0];
     active_.displayH = kOutputResolutions[ui_.outputResIndex][1];
 
-    if (!window_.create("sr_compare — gui", static_cast<int>(active_.displayW),
-                        static_cast<int>(active_.displayH)))
+    // Windowed client size: the remembered [window] width/height wins over
+    // the output resolution (the swapchain follows the actual window size).
+    windowedW_ = static_cast<int>(active_.displayW);
+    windowedH_ = static_cast<int>(active_.displayH);
+    if (opts_.engineCfg.width && opts_.engineCfg.height) {
+        windowedW_ = *opts_.engineCfg.width;
+        windowedH_ = *opts_.engineCfg.height;
+    }
+    if (!window_.create("sr_compare — gui", windowedW_, windowedH_))
         return false;
     window_.setClickToCaptureEnabled(false); // LMB belongs to the UI now
     // engine.toml [window] fullscreen (no CLI flag): borderless desktop mode.
@@ -323,7 +330,10 @@ bool GuiApp::init(const GuiOptions& opts) {
         hdrEnabled_ = *opts_.engineCfg.hdr && (hdrSupportHdr10_ || hdrSupportScRgb_);
     swapchainVsync_ = guiWantVsync();
     swapchainMailbox_ = guiAllowMailbox();
-    if (!swapchain_.create(ctx_, active_.displayW, active_.displayH, swapchainVsync_,
+    // The swapchain extent follows the actual window client size; the
+    // composite scales to it in the present copy pass.
+    if (!swapchain_.create(ctx_, static_cast<uint32_t>(window_.width()),
+                           static_cast<uint32_t>(window_.height()), swapchainVsync_,
                            swapchainMailbox_, hdrEnabled_))
         return false;
     // Grading LUT (Phase 6c): procedural identity, created once — it survives
@@ -682,6 +692,17 @@ void GuiApp::applyEngineConfigHot(const EngineConfig& cfg, EngineConfigLog& log)
         setFullscreenEnabled(*cfg.fullscreen);
         log.add("fullscreen", fullscreenEnabled_);
     }
+    // Windowed size memory (no CLI flag): applied hot while windowed.  While
+    // fullscreen the values are kept for the round-trip but not applied to
+    // the (desktop-sized) window.
+    if (cfg.width && cfg.height &&
+        (*cfg.width != windowedW_ || *cfg.height != windowedH_)) {
+        windowedW_ = *cfg.width;
+        windowedH_ = *cfg.height;
+        if (!fullscreenEnabled_) window_.setClientSize(windowedW_, windowedH_);
+        log.add("width", windowedW_);
+        log.add("height", windowedH_);
+    }
 }
 
 // Hot-reload watch: stats engine.toml about once a second; on a modification
@@ -742,6 +763,10 @@ void GuiApp::pollEngineConfig() {
 EngineConfig GuiApp::currentEngineConfig() const {
     EngineConfig c;
     c.fullscreen = fullscreenEnabled_;
+    if (windowedW_ > 0 && windowedH_ > 0) {
+        c.width = windowedW_;
+        c.height = windowedH_;
+    }
     c.renderScale = ui_.renderScale;
     c.hdr = hdrEnabled_;
     c.envMap = std::string(ui_.envMap);
@@ -4820,8 +4845,18 @@ bool GuiApp::guiAllowMailbox() const {
 bool GuiApp::recreateGuiSwapchain() {
     swapchainVsync_ = guiWantVsync();
     swapchainMailbox_ = guiAllowMailbox();
-    if (!swapchain_.create(ctx_, active_.displayW, active_.displayH, swapchainVsync_,
-                           swapchainMailbox_, hdrEnabled_))
+    // The swapchain extent follows the actual window client size (border
+    // drag-resize, fullscreen switches, output-resolution Apply); the
+    // fixed output-resolution composite is scaled to it by the present
+    // copy pass.  A minimized window reports 0 — keep the configured size
+    // then (the acquire/present OUT_OF_DATE loop retries on restore).
+    uint32_t w = active_.displayW;
+    uint32_t h = active_.displayH;
+    if (window_.width() > 0 && window_.height() > 0) {
+        w = static_cast<uint32_t>(window_.width());
+        h = static_cast<uint32_t>(window_.height());
+    }
+    if (!swapchain_.create(ctx_, w, h, swapchainVsync_, swapchainMailbox_, hdrEnabled_))
         return false;
     ensurePresentSemaphores();
     return true;
@@ -5072,6 +5107,14 @@ void GuiApp::run() {
     auto lastTime = std::chrono::steady_clock::now();
 
     while (window_.poll()) {
+        // Track the windowed client size (border drags, output-resolution
+        // Applies, fullscreen-exit snap) for the engine.toml width/height
+        // memory; while fullscreen the window holds the desktop size, which
+        // must not overwrite the remembered windowed size.
+        if (!fullscreenEnabled_ && window_.width() > 0 && window_.height() > 0) {
+            windowedW_ = window_.width();
+            windowedH_ = window_.height();
+        }
         ensureGuiSwapchainMode();
         const int lockN = std::max(15, std::min(120, ui_.lockFpsTarget));
         if (currentTab_ != 2 && ui_.lockFps) {
