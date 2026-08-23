@@ -61,9 +61,18 @@ float ssrClipToScreen(vec2 startUv, vec2 endUv) {
 // sharp copy); colorMipCount = textureQueryLevels(colorTex).  The hit colour
 // is read at a roughness-driven LOD so one ray approximates the widened GGX
 // lobe (rough reflections average a larger screen footprint).
+// escalateEvery: coarsen one mip per this many in-front advances (1 = classic
+// Hi-Z, one per step).  The max-reduced hull is conservative only for rays
+// whose view-Z grows; rays reflected off camera-facing surfaces (shop
+// windows) travel back TOWARD the camera, and a mixed cell's far max lets
+// the march skip thin near geometry (lamps, mullions, the opposite
+// storefront) hiding inside it.  Coarsening one mip per single step then
+// quantizes the detected hit region to coarse cell blocks — round reflectors
+// read as axis-aligned squares.  The glass callers pass 4 so the near field
+// is searched at fine mips; the temporally-accumulated opaque path keeps 1.
 vec4 traceSsr(sampler2D colorTex, int colorMipCount, sampler2D hizTex, int hizMipCount,
               mat4 viewProj, mat4 invViewProj, vec3 cameraPos, vec3 worldPos,
-              vec3 N, vec3 R, float roughness, vec2 renderSize) {
+              vec3 N, vec3 R, float roughness, vec2 renderSize, int escalateEvery) {
     const int kMaxIters = 128; // hierarchy steps (each descends or advances)
     const int kRefine = 8;
     const float kMaxDist = 100.0;
@@ -120,6 +129,7 @@ vec4 traceSsr(sampler2D colorTex, int colorMipCount, sampler2D hizTex, int hizMi
     float t = 0.0;
     float tFront = 0.0; // last sampled position still in front of the hull
     int level = 0;
+    int advances = 0; // in-front steps taken; gates mip coarsening
     bool hit = false;
     vec2 hitUv = endUv;
     float hitDist = kMaxDist;
@@ -147,7 +157,9 @@ vec4 traceSsr(sampler2D colorTex, int colorMipCount, sampler2D hizTex, int hizMi
             // then coarsen so long empty runs cost one iteration per cell.
             tFront = t;
             t += float(1 << level) / pixelDist;
-            level = min(level + 1, maxMip);
+            ++advances;
+            if (advances % escalateEvery == 0)
+                level = min(level + 1, maxMip);
             continue;
         }
         if (level > 0) {

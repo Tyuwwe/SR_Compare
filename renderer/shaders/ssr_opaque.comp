@@ -136,7 +136,7 @@ void main() {
     const vec3 R = reflect(-V, N);
     const vec4 ssr = traceSsr(ssrColor, textureQueryLevels(ssrColor), ssrHiZ,
                               textureQueryLevels(ssrHiZ), push.viewProj, u.invViewProj,
-                              u.cameraPos.xyz, wp.xyz, N, R, roughness, renderSize);
+                              u.cameraPos.xyz, wp.xyz, N, R, roughness, renderSize, 1);
     // Weight shaping, both applied to the hit confidence (so the temporal EMA
     // filters the scaled value and the miss path stays exactly 0):
     //  - params.x: global strength scale (default 0.6).  A single

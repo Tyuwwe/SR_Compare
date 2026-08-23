@@ -309,7 +309,7 @@ void main() {
     vec4 ssr = traceSsr(ssrColor, textureQueryLevels(ssrColor), ssrHiZ,
                         textureQueryLevels(ssrHiZ), ubo.viewProj,
                         lighting.invViewProj, ubo.cameraPos.xyz, vWorldPos, N, R, roughness,
-                        ubo.renderSizeJitter.xy);
+                        ubo.renderSizeJitter.xy, 4);
     float ssrHit = clamp(ssr.a, 0.0, 1.0);
     // UE applies EnvBRDF on the hit (not D*G*F).  Shop glass is a
     // coated mirror: lerp EnvBRDF toward 1 with hit confidence so a

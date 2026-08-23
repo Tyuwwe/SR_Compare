@@ -1518,9 +1518,16 @@ void Renderer::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         jitterY_ = 0.f;
     }
 
-    updateSceneUBO(frameIndex, jitter, renderWidth_, renderHeight_, view, proj, projJittered, prevViewProj_);
-
     const bool gbuffer = useUpscaler;
+
+    // The SceneUBO's render size must match the ACTIVE path's scene
+    // resolution: the GT path renders/pyramids at display res, the upscaler
+    // path at render res.  Feeding the LR size to the GT path halved the
+    // pixel math of the inline glass SSR trace (traceSsr's renderSize) and
+    // the GT motion-vector scale.
+    const uint32_t sceneUBOW = gbuffer ? renderWidth_ : opts_.displayWidth;
+    const uint32_t sceneUBOH = gbuffer ? renderHeight_ : opts_.displayHeight;
+    updateSceneUBO(frameIndex, jitter, sceneUBOW, sceneUBOH, view, proj, projJittered, prevViewProj_);
 
     // Lighting reconstructs world positions with the inverse of the exact
     // view-projection used for this pass (jittered for the low-res path).
