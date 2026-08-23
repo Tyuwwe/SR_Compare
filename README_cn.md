@@ -73,7 +73,9 @@ Arm NSS 在 PC 上经 Vulkan ML Emulation Layer 软件模拟推理，性能数�
 
 - **gui** — ImGui 界面（Viewer / Compare / Bench 三个标签页）。切场景/算法在工作
   线程异步加载并显示进度浮层，旧画面持续渲染不卡死；分级重建——只改算法不再
-  重载场景。
+  重载场景。侧栏底部有 **Exit** 按钮，走正常窗口关闭路径（完整 Vulkan 清理）。
+  SSR 仅限 CLI/engine.toml：GUI 复选框与 Render Graph 节点均锁定（灰显，
+  tooltip 指向 `--ssr`）。
 - **viewer** — 自由视角单算法全屏预览。
 - **compare** — 分栏实时对比：最左栏原生 GT，右侧各算法列，实时 PSNR/SSIM；等比
   裁切、滚轮缩放（指标按可视区域重算）、可选 GT 200% SSAA。

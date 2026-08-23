@@ -37,6 +37,9 @@ public:
     int width() const { return width_; }
     int height() const { return height_; }
     bool shouldClose() const { return shouldClose_; }
+    // Request a clean quit (e.g. a UI Exit button): the next poll() returns
+    // false, so the caller's normal shutdown path runs.
+    void requestClose() { shouldClose_ = true; }
 
     const Input& input() const { return input_; }
     void clearMouseDelta() { input_.mouseDX = 0.f; input_.mouseDY = 0.f; input_.resized = false; }

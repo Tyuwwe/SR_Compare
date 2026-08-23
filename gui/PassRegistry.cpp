@@ -48,7 +48,8 @@ const std::vector<PassNode>& passTable() {
         {"ssr (opaque)", "reflections", PassToggle::Ssr,
          PassToggle::None,
          {"gbuffer", "hiz", "hdr color"}, {"color pyramid", "hdr color"},
-         "color pyramid + trace + temporal composite"},
+         "color pyramid + trace + temporal composite — CLI/engine.toml only "
+         "(--ssr); this node's checkbox is locked in the GUI"},
         {"transparent", "transparent", PassToggle::None,
          PassToggle::None,
          {"hdr color", "depth", "color pyramid", "fog volume"},

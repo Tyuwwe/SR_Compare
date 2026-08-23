@@ -533,6 +533,9 @@ private:
     bool contactShadowsEnabled_ = true;
     // Opaque screen-space reflections (per-frame pass skip, no rebuild).
     // Off by default — the probe/env fallback carries the specular term.
+    // CLI/engine.toml-only switch: the panel checkbox and the graph node are
+    // locked; applyPassToggle(Ssr) is reached only from applyEngineConfigHot
+    // and the SR_GUI_INPUT_FILE debug hook.
     bool ssrEnabled_ = false;
     // Global SSR weight scale (trace-stage confidence multiplier, 0..1).
     float ssrStrength_ = 0.6f;

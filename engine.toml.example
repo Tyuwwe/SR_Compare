@@ -37,6 +37,8 @@
 
 [effects]
 # Opaque screen-space reflections (default off; CLI: --ssr / --no-ssr).
+# The GUI checkbox is locked — the CLI flag and this file are the only
+# switches; the GUI hot reload still applies edits to this entry.
 # ssr = false
 # Global SSR weight scale [0, 1] (CLI: --ssr-strength, default 0.6).
 # ssr_strength = 0.6

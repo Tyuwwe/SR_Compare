@@ -22,7 +22,7 @@ enum class PassToggle {
     None,
     Shadows,
     ContactShadows, // not a pass: a screen-space ray march inside lighting
-    Ssr,
+    Ssr,            // CLI/engine.toml-only: locked in the panel and here
     VolFog,
     Occlusion,
     Bloom,

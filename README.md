@@ -94,7 +94,10 @@ its performance numbers are not representative of real hardware.
 - **gui** — ImGui front end with Viewer / Compare / Bench tabs. Scene and
   algorithm changes load asynchronously on a worker thread with a progress
   overlay; the current frame keeps rendering. Rebuilds are tiered: switching
-  only algorithms does not reload the scene.
+  only algorithms does not reload the scene. The side panel's bottom **Exit**
+  button quits through the normal window-close path (full Vulkan cleanup).
+  SSR is intentionally CLI/engine.toml-only: the GUI checkbox and the Render
+  Graph node are locked (greyed, tooltip points at `--ssr`).
 - **viewer** — free-fly single-algorithm fullscreen preview.
 - **compare** — split-screen columns: native GT on the left, one column per
   algorithm, live PSNR/SSIM against GT; aspect-preserving crop, wheel zoom
@@ -155,10 +158,12 @@ stderr and falls back to defaults; applied keys are echoed to stderr as
 `[engine.toml] <mode>: key=value ...` so scripted runs can verify them.
 
 Sections: `[renderer]` (render_scale, hdr, env_map), `[exposure]` (manual
-exposure + auto-exposure EV range), `[effects]` (ssr/ssr_strength, shadows,
-contact_shadows, volfog, bloom, motion_blur, lens_fx), `[lens_fx]` (GUI
-sub-items), `[culling]` (occlusion, lod — GUI), `[dof]`, `[grading]`
-(temperature/tint/contrast/saturation/lut), `[sun]` (elevation/azimuth).
+exposure + auto-exposure EV range), `[effects]` (ssr/ssr_strength — the GUI
+counts as CLI side here, hot reload applies them but the panel checkbox stays
+locked —, shadows, contact_shadows, volfog, bloom, motion_blur, lens_fx),
+`[lens_fx]` (GUI sub-items), `[culling]` (occlusion, lod — GUI), `[dof]`,
+`[grading]` (temperature/tint/contrast/saturation/lut), `[sun]`
+(elevation/azimuth).
 Bench spawns viewer children that read the same file, so bench runs stay
 deterministic under a given engine.toml.
 

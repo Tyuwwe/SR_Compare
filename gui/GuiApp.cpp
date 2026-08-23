@@ -5453,7 +5453,14 @@ void GuiApp::drawViewerTab() {
     if (!shadowsEnabled_) ImGui::EndDisabled();
     if (!shadowsActive_) ImGui::EndDisabled();
     // Opaque SSR: per-frame pass skip (no rebuild), all deferred paths.
+    // CLI/engine.toml-only switch (--ssr / [effects] ssr) — the GUI checkbox
+    // is locked and only displays the current state (kept visible so a
+    // toml/CLI-enabled SSR is not hidden).
+    ImGui::BeginDisabled();
     ImGui::Checkbox("ssr (opaque)", &ssrEnabled_);
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("CLI only: --ssr (or engine.toml [effects] ssr)");
     if (!ssrEnabled_) ImGui::BeginDisabled();
     // Global SSR weight: scales the trace-stage hit confidence; below 1 the
     // composite leans on the IBL fallback (rough ground reads less greasy).
@@ -5927,6 +5934,19 @@ void GuiApp::drawUi() {
     // Global reference selector, shared by all three tabs.
     drawReferenceSection();
 
+    // The tab area lives in a child window so a long (scrollable) tab can
+    // never push the footer — status line + Exit — past the bottom edge.
+    // The footer height is measured from the wrapped status text so long
+    // paths cannot push the Exit button out of the clickable area.
+    const float wrapW =
+        ImGui::GetWindowWidth() - 2.f * ImGui::GetStyle().WindowPadding.x;
+    const ImVec2 statusSize =
+        ImGui::CalcTextSize(statusLine_.c_str(), nullptr, false, wrapW);
+    const float footerH = ImGui::GetFrameHeightWithSpacing() + // Exit button
+                          ImGui::GetStyle().ItemSpacing.y * 2.f +
+                          std::max(statusSize.y, ImGui::GetTextLineHeight());
+    ImGui::BeginChild("##tabarea", ImVec2(0.f, -footerH));
+
     int newTab = currentTab_;
     if (ImGui::BeginTabBar("modes")) {
         // Launch options may preselect a tab; ImGui otherwise activates the
@@ -5954,6 +5974,7 @@ void GuiApp::drawUi() {
         }
         ImGui::EndTabBar();
     }
+    ImGui::EndChild();
 
     // Tab switches between Viewer/Compare rebuild the render stack with the
     // target tab's stored settings.
@@ -5966,6 +5987,9 @@ void GuiApp::drawUi() {
 
     ImGui::Separator();
     ImGui::TextWrapped("%s", statusLine_.c_str());
+    // Exit through the normal window-close path: the next Window::poll()
+    // returns false and run()/shutdown() destroy the Vulkan stack as usual.
+    if (ImGui::Button("Exit", ImVec2(-1.f, 0.f))) window_.requestClose();
     ImGui::End();
 
     drawCameraPose();
