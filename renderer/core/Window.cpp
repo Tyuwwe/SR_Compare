@@ -44,12 +44,18 @@ bool Window::create(const char* title, int width, int height) {
         return false;
     }
     // The Vulkan surface is created later by SDL_Vulkan_CreateSurface.
+    // HIGH_PIXEL_DENSITY: the drawable (framebuffer) size may exceed the
+    // logical window size on scaled displays (macOS Retina; a no-op on
+    // Windows, where both are reported in physical pixels) — swapchain code
+    // must use pixelWidth()/pixelHeight(), not width()/height().
     window_ = SDL_CreateWindow(title, width, height,
-                               SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
+                               SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE |
+                                   SDL_WINDOW_HIGH_PIXEL_DENSITY);
     if (!window_) {
         std::fprintf(stderr, "window: SDL_CreateWindow failed: %s\n", SDL_GetError());
         return false;
     }
+    SDL_GetWindowSizeInPixels(window_, &pixelWidth_, &pixelHeight_);
     return true;
 }
 
@@ -93,6 +99,23 @@ bool Window::poll() {
                 input_.resized = true;
             }
             break;
+        case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
+            // Framebuffer size changed without a logical-size change (display
+            // scale change on a scaled-display platform): the swapchain must
+            // be rebuilt against the new pixel extent.
+            if (event.window.data1 > 0 && event.window.data2 > 0 &&
+                (event.window.data1 != pixelWidth_ || event.window.data2 != pixelHeight_)) {
+                pixelWidth_ = event.window.data1;
+                pixelHeight_ = event.window.data2;
+                input_.resized = true;
+            }
+            break;
+        case SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED:
+            // Moved to a monitor with a different content scale (Windows
+            // 100%/125%/150%/...): the UI re-scales from contentScale().
+            input_.displayScaleChanged = true;
+            SDL_GetWindowSizeInPixels(window_, &pixelWidth_, &pixelHeight_);
+            break;
         case SDL_EVENT_KEY_DOWN:
         case SDL_EVENT_KEY_UP: {
             if (consumed) break;
@@ -125,6 +148,13 @@ bool Window::poll() {
     return !shouldClose_;
 }
 
+float Window::contentScale() const {
+    if (!window_) return 1.f;
+    const float s = SDL_GetWindowDisplayScale(window_);
+    // 0 = query failed; never let the UI scale collapse to zero.
+    return s > 0.f ? s : 1.f;
+}
+
 void Window::setCaptured(bool captured) {
     if (captured == input_.mouseCaptured) return;
     input_.mouseCaptured = captured;
@@ -142,6 +172,7 @@ void Window::setClientSize(int width, int height) {
     SDL_SetWindowSize(window_, width, height);
     width_ = width;
     height_ = height;
+    SDL_GetWindowSizeInPixels(window_, &pixelWidth_, &pixelHeight_);
 }
 
 void Window::setFullscreen(bool enabled) {

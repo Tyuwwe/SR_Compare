@@ -330,10 +330,12 @@ bool GuiApp::init(const GuiOptions& opts) {
         hdrEnabled_ = *opts_.engineCfg.hdr && (hdrSupportHdr10_ || hdrSupportScRgb_);
     swapchainVsync_ = guiWantVsync();
     swapchainMailbox_ = guiAllowMailbox();
-    // The swapchain extent follows the actual window client size; the
-    // composite scales to it in the present copy pass.
-    if (!swapchain_.create(ctx_, static_cast<uint32_t>(window_.width()),
-                           static_cast<uint32_t>(window_.height()), swapchainVsync_,
+    // The swapchain extent follows the actual window client size in PHYSICAL
+    // PIXELS (logical size would under-size the surface on scaled displays,
+    // producing a blurry upscale); the composite scales to it in the present
+    // copy pass.
+    if (!swapchain_.create(ctx_, static_cast<uint32_t>(window_.pixelWidth()),
+                           static_cast<uint32_t>(window_.pixelHeight()), swapchainVsync_,
                            swapchainMailbox_, hdrEnabled_))
         return false;
     // Grading LUT (Phase 6c): procedural identity, created once — it survives
@@ -466,9 +468,26 @@ bool GuiApp::initImGui() {
     ImGuiStyle& style = ImGui::GetStyle();
     style.WindowRounding = 4.f;
     style.FrameRounding = 3.f;
+    // High-DPI: scale the whole UI by the monitor content scale (Windows
+    // display scaling 125%/150%/...).  Style sizes first, then FontScaleMain —
+    // dynamic fonts (1.92+) rasterize at the scaled size, staying crisp.
+    applyUiScale(window_.contentScale());
 
     if (!ImGui_ImplSDL3_InitForVulkan(window_.sdlWindow())) return false;
     return initImGuiVulkanBackend();
+}
+
+void GuiApp::applyUiScale(float scale) {
+    if (scale <= 0.f) scale = 1.f;
+    if (scale == uiScale_) return;
+    ImGuiStyle& style = ImGui::GetStyle();
+    // ScaleAllSizes multiplies the CURRENT values, so pass the ratio against
+    // the previously applied scale (from the initial 1.0 style at init).
+    style.ScaleAllSizes(scale / uiScale_);
+    style.FontScaleMain = scale;
+    uiScale_ = scale;
+    std::fprintf(stderr, "gui: display content scale %.2f -> UI scaled\n",
+                 static_cast<double>(scale));
 }
 
 // Vulkan backend (device objects + pipeline) — the pipeline bakes the
@@ -4845,16 +4864,16 @@ bool GuiApp::guiAllowMailbox() const {
 bool GuiApp::recreateGuiSwapchain() {
     swapchainVsync_ = guiWantVsync();
     swapchainMailbox_ = guiAllowMailbox();
-    // The swapchain extent follows the actual window client size (border
-    // drag-resize, fullscreen switches, output-resolution Apply); the
-    // fixed output-resolution composite is scaled to it by the present
-    // copy pass.  A minimized window reports 0 — keep the configured size
-    // then (the acquire/present OUT_OF_DATE loop retries on restore).
+    // The swapchain extent follows the actual window client size in PHYSICAL
+    // PIXELS (border drag-resize, fullscreen switches, output-resolution
+    // Apply); the fixed output-resolution composite is scaled to it by the
+    // present copy pass.  A minimized window reports 0 — keep the configured
+    // size then (the acquire/present OUT_OF_DATE loop retries on restore).
     uint32_t w = active_.displayW;
     uint32_t h = active_.displayH;
-    if (window_.width() > 0 && window_.height() > 0) {
-        w = static_cast<uint32_t>(window_.width());
-        h = static_cast<uint32_t>(window_.height());
+    if (window_.pixelWidth() > 0 && window_.pixelHeight() > 0) {
+        w = static_cast<uint32_t>(window_.pixelWidth());
+        h = static_cast<uint32_t>(window_.pixelHeight());
     }
     if (!swapchain_.create(ctx_, w, h, swapchainVsync_, swapchainMailbox_, hdrEnabled_))
         return false;
@@ -5114,6 +5133,12 @@ void GuiApp::run() {
         if (!fullscreenEnabled_ && window_.width() > 0 && window_.height() > 0) {
             windowedW_ = window_.width();
             windowedH_ = window_.height();
+        }
+        // Monitor change with a different Windows display scaling: re-apply
+        // the ImGui style scale before the next ImGui frame starts.
+        if (window_.input().displayScaleChanged) {
+            window_.clearDisplayScaleChanged();
+            applyUiScale(window_.contentScale());
         }
         ensureGuiSwapchainMode();
         const int lockN = std::max(15, std::min(120, ui_.lockFpsTarget));

@@ -236,6 +236,11 @@ private:
     // --- core (window/context/swapchain/imgui), created once ----------------
     bool initImGui();
     void shutdownImGui();
+    // DPI content scale applied to the ImGui style: ScaleAllSizes by the
+    // ratio to the previous scale + FontScaleMain (dynamic fonts rasterize at
+    // the scaled size, so text stays crisp).  Called at init from
+    // window_.contentScale() and again on SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED.
+    void applyUiScale(float scale);
     // Vulkan backend half of initImGui; re-run by setHdrEnabled after the
     // swapchain format changes (Phase 6c).
     bool initImGuiVulkanBackend();
@@ -616,9 +621,14 @@ private:
     // Windowed client size ([window] width/height in engine.toml): remembered
     // across runs, tracked from resize events while not fullscreen and saved
     // back by the debounced auto-save.  0 = not initialized yet (init seeds
-    // it from the toml value or the output resolution).
+    // it from the toml value or the output resolution).  These are LOGICAL
+    // window coordinates (SDL_GetWindowSize space); on Windows that equals
+    // physical pixels, so the remembered size round-trips unchanged across
+    // monitors with different display scaling.
     int windowedW_ = 0;
     int windowedH_ = 0;
+    // Content scale currently applied to the ImGui style (1.0 = 100% DPI).
+    float uiScale_ = 1.f;
 
     ImageResource gbColor_;
     ImageResource gbColorSpatial_; // unjittered LR HDR copy for spatial upscalers
@@ -919,7 +929,11 @@ private:
     std::vector<std::string> benchHeader_;
 
     GuiOptions opts_;
-    std::string inputFile_;    // SR_GUI_INPUT_FILE automation (empty = off)
+    // SR_GUI_INPUT_FILE automation (empty = off).  Mouse coordinates in the
+    // file are LOGICAL ImGui coordinates (io.AddMousePosEvent space, same as
+    // SDL mouse event coordinates) — they are independent of the display DPI
+    // scale, so a script recorded at 100% still hits the same widgets at 150%.
+    std::string inputFile_;
     uint64_t inputFileLine_ = 0; // lines consumed so far
     // engine.toml hot-reload watch (path captured at init; ~1 s stat interval)
     // + auto-save state (debounced write of the canonical serialization).

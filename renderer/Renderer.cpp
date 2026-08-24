@@ -97,7 +97,10 @@ bool Renderer::init(const RendererOptions& opts) {
                         static_cast<int>(opts.displayHeight)))
         return false;
     if (!ctx_.create(window_)) return false;
-    if (!swapchain_.create(ctx_, opts.displayWidth, opts.displayHeight, opts.vsync,
+    // Swapchain extent = physical framebuffer pixels (SDL_GetWindowSizeInPixels);
+    // the logical window size would under-size the surface on scaled displays.
+    if (!swapchain_.create(ctx_, static_cast<uint32_t>(window_.pixelWidth()),
+                           static_cast<uint32_t>(window_.pixelHeight()), opts.vsync,
                            /*allowMailbox=*/true, opts.hdr))
         return false;
     if (opts.hdr) {
@@ -2219,8 +2222,8 @@ void Renderer::run() {
         // resize works at the presentation level only.
         if (window_.input().resized) {
             window_.clearMouseDelta();
-            recreateSwapchain(static_cast<uint32_t>(window_.width()),
-                              static_cast<uint32_t>(window_.height()), opts_.vsync);
+            recreateSwapchain(static_cast<uint32_t>(window_.pixelWidth()),
+                              static_cast<uint32_t>(window_.pixelHeight()), opts_.vsync);
         }
 
         if (opts_.frames >= 0 && static_cast<int>(frameIndex) >= opts_.frames) break;

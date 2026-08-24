@@ -162,7 +162,10 @@ bool CompareApp::init(const CompareOptions& opts) {
                         static_cast<int>(opts.displayHeight)))
         return false;
     if (!ctx_.create(window_)) return false;
-    if (!swapchain_.create(ctx_, opts.displayWidth, opts.displayHeight, opts.vsync)) return false;
+    // Swapchain extent = physical framebuffer pixels (SDL_GetWindowSizeInPixels).
+    if (!swapchain_.create(ctx_, static_cast<uint32_t>(window_.pixelWidth()),
+                           static_cast<uint32_t>(window_.pixelHeight()), opts.vsync))
+        return false;
 
     renderWidth_ = std::max(1u, static_cast<uint32_t>(static_cast<float>(opts_.displayWidth) * opts_.renderScale));
     renderHeight_ = std::max(1u, static_cast<uint32_t>(static_cast<float>(opts_.displayHeight) * opts_.renderScale));
