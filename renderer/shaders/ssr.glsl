@@ -70,10 +70,21 @@ float ssrClipToScreen(vec2 startUv, vec2 endUv) {
 // quantizes the detected hit region to coarse cell blocks — round reflectors
 // read as axis-aligned squares.  The glass callers pass 4 so the near field
 // is searched at fine mips; the temporally-accumulated opaque path keeps 1.
+// maxMipCap caps the coarsest level the march may reach.  Glass passes 2:
+// coarser cells (8px+) mix the thin near-field reflectors with the sky
+// behind them (sky max-reduces to +inf and the march skips the whole cell),
+// so hit/miss at coarse level tiles the mirror with the scene's triangular
+// silhouettes; a 4px ceiling keeps cells small enough to resolve the
+// awning/lamp band, at the price of a shorter maximum march (compensated by
+// the raised kMaxIters below).  The opaque path passes the full chain (long
+// rays across the ground plane need it).
 vec4 traceSsr(sampler2D colorTex, int colorMipCount, sampler2D hizTex, int hizMipCount,
               mat4 viewProj, mat4 invViewProj, vec3 cameraPos, vec3 worldPos,
-              vec3 N, vec3 R, float roughness, vec2 renderSize, int escalateEvery) {
-    const int kMaxIters = 128; // hierarchy steps (each descends or advances)
+              vec3 N, vec3 R, float roughness, vec2 renderSize, int escalateEvery,
+              int maxMipCap) {
+    const int kMaxIters = 256; // hierarchy steps (each descends or advances);
+                               // 256 keeps ~1 Kpx reach now that the glass
+                               // callers cap the coarsest mip (see maxMipCap)
     const int kRefine = 8;
     const float kMaxDist = 100.0;
     const float kBias = 0.08;
@@ -117,7 +128,7 @@ vec4 traceSsr(sampler2D colorTex, int colorMipCount, sampler2D hizTex, int hizMi
     // still take a few samples so a slight offset can hit on-screen geometry.
     if (pixelDist < 0.25) return vec4(0.0);
 
-    const int maxMip = hizMipCount - 1;
+    const int maxMip = min(hizMipCount - 1, maxMipCap);
     const ivec2 size0 = ivec2(renderSize);
     // |R·N|: 1 head-on, ~0 at grazing.  Scales the self-hit radius and the
     // thickness window below; grazing incidence is where both fixed
@@ -133,6 +144,7 @@ vec4 traceSsr(sampler2D colorTex, int colorMipCount, sampler2D hizTex, int hizMi
     bool hit = false;
     vec2 hitUv = endUv;
     float hitDist = kMaxDist;
+    float hitSide = 0.0;
 
     for (int it = 0; it < kMaxIters && t <= 1.0; ++it) {
         vec2 px = startPx + dPx * t;
@@ -170,11 +182,41 @@ vec4 traceSsr(sampler2D colorTex, int colorMipCount, sampler2D hizTex, int hizMi
             continue;
         }
 
-        // Mip-0 crossing between tFront and t: binary-refine the exact
-        // front-to-back transition, then apply the acceptance tests.
+        // Mip-0 crossing between tFront and t.  When the crossing was
+        // detected right after a COARSE advance, the span [tFront, t] covers
+        // up to 2^level px of non-monotonic depth (a thin reflector in front
+        // of a wall): binary search assumes monotonicity, converges onto one
+        // arbitrary texel of the span, and collapses many neighbouring rays
+        // onto that same texel — round reflectors (the hanging lamp) read as
+        // axis-aligned rectangles.  Scan the span at 1px steps for the FIRST
+        // front-to-back transition and refine only that 1px interval.
         float lo = tFront;
         float hi = t;
         vec2 hiUv = uv;
+        const float spanPx = (hi - lo) * pixelDist;
+        if (spanPx > 1.5) {
+            const int kScan = 16; // px; wider spans fall back to plain bisect
+            const float stepT = 1.0 / pixelDist;
+            float tScan = lo;
+            for (int s = 0; s < kScan; ++s) {
+                const float tPrev = tScan;
+                tScan = min(tScan + stepT, hi);
+                const vec2 sUv = mix(startUv, endUv, tScan);
+                const float sDepth = texelFetch(hizTex, ivec2(clamp(sUv * renderSize, vec2(0.0),
+                                                                      renderSize - 1.0)), 0).r;
+                if (sDepth < 0.9999) {
+                    const float sRayZ = abs(1.0 / mix(invW0, invW1, tScan));
+                    const float sSceneZ = ssrViewZ(viewProj, invViewProj, sUv, sDepth);
+                    if (sRayZ > sSceneZ) {
+                        lo = tPrev;
+                        hi = tScan;
+                        hiUv = sUv;
+                        break;
+                    }
+                }
+                if (tScan >= hi) break;
+            }
+        }
         for (int r = 0; r < kRefine; ++r) {
             float mid = 0.5 * (lo + hi);
             vec2 mUv = mix(startUv, endUv, mid);
@@ -212,6 +254,18 @@ vec4 traceSsr(sampler2D colorTex, int colorMipCount, sampler2D hizTex, int hizMi
             vec4 hw = invViewProj * vec4(hiUv * 2.0 - 1.0, hiDepth, 1.0);
             hw /= hw.w;
             dist = length(hw.xyz - worldPos);
+            hitSide = dot(hw.xyz - worldPos, N);
+            // A reflection can only show what sits on the reflector's FRONT
+            // (+N) side.  Glass writes no depth, so a ray marched from a shop
+            // window crosses the pane's own screen region and meets the
+            // INTERIOR behind it in the depth buffer; those back-side (-N)
+            // crossings read as reflections of interior furniture and the
+            // rectangular ceiling lights (triangular/rectangular blobs tiling
+            // the mirror).  Reject them like any other invalid crossing; the
+            // march then resumes and can still find real front-side content
+            // (street, awning, the hanging lamp).  Valid opaque-path hits are
+            // on the front side as well, so the test is safe for both callers.
+            if (hitSide < -0.02) reject = true;
             // Reject hits on the reflecting surface itself, not hits that are
             // simply closer to the camera (street furniture in front of a
             // shop window is a valid mirror image).  The fixed 0.22 m radius

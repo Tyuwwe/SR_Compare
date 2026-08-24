@@ -258,7 +258,7 @@ void main() {
     vec4 ssr = traceSsr(ssrColor, textureQueryLevels(ssrColor), ssrHiZ,
                         textureQueryLevels(ssrHiZ), ubo.viewProj,
                         lighting.invViewProj, ubo.cameraPos.xyz, vWorldPos, N, R, roughness,
-                        ubo.renderSizeJitter.xy, 4);
+                        ubo.renderSizeJitter.xy, 4, 2);
     float ssrHit = clamp(ssr.a, 0.0, 1.0);
     specSsr = mix(specSsr, ssr.rgb * mix(envBrdf, vec3(1.0), ssrHit * 0.8), ssrHit);
 
