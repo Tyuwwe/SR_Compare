@@ -1155,7 +1155,7 @@ void GuiApp::drawLoadOverlay() {
     const ImGuiIO& io = ImGui::GetIO();
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f),
                             ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSize(ImVec2(380.f, 0.f), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(380.f * uiScale_, 0.f), ImGuiCond_Always);
     ImGui::SetNextWindowBgAlpha(0.94f);
     if (ImGui::Begin("Loading##overlay", nullptr,
                      ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
@@ -3237,9 +3237,9 @@ void GuiApp::handleCompareZoomInput() {
     // separate pan latch below).
     const bool overPanel =
         panelCollapsed_
-            ? (io.MousePos.x >= 0.f && io.MousePos.x < 56.f && io.MousePos.y >= 0.f &&
-               io.MousePos.y < 34.f)
-            : (io.MousePos.x >= 0.f && io.MousePos.x < kPanelWidth && io.MousePos.y >= 0.f);
+            ? (io.MousePos.x >= 0.f && io.MousePos.x < 56.f * uiScale_ && io.MousePos.y >= 0.f &&
+               io.MousePos.y < 34.f * uiScale_)
+            : (io.MousePos.x >= 0.f && io.MousePos.x < panelWidth() && io.MousePos.y >= 0.f);
     const bool uiHover = overPanel || io.WantCaptureMouse;
 
     // Wheel zoom at the cursor.
@@ -6056,7 +6056,7 @@ void GuiApp::drawCameraPose() {
     // Camera looks down -Z: yaw 0 faces -Z, positive yaw turns right (+X).
     const float yawDeg = std::atan2(f.x, -f.z) * deg;
     const float pitchDeg = std::asin(std::clamp(f.y, -1.f, 1.f)) * deg;
-    const float x = panelCollapsed_ ? 8.f : kPanelWidth + 8.f;
+    const float x = panelCollapsed_ ? 8.f : panelWidth() + 8.f;
     ImGui::SetNextWindowPos(ImVec2(x, io.DisplaySize.y - 8.f), ImGuiCond_Always,
                             ImVec2(0.f, 1.f));
     ImGui::SetNextWindowBgAlpha(0.55f);
@@ -6144,8 +6144,8 @@ void GuiApp::drawUi() {
         // in the top-left corner, see compare_compose.frag) so it never
         // covers that text.  NoScrollbar: the full-width button would
         // otherwise push the content region past the client width.
-        ImGui::SetNextWindowPos(ImVec2(0.f, 60.f), ImGuiCond_Always);
-        ImGui::SetNextWindowSize(ImVec2(56.f, 34.f), ImGuiCond_Always);
+        ImGui::SetNextWindowPos(ImVec2(0.f, 60.f * uiScale_), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(56.f * uiScale_, 34.f * uiScale_), ImGuiCond_Always);
         ImGui::SetNextWindowBgAlpha(0.88f);
         if (ImGui::Begin("##panelstrip", nullptr,
                          ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
@@ -6160,7 +6160,7 @@ void GuiApp::drawUi() {
     }
 
     ImGui::SetNextWindowPos(ImVec2(0.f, 0.f), ImGuiCond_Always);
-    ImGui::SetNextWindowSize(ImVec2(kPanelWidth, io.DisplaySize.y), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(panelWidth(), io.DisplaySize.y), ImGuiCond_Always);
     ImGui::SetNextWindowBgAlpha(0.88f);
     ImGui::Begin("sr_compare", nullptr,
                  ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |

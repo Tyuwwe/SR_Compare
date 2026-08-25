@@ -102,6 +102,10 @@ private:
     static constexpr uint32_t kHistoryLen = 240;           // PlotLines frame history
     static constexpr uint32_t kMaxRegistered = 16;         // UI checkbox capacity
     static constexpr float kPanelWidth = 360.f;
+    // Side panel width in UI units, scaled with the display content scale so
+    // high-DPI scaling does not squeeze the (scaled) widgets into a fixed
+    // pixel strip.
+    float panelWidth() const { return kPanelWidth * uiScale_; }
 
     enum class Mode { Viewer, Compare };
 
@@ -366,7 +370,7 @@ private:
     // columns start right of it; collapsed, they span the full window (the
     // GT column then touches the left edge).
     uint32_t layoutOriginX() const {
-        return panelCollapsed_ ? 0u : static_cast<uint32_t>(kPanelWidth);
+        return panelCollapsed_ ? 0u : static_cast<uint32_t>(panelWidth());
     }
     // Visible source region (px) for a column of colW x colH: aspect-preserving
     // center-crop at zoom 1; zoomed window centered on (centerU, centerV) when
