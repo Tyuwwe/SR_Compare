@@ -364,14 +364,11 @@ private:
     // "key F1" / "keyup F1", "shot path.png", "graph" (toggle the Render
     // Graph editor window), "profiler" (toggle the GPU profiler window), "pass <name> <0|1>" (toggle a runtime pass
     // switch: shadows/contact/ssr/volfog/occlusion/bloom/mb/dof/autoexp),
-    // "fullscreen <0|1>" (borderless fullscreen), "wait" (one frame gap).
+    // "fullscreen <0|1>" (borderless fullscreen), "hdr <0|1>" (HDR output
+    // toggle), "wait" (one frame gap).
     void pumpInputFile();
-    // Column layout origin: while the side panel is visible the render
-    // columns start right of it; collapsed, they span the full window (the
-    // GT column then touches the left edge).
-    uint32_t layoutOriginX() const {
-        return panelCollapsed_ ? 0u : static_cast<uint32_t>(panelWidth());
-    }
+    // The render columns always span the full window client area; the side
+    // panel is a floating overlay on top (F1 collapses it to a slim strip).
     // Visible source region (px) for a column of colW x colH: aspect-preserving
     // center-crop at zoom 1; zoomed window centered on (centerU, centerV) when
     // zoom > 1.  out = {offX, offY, sizeX, sizeY}.

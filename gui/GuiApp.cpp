@@ -522,6 +522,9 @@ void GuiApp::shutdownImGui() {
 }
 
 void GuiApp::shutdown() {
+    // Flush a pending debounced auto-save: quitting inside the 1.5 s window
+    // must not drop the last UI edits (HDR toggle, sliders, ...).
+    if (engineCfgDirty_) saveEngineConfigNow();
     // An async load may still be running: wait for it before touching the
     // device (the worker submits uploads through ctx_.graphicsQueue).
     if (loadThread_.joinable()) loadThread_.join();
@@ -3224,8 +3227,8 @@ void GuiApp::handleCompareZoomInput() {
     const uint32_t dw = active_.displayW;
     const uint32_t dh = active_.displayH;
     const uint32_t numColumns = 1 + static_cast<uint32_t>(algos_.size());
-    const float x0 = static_cast<float>(layoutOriginX());
-    const float colW = (static_cast<float>(dw) - x0) / static_cast<float>(numColumns);
+    // The render columns span the full window; the side panel floats on top.
+    const float colW = static_cast<float>(dw) / static_cast<float>(numColumns);
 
     bool changed = false;
 
@@ -3246,7 +3249,7 @@ void GuiApp::handleCompareZoomInput() {
     if (io.MouseWheel != 0.f && !uiHover && io.MousePos.y >= 0.f) {
         // Cursor position in column-local UV (every column shows the same
         // region, so the column index only matters for the local X).
-        const float relX = io.MousePos.x - x0;
+        const float relX = io.MousePos.x;
         const float colIdx = std::floor(relX / colW);
         const float localU = std::clamp((relX - colIdx * colW) / colW, 0.f, 1.f);
         const float localV = std::clamp(io.MousePos.y / static_cast<float>(dh), 0.f, 1.f);
@@ -4596,8 +4599,8 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     // --- 4) GPU metric reduction (compare only, every kMetricInterval frames) ----
     // Metric region: full image at zoom 1; the zoomed view window otherwise.
     const uint32_t numColumns = compareMode ? (1 + static_cast<uint32_t>(algos_.size())) : 1;
-    const uint32_t layoutX0 = layoutOriginX();
-    const uint32_t colW = (dw - layoutX0) / numColumns;
+    // Full-window columns: the side panel is an overlay, not a layout region.
+    const uint32_t colW = dw / numColumns;
     uint32_t regX = 0, regY = 0, regW = dw, regH = dh;
     if (compareMode && compareZoom_ > 1.f) {
         float rect[4];
@@ -4705,8 +4708,8 @@ void GuiApp::recordComposePresent(VkCommandBuffer cmd, uint32_t swapchainIndex,
     const uint32_t dh = active_.displayH;
     const bool compareMode = active_.mode == Mode::Compare;
     const uint32_t numColumns = compareMode ? (1 + static_cast<uint32_t>(algos_.size())) : 1;
-    const uint32_t layoutX0 = layoutOriginX();
-    const uint32_t colW = (dw - layoutX0) / numColumns;
+    // Full-window columns: the side panel is an overlay, not a layout region.
+    const uint32_t colW = dw / numColumns;
 
     imageBarrier(cmd, composeImage_.image, composeLayout_,
                  VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
@@ -4725,7 +4728,7 @@ void GuiApp::recordComposePresent(VkCommandBuffer cmd, uint32_t swapchainIndex,
         const float viewPanU = compareMode ? comparePanU_ : 0.5f;
         const float viewPanV = compareMode ? comparePanV_ : 0.5f;
         for (uint32_t i = 0; i < numColumns; ++i) {
-            const uint32_t x = layoutX0 + i * colW;
+            const uint32_t x = i * colW;
             const uint32_t w = (i == numColumns - 1) ? (dw - x) : colW;
             VkViewport viewport = {static_cast<float>(x), 0.f, static_cast<float>(w),
                                    static_cast<float>(dh), 0.f, 1.f};
@@ -5111,6 +5114,13 @@ void GuiApp::pumpInputFile() {
             int on = 0;
             ss >> on;
             setFullscreenEnabled(on != 0);
+        } else if (cmd == "hdr") {
+            // hdr <0|1>: HDR output toggle (same as the panel checkbox, but
+            // not gated on the surface probe so the persistence path stays
+            // testable on SDR-only machines — the swapchain falls back).
+            int on = 0;
+            ss >> on;
+            setHdrEnabled(on != 0);
         } // "wait" and unknown commands just consume the frame
         if (dbgInputEnabled())
             std::fprintf(stderr, "[inputfile] line %llu: %s\n",
@@ -5601,7 +5611,11 @@ void GuiApp::drawSharedControls() {
     // true scene-HDR headroom is viewer-only (--hdr).
     const bool hdrAny = hdrSupportHdr10_ || hdrSupportScRgb_;
     if (!hdrAny) ImGui::BeginDisabled();
-    if (ImGui::Checkbox("hdr output", &hdrEnabled_)) setHdrEnabled(hdrEnabled_);
+    // Local copy, like the fullscreen checkbox below: Checkbox mutates its
+    // bool before returning, so passing &hdrEnabled_ directly would make
+    // setHdrEnabled see "no change" and skip the swapchain re-creation.
+    bool hdr = hdrEnabled_;
+    if (ImGui::Checkbox("hdr output", &hdr)) setHdrEnabled(hdr);
     if (!hdrAny) ImGui::EndDisabled();
     if (hdrAny) {
         ImGui::TextDisabled("%s%s (sdr content in hdr container)",
