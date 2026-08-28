@@ -85,6 +85,38 @@ enum UpscalerCapability : uint32_t {
     Cap_ML       = 1u << 2,   // 神经网络推理
 };
 
+// 可选的、稳定的 GUI debug-view 契约。实现方只暴露有意支持的公共 SDK
+// 输出，绝不暴露 SDK 私有内部资源。
+enum class UpscalerDebugVisualization : uint32_t {
+    HdrColor,
+    LdrColor,
+    Depth,
+    Motion,
+    Scalar,
+};
+
+enum class UpscalerDebugResourceKind : uint32_t {
+    Output,          // debug 内容写入算法常规输出纹理
+    PluginResource,  // 插件自有的独立纹理（经 debugViewResource 提供）
+};
+
+struct UpscalerDebugViewInfo {
+    const char* id = nullptr;
+    const char* label = nullptr;
+    UpscalerDebugVisualization visualization = UpscalerDebugVisualization::HdrColor;
+    UpscalerDebugResourceKind resourceKind = UpscalerDebugResourceKind::Output;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    bool replacesOutput = false;  // true 时输出不再是上采样结果，指标应暂停
+};
+
+struct UpscalerDebugResource {
+    VkImage image = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE;
+    VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
+};
+
 class IUpscaler {
 public:
     virtual ~IUpscaler() = default;
@@ -108,6 +140,13 @@ public:
 
     // 算法内部分配的显存估计（字节），用于 benchmark 显存指标
     virtual uint64_t gpuMemoryBytes() const = 0;
+
+    // 可选 debug-view 契约（默认：无 debug view）。index < 0 关闭所有
+    // 插件特定 debug 模式。
+    virtual uint32_t debugViewCount() const { return 0; }
+    virtual bool debugViewInfo(uint32_t, UpscalerDebugViewInfo&) const { return false; }
+    virtual void setDebugView(int32_t) {}
+    virtual UpscalerDebugResource debugViewResource(uint32_t) const { return {}; }
 };
 
 // Spatial-only plugins (FSR1 / SGSR1) must not receive Halton jitter: they

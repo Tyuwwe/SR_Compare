@@ -658,12 +658,32 @@ struct Fsr3Upscaler::Impl {
     OwnedImage dilatedMotionVectors;            // R16G16_SFLOAT, render size
     OwnedImage reconstructedPrevNearestDepth;   // R32_UINT, render size
     uint64_t memoryBytes = 0;
+    bool debugViewEnabled = false;
 };
 
 Fsr3Upscaler::~Fsr3Upscaler() { shutdown(); }
 const char* Fsr3Upscaler::name() const { return "FSR3.1"; }
 uint32_t Fsr3Upscaler::capabilities() const { return Cap_Temporal; }
 bool Fsr3Upscaler::isAvailable(const VulkanEnv& env) { return env.device != VK_NULL_HANDLE; }
+
+uint32_t Fsr3Upscaler::debugViewCount() const { return 1; }
+
+bool Fsr3Upscaler::debugViewInfo(uint32_t index, UpscalerDebugViewInfo& out) const {
+    if (index != 0) return false;
+    out.id = "fsr3-sdk-debug";
+    out.label = "SDK Debug View";
+    out.visualization = UpscalerDebugVisualization::HdrColor;
+    out.resourceKind = UpscalerDebugResourceKind::Output;
+    out.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+    out.width = impl_ ? impl_->desc.displayWidth : 0;
+    out.height = impl_ ? impl_->desc.displayHeight : 0;
+    out.replacesOutput = true; // SDK debug view overwrites the upscaled output
+    return true;
+}
+
+void Fsr3Upscaler::setDebugView(int32_t index) {
+    if (impl_) impl_->debugViewEnabled = index == 0;
+}
 
 bool Fsr3Upscaler::init(const VulkanEnv& env, const UpscalerDesc& desc) {
     shutdown();
@@ -764,7 +784,10 @@ void Fsr3Upscaler::dispatch(VkCommandBuffer cmd, const UpscalerResources& res, c
     dd.cameraFar = cameraFarOf(impl_->desc, cam);
     dd.cameraFovAngleVertical = cam.fovY;
     dd.viewSpaceToMetersFactor = 1.f;
-    dd.flags = 0;
+    // SDK debug view: an extra pass drawn after accumulate/RCAS into the same
+    // output (the internal accumulation passes run unchanged, so toggling it
+    // does not disturb the temporal history).
+    dd.flags = impl_->debugViewEnabled ? FFX_FSR3UPSCALER_DISPATCH_DRAW_DEBUG_VIEW : 0;
     ffxFsr3UpscalerContextDispatch(&impl_->context, &dd);
 }
 

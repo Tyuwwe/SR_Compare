@@ -59,6 +59,9 @@ public:
                   const FrameParams& frame) override;
     void shutdown() override;
     uint64_t gpuMemoryBytes() const override;
+    uint32_t debugViewCount() const override;
+    bool debugViewInfo(uint32_t index, UpscalerDebugViewInfo& out) const override;
+    void setDebugView(int32_t index) override;
 
 private:
     struct Impl;
