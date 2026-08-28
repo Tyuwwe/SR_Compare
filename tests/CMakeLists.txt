@@ -1,0 +1,3 @@
+add_executable(sr_motion_convention_tests MotionConventionTests.cpp)
+sr_common_setup(sr_motion_convention_tests)
+add_test(NAME motion_convention COMMAND sr_motion_convention_tests)
