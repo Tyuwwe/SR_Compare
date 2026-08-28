@@ -611,7 +611,7 @@ void NssUpscaler::dispatch(VkCommandBuffer cmd, const UpscalerResources& res, co
                                impl->desc.renderHeight, FFX_API_RESOURCE_USAGE_READ_ONLY,
                                FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
         desc.depth = wrapImage(res.depth, VK_FORMAT_D32_SFLOAT, impl->desc.renderWidth,
-                               impl->desc.renderHeight, FFX_API_RESOURCE_USAGE_READ_ONLY,
+                               impl->desc.renderHeight, FFX_API_RESOURCE_USAGE_DEPTHTARGET,
                                FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
         desc.motionVectors = wrapImage(res.motion, VK_FORMAT_R16G16_SFLOAT, impl->desc.renderWidth,
                                        impl->desc.renderHeight, FFX_API_RESOURCE_USAGE_READ_ONLY,

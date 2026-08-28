@@ -1358,7 +1358,8 @@ bool GuiApp::initAlgorithmsFor(const VulkanEnv& env, const RenderConfig& cfg, ui
         desc.displayHeight = cfg.displayH;
         desc.hdr = true;
         desc.invertedDepth = false;
-        desc.infiniteFarPlane = true;
+        // The renderer's projection has a finite far plane.
+        desc.infiniteFarPlane = false;
         if (!up->init(env, desc)) {
             err = spec.sr + " init failed";
             continue;
@@ -1384,7 +1385,8 @@ bool GuiApp::initAlgorithmsFor(const VulkanEnv& env, const RenderConfig& cfg, ui
                 fgDesc.displayHeight = cfg.displayH;
                 fgDesc.hdr = true;
                 fgDesc.invertedDepth = false;
-                fgDesc.infiniteFarPlane = true;
+                // The renderer's projection has a finite far plane.
+                fgDesc.infiniteFarPlane = false;
                 if (!col.frameGen->init(env, fgDesc)) {
                     err = spec.fg + " frame interpolator init failed";
                     col.frameGen.reset();

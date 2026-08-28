@@ -294,7 +294,8 @@ bool CompareApp::initAlgorithms() {
         desc.displayHeight = opts_.displayHeight;
         desc.hdr = true;
         desc.invertedDepth = false;
-        desc.infiniteFarPlane = true;
+        // The renderer's projection has a finite far plane.
+        desc.infiniteFarPlane = false;
         if (!up->init(env, desc)) {
             std::fprintf(stderr, "warning: upscaler '%s' init failed, skipped\n", name.c_str());
             continue;

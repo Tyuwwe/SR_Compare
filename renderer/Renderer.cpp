@@ -188,7 +188,9 @@ bool Renderer::init(const RendererOptions& opts) {
             desc.displayHeight = opts.displayHeight;
             desc.hdr = true;
             desc.invertedDepth = false;
-            desc.infiniteFarPlane = true;
+            // Mat4::perspective() uses a finite far plane; do not ask temporal
+            // upscalers to decode depth using an infinite-far projection.
+            desc.infiniteFarPlane = false;
             if (!upscaler_->init(ctx_.toEnv(), desc)) upscaler_.reset();
         }
         if (!upscaler_) {
