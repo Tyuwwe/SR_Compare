@@ -70,6 +70,18 @@
 //   one frame).  Manual mode (--exposure) feeds the fixed override instead.
 //   Deterministic: the solver smooths with a fixed 1/60 step per frame, so a
 //   fixed camera path reproduces the same preExposure per frame index.
+// Per-algorithm consumption of that display exposure E:
+//   * FSR2 : preExposure = 1/E — reproduces the canonical 1x1 exposure-
+//            texture working range (scene*E) without a GPU texture; the value
+//            cancels in the net output (FsrUpscaler.cpp).
+//   * FSR3 : preExposure = 1 constant — FSR3 applies only the frame-to-frame
+//            preExposure delta to history, and the input is not pre-exposed.
+//   * XeSS : exposureScale = E — the scalar input-color scale; algebraically
+//            the same value the optional 1x1 exposureScaleTexture would carry.
+//   * DLSS : useAutoExposure = true — the contract carries no exposure buffer,
+//            so DLSS applies its internal exposure normalization.
+//   * NSS  : desc.exposure = E — NSS multiplies color/history by it before its
+//            internal tonemap and applies the reciprocal on output.
 // ============================================================================
 #include <cstdint>
 

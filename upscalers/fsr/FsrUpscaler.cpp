@@ -9,8 +9,12 @@
 //     no jitter. motionVectorScale converts them to input pixels; the SDK then
 //     normalizes them internally for reprojection.
 //   * depth is D32_SFLOAT, non-inverted, with the host-selected far-plane mode.
-//   * no exposure input: preExposure = 1 and the effects fall back to their
-//     internal default exposure resource.
+//   * exposure: the IUpscaler contract carries no GPU exposure texture, so
+//     the effects keep their internal default exposure resource (1.0).
+//     FSR2 receives preExposure = 1/displayExposure, which reproduces the
+//     canonical 1x1-exposure-texture working range algebraically; FSR3
+//     receives preExposure = 1 because it consumes only the frame-to-frame
+//     preExposure delta and our input is not pre-exposed (see dispatch).
 //   * when UpscalerResources::reactive is non-null (translucency coverage mask,
 //     R16_SFLOAT), the same mask feeds both the reactive and the
 //     transparencyAndComposition inputs of FSR2/FSR3.
@@ -606,7 +610,16 @@ void Fsr2Upscaler::dispatch(VkCommandBuffer cmd, const UpscalerResources& res, c
     dd.enableSharpening = true;
     dd.sharpness = kSharpness;
     dd.frameTimeDelta = frame.deltaTime * 1000.f;  // milliseconds
-    dd.preExposure = frame.preExposure;
+    // The input color is NOT pre-exposed (raw scene-linear HDR).  FSR2
+    // prepares color as c/preExposure*exposureTex and unprepares with the
+    // exact reciprocal (current preExposure at store, previous at reproject),
+    // so preExposure cancels in the net output for any value sequence; what
+    // it sets is the internal fp16 working range.  The canonical integration
+    // (preExposure = 1 + 1x1 exposure texture = display exposure E) works on
+    // scene*E; with the default exposure resource (1.0), preExposure = 1/E
+    // lands on the same range, keeping intermediates off the FP16_MAX clamp
+    // in bright scenes and away from denormals in dark ones.
+    dd.preExposure = 1.f / (frame.preExposure > 1e-6f ? frame.preExposure : 1.f);
     dd.reset = frame.resetHistory;
     dd.cameraNear = cam.cameraNear;
     dd.cameraFar = cameraFarOf(impl_->desc, cam);
@@ -739,7 +752,13 @@ void Fsr3Upscaler::dispatch(VkCommandBuffer cmd, const UpscalerResources& res, c
     dd.enableSharpening = true;
     dd.sharpness = kSharpness;
     dd.frameTimeDelta = frame.deltaTime * 1000.f;  // milliseconds
-    dd.preExposure = frame.preExposure;
+    // FSR3 consumes preExposure only as the frame-to-frame DELTA that
+    // rescales stored history (deltaPreExposure = preExposure /
+    // prevPreExposure); the current input color is never divided by it.
+    // Our input is not pre-exposed, so the delta must stay 1: feeding the
+    // (adapting) display exposure here would erroneously rescale history by
+    // E_n/E_{n-1} on every frame while auto exposure converges.
+    dd.preExposure = 1.f;
     dd.reset = frame.resetHistory;
     dd.cameraNear = cam.cameraNear;
     dd.cameraFar = cameraFarOf(impl_->desc, cam);
