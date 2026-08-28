@@ -117,6 +117,18 @@ struct ComposePush {
 };
 static_assert(sizeof(ComposePush) == 96, "ComposePush size mismatch");
 
+// Debug-tab fullscreen visualization (debug_compose.frag): one sampled
+// source + mode/range/near/far.  Bound through composePipelineLayout_ — the
+// block fits in its 96-byte fragment push range, so no extra layout exists.
+struct DebugComposePush {
+    float srcSize[2]; // source image pixels
+    float nearest;    // != 0: sample nearest (magnification >= 1:1)
+    float exposure;   // display-domain ACES input multiplier (HDR color mode)
+    float debug[4];   // x = visualization mode, y = range/gain, z = near, w = far
+    float flags[4];   // x = logarithmic depth
+};
+static_assert(sizeof(DebugComposePush) == 48, "DebugComposePush size mismatch");
+
 // Metric compute push constants (two uvec4s in the shaders).
 struct MetricPush {
     uint32_t x = 0, y = 0, z = 0, w = 0;      // region offset xy, extent zw
@@ -1762,6 +1774,7 @@ bool GuiApp::createShaders() {
     // target).
     return loadShader("fullscreen.vert.spv", fullscreenVert_) &&
            loadShader("compare_compose.frag.spv", composeFrag_) &&
+           loadShader("debug_compose.frag.spv", debugComposeFrag_) &&
            loadShader("compare_copy.frag.spv", copyFrag_) &&
            loadShader("compare_metrics_blocks.comp.spv", metricBlocksComp_) &&
            loadShader("compare_metrics_reduce.comp.spv", metricReduceComp_);
@@ -1846,7 +1859,8 @@ bool GuiApp::createDescriptors() {
     sizes[0].descriptorCount =
         deferred::kMaxTextures + numColumns * 3 + 2 + numAlgos * 8 + 14 * kFramesInFlight * 4 +
         8 * kFramesInFlight * 4 + 11 * kFramesInFlight * 4 + 10 * 3 + 3 * 6 + hizSets + colorSets +
-        2 + 14 * fogPaths + 17 * postFxPaths + bloomSets + 3 + 2;
+        2 + 14 * fogPaths + 17 * postFxPaths + bloomSets + 3 + 2 + 15;
+                           // + 5 debug-tab sets (3 samplers each, patch 0004)
                            // + ssr temporal samplers (GB/GT/SSAA x2 sets); auto-exposure HDR
                            // sources (LR + GT); volfog light/temporal/march/composite samplers;
                            // lighting sets: 14 samplers each (GB/GT/SSAA/spatial), incl. shadow +
@@ -1859,7 +1873,8 @@ bool GuiApp::createDescriptors() {
     sizes[1].descriptorCount = kFramesInFlight * 3 + numColumns + numAlgos + kFramesInFlight * 4 +
                                kFramesInFlight * 4 + kFramesInFlight * 4 + // + opaque-SSR UBOs
                                kFramesInFlight * 8 + // + probe UBOs (lighting + SSR sets)
-                               kClusterSlots * fogPaths; // volfog light sets
+                               kClusterSlots * fogPaths + // volfog light sets
+                               5; // + debug-tab sets (text UBO binding, patch 0004)
     sizes[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
     sizes[2].descriptorCount = kFramesInFlight * 3;
     sizes[3].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -1893,6 +1908,7 @@ bool GuiApp::createDescriptors() {
                      bloomSets +           // bloom pyramid sets (Phase 6a)
                      1 +                   // reactive mask dilate set
                      3 +                   // occlusion cull sets (GB/GT/SSAA, Phase 7a)
+                     5 +                   // debug-tab sets (patch 0004)
                      hizSets + colorSets;
     poolCi.poolSizeCount = 5;
     poolCi.pPoolSizes = sizes;
@@ -2013,6 +2029,11 @@ bool GuiApp::createDescriptors() {
         if (!allocSet(deferred_.ssaoSetLayout(), ssaoSetSsaa_)) return false;
     }
     if (!allocSet(composeSetLayout_, gtComposeSet_)) return false;
+    if (!allocSet(composeSetLayout_, debugInputTemporalSet_)) return false;
+    if (!allocSet(composeSetLayout_, debugInputSpatialSet_)) return false;
+    if (!allocSet(composeSetLayout_, debugDepthSet_)) return false;
+    if (!allocSet(composeSetLayout_, debugMotionSet_)) return false;
+    if (!allocSet(composeSetLayout_, debugReactiveSet_)) return false;
     if (!allocSet(copySetLayout_, copySet_)) return false;
     if (active_.gtSsaa && !allocSet(copySetLayout_, gtDownsampleSet_)) return false;
     // (Per-algo compose/metric sets are allocated by createAlgoResources.)
@@ -2021,6 +2042,13 @@ bool GuiApp::createDescriptors() {
     deferred_.writeTextureSet(ctx_, textureSet_, scene_);
 
     writeComposeSetInto(gtComposeSet_, gtColor_.view);
+    // Debug-tab sources (patch 0004): the debug shader only declares the
+    // binding-0 sampler; the remaining bindings stay written but unused.
+    writeComposeSetInto(debugInputTemporalSet_, gbColor_.view);
+    writeComposeSetInto(debugInputSpatialSet_, gbColorSpatial_.view);
+    writeComposeSetInto(debugDepthSet_, gbDepth_.view);
+    writeComposeSetInto(debugMotionSet_, gbMotion_.view);
+    writeComposeSetInto(debugReactiveSet_, gbReactive_.view);
 
     {
         VkDescriptorImageInfo info = {};
@@ -2370,6 +2398,13 @@ bool GuiApp::createPipelines() {
     fsCi.layout = composePipelineLayout_;
     if (createGraphicsPipeline(ctx_, fsCi, composePipeline_) != VK_SUCCESS)
         return false;
+
+    // Debug-tab visualization (patch 0004): same layout/state, the debug
+    // fragment shader (its 48-byte push block fits the layout's range).
+    fsStages[1].module = debugComposeFrag_;
+    if (createGraphicsPipeline(ctx_, fsCi, debugComposePipeline_) != VK_SUCCESS)
+        return false;
+    fsStages[1].module = composeFrag_;
 
     if (!createCopyPipeline()) return false;
 
@@ -2745,7 +2780,11 @@ bool GuiApp::createScreenshotStaging() {
 
 void GuiApp::destroyAlgoResources() {
     for (AlgoColumn& algo : algos_) {
-        if (algo.upscaler) { algo.upscaler->shutdown(); algo.upscaler.reset(); }
+        if (algo.upscaler) {
+            algo.upscaler->setDebugView(-1); // leave no debug mode behind
+            algo.upscaler->shutdown();
+            algo.upscaler.reset();
+        }
         if (algo.frameGen) { algo.frameGen->shutdown(); algo.frameGen.reset(); }
         algo.output.destroy(ctx_);
         algo.fgOutput.destroy(ctx_);
@@ -2876,6 +2915,7 @@ void GuiApp::destroyStackResources() {
     // renderFinished_ persists across rebuilds (owned by createUiSync).
 
     if (composePipeline_) { vkDestroyPipeline(ctx_.device, composePipeline_, nullptr); composePipeline_ = VK_NULL_HANDLE; }
+    if (debugComposePipeline_) { vkDestroyPipeline(ctx_.device, debugComposePipeline_, nullptr); debugComposePipeline_ = VK_NULL_HANDLE; }
     if (copyPipeline_) { vkDestroyPipeline(ctx_.device, copyPipeline_, nullptr); copyPipeline_ = VK_NULL_HANDLE; }
     if (downsamplePipeline_) { vkDestroyPipeline(ctx_.device, downsamplePipeline_, nullptr); downsamplePipeline_ = VK_NULL_HANDLE; }
     if (metricBlocksPipeline_) { vkDestroyPipeline(ctx_.device, metricBlocksPipeline_, nullptr); metricBlocksPipeline_ = VK_NULL_HANDLE; }
@@ -2885,6 +2925,7 @@ void GuiApp::destroyStackResources() {
     if (metricPipelineLayout_) { vkDestroyPipelineLayout(ctx_.device, metricPipelineLayout_, nullptr); metricPipelineLayout_ = VK_NULL_HANDLE; }
     if (fullscreenVert_) { vkDestroyShaderModule(ctx_.device, fullscreenVert_, nullptr); fullscreenVert_ = VK_NULL_HANDLE; }
     if (composeFrag_) { vkDestroyShaderModule(ctx_.device, composeFrag_, nullptr); composeFrag_ = VK_NULL_HANDLE; }
+    if (debugComposeFrag_) { vkDestroyShaderModule(ctx_.device, debugComposeFrag_, nullptr); debugComposeFrag_ = VK_NULL_HANDLE; }
     if (copyFrag_) { vkDestroyShaderModule(ctx_.device, copyFrag_, nullptr); copyFrag_ = VK_NULL_HANDLE; }
     if (metricBlocksComp_) { vkDestroyShaderModule(ctx_.device, metricBlocksComp_, nullptr); metricBlocksComp_ = VK_NULL_HANDLE; }
     if (metricReduceComp_) { vkDestroyShaderModule(ctx_.device, metricReduceComp_, nullptr); metricReduceComp_ = VK_NULL_HANDLE; }
@@ -2899,6 +2940,11 @@ void GuiApp::destroyStackResources() {
     textureSet_ = VK_NULL_HANDLE;
     copySet_ = VK_NULL_HANDLE;
     gtComposeSet_ = VK_NULL_HANDLE;
+    debugInputTemporalSet_ = VK_NULL_HANDLE;
+    debugInputSpatialSet_ = VK_NULL_HANDLE;
+    debugDepthSet_ = VK_NULL_HANDLE;
+    debugMotionSet_ = VK_NULL_HANDLE;
+    debugReactiveSet_ = VK_NULL_HANDLE;
     gtDownsampleSet_ = VK_NULL_HANDLE;
     ssaoSetGb_ = VK_NULL_HANDLE;
     ssaoSetGt_ = VK_NULL_HANDLE;
@@ -4040,6 +4086,27 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
 
         for (AlgoColumn& algo : algos_) {
             SR_GPU_ZONE(profiler_, cmd, algo.id.c_str());
+            // Debug tab, "upscaler debug view" source: the selected plugin
+            // draws its SDK debug view; every other column stays normal.
+            // Stateless per frame, so tab/source switches take effect
+            // immediately and a rebuild never leaves a debug mode behind.
+            const bool pluginDebugRequested =
+                currentTab_ == 3 &&
+                ui_.debugSource == static_cast<int>(DebugSource::PluginView);
+            const int32_t debugView =
+                (pluginDebugRequested && &algo == &algos_[debugTargetAlgo()])
+                    ? ui_.debugPluginView
+                    : -1;
+            algo.upscaler->setDebugView(debugView);
+            algo.debugOutputActive = false;
+            if (debugView >= 0) {
+                UpscalerDebugViewInfo info;
+                if (algo.upscaler->debugViewInfo(static_cast<uint32_t>(debugView), info))
+                    algo.debugOutputActive = info.replacesOutput;
+            }
+            // The debug view replaces the upscaled output: metrics against it
+            // are meaningless and stay suspended while it is active.
+            if (algo.debugOutputActive) algo.hasMetric = false;
             transition(algo.output.image, algo.outputLayout, VK_IMAGE_LAYOUT_GENERAL,
                        sync::kSampleStages, sync::kSampled, sync::kSampleStages,
                        sync::kStorageWrite, VK_IMAGE_ASPECT_COLOR_BIT);
@@ -4620,9 +4687,12 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         uint32_t algoIndex = 0;
         for (AlgoColumn& algo : algos_) {
             // Half-rate FG: only interpolator columns vs midpoint GT.  Other
-            // columns are a visual reference and show "--".
+            // columns are a visual reference and show "--".  A column whose
+            // output is currently a plugin debug view (Debug tab) is
+            // suspended too — the numbers would be meaningless.
             const bool eligible =
-                !anyFg ? true : (algo.frameGen != nullptr && algo.fgReady);
+                (!anyFg ? true : (algo.frameGen != nullptr && algo.fgReady)) &&
+                !algo.debugOutputActive;
             if (!eligible) {
                 ++algoIndex;
                 continue;
@@ -4723,6 +4793,119 @@ void GuiApp::recordComposePresent(VkCommandBuffer cmd, uint32_t swapchainIndex,
             makeColorAttachment(composeImage_.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                                 VK_ATTACHMENT_LOAD_OP_CLEAR);
         beginRendering(cmd, dw, dh, 1, &color, nullptr);
+
+        // Debug tab (patch 0004): replace the columns with a fullscreen view
+        // of the selected debug texture.  The render stack itself is
+        // untouched — this only changes what the compose pass draws.
+        VkDescriptorSet debugSet = VK_NULL_HANDLE;
+        uint32_t debugW = renderWidth_;
+        uint32_t debugH = renderHeight_;
+        int debugMode = 0;
+        float debugRange = 1.f;
+        if (currentTab_ == 3 && !algos_.empty()) {
+            const uint32_t target = debugTargetAlgo();
+            switch (static_cast<DebugSource>(ui_.debugSource)) {
+            case DebugSource::InputColor: {
+                // Mixed temporal+spatial stacks feed spatial plugins a second
+                // unjittered LR color; show the one the target consumes.
+                bool hasTemporal = false;
+                bool hasSpatial = false;
+                for (const AlgoColumn& a : algos_)
+                    (upscalerNeedsJitter(a.upscaler.get()) ? hasTemporal : hasSpatial) = true;
+                const bool targetSpatial =
+                    !upscalerNeedsJitter(algos_[target].upscaler.get());
+                debugSet = (hasTemporal && hasSpatial && targetSpatial)
+                               ? debugInputSpatialSet_
+                               : debugInputTemporalSet_;
+                break;
+            }
+            case DebugSource::Depth:
+                debugSet = debugDepthSet_;
+                debugMode = 1;
+                debugRange = ui_.debugMaxDepth;
+                break;
+            case DebugSource::Motion:
+                debugSet = debugMotionSet_;
+                debugMode = 2;
+                debugRange = ui_.debugMaxMotion;
+                break;
+            case DebugSource::UpscaledOutput:
+                debugSet = algos_[target].composeSet;
+                debugW = dw;
+                debugH = dh;
+                break;
+            case DebugSource::ReactiveMask:
+                if (hasTransparency_) {
+                    debugSet = debugReactiveSet_;
+                    debugMode = 3;
+                    debugRange = ui_.debugReactiveGain;
+                }
+                break;
+            case DebugSource::PluginView: {
+                UpscalerDebugViewInfo info;
+                if (algos_[target].upscaler->debugViewInfo(
+                        static_cast<uint32_t>(std::max(ui_.debugPluginView, 0)), info) &&
+                    info.resourceKind == UpscalerDebugResourceKind::Output) {
+                    debugSet = algos_[target].composeSet;
+                    debugW = info.width ? info.width : dw;
+                    debugH = info.height ? info.height : dh;
+                    switch (info.visualization) {
+                    case UpscalerDebugVisualization::LdrColor:
+                        debugMode = 4;
+                        break;
+                    case UpscalerDebugVisualization::Depth:
+                        debugMode = 1;
+                        debugRange = ui_.debugMaxDepth;
+                        break;
+                    case UpscalerDebugVisualization::Motion:
+                        debugMode = 2;
+                        debugRange = ui_.debugMaxMotion;
+                        break;
+                    case UpscalerDebugVisualization::Scalar:
+                        debugMode = 3;
+                        break;
+                    default:
+                        debugMode = 0;
+                        break;
+                    }
+                }
+                break;
+            }
+            }
+        }
+
+        if (debugSet) {
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, debugComposePipeline_);
+            // Aspect-preserving fit into the full window, centered.
+            const float scale = std::min(static_cast<float>(dw) / static_cast<float>(debugW),
+                                         static_cast<float>(dh) / static_cast<float>(debugH));
+            const uint32_t w =
+                std::max(1u, static_cast<uint32_t>(static_cast<float>(debugW) * scale + 0.5f));
+            const uint32_t h =
+                std::max(1u, static_cast<uint32_t>(static_cast<float>(debugH) * scale + 0.5f));
+            const uint32_t x = (dw - w) / 2;
+            const uint32_t y = (dh - h) / 2;
+            VkViewport viewport = {static_cast<float>(x), static_cast<float>(y),
+                                   static_cast<float>(w), static_cast<float>(h), 0.f, 1.f};
+            vkCmdSetViewport(cmd, 0, 1, &viewport);
+            VkRect2D scissor = {{static_cast<int32_t>(x), static_cast<int32_t>(y)}, {w, h}};
+            vkCmdSetScissor(cmd, 0, 1, &scissor);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, composePipelineLayout_,
+                                    0, 1, &debugSet, 0, nullptr);
+            DebugComposePush push = {};
+            push.srcSize[0] = static_cast<float>(debugW);
+            push.srcSize[1] = static_cast<float>(debugH);
+            push.nearest = scale >= 1.f ? 1.f : 0.f;
+            push.exposure = lrExposureNow();
+            push.debug[0] = static_cast<float>(debugMode);
+            push.debug[1] = debugRange;
+            push.debug[2] = camera_.nearPlane;
+            push.debug[3] = camera_.farPlane;
+            push.flags[0] = ui_.debugLogDepth ? 1.f : 0.f;
+            vkCmdPushConstants(cmd, composePipelineLayout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                               sizeof(push), &push);
+            vkCmdDraw(cmd, 3, 1, 0, 0);
+        } else {
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, composePipeline_);
 
         const float textScale = colW >= 300 ? 2.f : 1.f;
@@ -4801,6 +4984,7 @@ void GuiApp::recordComposePresent(VkCommandBuffer cmd, uint32_t swapchainIndex,
                                sizeof(push), &push);
             vkCmdDraw(cmd, 3, 1, 0, 0);
         }
+        } // !debugSet
         vkCmdEndRendering(cmd);
     }
     imageBarrier(cmd, composeImage_.image, composeLayout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
@@ -5123,6 +5307,27 @@ void GuiApp::pumpInputFile() {
             int on = 0;
             ss >> on;
             setHdrEnabled(on != 0);
+        } else if (cmd == "tab") {
+            // tab <n>: one-shot tab selection (0 viewer, 1 compare, 2 bench,
+            // 3 debug) — same as clicking the tab.
+            int idx = 0;
+            ss >> idx;
+            tabRequest_ = idx;
+        } else if (cmd == "debug") {
+            // debug <source>: Debug-tab source selection by name.
+            std::string name;
+            ss >> name;
+            if (name == "input") ui_.debugSource = static_cast<int>(DebugSource::InputColor);
+            else if (name == "depth") ui_.debugSource = static_cast<int>(DebugSource::Depth);
+            else if (name == "motion") ui_.debugSource = static_cast<int>(DebugSource::Motion);
+            else if (name == "output") ui_.debugSource = static_cast<int>(DebugSource::UpscaledOutput);
+            else if (name == "reactive") ui_.debugSource = static_cast<int>(DebugSource::ReactiveMask);
+            else if (name == "plugin") ui_.debugSource = static_cast<int>(DebugSource::PluginView);
+        } else if (cmd == "debugtarget") {
+            // debugtarget <n>: Debug-tab target column index.
+            int idx = 0;
+            ss >> idx;
+            ui_.debugTarget = idx;
         } // "wait" and unknown commands just consume the frame
         if (dbgInputEnabled())
             std::fprintf(stderr, "[inputfile] line %llu: %s\n",
@@ -5484,6 +5689,12 @@ int GuiApp::upscalerIndexById(const std::string& id) const {
     return -1;
 }
 
+uint32_t GuiApp::debugTargetAlgo() const {
+    if (algos_.empty()) return 0;
+    return static_cast<uint32_t>(
+        std::clamp(ui_.debugTarget, 0, static_cast<int>(algos_.size()) - 1));
+}
+
 bool GuiApp::drawGroupedUpscalerCombo(const char* label, int* index, bool includeNative) {
     const int n = static_cast<int>(upscalerNames_.size());
     std::string preview;
@@ -5632,6 +5843,141 @@ void GuiApp::drawSharedControls() {
         bool fs = fullscreenEnabled_;
         if (ImGui::Checkbox("fullscreen (borderless)", &fs)) setFullscreenEnabled(fs);
     }
+}
+
+void GuiApp::drawDebugTab() {
+    // Patch 0004 design, on the ImGui GUI: the tab itself activates the
+    // fullscreen debug view (drawn by recordComposePresent); the render
+    // stack is never rebuilt for it.
+    ImGui::TextDisabled("Fullscreen debug view of the active stack's textures.\n"
+                        "Switching tabs restores the normal columns.");
+    ImGui::Separator();
+
+    const bool hasUpscaler = !algos_.empty();
+    if (!hasUpscaler) {
+        ImGui::TextWrapped("No upscaler in the active stack (native viewer): the "
+                           "low-res inputs this tab visualizes are not rendered.");
+        return;
+    }
+
+    const int target = static_cast<int>(debugTargetAlgo());
+    ui_.debugTarget = target;
+    const uint32_t pluginViews = algos_[static_cast<size_t>(target)].upscaler->debugViewCount();
+
+    static const char* sourceLabels[] = {"input color",         "depth",
+                                         "motion vectors",      "upscaled output",
+                                         "reactive mask",       "upscaler debug view"};
+    auto sourceAvailable = [&](int source) {
+        if (source == static_cast<int>(DebugSource::ReactiveMask)) return hasTransparency_;
+        if (source == static_cast<int>(DebugSource::PluginView)) return pluginViews > 0;
+        return true;
+    };
+    const int sourceCount = static_cast<int>(sizeof(sourceLabels) / sizeof(sourceLabels[0]));
+    ui_.debugSource = std::clamp(ui_.debugSource, 0, sourceCount - 1);
+    if (ImGui::BeginCombo("source", sourceLabels[ui_.debugSource])) {
+        for (int i = 0; i < sourceCount; ++i) {
+            const bool available = sourceAvailable(i);
+            if (!available) ImGui::BeginDisabled();
+            if (ImGui::Selectable(sourceLabels[i], ui_.debugSource == i) && available) {
+                ui_.debugSource = i;
+                ui_.debugPluginView = 0;
+            }
+            if (!available) ImGui::EndDisabled();
+        }
+        ImGui::EndCombo();
+    }
+
+    const DebugSource source = static_cast<DebugSource>(ui_.debugSource);
+    const bool targetDependent = source == DebugSource::InputColor ||
+                                 source == DebugSource::UpscaledOutput ||
+                                 source == DebugSource::PluginView;
+    if (targetDependent) {
+        if (ImGui::BeginCombo("target upscaler", algos_[static_cast<size_t>(target)].upscaler->name())) {
+            for (int i = 0; i < static_cast<int>(algos_.size()); ++i) {
+                if (ImGui::Selectable(algos_[static_cast<size_t>(i)].upscaler->name(),
+                                      target == i)) {
+                    ui_.debugTarget = i;
+                    ui_.debugPluginView = 0;
+                }
+            }
+            ImGui::EndCombo();
+        }
+    }
+
+    UpscalerDebugViewInfo pluginInfo;
+    bool havePluginInfo = false;
+    if (source == DebugSource::PluginView) {
+        if (pluginViews > 0) {
+            ui_.debugPluginView =
+                std::clamp(ui_.debugPluginView, 0, static_cast<int>(pluginViews) - 1);
+            UpscalerDebugViewInfo current;
+            algos_[static_cast<size_t>(target)].upscaler->debugViewInfo(
+                static_cast<uint32_t>(ui_.debugPluginView), current);
+            if (ImGui::BeginCombo("plugin view", current.label ? current.label : current.id)) {
+                for (uint32_t i = 0; i < pluginViews; ++i) {
+                    UpscalerDebugViewInfo info;
+                    if (!algos_[static_cast<size_t>(target)].upscaler->debugViewInfo(i, info))
+                        continue;
+                    const char* label = info.label ? info.label : info.id;
+                    if (ImGui::Selectable(label, ui_.debugPluginView == static_cast<int>(i)))
+                        ui_.debugPluginView = static_cast<int>(i);
+                }
+                ImGui::EndCombo();
+            }
+            havePluginInfo = algos_[static_cast<size_t>(target)].upscaler->debugViewInfo(
+                static_cast<uint32_t>(ui_.debugPluginView), pluginInfo);
+        } else {
+            ImGui::TextDisabled("Selected upscaler exposes no supported debug views.");
+        }
+    }
+
+    if (source == DebugSource::Depth) {
+        ImGui::Checkbox("logarithmic depth", &ui_.debugLogDepth);
+        ImGui::SliderFloat("maximum depth", &ui_.debugMaxDepth, 1.f, 1000.f, "%.1f m",
+                           ImGuiSliderFlags_Logarithmic);
+    } else if (source == DebugSource::Motion) {
+        ImGui::SliderFloat("maximum magnitude", &ui_.debugMaxMotion, 0.25f, 128.f, "%.1f px",
+                           ImGuiSliderFlags_Logarithmic);
+        ImGui::TextDisabled(
+            "Stored previousUV - currentUV; hue = current-to-previous\ndirection, "
+            "brightness = pixel magnitude.");
+    } else if (source == DebugSource::ReactiveMask) {
+        ImGui::SliderFloat("reactive gain", &ui_.debugReactiveGain, 0.1f, 16.f, "%.2fx",
+                           ImGuiSliderFlags_Logarithmic);
+    }
+
+    ImGui::SeparatorText("resource");
+    const char* format = "R16G16B16A16_SFLOAT";
+    uint32_t width = renderWidth_, height = renderHeight_;
+    const char* name = sourceLabels[ui_.debugSource];
+    if (source == DebugSource::Depth) format = "D32_SFLOAT";
+    if (source == DebugSource::Motion) format = "R16G16_SFLOAT";
+    if (source == DebugSource::ReactiveMask) format = "R16_SFLOAT";
+    if (source == DebugSource::UpscaledOutput) {
+        width = active_.displayW;
+        height = active_.displayH;
+    }
+    if (source == DebugSource::PluginView && havePluginInfo) {
+        name = pluginInfo.label ? pluginInfo.label : pluginInfo.id;
+        width = pluginInfo.width ? pluginInfo.width : active_.displayW;
+        height = pluginInfo.height ? pluginInfo.height : active_.displayH;
+        switch (pluginInfo.format) {
+        case VK_FORMAT_R8G8B8A8_UNORM: format = "R8G8B8A8_UNORM"; break;
+        case VK_FORMAT_R16_SFLOAT: format = "R16_SFLOAT"; break;
+        case VK_FORMAT_R16G16_SFLOAT: format = "R16G16_SFLOAT"; break;
+        case VK_FORMAT_D32_SFLOAT: format = "D32_SFLOAT"; break;
+        default: format = "R16G16B16A16_SFLOAT"; break;
+        }
+    }
+    ImGui::TextWrapped("%s", name ? name : "debug resource");
+    ImGui::Text("%ux%u", width, height);
+    ImGui::TextWrapped("%s", format);
+    ImGui::Text("upscaler: %s", algos_[static_cast<size_t>(target)].upscaler->name());
+    if (!sourceAvailable(ui_.debugSource))
+        ImGui::TextDisabled("This source is unavailable in the active stack.");
+    if (havePluginInfo && pluginInfo.replacesOutput)
+        ImGui::TextDisabled("This SDK view replaces the upscaled output:\n"
+                            "compare metrics for the column are suspended.");
 }
 
 void GuiApp::drawViewerTab() {
@@ -6054,9 +6400,12 @@ void GuiApp::drawReferenceSection() {
     }
     // Instant apply: rebuild the current render stack with the new GT.  The
     // bench tab spawns a child process instead — the flag is picked up by
-    // the next viewer/compare rebuild.
-    if (rebuild && currentTab_ != 2)
-        requestRebuild(configFromUi(currentTab_ == 0 ? Mode::Viewer : Mode::Compare));
+    // the next viewer/compare rebuild.  The Debug tab keeps the active mode.
+    if (rebuild && currentTab_ != 2) {
+        const Mode mode = currentTab_ == 3 ? active_.mode
+                                           : (currentTab_ == 0 ? Mode::Viewer : Mode::Compare);
+        requestRebuild(configFromUi(mode));
+    }
     if (loadInFlight) ImGui::EndDisabled();
     ImGui::TextDisabled("SSAA: GT at 2x, downsampled.\nApply scale: GT at the low input res,\nno AA/upscale. Metrics compare against it.");
 }
@@ -6232,16 +6581,31 @@ void GuiApp::drawUi() {
             drawBenchTab();
             ImGui::EndTabItem();
         }
+        if (ImGui::BeginTabItem("Debug", nullptr,
+                                req == 3 ? ImGuiTabItemFlags_SetSelected : ImGuiTabItemFlags_None)) {
+            newTab = 3;
+            drawDebugTab();
+            ImGui::EndTabItem();
+        }
         ImGui::EndTabBar();
+        // A programmatic request (launch option / SR_GUI_INPUT_FILE "tab")
+        // is authoritative: ImGui activates the first tab on the tab bar's
+        // first frame and applies SetSelected a frame later, which otherwise
+        // reads as a spurious switch to Viewer (triggering a rebuild) and a
+        // switch back without one, leaving the requested tab on the wrong
+        // stack.
+        if (req >= 0) newTab = req;
     }
     ImGui::EndChild();
 
     // Tab switches between Viewer/Compare rebuild the render stack with the
-    // target tab's stored settings.
+    // target tab's stored settings.  The Debug tab keeps whatever stack is
+    // active (it only re-points the compose pass at debug textures).
     if (newTab != currentTab_) {
         const int oldTab = currentTab_;
         currentTab_ = newTab;
-        if (newTab != 2 && (oldTab == 2 || (newTab == 0) != (active_.mode == Mode::Viewer)))
+        if ((newTab == 0 || newTab == 1) &&
+            (oldTab == 2 || (newTab == 0) != (active_.mode == Mode::Viewer)))
             requestRebuild(configFromUi(newTab == 0 ? Mode::Viewer : Mode::Compare));
     }
 

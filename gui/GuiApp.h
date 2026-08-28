@@ -2,13 +2,19 @@
 // ============================================================================
 // GuiApp — Dear ImGui front end for sr_compare (`sr_compare gui`).
 //
-// Covers the full CLI surface in three tabs:
+// Covers the full CLI surface in four tabs:
 //   Viewer  — single-upscaler full-screen preview (scene/upscaler/scale/
 //             resolution/camera path/screenshot/frame-times CSV).
 //   Compare — split-screen GT + up to 4 algorithm columns with the live
 //             GPU-reduction PSNR/SSIM overlay (same shaders as compare mode).
 //   Bench   — spawns `sr_compare bench` as a child process and shows the
 //             resulting CSV in a table.
+//   Debug   — fullscreen visualization of the render inputs (HDR color,
+//             linearized depth, motion vectors, reactive mask), an upscaler
+//             output, or a plugin SDK debug view (patch 0004 design).  The
+//             render stack is not rebuilt for this tab; while a plugin view
+//             that replaces the output is active, compare metrics for that
+//             column are suspended.
 //
 // The render organization mirrors compare/CompareApp: a low-res deferred
 // GBuffer (Halton jittered when any temporal plugin is selected) feeds the
@@ -108,6 +114,15 @@ private:
     float panelWidth() const { return kPanelWidth * uiScale_; }
 
     enum class Mode { Viewer, Compare };
+    // Debug-tab texture views (patch 0004 design); UiState::debugSource.
+    enum class DebugSource : int {
+        InputColor,
+        Depth,
+        Motion,
+        UpscaledOutput,
+        ReactiveMask,
+        PluginView,
+    };
 
     struct ImageResource {
         VkImage image = VK_NULL_HANDLE;
@@ -179,6 +194,9 @@ private:
         float psnr = 0.f;
         float ssim = 0.f;
         bool hasMetric = false;
+        // A plugin debug view that replaces this column's output is active
+        // (Debug tab): compare metrics are meaningless and stay suspended.
+        bool debugOutputActive = false;
     };
 
     // What the render stack is currently built with.
@@ -225,6 +243,15 @@ private:
         char compareShotPath[260] = "output/gui_compare.png";
         char frameTimesPath[260] = "output/gui_frame_times.csv";
         char envMap[260] = {}; // HDR env map path (filled from options at init)
+        // debug tab (patch 0004): the tab itself activates the fullscreen
+        // debug view; these select what it shows.
+        int debugSource = static_cast<int>(DebugSource::InputColor);
+        int debugTarget = 0;     // algo column the target-dependent views use
+        int debugPluginView = 0; // index into the target's debugViewCount()
+        bool debugLogDepth = true;
+        float debugMaxDepth = 100.f;   // meters
+        float debugMaxMotion = 16.f;   // source pixels
+        float debugReactiveGain = 1.f;
         // bench tab
         bool benchSelected[kMaxRegistered] = {};
         bool benchNative = true;
@@ -365,7 +392,10 @@ private:
     // Graph editor window), "profiler" (toggle the GPU profiler window), "pass <name> <0|1>" (toggle a runtime pass
     // switch: shadows/contact/ssr/volfog/occlusion/bloom/mb/dof/autoexp),
     // "fullscreen <0|1>" (borderless fullscreen), "hdr <0|1>" (HDR output
-    // toggle), "wait" (one frame gap).
+    // toggle), "tab <n>" (0 viewer, 1 compare, 2 bench, 3 debug),
+    // "debug <source>" (Debug-tab view: input/depth/motion/output/reactive/
+    // plugin), "debugtarget <n>" (Debug-tab target column), "wait" (one
+    // frame gap).
     void pumpInputFile();
     // The render columns always span the full window client area; the side
     // panel is a floating overlay on top (F1 collapses it to a slim strip).
@@ -383,6 +413,7 @@ private:
     void drawViewerTab();
     void drawCompareTab();
     void drawBenchTab();
+    void drawDebugTab();
     // Vendor-grouped upscaler combo. nativeIndex>=0 adds a "native" item.
     // `index` is 0 = native when nativeIndex>=0, else 0 = first plugin.
     bool drawGroupedUpscalerCombo(const char* label, int* index, bool includeNative);
@@ -391,6 +422,8 @@ private:
     static const char* fgLabel(int fg); // 0 none / 1 FSR3 / 2 NFRU
     static const char* fgId(int fg);    // empty / "fsr3" / "nfru"
     int upscalerIndexById(const std::string& id) const;
+    // Clamped Debug-tab target column index (0 when no upscaler is active).
+    uint32_t debugTargetAlgo() const;
     RenderConfig configFromUi(Mode mode) const;
     void requestRebuild(const RenderConfig& cfg);
     void applyRebuild();
@@ -779,12 +812,14 @@ private:
     VkPipelineLayout copyPipelineLayout_ = VK_NULL_HANDLE;
     VkPipelineLayout metricPipelineLayout_ = VK_NULL_HANDLE;
     VkPipeline composePipeline_ = VK_NULL_HANDLE;
+    VkPipeline debugComposePipeline_ = VK_NULL_HANDLE; // Debug tab (debug_compose.frag)
     VkPipeline copyPipeline_ = VK_NULL_HANDLE;
     VkPipeline downsamplePipeline_ = VK_NULL_HANDLE; // 2x GT -> 1x GT (SSAA)
     VkPipeline metricBlocksPipeline_ = VK_NULL_HANDLE;
     VkPipeline metricReducePipeline_ = VK_NULL_HANDLE;
     VkShaderModule fullscreenVert_ = VK_NULL_HANDLE;
     VkShaderModule composeFrag_ = VK_NULL_HANDLE;
+    VkShaderModule debugComposeFrag_ = VK_NULL_HANDLE;
     VkShaderModule copyFrag_ = VK_NULL_HANDLE;
     VkShaderModule metricBlocksComp_ = VK_NULL_HANDLE;
     VkShaderModule metricReduceComp_ = VK_NULL_HANDLE;
@@ -798,6 +833,14 @@ private:
     VkDescriptorSet textureSet_ = VK_NULL_HANDLE;
     VkDescriptorSet copySet_ = VK_NULL_HANDLE;
     VkDescriptorSet gtComposeSet_ = VK_NULL_HANDLE;
+    // Debug-tab views (patch 0004): persistent compose-layout sets over the
+    // render-res input textures (written once at stack build; the images are
+    // recreated with the stack, so the sets are rebuilt with it).
+    VkDescriptorSet debugInputTemporalSet_ = VK_NULL_HANDLE;
+    VkDescriptorSet debugInputSpatialSet_ = VK_NULL_HANDLE;
+    VkDescriptorSet debugDepthSet_ = VK_NULL_HANDLE;
+    VkDescriptorSet debugMotionSet_ = VK_NULL_HANDLE;
+    VkDescriptorSet debugReactiveSet_ = VK_NULL_HANDLE;
     VkDescriptorSet gtDownsampleSet_ = VK_NULL_HANDLE; // 2x GT source (SSAA)
     // SSAO descriptor sets (static: the referenced textures never change).
     // The blur sets live inside AoHistory (one per ping-pong buffer).
@@ -880,7 +923,7 @@ private:
 
     // --- runtime/UI state ----------------------------------------------------------
     UiState ui_;
-    int currentTab_ = 0; // 0 viewer, 1 compare, 2 bench
+    int currentTab_ = 0; // 0 viewer, 1 compare, 2 bench, 3 debug
     int tabRequest_ = -1; // one-shot ImGui tab selection (launch options)
     bool panelCollapsed_ = false; // side panel hidden (F1 / panel button toggles)
     std::vector<std::string> upscalerNames_;     // registered plugin ids

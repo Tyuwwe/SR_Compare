@@ -36,4 +36,8 @@ add_library(gui STATIC GuiApp.cpp BenchRunner.cpp GpuProfilerWindow.cpp RenderGr
 sr_common_setup(gui)
 target_compile_definitions(gui PRIVATE SR_SHADER_DIR="${SR_SHADER_OUT_DIR}/")
 target_link_libraries(gui PUBLIC renderer upscalers imgui imnodes)
-add_dependencies(gui renderer_shaders compare_shaders)
+
+# Debug-tab fullscreen texture visualization (patch 0004).
+sr_compile_shader(GUI_DEBUG_COMPOSE_SPV shaders/debug_compose.frag "${SR_TONE_MAP_GLSL}")
+add_custom_target(gui_shaders DEPENDS ${GUI_DEBUG_COMPOSE_SPV})
+add_dependencies(gui gui_shaders renderer_shaders compare_shaders)
