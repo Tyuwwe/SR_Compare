@@ -102,7 +102,8 @@ layout(location = 0) in vec3 vWorldPos;
 layout(location = 1) in vec3 vNormal;
 layout(location = 2) in vec2 vUV;
 layout(location = 3) in vec4 vTangent;
-layout(location = 4) in vec2 vMotion;
+layout(location = 4) in vec4 vCurrentClip;
+layout(location = 5) in vec4 vPreviousClip;
 
 layout(location = 0) out vec4 outColor;
 layout(location = 1) out vec2 outMotion;
@@ -349,6 +350,8 @@ void main() {
     }
 
     outColor = vec4(glassColor, alpha);
-    outMotion = vMotion;
+    vec2 currentUV = vCurrentClip.xy / vCurrentClip.w * 0.5 + 0.5;
+    vec2 previousUV = vPreviousClip.xy / vPreviousClip.w * 0.5 + 0.5;
+    outMotion = previousUV - currentUV;
     outMask = alpha; // accumulated additively across layers
 }

@@ -4,6 +4,7 @@
 // R16G16B16A16.  Dispatch uses NO_SWAPCHAIN so we write a texture.
 // ============================================================================
 #include "upscalers/IFrameGen.h"
+#include "upscalers/InputAdapter.h"
 #include "upscalers/UpscalerFactory.h"
 #include "renderer/core/PathUtil.h"
 #include "renderer/math/Math.h"
@@ -286,8 +287,11 @@ public:
         prep.commandList = reinterpret_cast<void*>(cmd);
         prep.jitterOffset.x = -cam.jitterX;
         prep.jitterOffset.y = -cam.jitterY;
-        prep.motionVectorScale.x = -1.f;
-        prep.motionVectorScale.y = -1.f;
+        // Canonical motion is backward framebuffer UV; NFRU (ffx-api, same
+        // convention as NSS) consumes backward input-pixel offsets.
+        const MotionScale motionScale = nssMotionVectorScale(rw, rh);
+        prep.motionVectorScale.x = motionScale.x;
+        prep.motionVectorScale.y = motionScale.y;
         prep.frameTimeDelta = (std::max)(frame.deltaTime * 1000.f, 1.f);
         prep.cameraNear = cam.cameraNear;
         prep.cameraFar = cam.cameraFar;

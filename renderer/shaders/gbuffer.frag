@@ -5,8 +5,7 @@
 //   RT1 normal   A2B10G10R10 xyz = world normal * 0.5 + 0.5 (packed [0,1])
 //   RT2 material RGBA8_UNORM r = metallic, g = roughness, b = AO
 //   RT3 emissive B10G11R11UF rgb = emissive (unsigned float, no alpha)
-//   RT4 motion   RG16F       pixel units, cur - prev, no jitter (unchanged
-//                            upscaler contract)
+//   RT4 motion   RG16F       previousUV - currentUV, no jitter
 
 layout(set = 0, binding = 1) uniform MaterialUBO {
     vec4 baseColor; // rgb + alpha factor
@@ -34,7 +33,8 @@ layout(location = 0) in vec3 vWorldPos;
 layout(location = 1) in vec3 vNormal;
 layout(location = 2) in vec2 vUV;
 layout(location = 3) in vec4 vTangent;
-layout(location = 4) in vec2 vMotion;
+layout(location = 4) in vec4 vCurrentClip;
+layout(location = 5) in vec4 vPreviousClip;
 
 layout(location = 0) out vec4 outAlbedo;
 layout(location = 1) out vec4 outNormal;
@@ -94,5 +94,10 @@ void main() {
     outMaterial = vec4(clamp(metallic, 0.0, 1.0), clamp(roughness, 0.0, 1.0),
                        clamp(ao, 0.0, 1.0), 1.0);
     outEmissive = emissive;
-    outMotion = vMotion;
+    // Canonical renderer motion: current -> previous in framebuffer-oriented
+    // normalized UV space. Do not clamp: an off-screen previous coordinate is
+    // meaningful to temporal consumers and must remain detectable.
+    vec2 currentUV = vCurrentClip.xy / vCurrentClip.w * 0.5 + 0.5;
+    vec2 previousUV = vPreviousClip.xy / vPreviousClip.w * 0.5 + 0.5;
+    outMotion = previousUV - currentUV;
 }

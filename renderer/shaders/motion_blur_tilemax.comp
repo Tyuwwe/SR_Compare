@@ -1,7 +1,9 @@
 #version 450
 // Motion blur tile-max pass (Phase 6b): reduces the full-res motion RT
-// (RG16F, pixel units, no jitter) into one max-magnitude velocity per
-// kTileSize x kTileSize tile.  This is the "tile max" stage of McGuire et
+// (RG16F, previousUV - currentUV framebuffer UV, no jitter) into one
+// max-magnitude velocity per kTileSize x kTileSize tile, converted to pixel
+// units so all downstream passes (and their px thresholds) stay in the pixel
+// domain.  This is the "tile max" stage of McGuire et
 // al.'s reconstruction filter (and of DOOM Eternal's / UE's motion blur):
 // the gather pass (motion_blur_gather.comp) consults the neighbourhood max
 // to know how far a pixel must search for geometry moving over it.
@@ -33,7 +35,7 @@ void main() {
     float bestLen2 = -1.0;
     for (int y = begin.y; y < end.y; ++y) {
         for (int x = begin.x; x < end.x; ++x) {
-            const vec2 v = texelFetch(motion, ivec2(x, y), 0).xy;
+            const vec2 v = texelFetch(motion, ivec2(x, y), 0).xy * vec2(pc.params.xy);
             const float len2 = dot(v, v);
             if (len2 > bestLen2) {
                 bestLen2 = len2;

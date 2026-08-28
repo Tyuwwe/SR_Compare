@@ -2,32 +2,33 @@
 // ============================================================================
 // InputAdapter — per-algorithm input convention conversion helpers.
 //
-// Our renderer produces motion vectors with the following convention:
-//   * R16G16_SFLOAT, pixel units, no jitter
-//   * screen-space displacement: (currentNDC - previousNDC) * 0.5 * renderSize
-//     => direction cur->prev ("forward motion"), +x = right, +y = down
+// Our renderer produces motion vectors with one canonical convention:
+//   * R16G16_SFLOAT, normalized framebuffer UV units, no jitter
+//   * previousUV - currentUV (current->previous / backward motion)
+//   * +x = right, +y = down; previousUV = currentUV + motionUV
 //
 // Algorithm-specific consumption (verified per integration; most temporal
-// upscalers reproject with prev = uv + MV, i.e. they want cur->prev negated):
-//   * TAA   : samples history at uv - MV -> correct as-is.
-//   * FSR2/3: prev = uv + MV (see ffx_fsr2_reproject.h) -> motionVectorScale
-//             {-1,-1} (A/B verified: +2.5 dB PSNR vs the wrong sign).
-//   * XeSS  : wants cur->prev -> xessSetVelocityScale(-1,-1).
+// upscalers reproject with prev = uv + MV, i.e. they want current->previous):
+//   * TAA   : samples history at uv + MV -> correct as-is.
+//   * FSR2/3: motionVectorScale {renderWidth,renderHeight}; the SDK divides
+//             by render size internally, recovering the stored backward UV.
+//   * XeSS  : xessSetVelocityScale(renderWidth,renderHeight) converts UV to
+//             the backward input-pixel displacement expected by XeSS.
 //             jitterOffset is the framebuffer pixel displacement (same
 //             sign as FSR2).  The official sample's -jitterY must not be
 //             copied: it compensates clip.xy += on Y-up clip positions.
-//   * DLSS  : wants cur->prev in [-1,1] -> mvecScale {-1/renderW, -1/renderH}
-//             (same sign flip as FSR2).  jitterOffset is framebuffer pixels.
-//   * NSS   : backward pixel motion -> motionVectorScale {-1,-1}.
+//   * DLSS  : wants normalized cur->prev -> mvecScale {1,1}.
+//             jitterOffset is framebuffer pixels.
+//   * NSS   : backward pixel motion -> motionVectorScale {renderWidth,
+//             renderHeight}, matching the NSS user guide's UV-space example.
 //             jitterOffset is negated (NssUpscaler.cpp): NSS wants the
 //             unjitter sampling offset, not the content displacement —
 //             Arm's reference sample applies jitter with proj[2][0/1] +=
 //             on a clip.w = -z projection (content moves by -jitter
 //             pixels) and reports the positive value.
-//   * SGSR2 : official InputVelocity is dynamic objects only (zero for
-//             static); Convert reconstructs camera motion from clipToPrevClip
-//             + nearest-depth.  Encode writes zeros.  REQUEST_NDC_Y_UP unset
-//             (Vulkan Y-down).  jitterOffset is framebuffer pixels.
+//   * SGSR2 : official InputVelocity is forward NDC for dynamic objects only.
+//             Static pixels remain zero and use clipToPrevClip + nearest depth;
+//             reactive pixels encode forwardNDC = -2*motionUV.
 //
 // Reactive mask (UpscalerResources::reactive/reactiveView) convention:
 //   * R16_SFLOAT, render resolution, per-pixel accumulated translucent alpha
@@ -54,8 +55,9 @@
 //   * Not consumed (no mask input in the vendor API):
 //       NSS    : ffxApiDispatchDescNss has only color/depth/motionVectors/
 //                output/outputTm1 + scalars (ffx-api/include/ffx_api/ffx_nss.h).
-//       SGSR2  : fixed shader inputs (color/depth/velocity/history), no mask
-//                concept in the reference shaders.
+//       SGSR2  : uses coverage only to select pixels that need explicit
+//                forward-NDC velocity; static opaque pixels retain matrix/depth
+//                reconstruction from the reference shaders.
 // FrameParams::preExposure convention:
 //   The input color (UpscalerResources::color) is un-exposed scene-linear HDR.
 //   preExposure is the display exposure multiplier (ACES input scale) that the
@@ -78,16 +80,32 @@ struct MotionScale {
     float y = 1.f;
 };
 
-// Scale render-resolution pixel motion into display-resolution pixels.
-inline MotionScale motionScale(uint32_t renderWidth, uint32_t renderHeight, uint32_t displayWidth,
-                               uint32_t displayHeight) {
-    return {static_cast<float>(displayWidth) / static_cast<float>(renderWidth),
-            static_cast<float>(displayHeight) / static_cast<float>(renderHeight)};
+// Convert canonical UV motion to input-resolution pixel motion.
+inline MotionScale motionUvToPixels(uint32_t renderWidth, uint32_t renderHeight) {
+    return {static_cast<float>(renderWidth), static_cast<float>(renderHeight)};
 }
 
-// Flip the Y sign (Vulkan y-down <-> GL / NSS y-up).
-inline float flipMotionY(float y) {
-    return -y;
+// Named wrappers keep each SDK integration tied to the tested shared contract,
+// even where several SDKs currently require the same numerical conversion.
+inline MotionScale fsrMotionVectorScale(uint32_t renderWidth, uint32_t renderHeight) {
+    return motionUvToPixels(renderWidth, renderHeight);
+}
+
+inline MotionScale nssMotionVectorScale(uint32_t renderWidth, uint32_t renderHeight) {
+    return motionUvToPixels(renderWidth, renderHeight);
+}
+
+inline MotionScale xessVelocityScale(uint32_t renderWidth, uint32_t renderHeight) {
+    return motionUvToPixels(renderWidth, renderHeight);
+}
+
+inline MotionScale dlssMotionVectorScale() {
+    return {1.f, 1.f};
+}
+
+// SGSR2 stores forward NDC while the canonical texture stores backward UV.
+inline MotionScale motionUvToSgsrForwardNdc() {
+    return {-2.f, -2.f};
 }
 
 } // namespace sr

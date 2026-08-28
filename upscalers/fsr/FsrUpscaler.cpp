@@ -5,10 +5,10 @@
 // ffx_permutations/ by gen_permutations.sh.
 //
 // Input conventions (see upscalers/InputAdapter.h):
-//   * motion vectors are render-resolution pixels, y down, no jitter, but ours
-//     point cur->prev while FSR2/FSR3 reproject with prev = uv + MV, so
-//     motionVectorScale negates them ({-1,-1}).
-//   * depth is D32_SFLOAT, non-inverted, infinite far plane.
+//   * motion vectors are current->previous framebuffer UV offsets, y down and
+//     no jitter. motionVectorScale converts them to input pixels; the SDK then
+//     normalizes them internally for reprojection.
+//   * depth is D32_SFLOAT, non-inverted, with the host-selected far-plane mode.
 //   * no exposure input: preExposure = 1 and the effects fall back to their
 //     internal default exposure resource.
 //   * when UpscalerResources::reactive is non-null (translucency coverage mask,
@@ -23,6 +23,7 @@
 #include "upscalers/fsr/FsrUpscaler.h"
 
 #include "renderer/core/PathUtil.h"
+#include "upscalers/InputAdapter.h"
 #include "upscalers/UpscalerFactory.h"
 #include "upscalers/VkHelpers.h"
 
@@ -598,7 +599,9 @@ void Fsr2Upscaler::dispatch(VkCommandBuffer cmd, const UpscalerResources& res, c
     dd.transparencyAndComposition = f.reactive;  // same coverage mask feeds TC
     dd.output = f.output;
     dd.jitterOffset = jitterOf(cam);
-    dd.motionVectorScale = {-1.f, -1.f};  // our MVs are cur->prev; FSR wants prev = uv + MV (cur->prev negated)
+    const MotionScale motionScale =
+        fsrMotionVectorScale(impl_->desc.renderWidth, impl_->desc.renderHeight);
+    dd.motionVectorScale = {motionScale.x, motionScale.y};
     dd.renderSize = {impl_->desc.renderWidth, impl_->desc.renderHeight};
     dd.enableSharpening = true;
     dd.sharpness = kSharpness;
@@ -729,7 +732,8 @@ void Fsr3Upscaler::dispatch(VkCommandBuffer cmd, const UpscalerResources& res, c
     dd.reconstructedPrevNearestDepth = reconDepth;
     dd.output = f.output;
     dd.jitterOffset = jitterOf(cam);
-    dd.motionVectorScale = {-1.f, -1.f};  // our MVs are cur->prev; FSR wants prev = uv + MV (cur->prev negated)
+    const MotionScale motionScale = fsrMotionVectorScale(rw, rh);
+    dd.motionVectorScale = {motionScale.x, motionScale.y};
     dd.renderSize = {rw, rh};
     dd.upscaleSize = {impl_->desc.displayWidth, impl_->desc.displayHeight};
     dd.enableSharpening = true;

@@ -1,6 +1,6 @@
 #version 450
 // Transparency pass vertex shader: identical contract to gbuffer.vert
-// (current jittered clip position + un-jittered cur-vs-prev motion).
+// (current jittered clip position + unjittered current/previous clip data).
 
 layout(location = 0) in vec3 aPos;
 layout(location = 1) in vec3 aNormal;
@@ -26,7 +26,8 @@ layout(location = 0) out vec3 vWorldPos;
 layout(location = 1) out vec3 vNormal;
 layout(location = 2) out vec2 vUV;
 layout(location = 3) out vec4 vTangent;
-layout(location = 4) out vec2 vMotion;
+layout(location = 4) out vec4 vCurrentClip;
+layout(location = 5) out vec4 vPreviousClip;
 
 void main() {
     vec4 world = pc.model * vec4(aPos, 1.0);
@@ -37,11 +38,8 @@ void main() {
 
     gl_Position = ubo.viewProj * world;
 
-    // Motion against the previous frame, un-jittered projections on both
-    // sides (same convention as the GBuffer pass).
-    vec4 curClipNoJitter = ubo.viewProjNoJitter * world;
-    vec4 prevClip = ubo.prevViewProj * (pc.prevModel * vec4(aPos, 1.0));
-    vec2 curNDC = curClipNoJitter.xy / curClipNoJitter.w;
-    vec2 prevNDC = prevClip.xy / prevClip.w;
-    vMotion = (curNDC - prevNDC) * 0.5 * ubo.renderSizeJitter.xy;
+    // Perspective division is deferred until the fragment stage so motion is
+    // exact across large triangles. Both projections deliberately omit jitter.
+    vCurrentClip = ubo.viewProjNoJitter * world;
+    vPreviousClip = ubo.prevViewProj * (pc.prevModel * vec4(aPos, 1.0));
 }

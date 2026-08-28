@@ -4,11 +4,9 @@
 // Input conventions (contract from upscalers/InputAdapter.h):
 //   color  : render-res HDR, R16G16B16A16_SFLOAT
 //   depth  : D32_SFLOAT, not inverted; near/far match Camera (finite far)
-//   motion : R16G16_SFLOAT, pixel units at render res, no jitter,
-//            (currentNDC - previousNDC) * 0.5 * renderSize, +y down,
-//            i.e. previous -> current.  NGX wants current -> previous in
-//            [-1,1], so mvecScale is {-1/renderW, -1/renderH} (same sign
-//            flip as FSR2's {-1,-1}).
+//   motion : R16G16_SFLOAT, previousUV-currentUV, framebuffer-oriented and
+//            unjittered. NGX wants normalized current->previous motion, so
+//            mvecScale is {1,1}.
 //   jitter : pixel units, framebuffer displacement (same as FSR2/TAA);
 //            matrices passed to SL never contain jitter.
 //   reactive (optional, may be null) : R16_SFLOAT transparency-coverage mask
@@ -19,6 +17,7 @@
 #include "upscalers/dlss/DlssUpscaler.h"
 
 #include "renderer/core/Vk.h" // Vulkan headers must precede the SL headers
+#include "upscalers/InputAdapter.h"
 #include "upscalers/UpscalerFactory.h"
 #include "upscalers/dlss/SlContext.h"
 
@@ -181,9 +180,9 @@ void DlssUpscaler::dispatch(VkCommandBuffer cmd, const UpscalerResources& res,
     sl::matrixFullInvert(consts.prevClipToClip, consts.clipToPrevClip);
 
     consts.jitterOffset = {cam.jitterX, cam.jitterY};
-    // Previous -> current pixels -> current -> previous in [-1,1].
-    consts.mvecScale = {-1.0f / static_cast<float>(desc_.renderWidth),
-                        -1.0f / static_cast<float>(desc_.renderHeight)};
+    // Canonical input is already normalized current -> previous motion.
+    const MotionScale motionScale = dlssMotionVectorScale();
+    consts.mvecScale = {motionScale.x, motionScale.y};
     consts.cameraPinholeOffset = {0.0f, 0.0f};
     // Rows of (world -> camera view)^-1 in row-major layout are the camera
     // basis vectors in world space; translation sits in the last row.

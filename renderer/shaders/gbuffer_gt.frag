@@ -29,13 +29,14 @@ layout(location = 0) in vec3 vWorldPos;
 layout(location = 1) in vec3 vNormal;
 layout(location = 2) in vec2 vUV;
 layout(location = 3) in vec4 vTangent;
-layout(location = 4) in vec2 vMotion;
+layout(location = 4) in vec4 vCurrentClip;
+layout(location = 5) in vec4 vPreviousClip;
 
 layout(location = 0) out vec4 outAlbedo;
 layout(location = 1) out vec4 outNormal;
 layout(location = 2) out vec4 outMaterial;
 layout(location = 3) out vec3 outEmissive; // B10G11R11_UFLOAT: no alpha channel
-layout(location = 4) out vec2 outMotion;   // RG16F, pixel units, no jitter
+layout(location = 4) out vec2 outMotion;   // RG16F, previousUV - currentUV, no jitter
 
 int texIndex(float f) { return int(floor(f + 0.5)); }
 
@@ -83,5 +84,9 @@ void main() {
     outMaterial = vec4(clamp(metallic, 0.0, 1.0), clamp(roughness, 0.0, 1.0),
                        clamp(ao, 0.0, 1.0), 1.0);
     outEmissive = emissive;
-    outMotion = vMotion;
+    // Same canonical motion as gbuffer.frag: current -> previous in
+    // framebuffer-oriented normalized UV, unclamped, no jitter.
+    vec2 currentUV = vCurrentClip.xy / vCurrentClip.w * 0.5 + 0.5;
+    vec2 previousUV = vPreviousClip.xy / vPreviousClip.w * 0.5 + 0.5;
+    outMotion = previousUV - currentUV;
 }

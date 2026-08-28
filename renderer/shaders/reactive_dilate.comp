@@ -40,7 +40,9 @@ void main() {
         for (int x = -1; x <= 1; ++x)
             m = max(m, texelFetch(inMask, clamp(pix + ivec2(x, y), ivec2(0), size - 1), 0).r);
 
-    vec2 mv = texelFetch(inMotion, pix, 0).xy;
+    // Canonical motion is framebuffer UV; scale back to render-res pixels
+    // for the 0.5/1.5 px gate thresholds.
+    vec2 mv = texelFetch(inMotion, pix, 0).xy * vec2(size);
     m *= smoothstep(0.5, 1.5, length(mv));
 
     imageStore(outMask, pix, vec4(m, 0.0, 0.0, 0.0));

@@ -1,9 +1,10 @@
 #pragma once
 // ============================================================================
 // XeSS — Intel XeSS Super Resolution (Vulkan path) plugin.
-// Temporal ML upscaler: consumes render-resolution HDR color, low-res motion
-// vectors (pixel units, no jitter) and depth; XeSS dilates/up-samples the MVs
-// internally.  On non-Intel GPUs it runs the cross-vendor DP4a kernel.
+// Temporal ML upscaler: consumes render-resolution HDR color, motion vectors
+// (canonical previousUV-currentUV framebuffer UV, no jitter) and depth; XeSS
+// dilates/up-samples the MVs internally.  On non-Intel GPUs it runs the
+// cross-vendor DP4a kernel.
 // Implements sr::IUpscaler.
 // ============================================================================
 #include "upscalers/IUpscaler.h"

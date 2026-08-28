@@ -1,5 +1,6 @@
 #include "upscalers/nss/NssUpscaler.h"
 
+#include "upscalers/InputAdapter.h"
 #include "upscalers/UpscalerFactory.h"
 #include "renderer/core/PathUtil.h"
 #include "upscalers/VkHelpers.h"
@@ -641,10 +642,12 @@ void NssUpscaler::dispatch(VkCommandBuffer cmd, const UpscalerResources& res, co
         desc.cameraFar  = cam.cameraFar;
         desc.cameraFovAngleVertical = cam.fovY;
         desc.exposure = frame.preExposure != 0.f ? frame.preExposure : 1.f;  // must not be 0
-        // Our motion is forward (curNDC - prevNDC), pixel units, y-down; NSS
-        // consumes backward pixel motion in the same screen space.
-        desc.motionVectorScale.x = -1.f;
-        desc.motionVectorScale.y = -1.f;
+        // Canonical motion is already backward and stored in framebuffer UV.
+        // NSS consumes backward input-pixel offsets after this scale is applied.
+        const MotionScale motionScale =
+            nssMotionVectorScale(impl->desc.renderWidth, impl->desc.renderHeight);
+        desc.motionVectorScale.x = motionScale.x;
+        desc.motionVectorScale.y = motionScale.y;
         desc.frameTimeDelta = frame.deltaTime * 1000.f;
         if (desc.frameTimeDelta < 1.f) desc.frameTimeDelta = 1.f;
         desc.reset = frame.resetHistory;

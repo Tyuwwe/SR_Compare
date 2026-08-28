@@ -13,10 +13,8 @@
 //   * color/output are converted between our R16G16B16A16_SFLOAT and the
 //     SDK-mandated R11G11B10 float via two small compute passes.
 //   * depth (D32_SFLOAT) and motion (R16G16_SFLOAT) are passed through.
-//     Our motion is forward, pixel units, y-down; NSS expects backward
-//     pixel motion in the same screen space ("backward direction in pixel
-//     space to match FSR/ASR", ffx_nss_preprocess.h), so a single negated
-//     motionVectorScale = (-1, -1) performs the conversion.
+//     Motion is backward framebuffer UV; NSS expects backward pixel motion,
+//     so motionVectorScale = (renderWidth, renderHeight) converts the units.
 // ============================================================================
 #include "upscalers/IUpscaler.h"
 

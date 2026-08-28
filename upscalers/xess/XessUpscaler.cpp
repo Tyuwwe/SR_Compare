@@ -2,9 +2,8 @@
 // XeSS — Intel XeSS Super Resolution (Vulkan path) plugin.
 //
 // Conventions (XeSS-SR 2.x/3.x developer guide + Intel VK/DX12 samples):
-//   * Motion vectors: pixel units at input resolution, current -> previous,
-//     no jitter (2.x guide).  Our GBuffer stores previous -> current, so
-//     xessSetVelocityScale(-1,-1) — same sign flip as FSR2/NSS.
+//   * Motion vectors: canonical current -> previous UV, no jitter. XeSS wants
+//     backward input-pixel motion, so velocityScale is the render dimensions.
 //   * Jitter: pixel units in [-0.5, 0.5], framebuffer displacement of the
 //     jittered content (same contract as FSR2/TAA/DLSS).  The official
 //     samples pass jitterOffsetY = -halton.y because they add jitter with
@@ -27,6 +26,7 @@
 // ============================================================================
 #include "upscalers/xess/XessUpscaler.h"
 
+#include "upscalers/InputAdapter.h"
 #include "upscalers/UpscalerFactory.h"
 #include "upscalers/VkHelpers.h"
 
@@ -451,10 +451,9 @@ bool XessUpscaler::init(const VulkanEnv& env, const UpscalerDesc& desc) {
         return false;
     }
 
-    // Our MV buffer stores previous -> current motion; XeSS 2.x expects
-    // current -> previous, so flip both axes (velocity is already in
-    // input-resolution pixels, y down).
-    r = xessSetVelocityScale(impl_->context, -1.f, -1.f);
+    // Convert canonical framebuffer UV offsets into input-resolution pixels.
+    const MotionScale motionScale = xessVelocityScale(desc.renderWidth, desc.renderHeight);
+    r = xessSetVelocityScale(impl_->context, motionScale.x, motionScale.y);
     if (r != XESS_RESULT_SUCCESS) {
         std::fprintf(stderr, "XeSS: xessSetVelocityScale failed (%s)\n", xessResultStr(r));
         shutdown();

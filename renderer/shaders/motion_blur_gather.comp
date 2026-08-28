@@ -15,7 +15,8 @@
 // noise keyed on the frame index — deterministic, no wall clock.
 //
 //   binding 0 = lit HDR color (sampler, SHADER_READ_ONLY)
-//   binding 1 = motion RT (sampler, pixel units, no jitter)
+//   binding 1 = motion RT (sampler, framebuffer UV units, no jitter;
+//               converted to pixels via params2 on sample)
 //   binding 2 = neighbourhood max (sampler, tile grid)
 //   binding 3 = depth (sampler, D32; only relative ordering is used)
 //   binding 4 = blurred color out (RGBA16F storage, full res)
@@ -56,7 +57,7 @@ void main() {
     const float shutter = pc.params.x;
 
     const vec3 centerColor = texelFetch(color, pix, 0).rgb;
-    const vec2 centerVel = texelFetch(motion, pix, 0).xy * shutter;
+    const vec2 centerVel = texelFetch(motion, pix, 0).xy * pc.params2.xy * shutter;
     const float centerDepth = texelFetch(depth, pix, 0).r;
     const ivec2 tile = min(pix / int(pc.params.w), textureSize(neighborMax, 0) - 1);
     const vec2 tileVel = texelFetch(neighborMax, tile, 0).xy * shutter;
@@ -88,7 +89,7 @@ void main() {
         const vec2 suv = uv + off * texel;
 
         const vec3 sColor = texture(color, suv).rgb;
-        const vec2 sVel = texture(motion, suv).xy * shutter;
+        const vec2 sVel = texture(motion, suv).xy * pc.params2.xy * shutter;
         const float sDepth = texture(depth, suv).r;
         const float sLen = length(sVel);
 

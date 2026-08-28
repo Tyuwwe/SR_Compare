@@ -725,7 +725,8 @@ struct BloomPyramid {
 // Feature-Aware Motion Blur Filter", HPG 2012; same tile-max/gather structure
 // as DOOM Eternal's motion blur, SIGGRAPH 2020):
 //   1. tile max   (motion_blur_tilemax.comp): max-magnitude velocity per
-//      kMotionBlurTileSize^2 tile of the path's motion RT (pixel units);
+//      kMotionBlurTileSize^2 tile of the path's motion RT (canonical UV,
+//      converted to pixel units at sample time);
 //   2. neighbour  (motion_blur_neighborhood.comp): 3x3 dilation of the tile
 //      grid so edge pixels search far enough for fast neighbours;
 //   3. gather     (motion_blur_gather.comp): full-res N-tap line gather along

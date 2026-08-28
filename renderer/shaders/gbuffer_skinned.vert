@@ -39,7 +39,8 @@ layout(location = 0) out vec3 vWorldPos;
 layout(location = 1) out vec3 vNormal;
 layout(location = 2) out vec2 vUV;
 layout(location = 3) out vec4 vTangent;
-layout(location = 4) out vec2 vMotion;
+layout(location = 4) out vec4 vCurrentClip;
+layout(location = 5) out vec4 vPreviousClip;
 
 void main() {
     mat4 skin = mat4(0.0);
@@ -61,12 +62,10 @@ void main() {
     vec4 clip = ubo.viewProj * world;
     gl_Position = clip;
 
-    // Motion against the previous frame, computed from the *un-jittered*
-    // projections on both sides (same contract as gbuffer.vert).
-    vec4 curClipNoJitter = ubo.viewProjNoJitter * world;
-    vec4 prevClip = ubo.prevViewProj * prevWorld;
-    vec2 curNDC = curClipNoJitter.xy / curClipNoJitter.w;
-    vec2 prevNDC = prevClip.xy / prevClip.w;
-    // Pixel units, no jitter.  Points from previous position to current.
-    vMotion = (curNDC - prevNDC) * 0.5 * ubo.renderSizeJitter.xy;
+    // Both projections are unjittered. Temporal jitter is reported separately
+    // to each upscaler and must not be baked into object/camera motion.
+    // Perspective division is deferred until the fragment stage so motion is
+    // exact across large triangles.
+    vCurrentClip = ubo.viewProjNoJitter * world;
+    vPreviousClip = ubo.prevViewProj * prevWorld;
 }

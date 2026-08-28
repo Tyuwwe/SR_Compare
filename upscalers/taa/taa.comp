@@ -84,11 +84,18 @@ void main() {
         return;
     }
 
-    vec2 motionPx = texture(uMotion, uv + juv).xy;   // render-res pixels
-    vec2 scale = ds / pc.sizes.xy;                   // display/render
-    vec2 historyUV = uv - motionPx * scale / ds;
+    // Motion is a current->previous UV offset. Use an unfiltered texel from
+    // the same jittered input location as current color; filtering velocity
+    // across geometry boundaries invents invalid intermediate reprojections.
+    vec2 inputUV = uv + juv;
+    ivec2 motionPx = clamp(ivec2(inputUV * pc.sizes.xy), ivec2(0),
+                           ivec2(pc.sizes.xy) - ivec2(1));
+    vec2 motionUV = texelFetch(uMotion, motionPx, 0).xy;
+    vec2 historyUV = uv + motionUV;
+    bool historyValid = all(greaterThanEqual(historyUV, vec2(0.0))) &&
+                        all(lessThanEqual(historyUV, vec2(1.0)));
 
-    vec3 history = texture(uHistory, historyUV).rgb;
+    vec3 history = historyValid ? texture(uHistory, historyUV).rgb : current;
 
     // Variance clipping of the 3x3 neighborhood in YCoCg.  On heavily
     // aliased inputs a single jitter phase's min/max box is much narrower
@@ -119,8 +126,9 @@ void main() {
     // Velocity-adaptive weight: reprojection error grows with motion, so
     // confidence falls linearly to zero over ~4 display pixels of motion and
     // the blend moves from baseAlpha towards a 0.5 floor (UE4 TAA applies the
-    // same idea via its velocity-dependent current-frame weight).
-    float speed = length(motionPx * scale);
+    // same idea via its velocity-dependent current-frame weight).  The
+    // canonical UV motion is resolution-independent; scale to display pixels.
+    float speed = length(motionUV * ds);
     float motionConf = 1.0 - clamp(speed * 0.25, 0.0, 1.0);
     float alpha = mix(0.5, baseAlpha, motionConf);
 
@@ -129,7 +137,7 @@ void main() {
     // tolerance combines an absolute floor with slack relative to the current
     // value; confidence ramps down smoothly over 1x..4x the tolerance instead
     // of hard-switching, which avoids edge flicker at tolerance boundaries.
-    if (historyUV != clamp(historyUV, vec2(0.0), vec2(1.0))) {
+    if (!historyValid) {
         alpha = 0.0; // reprojection left the screen: no valid history at all
     } else {
         float historyDepth = texture(uHistoryDepth, historyUV).r;
@@ -147,7 +155,7 @@ void main() {
     // history would pass the phase-flipping aliased current frame through
     // unfiltered (shimmer around glass).
     if (pc.params.z > 0.5) {
-        float mask = clamp(texture(uReactive, uv).r, 0.0, 1.0);
+        float mask = clamp(texture(uReactive, inputUV).r, 0.0, 1.0);
         alpha *= 1.0 - mask;
     }
 

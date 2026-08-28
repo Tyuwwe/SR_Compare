@@ -80,7 +80,8 @@ layout(location = 0) in vec3 vWorldPos;
 layout(location = 1) in vec3 vNormal;
 layout(location = 2) in vec2 vUV;
 layout(location = 3) in vec4 vTangent;
-layout(location = 4) in vec2 vMotion; // unused in the GT path
+layout(location = 4) in vec4 vCurrentClip;  // unused in the GT path
+layout(location = 5) in vec4 vPreviousClip; // unused
 
 layout(location = 0) out vec4 outColor;
 

@@ -3,6 +3,7 @@
 // texture (no FrameInterpolationSwapchain).
 // ============================================================================
 #include "upscalers/IFrameGen.h"
+#include "upscalers/InputAdapter.h"
 #include "upscalers/UpscalerFactory.h"
 #include "upscalers/VkHelpers.h"
 #include "renderer/math/Math.h"
@@ -265,7 +266,10 @@ public:
         prep.commandList = cl;
         prep.renderSize = {rw, rh};
         prep.jitterOffset = {cam.jitterX, cam.jitterY};
-        prep.motionVectorScale = {-1.f, -1.f};
+        // Same canonical UV motion as the SR path: scale to input pixels, the
+        // SDK normalizes internally (see InputAdapter.h).
+        const MotionScale motionScale = fsrMotionVectorScale(rw, rh);
+        prep.motionVectorScale = {motionScale.x, motionScale.y};
         prep.frameTimeDelta = std::max(frame.deltaTime * 1000.f, 1.f);
         prep.cameraNear = cam.cameraNear;
         prep.cameraFar = cam.cameraFar;

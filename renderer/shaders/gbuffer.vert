@@ -1,7 +1,9 @@
 #version 450
 // Deferred GBuffer vertex shader: transforms to current (possibly jittered)
-// clip space and computes the motion vector against the previous, un-jittered
-// frame.  Same UBO contract as the legacy forward scene.vert; per-instance
+// clip space and passes the current/previous un-jittered clip positions to the
+// fragment shader.  The perspective divides must happen per fragment: dividing
+// per vertex and interpolating the result is not exact on large triangles.
+// Same UBO contract as the legacy forward scene.vert; per-instance
 // transforms come from the instance SSBO (Phase 7a) at gl_InstanceIndex (the
 // indirect command's firstInstance) instead of push constants, so static
 // draws can be issued as vkCmdDrawIndexedIndirect.
@@ -40,7 +42,8 @@ layout(location = 0) out vec3 vWorldPos;
 layout(location = 1) out vec3 vNormal;
 layout(location = 2) out vec2 vUV;
 layout(location = 3) out vec4 vTangent;
-layout(location = 4) out vec2 vMotion;
+layout(location = 4) out vec4 vCurrentClip;
+layout(location = 5) out vec4 vPreviousClip;
 
 void main() {
     GpuInstance inst = gInstances[gl_InstanceIndex];
@@ -55,12 +58,8 @@ void main() {
     vec4 clip = ubo.viewProj * world;
     gl_Position = clip;
 
-    // Motion against the previous frame, computed from the *un-jittered*
-    // projections on both sides (jitter is resolved by TAA, not encoded here).
-    vec4 curClipNoJitter = ubo.viewProjNoJitter * world;
-    vec4 prevClip = ubo.prevViewProj * (inst.prevModel * vec4(aPos, 1.0));
-    vec2 curNDC = curClipNoJitter.xy / curClipNoJitter.w;
-    vec2 prevNDC = prevClip.xy / prevClip.w;
-    // Pixel units, no jitter.  Points from previous position to current.
-    vMotion = (curNDC - prevNDC) * 0.5 * ubo.renderSizeJitter.xy;
+    // Both projections are unjittered. Temporal jitter is reported separately
+    // to each upscaler and must not be baked into object/camera motion.
+    vCurrentClip = ubo.viewProjNoJitter * world;
+    vPreviousClip = ubo.prevViewProj * (inst.prevModel * vec4(aPos, 1.0));
 }

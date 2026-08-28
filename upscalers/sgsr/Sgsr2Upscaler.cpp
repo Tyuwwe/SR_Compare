@@ -146,7 +146,7 @@ struct Sgsr2Upscaler::Impl {
     // Internal images (render resolution unless noted).  All stay in GENERAL
     // layout after the first-frame transition; passes are ordered by memory
     // barriers only.
-    sgsr::Image2D encodedVelocity; // rgba16f render, clip-space encoded MV
+    sgsr::Image2D encodedVelocity; // rgba16unorm render, forward-NDC encoded MV
     sgsr::Image2D ycocg;           // r32ui render, packed YCoCg
     sgsr::Image2D motionDepthAlpha;// rgba16f render
     sgsr::Image2D motionDepthClip; // rgba16f render
@@ -222,22 +222,26 @@ bool Sgsr2Upscaler::init(const VulkanEnv& env, const UpscalerDesc& desc) {
     }
 
     // --- Descriptor set layouts (one per pass, matching the shaders) --------
-    // mv:      b0 motion sampler, b1 encoded velocity storage (no UBO)
+    // mv:      b0 motion, b1 reactive, b2 encoded velocity storage (no UBO)
     // convert: b0 UBO, b1..b4 samplers, b5..b6 storage
     // activate/upscale: b0 UBO, b1..b3 samplers, b4..b5 storage
     {
-        VkDescriptorSetLayoutBinding bindings[2] = {};
+        VkDescriptorSetLayoutBinding bindings[3] = {};
         bindings[0].binding = 0;
         bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         bindings[0].descriptorCount = 1;
         bindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
         bindings[1].binding = 1;
-        bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         bindings[1].descriptorCount = 1;
         bindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        bindings[2].binding = 2;
+        bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        bindings[2].descriptorCount = 1;
+        bindings[2].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
         VkDescriptorSetLayoutCreateInfo ci = {};
         ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-        ci.bindingCount = 2;
+        ci.bindingCount = 3;
         ci.pBindings = bindings;
         if (vkCreateDescriptorSetLayout(env.device, &ci, nullptr, &impl_->mv.setLayout) != VK_SUCCESS) {
             shutdown();
@@ -257,7 +261,7 @@ bool Sgsr2Upscaler::init(const VulkanEnv& env, const UpscalerDesc& desc) {
     poolSizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     poolSizes[0].descriptorCount = 3 * kFrameSlots;
     poolSizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    poolSizes[1].descriptorCount = 11 * kFrameSlots;
+    poolSizes[1].descriptorCount = 12 * kFrameSlots;
     poolSizes[2].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     poolSizes[2].descriptorCount = 7 * kFrameSlots;
     VkDescriptorPoolCreateInfo poolCi = {};
@@ -308,7 +312,7 @@ bool Sgsr2Upscaler::init(const VulkanEnv& env, const UpscalerDesc& desc) {
         VkPushConstantRange push = {};
         push.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
         push.offset = 0;
-        push.size = 16; // vec4: xy = 2/renderSize, zw = renderSize
+        push.size = 16; // vec4: xy = renderSize, z = use reactive, w = threshold
         VkPipelineLayoutCreateInfo ci = {};
         ci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
         ci.setLayoutCount = 1;
@@ -437,13 +441,19 @@ void Sgsr2Upscaler::dispatch(VkCommandBuffer cmd, const UpscalerResources& res,
         vkUpdateDescriptorSets(im.env.device, 1, &w, 0, nullptr);
     };
 
-    // MV encode pass.
+    // MV encode pass. The reactive binding selects pixels that need explicit
+    // velocity; when absent, bind any valid sampled image and disable it.
     {
-        VkDescriptorImageInfo in =
+        VkDescriptorImageInfo motion =
             sampledInfo(im.samplerNearest, res.motionView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-        writeImage(im.mv.set[slot], 0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &in);
+        VkDescriptorImageInfo reactive = sampledInfo(
+            im.samplerNearest,
+            res.reactiveView != VK_NULL_HANDLE ? res.reactiveView : res.motionView,
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        writeImage(im.mv.set[slot], 0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &motion);
+        writeImage(im.mv.set[slot], 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &reactive);
         VkDescriptorImageInfo out = generalInfo(im.encodedVelocity.view);
-        writeImage(im.mv.set[slot], 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &out);
+        writeImage(im.mv.set[slot], 2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &out);
     }
     // Convert pass: b1 opaque color (= color, no translucency), b2 color,
     // b3 depth, b4 encoded velocity, b5 YCoCg (out), b6 MotionDepthAlpha (out).
@@ -506,9 +516,9 @@ void Sgsr2Upscaler::dispatch(VkCommandBuffer cmd, const UpscalerResources& res,
     const uint32_t displayGroupsX = (dw + 7) / 8;
     const uint32_t displayGroupsY = (dh + 7) / 8;
 
-    // Pass 0: motion encode (pixel units -> clip-space encoded).
-    float mvPush[4] = {2.f / static_cast<float>(rw), 2.f / static_cast<float>(rh),
-                       static_cast<float>(rw), static_cast<float>(rh)};
+    // Pass 0: canonical backward UV -> dynamic-only forward NDC encoding.
+    float mvPush[4] = {static_cast<float>(rw), static_cast<float>(rh),
+                       res.reactiveView != VK_NULL_HANDLE ? 1.f : 0.f, 1e-4f};
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, im.mv.pipeline);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, im.mv.pipelineLayout, 0, 1,
                             &im.mv.set[slot], 0, nullptr);

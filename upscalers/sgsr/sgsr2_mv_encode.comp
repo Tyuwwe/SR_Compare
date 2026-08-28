@@ -1,26 +1,34 @@
 #version 450
-// SGSR2 input adapter.  Official v2 README: InputVelocity is clip-space
-// encoded (`out = velocity * 0.2495 + 32767/65535`) and is "calculated for
-// dynamic objects only -- pass zero for static objects."  Convert then
-// reconstructs camera motion from clipToPrevClip + nearest-depth dilation.
-// This renderer has no skinned/rigid animation, so every pixel is static:
-// writing 0 selects that dilated matrix path.  (A previous version always
-// encoded the GBuffer MV, which forced the undilated velocity branch and
-// skipped nearest-Z.)
-// Binding 0 (uMotion) is kept so the pass layout stays identical; it is
-// unused while all geometry is static.
+// SGSR2 input adapter. Official v2 expects forward NDC velocity encoded as
+// `out = velocity * 0.2495 + 32767/65535`, for dynamic objects only. Static
+// opaque pixels remain zero so Convert reconstructs camera motion from
+// clipToPrevClip and nearest depth. Translucent pixels carry explicit velocity
+// converted from the renderer's canonical backward UV convention:
+// forwardNDC = -2 * backwardUV.
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 layout(set = 0, binding = 0) uniform sampler2D uMotion;
-layout(rgba16, set = 0, binding = 1) uniform writeonly image2D uEncodedVelocity;
+layout(set = 0, binding = 1) uniform sampler2D uReactive;
+layout(rgba16, set = 0, binding = 2) uniform writeonly image2D uEncodedVelocity;
 
 layout(push_constant) uniform Push {
-    vec4 params; // xy = 2.0 / renderSize, zw = renderSize (pixels)
+    vec4 params; // xy = renderSize, z = reactive available, w = coverage threshold
 } pc;
 
 void main() {
     ivec2 px = ivec2(gl_GlobalInvocationID.xy);
-    if (px.x >= int(pc.params.z) || px.y >= int(pc.params.w)) return;
-    imageStore(uEncodedVelocity, px, vec4(0.0));
+    if (px.x >= int(pc.params.x) || px.y >= int(pc.params.y)) return;
+
+    bool dynamicPixel = pc.params.z > 0.5 && texelFetch(uReactive, px, 0).r > pc.params.w;
+    if (!dynamicPixel) {
+        imageStore(uEncodedVelocity, px, vec4(0.0));
+        return;
+    }
+
+    vec2 backwardUV = texelFetch(uMotion, px, 0).xy;
+    vec2 forwardNDC = -2.0 * backwardUV;
+    const float bias = 32767.0 / 65535.0;
+    vec2 encoded = forwardNDC * 0.2495 + bias;
+    imageStore(uEncodedVelocity, px, vec4(encoded, 0.0, 1.0));
 }

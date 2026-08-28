@@ -48,7 +48,8 @@ struct UpscalerResources {
     VkImageView colorView  = VK_NULL_HANDLE;
     VkImage     depth      = VK_NULL_HANDLE;  // D32_SFLOAT
     VkImageView depthView  = VK_NULL_HANDLE;
-    VkImage     motion     = VK_NULL_HANDLE;  // R16G16_SFLOAT，像素单位、不含 jitter
+    // R16G16_SFLOAT: previousUV-currentUV, framebuffer UV units, no jitter.
+    VkImage     motion     = VK_NULL_HANDLE;
     VkImageView motionView = VK_NULL_HANDLE;
     // 半透明覆盖度 mask（R16_SFLOAT，渲染分辨率，0=无透明，逐层累加 alpha）。
     // 供支持 reactive/transparency/bias/responsive mask 的算法使用
