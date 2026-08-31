@@ -79,6 +79,17 @@ identical for the stock signed DLL and the community `310.8.SF` build.
    …), the driver reinstall wiped the ones used for the 610.62 logs, and
    this shell has no admin rights (HKCU values are ignored). The
    module-enumeration + IAT-spy evidence above substitutes for the log.
+5. **Manually planting the payload does not help.** As an experiment we
+   created `C:\ProgramData\NVIDIA\NGX\models\dlssnr\versions\20318208\files\`
+   mimicking the OTA layout (`nvngx_dlssnr.dll` plus a `160_<appid>.bin`
+   copy) and added a `[dlssnr]` section to `nvngx_config.txt`. The runtime
+   still made **zero** file/registry accesses during `CreateFeature1(18)`
+   and the result stayed `0xBAD0000B` — the in-memory initializer stub
+   fails before any payload lookup. Combined with
+   `GetFeatureRequirements(18)` → `NotImplemented`, this says the 616.56
+   runtime has the feature-18 *table entry* but not its *initializer*. The
+   experiment was fully reverted (config restored from backup, folder
+   removed).
 
 ### What would unblock it
 
