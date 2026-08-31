@@ -6527,9 +6527,12 @@ void GuiApp::drawUi() {
     ImGui::SetNextWindowPos(ImVec2(0.f, 0.f), ImGuiCond_Always);
     ImGui::SetNextWindowSize(ImVec2(panelWidth(), io.DisplaySize.y), ImGuiCond_Always);
     ImGui::SetNextWindowBgAlpha(0.88f);
+    // NoScrollbar: the ##tabarea child owns all vertical scrolling; the
+    // outer window must never grow a second scrollbar next to it.
     ImGui::Begin("sr_compare", nullptr,
                  ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
-                     ImGuiWindowFlags_NoCollapse);
+                     ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoScrollbar |
+                     ImGuiWindowFlags_NoScrollWithMouse);
 
     // Collapse button (mirrors the F1 hotkey).
     if (ImGui::SmallButton("<<")) panelCollapsed_ = true;
@@ -6553,6 +6556,9 @@ void GuiApp::drawUi() {
         ImGui::CalcTextSize(statusLine_.c_str(), nullptr, false, wrapW);
     const float footerH = ImGui::GetFrameHeightWithSpacing() + // Exit button
                           ImGui::GetStyle().ItemSpacing.y * 2.f +
+                          // Separator() line thickness (matches SeparatorEx,
+                          // which lays out ImMax(SeparatorSize, 1.0f)).
+                          std::max(ImGui::GetStyle().SeparatorSize, 1.f) +
                           std::max(statusSize.y, ImGui::GetTextLineHeight());
     ImGui::BeginChild("##tabarea", ImVec2(0.f, -footerH));
 
