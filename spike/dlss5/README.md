@@ -91,11 +91,35 @@ identical for the stock signed DLL and the community `310.8.SF` build.
    experiment was fully reverted (config restored from backup, folder
    removed).
 
+### NGX OTA investigation (2026-08-31): route definitively closed
+
+The updater was coaxed into revealing its endpoint and server layout:
+
+- `nvngx_update.exe` honors `http_proxy`/`https_proxy`; a CONNECT capture
+  shows the OTA endpoint is **`ngx.download.nvidia.com:443`** (reachable
+  from this network, HTTP 200). TLS is pinned to an embedded CA, so the
+  request path could not be MITM'd directly; instead, the updater's
+  `-test`/`-testroot` mode revealed that the remote layout mirrors the
+  local `C:\ProgramData\NVIDIA\NGX\models` tree (passing that directory as
+  `-testroot` satisfies its config-file lookups).
+- The production server config was fetched directly:
+  `https://ngx.download.nvidia.com/models/org/nvidia/team/ngx/models/config/versions/2/files/nvngx_server_config.txt`
+  (plus the `dev-models/...` variant). It lists every published feature
+  section (`[dlss]`, `[dlssd]`, `[dlssg]`, `[dlisp]`, broadcast/AI
+  features, …) — **there is no `[dlssnr]` section** (nor any
+  `cg2r`/`neural` alias), and `[dlss]` tops out below 310.8. The dev
+  config only adds internal sections (`[unsigned_dlss]`, `[high_driver]`).
+- Conclusion: **NGX OTA does not distribute DLSSNR at all** (pre-launch it
+  ships only inside game packages, e.g. NBA 2K27). The earlier curl
+  failures were network noise; even with perfect connectivity there is no
+  dlssnr payload to fetch. The `nvngx_config.txt` edits made during this
+  investigation were reverted.
+
 ### What would unblock it
 
-- Working NGX OTA connectivity (so the runtime can fetch the dlssnr payload
-  the 616.56 runtime now has a table entry for), or a driver/runtime drop
-  that ships the DLSSNR initializer itself, or
+- A driver/runtime drop that ships the DLSSNR initializer itself (the DLSS
+  5 launch driver branch; possibly accompanied by a first OTA publication
+  of the dlssnr payload), or
 - the full renodx-dlss5 inline-hook stack (the add-on patches the plugin
   in-memory beyond a single IAT entry) — out of scope for this spike.
 
