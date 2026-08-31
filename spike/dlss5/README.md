@@ -21,10 +21,11 @@ slprobe`, the `sl.*.dll` set):
 copy "D:\Code\SL 2.13\*.dll" build\spike\dlss5\Release\
 ```
 
-`--api glue` additionally requires `nvsdk_ngx_d.lib` from the NVIDIA DLSS
-SDK (not committed). Point CMake at it with
+`--api glue`/`--api glue12` additionally require `nvsdk_ngx_d.lib` from the
+NVIDIA DLSS SDK (not committed). Point CMake at it with
 `-DDLSS5_NGX_SDK_LIB_DIR=<sdk>/lib/Windows_x86_64/x64`; if the lib is not
-found the other modes still build and `--api glue` reports it is disabled.
+found the other modes still build and the glue modes report they are
+disabled.
 
 ## Run
 
@@ -32,15 +33,118 @@ found the other modes still build and `--api glue` reports it is disabled.
 dlss5_spike --api vulkan  --dll "D:\Code\SL 2.13\nvngx_dlssnr.dll" --out out_vk
 dlss5_spike --api d3d12   --dll "D:\Code\SL 2.13\nvngx_dlssnr.dll" --out out_d3d12
 dlss5_spike --api glue    --dll "D:\Code\SL 2.13\nvngx_dlssnr.dll" --core "D:\Code\SL 2.13\nvngx_dlss.dll" --out out_glue
+dlss5_spike --api glue12  --dll "D:\Code\SL 2.13\nvngx_dlssnr.dll" --core "D:\Code\SL 2.13\nvngx_dlss.dll" --out out_glue12
 dlss5_spike --api slprobe --dll <nvngx_dlssnr.dll to stage>          --out out_sl
 ```
 
-Flags: `--core <nvngx_dlss.dll>` (glue mode: stage a specific core next to
-the exe), `--no-iat-patch` (skip the GetModuleFileNameW IAT patch), `--spy`
-(IAT-trace Win32 calls; in glue mode this traces the NGX core itself during
-Init/CreateFeature1).
+Flags: `--core <nvngx_dlss.dll>` (glue/glue12: stage a specific core next to
+the exe), `--feature <id>` (glue12: sanity-create another feature, e.g. 1 =
+DLSS SR), `--appid <id>` (glue12: NGX application id, hex ok),
+`--direct-after-glue` (call the plugin's direct `Init_Ext` after the core
+Init succeeded, same process), `--no-iat-patch` (skip the GetModuleFileNameW
+IAT patch), `--spy` (IAT-trace Win32 calls; in glue modes this traces the NGX
+core itself during Init/CreateFeature).
 
-## Results on driver 616.56 (2026-08-31): still blocked, one level deeper
+## Results on driver 616.56 (2026-08-31, round 2): renodx mechanism reversed, D3D12 core route tested
+
+**New lead:** ReShade + `renodx-dlss5.addon64` successfully enables DLSS 5 NR
+in Cyberpunk 2077 (D3D12) on this exact machine/driver, so the add-on's
+mechanism was reverse-engineered from its binary and every newly discovered
+route was tested standalone. Outcome: **still blocked** — the add-on's
+success depends on in-process host state (a live game NGX/Streamline context
+whose host has registered `nvngx_dlssnr.dll` into the shared NGX snippet
+runtime) that no standalone route below can reproduce.
+
+### The add-on's mechanism (static reversing of `renodx-dlss5.addon64`)
+
+- It Detours the game's `NVSDK_NGX_D3D12_CreateFeature` / `EvaluateFeature` /
+  `ReleaseFeature` / `EvaluateFeature_C` and `slEvaluateFeature`, captures the
+  game's DLSS contract, and inlines feature 18.
+- Feature-18 creation tries two function pointers in order, both called as
+  `CreateFeature(cmdList, 0x12, params, &handle)`:
+  1. **"the NGX core"** — resolved via `GetProcAddress` from the first loaded
+     module of **`{_nvngx.dll, nvngx.dll, nvngx_dlss.dll, nvngx_dlssd.dll}`**;
+  2. **"the signed snippet"** — resolved from `nvngx_dlssnr.dll`, which the
+     add-on `LoadLibrary`s itself first (*"nvngx_dlssnr.dll was not found
+     beside the addon"*).
+- Its create-parameter set (wider than what we tried before): base
+  `Width/Height/OutWidth/OutHeight` + `DLSS.Feature.Create.Flags` +
+  `CreationNodeMask`/`VisibilityNodeMask` + `DLSSNR.{Width,Height,InputWidth,
+  InputHeight,OutputWidth,OutputHeight,Output.Width,Output.Height,Scale,
+  ScalingRatio,Upscaling,Hint.Render.Preset,Enabled}`.
+- Its eval key set (exact names from the binary): `DLSSNR.{Color,Output,MVec,
+  Depth}` + `<res>SubrectBaseX/BaseY/Width/Height` per resource +
+  `MVecScaleX/Y,DepthInverted,Enabled,Reset,Intensity,LocalToneStrength,
+  LocalStructureStrength,SkinStructureStrength,UseAutoMask,Style,UICorrection`.
+  (`nvngx_dlssnr.dll` additionally knows optional `Backbuffer`, `ControlMask`,
+  `UI`, `UIAlpha`, `BidirectionalDistortionField` inputs.)
+
+### New mode `--api glue12` (D3D12 NGX core route)
+
+D3D12 device → `NVSDK_NGX_D3D12_Init` (app id `0x1000000`, fallback
+`Init_with_ProjectID` `a0f57b54-…`) → requirements/capability queries →
+`CreateFeature(18)` with the full renodx key set → eval + PNG readback.
+Extra flags: `--feature <id>` (sanity-create another feature),
+`--appid <id>`, `--direct-after-glue` (direct plugin `Init_Ext` after core
+Init, in the same process).
+
+| Experiment | Result |
+|---|---|
+| glue12 `D3D12_Init` | **Success** |
+| glue12 `GetFeatureRequirements(18)` | `0xBAD00012` NotImplemented |
+| glue12 `CreateFeature(18)`, all 4 param groups incl. full renodx set | `0xBAD0000B` UnableToInitializeFeature |
+| glue12 `--feature 1` (DLSS SR sanity create) | **Success** — the D3D12 core route itself works; the block is feature-18-specific |
+| glue12 `--appid 0xE658700` (Cyberpunk's NGX app id from `ProgramData\NVIDIA\NGX\models\nvngx_config.txt`) | no change (`0xBAD0000B`) |
+| exe renamed to `Cyberpunk2077.exe` (process-name/driver-profile gate test) | no change (`0xBAD0000B`) |
+| `--direct-after-glue`: direct plugin `D3D12_Init_Ext` after core Init (stock + SF) | `0xBAD00002` PlatformError (unchanged) |
+| Vulkan glue retest with the full renodx create set (task: maybe `0xBAD0000B` was missing params) | `0xBAD0000B` for all groups — params were never the issue |
+| Direct `_nvngx.dll` (no glue): `D3D12_Init_Ext` | **Success** — the glue is not even required for Init |
+| Direct `nvngx_dlss.dll` snippet `Init_Ext` (core-as-snippet), with/without IAT patch | `0xBAD00002` / plain Init `0xBAD00001` |
+| Snippet route: core-initialized app-dir `nvngx_dlss.dll` → its own `CreateFeature(18)` | returns **Success — but hollow**: bogus id 77 "creates" identically (the id is never validated), the DLL contains zero DLSSNR code/strings, and evaluate → `0xBAD00005` InvalidParameter |
+| Pre-loading `nvngx_dlssnr.dll` before the snippet create (the add-on's own step) | no change — still a hollow handle |
+| Plugin `Init_Ext` with parameters populated by the initialized runtime (`nvngx_dlss.dll` `PopulateParameters_Impl`) — "host registration via parameter map" hypothesis | `0xBAD00002` (unchanged) |
+| Streamline without OTA flags: `slSetFeatureLoaded(kFeatureDLSS)` | `eErrorFeatureFailedToLoad` (34) even for plain DLSS — the SL host path does not come up in our minimal harness, so `sl.dlss_nr`'s host-initialization of `nvngx_dlssnr.dll` cannot be reproduced this way |
+
+### Interpretation
+
+- The 616.56 driver's `_nvngx.dll` has a **hardcoded feature→plugin map that
+  excludes dlssnr**: an IAT spy during Init/CreateFeature shows it probing
+  only `nvngx_dlss.dll`/`nvngx_dlssg.dll` (app dir first, signature-verified,
+  DriverStore fallback), reading `nvngx_config.txt`/`nvngx_deny_list.txt` —
+  and never `nvngx_dlssnr.dll`. `CreateFeature(18)` fails before any plugin
+  lookup on both the Vulkan and D3D12 API surfaces, identically.
+- `nvngx_dlss.dll` 310.8.0.0 is *not* a dlssnr-aware core: its
+  `CreateFeature` accepts any feature id (a lazy stub), and it contains no
+  DLSSNR strings at all. A "successful" create through it is not a real
+  feature.
+- Therefore, in the working Cyberpunk setup, `nvngx_dlssnr.dll` must have
+  been **registered into the shared NGX snippet runtime by a real host** —
+  most plausibly `sl.dlss_nr.dll` (Cyberpunk uses Streamline), after which
+  the add-on's *"signed snippet"* create (its own `CreateFeature` export)
+  yields a real feature 18. Our standalone harness cannot reach that state:
+  sl.dlss itself fails to load (`eErrorFeatureFailedToLoad`) outside a real
+  frame/swapchain environment.
+- App identity is not the gate: Cyberpunk's real NGX app id and process name
+  change nothing.
+
+### What this means for integration
+
+The only proven end-to-end recipe is the **DLSS5-Feeder pattern**: run a
+standard DLSS **DLAA** evaluate (feature 1 — works today in `glue12`) on a
+D3D12 device inside a process that also hosts ReShade + the
+`renodx-dlss5.addon64` detour stack; the add-on intercepts the evaluate and
+inserts feature 18. For the Vulkan-based sr_compare renderer that implies a
+Vulkan↔D3D12 bridge (`VK_KHR_external_memory_win32` +
+`VK_KHR_external_semaphore_win32`, shared textures + shared fences, DLSS
+evaluate on a private D3D12 device — exactly DLSS5-Feeder's Vulkan path) plus
+shipping ReShade (dxgi.dll, add-on build) with the compare app. Estimated
+cost: the bridge is the small part (~1–2 days: three shared textures, fence
+ping-pong); the fragile part is the ReShade/add-on runtime dependency.
+Alternative: wait for a launch driver whose `_nvngx.dll` carries the
+feature-18 initializer, at which point the plain `glue`/`glue12` route in
+this spike should work unmodified.
+
+## Results on driver 616.56 (2026-08-31, round 1): still blocked, one level deeper
 
 The 616.56 driver update changed the core-route answers — the driver NGX
 runtime now *partially* knows feature 18 — but feature creation still
@@ -162,10 +266,14 @@ Every route below was run against both the stock signed DLL (SHA-256
   in-process; the app-dir `nvngx_dlss.dll` is only the DLSS feature plugin.
   That is why the 610.62→616.56 driver update changed the answers while the
   staged DLLs stayed the same.
-- DLSSNR parameter keys used (confirmed against `renodx-dlss5.addon64`
-  strings): `DLSSNR.{Color,Backbuffer,MVec,Depth,Output,Intensity,Reset,
-  Enabled,MVecScaleX,MVecScaleY,DepthInverted,Width,Height,InputWidth,
-  InputHeight,OutputWidth,OutputHeight,ScalingRatio}`.
+- DLSSNR parameter keys used (exact names extracted from
+  `renodx-dlss5.addon64` and `nvngx_dlssnr.dll` — see the round-2 section for
+  the full create/eval key sets): create `DLSSNR.{Width,Height,ScalingRatio,
+  Hint.Render.Preset,Enabled}` + base `Width/Height/OutWidth/OutHeight`;
+  evaluate `DLSSNR.{Color,Output,MVec,Depth[,Backbuffer]}` +
+  `<res>SubrectBaseX/BaseY/Width/Height` + `MVecScaleX/Y,DepthInverted,
+  Enabled,Reset,Intensity,LocalToneStrength,LocalStructureStrength,
+  SkinStructureStrength,UseAutoMask,Style,UICorrection`.
 - NGX feature-18 Vulkan requirements: instance
   `VK_KHR_get_physical_device_properties2`; device `VK_NVX_binary_import`,
   `VK_NVX_image_view_handle`, `VK_KHR_buffer_device_address`,

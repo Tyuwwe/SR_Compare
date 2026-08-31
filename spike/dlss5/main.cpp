@@ -6,9 +6,23 @@
 // API on this machine (RTX 4070 SUPER, Windows, Vulkan).
 //
 // VERDICT (see spike/dlss5/README.md for the full write-up):
-// still blocked after the 616.56 driver update, but the wall moved one
-// level deeper. On 610.62 the driver NGX runtime had no feature-18 entry at
-// all (every core-route query -> 0xBAD0000C OutOfDate). On 616.56 the
+// still blocked after the 616.56 driver update, including the D3D12 core
+// route reverse-engineered from the working renodx-dlss5 ReShade add-on
+// (round 2, 2026-08-31). The add-on creates feature 18 through the first
+// loaded of {_nvngx.dll, nvngx.dll, nvngx_dlss.dll, nvngx_dlssd.dll} or the
+// self-loaded nvngx_dlssnr.dll - but standalone, the 616.56 driver core has
+// a hardcoded feature map without dlssnr (CreateFeature(18) -> 0xBAD0000B
+// on both the Vulkan and D3D12 API surfaces, before any plugin probing),
+// the app-dir nvngx_dlss.dll accepts ANY feature id without a real
+// implementation (hollow create; evaluate -> 0xBAD00005), and the plugin's
+// own Init still requires host-registration state that only a live
+// game/Streamline NGX context provides (0xBAD00002, even with
+// runtime-populated params, the game's real app id, or a spoofed process
+// name). DLSS SR (feature 1) creates fine through the same D3D12 core, so
+// the harness is sound and the wall is feature-18-specific.
+//
+// Round-1 state: on 610.62 the driver NGX runtime had no feature-18 entry
+// at all (every core-route query -> 0xBAD0000C OutOfDate). On 616.56 the
 // driver runtime (_nvngx.dll, loaded in-process by the NGX glue from the
 // DriverStore) partially knows feature 18:
 //
@@ -54,15 +68,19 @@
 //   --api glue     official NGX route via the linked nvsdk_ngx_d glue lib:
 //                  glue loads the nvngx_dlss.dll core staged next to the exe,
 //                  the core loads the plugin; full pipeline + PNG readback
+//   --api glue12   same official route on the D3D12 API surface (the route
+//                  the renodx-dlss5 add-on uses: "feature 18 created via the
+//                  NGX core"); uses the add-on's full create/eval key set
 //   --api slprobe  Streamline feature-id probe via sl.interposer
 // Flags: --dll <nvngx_dlssnr.dll> --core <nvngx_dlss.dll> --out <dir>
-//        --no-iat-patch --spy
+//        --no-iat-patch --spy --direct-after-glue
 //
 // Every NGX call is wrapped in SEH (__try/__except) because the plugin is a
 // beta-quality leaked DLL and may crash instead of returning an error.
 
 #include <vulkan/vulkan.h>
 
+#include "nvsdk_ngx.h"
 #include "nvsdk_ngx_vk.h"
 #include "nvsdk_ngx_helpers_vk.h"
 
@@ -83,6 +101,7 @@
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <filesystem>
@@ -1159,6 +1178,26 @@ int Run(const std::string& dllPath, const std::string& outDir, bool iatPatch, bo
 namespace gluemode
 {
 
+// The renodx-dlss5 ReShade add-on (which successfully enables DLSS 5 NR in
+// Cyberpunk 2077 on this machine/driver) passes a much wider create-parameter
+// set than the 4 keys we originally tried. This is its full key set.
+void SetRenodxCreateKeys(NVSDK_NGX_Parameter* params)
+{
+    params->Set("DLSSNR.Width", static_cast<unsigned int>(kWidth));
+    params->Set("DLSSNR.Height", static_cast<unsigned int>(kHeight));
+    params->Set("DLSSNR.InputWidth", static_cast<unsigned int>(kWidth));
+    params->Set("DLSSNR.InputHeight", static_cast<unsigned int>(kHeight));
+    params->Set("DLSSNR.OutputWidth", static_cast<unsigned int>(kWidth));
+    params->Set("DLSSNR.OutputHeight", static_cast<unsigned int>(kHeight));
+    params->Set("DLSSNR.Output.Width", static_cast<unsigned int>(kWidth));
+    params->Set("DLSSNR.Output.Height", static_cast<unsigned int>(kHeight));
+    params->Set("DLSSNR.Scale", 1.0f);
+    params->Set("DLSSNR.ScalingRatio", 1.0f);
+    params->Set("DLSSNR.Upscaling", 1);
+    params->Set("DLSSNR.Hint.Render.Preset", 0);
+    params->Set("DLSSNR.Enabled", 1);
+}
+
 void EnumNgxModules(const char* tag)
 {
     HANDLE snap = ::CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, 0);
@@ -1211,7 +1250,7 @@ bool StageFile(const std::filesystem::path& src, const std::filesystem::path& ds
     return true;
 }
 
-int Run(const std::string& dllPath, const std::string& corePath, const std::string& outDir, bool spy)
+int Run(const std::string& dllPath, const std::string& corePath, const std::string& outDir, bool spy, bool directAfterGlue)
 {
     // -- Stage plugin (and optionally core) next to the exe --------------------
     char exeDirBuf[MAX_PATH]{};
@@ -1476,12 +1515,36 @@ int Run(const std::string& dllPath, const std::string& corePath, const std::stri
         }
     }
 
+    // -- Experiment: does core Init unblock the direct-plugin route? ------------
+    // Hypothesis: the plugin's direct Init fails with 0xBAD00002 because it
+    // expects in-process runtime state that only its host loader sets up. If
+    // the NGX core Init (which just ran, through the glue) establishes that
+    // state process-wide, a direct plugin Init_Ext in the same process may now
+    // succeed.
+    if (directAfterGlue)
+    {
+        Log("== direct-after-glue experiment: direct plugin Init_Ext after core Init ==");
+        NgxApi direct;
+        if (LoadNgx((exeDir / "nvngx_dlssnr.dll").string(), direct))
+        {
+            PatchIatByName(direct.dll, "GetModuleFileNameW", reinterpret_cast<void*>(&GetModuleFileNameW_Stub));
+            if (direct.InitExt)
+            {
+                SpikeParameterMap p;
+                NgxCall("direct VULKAN_Init_Ext (post-core-init)", [&] {
+                    return direct.InitExt(kAppId, outDirW.c_str(), ctx.instance, ctx.phys, ctx.device,
+                        NVSDK_NGX_Version_API, &p);
+                });
+            }
+        }
+    }
+
     // -- CreateFeature1 with parameter-set candidates --------------------------
     NVSDK_NGX_Handle* feature = nullptr;
     const char* groupNames[] = {
         "base Width/Height/OutWidth/OutHeight",
-        "base + DLSSNR.{Width,Height,Enabled,ScalingRatio}",
-        "DLSSNR.* only",
+        "base + renodx full DLSSNR.* create set",
+        "renodx full DLSSNR.* create set only",
         "empty parameters",
     };
     for (int group = 0; group < 4 && !feature; ++group)
@@ -1501,12 +1564,7 @@ int Run(const std::string& dllPath, const std::string& corePath, const std::stri
             params->Set("OutHeight", static_cast<unsigned int>(kHeight));
         }
         if (group == 1 || group == 2)
-        {
-            params->Set("DLSSNR.Width", static_cast<unsigned int>(kWidth));
-            params->Set("DLSSNR.Height", static_cast<unsigned int>(kHeight));
-            params->Set("DLSSNR.Enabled", 1);
-            params->Set("DLSSNR.ScalingRatio", 1.0f);
-        }
+            SetRenodxCreateKeys(params);
 
         BeginCmd(ctx);
         NVSDK_NGX_Result r = NgxCall("CreateFeature1(feature 18)", [&] {
@@ -1663,6 +1721,627 @@ int Run(const std::string& dllPath, const std::string& corePath, const std::stri
 }
 
 } // namespace gluemode
+
+// ===========================================================================
+// NGX D3D12 glue mode (--api glue12)
+//
+// Reverse-engineering the renodx-dlss5 ReShade add-on (which successfully
+// enables DLSS 5 NR in Cyberpunk 2077 on this exact machine/driver) shows it
+// creates feature 18 "via the NGX core" on the D3D12 API surface, with direct
+// plugin Init_Ext only as a fallback ("direct Init_Ext failed with 0x" ->
+// "feature 18 created via the NGX core" -> "signed DLSSNR 310.8.0 D3D12
+// runtime initialized"). We previously only tested the Vulkan core route
+// (--api glue -> 0xBAD0000B). The 616.56 runtime's dlssnr initializer may be
+// D3D12-only, so this mode mirrors the add-on's route standalone:
+//
+//   D3D12 device -> NVSDK_NGX_D3D12_Init (glue) -> CreateFeature(18) with the
+//   add-on's full create-parameter set -> EvaluateFeature + PNG readback.
+// ===========================================================================
+namespace glue12mode
+{
+
+using Microsoft::WRL::ComPtr;
+using d3d12mode::CmdCtx;
+using d3d12mode::HrCheck;
+
+int Run(const std::string& dllPath, const std::string& corePath, const std::string& outDir, bool spy, bool directAfterGlue, int featureId, unsigned long long appId)
+{
+    const NVSDK_NGX_Feature featureIdE = static_cast<NVSDK_NGX_Feature>(featureId);
+
+    // -- Stage plugin (and optionally core) next to the exe --------------------
+    char exeDirBuf[MAX_PATH]{};
+    ::GetModuleFileNameA(nullptr, exeDirBuf, MAX_PATH);
+    const std::filesystem::path exeDir = std::filesystem::path(exeDirBuf).parent_path();
+    if (!gluemode::StageFile(std::filesystem::absolute(dllPath), exeDir / "nvngx_dlssnr.dll", "plugin"))
+        return 1;
+    if (!corePath.empty() && !gluemode::StageFile(std::filesystem::absolute(corePath), exeDir / "nvngx_dlss.dll", "core"))
+        return 1;
+    Log("[GLUE12] core in use: %s (version %s)", (exeDir / "nvngx_dlss.dll").string().c_str(),
+        gluemode::FileVersionString(exeDir / "nvngx_dlss.dll").c_str());
+
+    const std::wstring outDirW = ToWide(std::filesystem::absolute(outDir).string());
+
+    // -- D3D12 device on the NVIDIA adapter -------------------------------------
+    ComPtr<IDXGIFactory6> factory;
+    HrCheck(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)), "CreateDXGIFactory2");
+    ComPtr<IDXGIAdapter1> adapter;
+    for (UINT i = 0;; ++i)
+    {
+        ComPtr<IDXGIAdapter1> a;
+        if (factory->EnumAdapters1(i, &a) == DXGI_ERROR_NOT_FOUND)
+            break;
+        DXGI_ADAPTER_DESC1 d{};
+        a->GetDesc1(&d);
+        Log("[D3D12] adapter %u: %ls (vendor 0x%04X)", i, d.Description, d.VendorId);
+        if (d.VendorId == 0x10DE && !adapter)
+            adapter = a;
+    }
+    if (!adapter)
+    {
+        Log("FATAL: no NVIDIA adapter");
+        return 1;
+    }
+    ComPtr<ID3D12Device> dev;
+    HrCheck(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&dev)), "D3D12CreateDevice");
+    D3D12_COMMAND_QUEUE_DESC qd{D3D12_COMMAND_LIST_TYPE_DIRECT};
+    ComPtr<ID3D12CommandQueue> queue;
+    HrCheck(dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue)), "CreateCommandQueue");
+
+    CmdCtx cmd;
+    HrCheck(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&cmd.fence)), "CreateFence");
+    cmd.fenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+
+    // -- Requirements + init through the D3D12 NGX core --------------------------
+    NVSDK_NGX_FeatureDiscoveryInfo discovery{};
+    discovery.SDKVersion = NVSDK_NGX_Version_API;
+    discovery.FeatureID = featureIdE;
+    discovery.Identifier.IdentifierType = NVSDK_NGX_Application_Identifier_Type_Application_Id;
+    discovery.Identifier.v.ApplicationId = appId;
+    discovery.ApplicationDataPath = outDirW.c_str();
+    discovery.FeatureInfo = nullptr;
+
+    {
+        NVSDK_NGX_FeatureRequirement req{};
+        NVSDK_NGX_Result r = NgxCall("D3D12_GetFeatureRequirements", [&] {
+            return NVSDK_NGX_D3D12_GetFeatureRequirements(adapter.Get(), &discovery, &req);
+        });
+        if (r == NVSDK_NGX_Result_Success)
+            Log("[NGX] feature %d FeatureSupported = %u, MinHWArch = 0x%08X, MinOS = %s",
+                featureId, static_cast<unsigned>(req.FeatureSupported), req.MinHWArchitecture, req.MinOSVersion);
+    }
+
+    NVSDK_NGX_Result rInit = NgxCall("D3D12_Init(appId)", [&] {
+        return NVSDK_NGX_D3D12_Init(appId, outDirW.c_str(), dev.Get(), nullptr, NVSDK_NGX_Version_API);
+    });
+    if (rInit != NVSDK_NGX_Result_Success)
+    {
+        rInit = NgxCall("D3D12_Init_with_ProjectID(a0f57b54-...)", [&] {
+            return NVSDK_NGX_D3D12_Init_with_ProjectID("a0f57b54-1daf-4934-90ae-c4035c19df04",
+                NVSDK_NGX_ENGINE_TYPE_CUSTOM, "dlss5_spike 1.0", outDirW.c_str(), dev.Get(), nullptr,
+                NVSDK_NGX_Version_API);
+        });
+    }
+    if (rInit != NVSDK_NGX_Result_Success)
+    {
+        Log("FATAL: NGX D3D12 glue init failed");
+        return 1;
+    }
+    if (spy)
+    {
+        gluemode::EnumNgxModules("post-init");
+        for (const char* name : {"_nvngx.dll", "nvngx.dll", "nvngx_dlss.dll"})
+        {
+            HMODULE core = ::GetModuleHandleA(name);
+            if (core)
+                InstallSpy(core);
+        }
+    }
+
+    {
+        NVSDK_NGX_Parameter* caps = nullptr;
+        NVSDK_NGX_Result r = NgxCall("D3D12_GetCapabilityParameters", [&] {
+            return NVSDK_NGX_D3D12_GetCapabilityParameters(&caps);
+        });
+        if (r == NVSDK_NGX_Result_Success && caps)
+        {
+            unsigned int avail = 0xFFFFFFFFu;
+            if (caps->Get("SuperSampling.Available", &avail) == NVSDK_NGX_Result_Success)
+                Log("[NGX] capability: SuperSampling.Available = %u", avail);
+            NgxCall("D3D12_DestroyParameters(caps)", [&] {
+                return NVSDK_NGX_D3D12_DestroyParameters(caps);
+            });
+        }
+    }
+
+    // -- Experiment: does core Init unblock the direct-plugin route? ------------
+    // Same hypothesis as --api glue: the plugin's direct Init fails with
+    // 0xBAD00002 because it expects in-process runtime state from its host
+    // loader; test whether the D3D12 core Init just performed provides it.
+    if (directAfterGlue)
+    {
+        Log("== direct-after-glue experiment: direct plugin D3D12_Init_Ext after core Init ==");
+        HMODULE plugin = ::LoadLibraryA((exeDir / "nvngx_dlssnr.dll").string().c_str());
+        if (plugin)
+        {
+            PatchIatByName(plugin, "GetModuleFileNameW", reinterpret_cast<void*>(&GetModuleFileNameW_Stub));
+            auto initExt = reinterpret_cast<d3d12mode::PFN_D3D12_Init_Ext>(
+                ::GetProcAddress(plugin, "NVSDK_NGX_D3D12_Init_Ext"));
+            if (initExt)
+            {
+                SpikeParameterMap p;
+                NgxCall("direct D3D12_Init_Ext (post-core-init)", [&] {
+                    return initExt(kAppId, outDirW.c_str(), dev.Get(), NVSDK_NGX_Version_API, &p);
+                });
+            }
+            else
+            {
+                Log("[NGX] GetProcAddress(NVSDK_NGX_D3D12_Init_Ext) failed, err %lu", ::GetLastError());
+            }
+        }
+        else
+        {
+            Log("[NGX] LoadLibrary(nvngx_dlssnr.dll) failed, err %lu", ::GetLastError());
+        }
+    }
+
+    // -- The renodx-dlss5 route: feature 18 through the core-initialized snippet --
+    //
+    // The driver core (_nvngx.dll) has a hardcoded feature->plugin map without
+    // dlssnr: glue-level CreateFeature(18) fails with 0xBAD0000B without ever
+    // probing nvngx_dlssnr.dll. But the app-dir nvngx_dlss.dll (310.8.0.0, the
+    // leaked DLSS 5 build) is itself a complete NGX snippet whose internal
+    // feature table may know feature 18. The add-on's recipe:
+    //
+    //   1. create SuperSampling through the normal NGX core -> the core loads
+    //      AND INITIALIZES the app-dir nvngx_dlss.dll plugin (this sets up the
+    //      in-process snippet runtime state that direct Init_Ext lacks)
+    //   2. call THAT module's NVSDK_NGX_D3D12_CreateFeature(18) directly,
+    //      bypassing the driver core's feature map
+    //
+    NVSDK_NGX_Handle* feature = nullptr;
+    NVSDK_NGX_Handle* ssFeature = nullptr;
+    d3d12mode::PFN_D3D12_EvaluateFeature snippetEval = nullptr;
+    d3d12mode::PFN_D3D12_ReleaseFeature snippetRelease = nullptr;
+    bool featureViaSnippet = false;
+    if (featureId != 1)
+    {
+        // Step 1: force the core to load + init the app-dir nvngx_dlss.dll.
+        {
+            NVSDK_NGX_Parameter* params = nullptr;
+            NVSDK_NGX_Result ra = NgxCall("D3D12_AllocateParameters(ss)", [&] {
+                return NVSDK_NGX_D3D12_AllocateParameters(&params);
+            });
+            if (ra == NVSDK_NGX_Result_Success && params)
+            {
+                params->Set("Width", static_cast<unsigned int>(kWidth));
+                params->Set("Height", static_cast<unsigned int>(kHeight));
+                params->Set("OutWidth", static_cast<unsigned int>(kWidth));
+                params->Set("OutHeight", static_cast<unsigned int>(kHeight));
+                params->Set("PerfQualityValue", static_cast<int>(NVSDK_NGX_PerfQuality_Value_MaxQuality));
+                d3d12mode::CmdBegin(dev.Get(), cmd);
+                NVSDK_NGX_Result r = NgxCall("D3D12_CreateFeature(1=SuperSampling)", [&] {
+                    return NVSDK_NGX_D3D12_CreateFeature(cmd.list.Get(), NVSDK_NGX_Feature_SuperSampling, params, &ssFeature);
+                });
+                if (cmd.list)
+                    d3d12mode::CmdSubmitWait(queue.Get(), cmd);
+                NgxCall("D3D12_DestroyParameters(ss)", [&] {
+                    return NVSDK_NGX_D3D12_DestroyParameters(params);
+                });
+                if (r != NVSDK_NGX_Result_Success || !ssFeature)
+                    ssFeature = nullptr;
+            }
+        }
+
+        // Step 2: call the initialized snippet's own CreateFeature(18).
+        // The add-on loads nvngx_dlssnr.dll into the process itself first
+        // ("nvngx_dlssnr.dll was not found beside the addon"); the snippet's
+        // feature-18 handler then forwards to the already-loaded plugin.
+        HMODULE dlssnr = ::LoadLibraryA((exeDir / "nvngx_dlssnr.dll").string().c_str());
+        Log("[SNIPPET] pre-load nvngx_dlssnr.dll -> 0x%p (err %lu)", static_cast<void*>(dlssnr), ::GetLastError());
+        HMODULE snippet = ::GetModuleHandleA("nvngx_dlss.dll");
+        if (!snippet)
+        {
+            Log("[SNIPPET] nvngx_dlss.dll not loaded (SS create must have failed) -- snippet route unavailable");
+        }
+        else
+        {
+            wchar_t snippetPath[MAX_PATH]{};
+            ::GetModuleFileNameW(snippet, snippetPath, MAX_PATH);
+            Log("[SNIPPET] nvngx_dlss.dll in use: %ls (version %s)", snippetPath,
+                gluemode::FileVersionString(snippetPath).c_str());
+
+            // Step 2a: try to register the dlssnr plugin into the shared NGX
+            // snippet runtime. The plugin's direct Init_Ext fails 0xBAD00002
+            // with empty/app-populated parameters; the hypothesis is that the
+            // host-to-snippet registration call expects runtime state inside
+            // the parameter map, so populate it from the INITIALIZED runtime
+            // module (nvngx_dlss.dll) first.
+            if (dlssnr && featureId == 18)
+            {
+                auto populateRT = reinterpret_cast<d3d12mode::PFN_D3D12_PopulateParameters>(
+                    ::GetProcAddress(snippet, "NVSDK_NGX_D3D12_PopulateParameters_Impl"));
+                auto nrInitExt = reinterpret_cast<d3d12mode::PFN_D3D12_Init_Ext>(
+                    ::GetProcAddress(dlssnr, "NVSDK_NGX_D3D12_Init_Ext"));
+                auto nrInit = reinterpret_cast<d3d12mode::PFN_D3D12_Init>(
+                    ::GetProcAddress(dlssnr, "NVSDK_NGX_D3D12_Init"));
+                auto nrCreate = reinterpret_cast<d3d12mode::PFN_D3D12_CreateFeature>(
+                    ::GetProcAddress(dlssnr, "NVSDK_NGX_D3D12_CreateFeature"));
+                auto nrEval = reinterpret_cast<d3d12mode::PFN_D3D12_EvaluateFeature>(
+                    ::GetProcAddress(dlssnr, "NVSDK_NGX_D3D12_EvaluateFeature"));
+                auto nrRelease = reinterpret_cast<d3d12mode::PFN_D3D12_ReleaseFeature>(
+                    ::GetProcAddress(dlssnr, "NVSDK_NGX_D3D12_ReleaseFeature"));
+                SpikeParameterMap rtParams;
+                if (populateRT)
+                    NgxCall("runtime PopulateParameters_Impl", [&] { return populateRT(&rtParams); });
+                bool nrInited = false;
+                if (nrInitExt)
+                {
+                    NVSDK_NGX_Result r = NgxCall("dlssnr Init_Ext (runtime-populated params)", [&] {
+                        return nrInitExt(kAppId, outDirW.c_str(), dev.Get(), NVSDK_NGX_Version_API, &rtParams);
+                    });
+                    nrInited = (r == NVSDK_NGX_Result_Success);
+                }
+                if (!nrInited && nrInit)
+                {
+                    NVSDK_NGX_Result r = NgxCall("dlssnr Init (runtime-populated state)", [&] {
+                        return nrInit(kAppId, outDirW.c_str(), dev.Get(), NVSDK_NGX_Version_API);
+                    });
+                    nrInited = (r == NVSDK_NGX_Result_Success);
+                }
+                if (nrInited && nrCreate && nrEval && nrRelease)
+                {
+                    Log("[SNIPPET] dlssnr plugin initialized via runtime-populated params -- trying its own CreateFeature(18)");
+                    const char* nrGroupNames[] = {
+                        "base Width/Height/OutWidth/OutHeight",
+                        "base + renodx full DLSSNR.* create set",
+                        "renodx full DLSSNR.* create set only",
+                        "empty parameters",
+                    };
+                    for (int group = 0; group < 4 && !feature; ++group)
+                    {
+                        Log("== dlssnr-snippet CreateFeature attempt %d: %s", group, nrGroupNames[group]);
+                        SpikeParameterMap params;
+                        if (group == 0 || group == 1)
+                        {
+                            params.Set("Width", static_cast<unsigned int>(kWidth));
+                            params.Set("Height", static_cast<unsigned int>(kHeight));
+                            params.Set("OutWidth", static_cast<unsigned int>(kWidth));
+                            params.Set("OutHeight", static_cast<unsigned int>(kHeight));
+                        }
+                        if (group == 1 || group == 2)
+                        {
+                            params.Set("DLSSNR.Width", static_cast<unsigned int>(kWidth));
+                            params.Set("DLSSNR.Height", static_cast<unsigned int>(kHeight));
+                            params.Set("DLSSNR.InputWidth", static_cast<unsigned int>(kWidth));
+                            params.Set("DLSSNR.InputHeight", static_cast<unsigned int>(kHeight));
+                            params.Set("DLSSNR.OutputWidth", static_cast<unsigned int>(kWidth));
+                            params.Set("DLSSNR.OutputHeight", static_cast<unsigned int>(kHeight));
+                            params.Set("DLSSNR.Output.Width", static_cast<unsigned int>(kWidth));
+                            params.Set("DLSSNR.Output.Height", static_cast<unsigned int>(kHeight));
+                            params.Set("DLSSNR.Scale", 1.0f);
+                            params.Set("DLSSNR.ScalingRatio", 1.0f);
+                            params.Set("DLSSNR.Upscaling", 1);
+                            params.Set("DLSSNR.Hint.Render.Preset", 0);
+                            params.Set("DLSSNR.Enabled", 1);
+                        }
+                        d3d12mode::CmdBegin(dev.Get(), cmd);
+                        NVSDK_NGX_Result r = NgxCall("dlssnr D3D12_CreateFeature(18)", [&] {
+                            return nrCreate(cmd.list.Get(), kFeatureId, &params, &feature);
+                        });
+                        if (cmd.list)
+                            d3d12mode::CmdSubmitWait(queue.Get(), cmd);
+                        if (r == NVSDK_NGX_Result_Success && feature)
+                        {
+                            Log("[SNIPPET] feature 18 created via the dlssnr plugin itself, group %d, handle %p",
+                                group, static_cast<void*>(feature));
+                            featureViaSnippet = true;
+                            snippetEval = nrEval;
+                            snippetRelease = nrRelease;
+                        }
+                        else
+                        {
+                            feature = nullptr;
+                        }
+                    }
+                }
+            }
+
+            auto snippetCreate = reinterpret_cast<d3d12mode::PFN_D3D12_CreateFeature>(
+                ::GetProcAddress(snippet, "NVSDK_NGX_D3D12_CreateFeature"));
+            if (!featureViaSnippet)
+            {
+                snippetEval = reinterpret_cast<d3d12mode::PFN_D3D12_EvaluateFeature>(
+                    ::GetProcAddress(snippet, "NVSDK_NGX_D3D12_EvaluateFeature"));
+                snippetRelease = reinterpret_cast<d3d12mode::PFN_D3D12_ReleaseFeature>(
+                    ::GetProcAddress(snippet, "NVSDK_NGX_D3D12_ReleaseFeature"));
+            }
+            if (!feature && snippetCreate && snippetEval && snippetRelease)
+            {
+                const char* snipGroupNames[] = {
+                    "base Width/Height/OutWidth/OutHeight",
+                    "base + renodx full DLSSNR.* create set",
+                    "renodx full DLSSNR.* create set only",
+                    "empty parameters",
+                };
+                for (int group = 0; group < 4 && !feature; ++group)
+                {
+                    Log("== snippet CreateFeature attempt %d: %s", group, snipGroupNames[group]);
+                    SpikeParameterMap params;
+                    if (group == 0 || group == 1)
+                    {
+                        params.Set("Width", static_cast<unsigned int>(kWidth));
+                        params.Set("Height", static_cast<unsigned int>(kHeight));
+                        params.Set("OutWidth", static_cast<unsigned int>(kWidth));
+                        params.Set("OutHeight", static_cast<unsigned int>(kHeight));
+                    }
+                    if (group == 1 || group == 2)
+                    {
+                        params.Set("DLSSNR.Width", static_cast<unsigned int>(kWidth));
+                        params.Set("DLSSNR.Height", static_cast<unsigned int>(kHeight));
+                        params.Set("DLSSNR.InputWidth", static_cast<unsigned int>(kWidth));
+                        params.Set("DLSSNR.InputHeight", static_cast<unsigned int>(kHeight));
+                        params.Set("DLSSNR.OutputWidth", static_cast<unsigned int>(kWidth));
+                        params.Set("DLSSNR.OutputHeight", static_cast<unsigned int>(kHeight));
+                        params.Set("DLSSNR.Output.Width", static_cast<unsigned int>(kWidth));
+                        params.Set("DLSSNR.Output.Height", static_cast<unsigned int>(kHeight));
+                        params.Set("DLSSNR.Scale", 1.0f);
+                        params.Set("DLSSNR.ScalingRatio", 1.0f);
+                        params.Set("DLSSNR.Upscaling", 1);
+                        params.Set("DLSSNR.Hint.Render.Preset", 0);
+                        params.Set("DLSSNR.Enabled", 1);
+                    }
+                    d3d12mode::CmdBegin(dev.Get(), cmd);
+                    NVSDK_NGX_Result r = NgxCall("snippet D3D12_CreateFeature", [&] {
+                        return snippetCreate(cmd.list.Get(), featureIdE, &params, &feature);
+                    });
+                    if (cmd.list)
+                        d3d12mode::CmdSubmitWait(queue.Get(), cmd);
+                    if (r == NVSDK_NGX_Result_Success && feature)
+                    {
+                        Log("[SNIPPET] feature %d created via the initialized nvngx_dlss.dll snippet, group %d, handle %p",
+                            featureId, group, static_cast<void*>(feature));
+                        featureViaSnippet = true;
+                    }
+                    else
+                    {
+                        feature = nullptr;
+                    }
+                }
+            }
+            else
+            {
+                Log("[SNIPPET] nvngx_dlss.dll is missing D3D12 snippet exports");
+            }
+        }
+    }
+
+    // -- CreateFeature with parameter-set candidates -----------------------------
+    const char* groupNames[] = {
+        "base Width/Height/OutWidth/OutHeight/PerfQualityValue",
+        "base + renodx full DLSSNR.* create set",
+        "renodx full DLSSNR.* create set only",
+        "empty parameters",
+    };
+    for (int group = 0; group < 4 && !feature; ++group)
+    {
+        Log("== D3D12 CreateFeature attempt %d: %s", group, groupNames[group]);
+        NVSDK_NGX_Parameter* params = nullptr;
+        NVSDK_NGX_Result ra = NgxCall("D3D12_AllocateParameters", [&] {
+            return NVSDK_NGX_D3D12_AllocateParameters(&params);
+        });
+        if (ra != NVSDK_NGX_Result_Success || !params)
+            continue;
+        if (group == 0 || group == 1)
+        {
+            params->Set("Width", static_cast<unsigned int>(kWidth));
+            params->Set("Height", static_cast<unsigned int>(kHeight));
+            params->Set("OutWidth", static_cast<unsigned int>(kWidth));
+            params->Set("OutHeight", static_cast<unsigned int>(kHeight));
+            params->Set("PerfQualityValue", static_cast<int>(NVSDK_NGX_PerfQuality_Value_MaxQuality));
+        }
+        if (group == 1 || group == 2)
+            gluemode::SetRenodxCreateKeys(params);
+
+        d3d12mode::CmdBegin(dev.Get(), cmd);
+        NVSDK_NGX_Result r = NgxCall("D3D12_CreateFeature", [&] {
+            return NVSDK_NGX_D3D12_CreateFeature(cmd.list.Get(), featureIdE, params, &feature);
+        });
+        if (cmd.list)
+            d3d12mode::CmdSubmitWait(queue.Get(), cmd);
+        NgxCall("D3D12_DestroyParameters(create)", [&] {
+            return NVSDK_NGX_D3D12_DestroyParameters(params);
+        });
+        if (r == NVSDK_NGX_Result_Success && feature)
+            Log("[NGX] feature %d created with group %d (%s), handle %p",
+                featureId, group, groupNames[group], static_cast<void*>(feature));
+        else
+            feature = nullptr;
+    }
+    if (!feature)
+    {
+        Log("FATAL: D3D12 CreateFeature failed for all parameter sets");
+        if (ssFeature)
+            NgxCall("D3D12_ReleaseFeature(ss)", [&] { return NVSDK_NGX_D3D12_ReleaseFeature(ssFeature); });
+        NgxCall("D3D12_Shutdown1", [&] { return NVSDK_NGX_D3D12_Shutdown1(dev.Get()); });
+        CloseHandle(cmd.fenceEvent);
+        return 1;
+    }
+    if (featureId != 18)
+    {
+        // Sanity-create mode (e.g. --feature 1): create success is the whole
+        // answer; skip the DLSSNR-specific eval/readback.
+        NgxCall("D3D12_ReleaseFeature", [&] { return NVSDK_NGX_D3D12_ReleaseFeature(feature); });
+        NgxCall("D3D12_Shutdown1", [&] { return NVSDK_NGX_D3D12_Shutdown1(dev.Get()); });
+        CloseHandle(cmd.fenceEvent);
+        Log("== dlss5_spike (glue12, sanity feature %d) done ==", featureId);
+        return 0;
+    }
+
+    // -- Textures + upload -------------------------------------------------------
+    const D3D12_RESOURCE_FLAGS rwFlags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    ComPtr<ID3D12Resource> texColor = d3d12mode::CreateTex2D(dev.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT, rwFlags);
+    ComPtr<ID3D12Resource> texOutput = d3d12mode::CreateTex2D(dev.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT, rwFlags);
+    ComPtr<ID3D12Resource> texMotion = d3d12mode::CreateTex2D(dev.Get(), DXGI_FORMAT_R16G16_FLOAT, rwFlags);
+    ComPtr<ID3D12Resource> texDepth = d3d12mode::CreateTex2D(dev.Get(), DXGI_FORMAT_R32_FLOAT, rwFlags);
+    Log("[D3D12] textures created (%ux%u)", kWidth, kHeight);
+
+    std::vector<uint16_t> colorPix(static_cast<size_t>(kWidth) * kHeight * 4);
+    FillColorPattern(colorPix);
+    std::vector<float> depthPix(static_cast<size_t>(kWidth) * kHeight, 0.5f);
+    std::vector<uint16_t> motionPix(static_cast<size_t>(kWidth) * kHeight * 2, 0);
+
+    d3d12mode::UploadTex2D(dev.Get(), queue.Get(), cmd, texColor.Get(), colorPix.data(), kWidth * 8);
+    d3d12mode::UploadTex2D(dev.Get(), queue.Get(), cmd, texMotion.Get(), motionPix.data(), kWidth * 4);
+    d3d12mode::UploadTex2D(dev.Get(), queue.Get(), cmd, texDepth.Get(), depthPix.data(), kWidth * 4);
+    Log("[D3D12] inputs uploaded");
+
+    WritePng(outDir + "/input_color.png", colorPix);
+    PrintStats("input color", colorPix, nullptr);
+
+    // -- Evaluate (the add-on's exact eval key set, extracted from its binary) ----
+    auto setEvalKeys = [&](NVSDK_NGX_Parameter* params) {
+        params->Set("DLSSNR.Color", static_cast<ID3D12Resource*>(texColor.Get()));
+        params->Set("DLSSNR.Output", static_cast<ID3D12Resource*>(texOutput.Get()));
+        params->Set("DLSSNR.MVec", static_cast<ID3D12Resource*>(texMotion.Get()));
+        params->Set("DLSSNR.Depth", static_cast<ID3D12Resource*>(texDepth.Get()));
+        params->Set("DLSSNR.Backbuffer", static_cast<ID3D12Resource*>(texColor.Get()));
+        params->Set("DLSSNR.ColorSubrectBaseX", 0u);
+        params->Set("DLSSNR.ColorSubrectBaseY", 0u);
+        params->Set("DLSSNR.ColorSubrectWidth", static_cast<unsigned int>(kWidth));
+        params->Set("DLSSNR.ColorSubrectHeight", static_cast<unsigned int>(kHeight));
+        params->Set("DLSSNR.DepthSubrectBaseX", 0u);
+        params->Set("DLSSNR.DepthSubrectBaseY", 0u);
+        params->Set("DLSSNR.DepthSubrectWidth", static_cast<unsigned int>(kWidth));
+        params->Set("DLSSNR.DepthSubrectHeight", static_cast<unsigned int>(kHeight));
+        params->Set("DLSSNR.MVecSubrectBaseX", 0u);
+        params->Set("DLSSNR.MVecSubrectBaseY", 0u);
+        params->Set("DLSSNR.MVecSubrectWidth", static_cast<unsigned int>(kWidth));
+        params->Set("DLSSNR.MVecSubrectHeight", static_cast<unsigned int>(kHeight));
+        params->Set("DLSSNR.OutputSubrectBaseX", 0u);
+        params->Set("DLSSNR.OutputSubrectBaseY", 0u);
+        params->Set("DLSSNR.OutputSubrectWidth", static_cast<unsigned int>(kWidth));
+        params->Set("DLSSNR.OutputSubrectHeight", static_cast<unsigned int>(kHeight));
+        params->Set("DLSSNR.BackbufferSubrectBaseX", 0u);
+        params->Set("DLSSNR.BackbufferSubrectBaseY", 0u);
+        params->Set("DLSSNR.BackbufferSubrectWidth", static_cast<unsigned int>(kWidth));
+        params->Set("DLSSNR.BackbufferSubrectHeight", static_cast<unsigned int>(kHeight));
+        params->Set("DLSSNR.Width", static_cast<unsigned int>(kWidth));
+        params->Set("DLSSNR.Height", static_cast<unsigned int>(kHeight));
+        params->Set("DLSSNR.ScalingRatio", 1.0f);
+        params->Set("DLSSNR.Hint.Render.Preset", 0);
+        params->Set("DLSSNR.MVecScaleX", static_cast<float>(kWidth));
+        params->Set("DLSSNR.MVecScaleY", static_cast<float>(kHeight));
+        params->Set("DLSSNR.DepthInverted", 0);
+        params->Set("DLSSNR.Enabled", 1);
+        params->Set("DLSSNR.Reset", 1);
+        params->Set("DLSSNR.Intensity", 1.0f);
+        params->Set("DLSSNR.LocalToneStrength", 1.0f);
+        params->Set("DLSSNR.LocalStructureStrength", 1.0f);
+        params->Set("DLSSNR.SkinStructureStrength", 1.0f);
+        params->Set("DLSSNR.UseAutoMask", 0);
+        params->Set("DLSSNR.Style", 0);
+        params->Set("DLSSNR.UICorrection", 0);
+        params->Set("Width", static_cast<unsigned int>(kWidth));
+        params->Set("Height", static_cast<unsigned int>(kHeight));
+    };
+    if (featureViaSnippet)
+    {
+        SpikeParameterMap params;
+        setEvalKeys(&params);
+        d3d12mode::CmdBegin(dev.Get(), cmd);
+        NVSDK_NGX_Result r = NgxCall("snippet D3D12_EvaluateFeature(18)", [&] {
+            return snippetEval(cmd.list.Get(), feature, &params, nullptr);
+        });
+        if (cmd.list)
+            d3d12mode::CmdSubmitWait(queue.Get(), cmd);
+        if (r != NVSDK_NGX_Result_Success)
+            Log("[NGX] snippet EvaluateFeature did not succeed -- output may be untouched");
+    }
+    else
+    {
+        NVSDK_NGX_Parameter* params = nullptr;
+        NVSDK_NGX_Result ra = NgxCall("D3D12_AllocateParameters(eval)", [&] {
+            return NVSDK_NGX_D3D12_AllocateParameters(&params);
+        });
+        if (ra == NVSDK_NGX_Result_Success && params)
+        {
+            setEvalKeys(params);
+
+            d3d12mode::CmdBegin(dev.Get(), cmd);
+            NVSDK_NGX_Result r = NgxCall("D3D12_EvaluateFeature(18)", [&] {
+                return NVSDK_NGX_D3D12_EvaluateFeature(cmd.list.Get(), feature, params, nullptr);
+            });
+            if (cmd.list)
+                d3d12mode::CmdSubmitWait(queue.Get(), cmd);
+            NgxCall("D3D12_DestroyParameters(eval)", [&] {
+                return NVSDK_NGX_D3D12_DestroyParameters(params);
+            });
+            if (r != NVSDK_NGX_Result_Success)
+                Log("[NGX] EvaluateFeature did not succeed -- output may be untouched");
+        }
+    }
+
+    // -- Readback + stats + PNG -------------------------------------------------
+    std::vector<uint16_t> outPix(static_cast<size_t>(kWidth) * kHeight * 4, 0);
+    {
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
+        UINT numRows = 0;
+        UINT64 rowSize = 0, totalSize = 0;
+        D3D12_RESOURCE_DESC desc = texOutput->GetDesc();
+        dev->GetCopyableFootprints(&desc, 0, 1, 0, &fp, &numRows, &rowSize, &totalSize);
+        D3D12_HEAP_PROPERTIES rbHeap{D3D12_HEAP_TYPE_READBACK};
+        D3D12_RESOURCE_DESC bufDesc{};
+        bufDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bufDesc.Width = totalSize;
+        bufDesc.Height = 1;
+        bufDesc.DepthOrArraySize = 1;
+        bufDesc.MipLevels = 1;
+        bufDesc.SampleDesc.Count = 1;
+        bufDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        ComPtr<ID3D12Resource> readback;
+        HrCheck(dev->CreateCommittedResource(&rbHeap, D3D12_HEAP_FLAG_NONE, &bufDesc,
+                D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readback)), "readback buffer");
+
+        d3d12mode::CmdBegin(dev.Get(), cmd);
+        D3D12_RESOURCE_BARRIER toSrc{D3D12_RESOURCE_BARRIER_TYPE_TRANSITION};
+        toSrc.Transition = {texOutput.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE};
+        cmd.list->ResourceBarrier(1, &toSrc);
+        D3D12_TEXTURE_COPY_LOCATION srcLoc{texOutput.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+        srcLoc.SubresourceIndex = 0;
+        D3D12_TEXTURE_COPY_LOCATION dstLoc{readback.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+        dstLoc.PlacedFootprint = fp;
+        cmd.list->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, nullptr);
+        d3d12mode::CmdSubmitWait(queue.Get(), cmd);
+
+        void* mapped = nullptr;
+        HrCheck(readback->Map(0, nullptr, &mapped), "Map(readback)");
+        for (UINT r = 0; r < numRows; ++r)
+            std::memcpy(outPix.data() + static_cast<size_t>(r) * kWidth * 4,
+                static_cast<const uint8_t*>(mapped) + static_cast<size_t>(r) * fp.Footprint.RowPitch,
+                kWidth * 8);
+        readback->Unmap(0, nullptr);
+    }
+    PrintStats("DLSSNR output", outPix, &colorPix);
+    const std::string pngPath = outDir + "/dlssnr_output.png";
+    if (WritePng(pngPath, outPix))
+        Log("[OUT] wrote %s", pngPath.c_str());
+    else
+        Log("[OUT] FAILED to write %s", pngPath.c_str());
+
+    // -- Teardown ---------------------------------------------------------------
+    if (featureViaSnippet)
+        NgxCall("snippet D3D12_ReleaseFeature", [&] { return snippetRelease(feature); });
+    else
+        NgxCall("D3D12_ReleaseFeature", [&] { return NVSDK_NGX_D3D12_ReleaseFeature(feature); });
+    if (ssFeature)
+        NgxCall("D3D12_ReleaseFeature(ss)", [&] { return NVSDK_NGX_D3D12_ReleaseFeature(ssFeature); });
+    NgxCall("D3D12_Shutdown1", [&] { return NVSDK_NGX_D3D12_Shutdown1(dev.Get()); });
+    CloseHandle(cmd.fenceEvent);
+    Log("== dlss5_spike (glue12) done ==");
+    return 0;
+}
+
+} // namespace glue12mode
 #endif // DLSS5_HAVE_GLUE
 
 // ===========================================================================
@@ -1733,8 +2412,6 @@ int Run(const std::string& outDir, const std::string& dllPath)
     pref.numPathsToPlugins = 1;
     pref.pathToLogsAndData = outDirW.c_str();
     pref.flags = sl::PreferenceFlags::eDisableCLStateTracking |
-        sl::PreferenceFlags::eAllowOTA |
-        sl::PreferenceFlags::eLoadDownloadedPlugins |
         sl::PreferenceFlags::eDisableDebugText;
     pref.featuresToLoad = nullptr;
     pref.numFeaturesToLoad = 0;
@@ -1831,6 +2508,9 @@ int main(int argc, char** argv)
     std::string api = "vulkan";
     bool iatPatch = true;
     bool spy = false;
+    bool directAfterGlue = false;
+    int featureId = 18;
+    unsigned long long appId = kAppId;
     for (int i = 1; i < argc; ++i)
     {
         if (!std::strcmp(argv[i], "--dll") && i + 1 < argc)
@@ -1841,33 +2521,41 @@ int main(int argc, char** argv)
             outDir = argv[++i];
         else if (!std::strcmp(argv[i], "--api") && i + 1 < argc)
             api = argv[++i];
+        else if (!std::strcmp(argv[i], "--feature") && i + 1 < argc)
+            featureId = std::atoi(argv[++i]);
+        else if (!std::strcmp(argv[i], "--appid") && i + 1 < argc)
+            appId = std::strtoull(argv[++i], nullptr, 0);
         else if (!std::strcmp(argv[i], "--no-iat-patch"))
             iatPatch = false;
         else if (!std::strcmp(argv[i], "--spy"))
             spy = true;
+        else if (!std::strcmp(argv[i], "--direct-after-glue"))
+            directAfterGlue = true;
         else
             Log("unknown argument: %s", argv[i]);
     }
     std::filesystem::create_directories(outDir);
-    Log("== dlss5_spike == api=%s dll=%s core=%s out=%s iat-patch=%d spy=%d", api.c_str(), dllPath.c_str(),
-        corePath.empty() ? "(exe dir)" : corePath.c_str(), outDir.c_str(), iatPatch ? 1 : 0, spy ? 1 : 0);
+    Log("== dlss5_spike == api=%s dll=%s core=%s out=%s iat-patch=%d spy=%d direct-after-glue=%d feature=%d appid=0x%llX", api.c_str(), dllPath.c_str(),
+        corePath.empty() ? "(exe dir)" : corePath.c_str(), outDir.c_str(), iatPatch ? 1 : 0, spy ? 1 : 0, directAfterGlue ? 1 : 0, featureId, appId);
 
     if (api == "d3d12")
         return d3d12mode::Run(dllPath, outDir, iatPatch, spy);
     if (api == "slprobe")
         return slprobe::Run(outDir, dllPath);
-    if (api == "glue")
+    if (api == "glue" || api == "glue12")
     {
 #if defined(DLSS5_HAVE_GLUE)
-        return gluemode::Run(dllPath, corePath, outDir, spy);
+        if (api == "glue12")
+            return glue12mode::Run(dllPath, corePath, outDir, spy, directAfterGlue, featureId, appId);
+        return gluemode::Run(dllPath, corePath, outDir, spy, directAfterGlue);
 #else
-        Log("FATAL: --api glue not built in (nvsdk_ngx_d.lib not found at configure time)");
+        Log("FATAL: --api %s not built in (nvsdk_ngx_d.lib not found at configure time)", api.c_str());
         return 1;
 #endif
     }
     if (api != "vulkan")
     {
-        Log("FATAL: unknown --api %s (expected vulkan|d3d12|glue|slprobe)", api.c_str());
+        Log("FATAL: unknown --api %s (expected vulkan|d3d12|glue|glue12|slprobe)", api.c_str());
         return 1;
     }
 
