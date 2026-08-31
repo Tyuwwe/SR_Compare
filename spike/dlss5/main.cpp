@@ -3,39 +3,60 @@
 // Goal: prove (or disprove) that the leaked DLSS 5 "neural rendering" NGX
 // feature (feature id 18 / NVSDK_NGX_Feature_Reserved18, runtime
 // nvngx_dlssnr.dll 310.8.0.0) can be created and executed through the NGX
-// API on this machine (RTX 4070 SUPER, driver 610.62, Windows, Vulkan).
+// API on this machine (RTX 4070 SUPER, Windows, Vulkan).
 //
-// VERDICT (2026-08-31, see spike/dlss5/README.md for the full write-up):
-// blocked on this machine/driver by the shipping driver's NGX runtime,
-// which does not know feature 18; NVIDIA's OTA servers (which would deliver
-// new feature definitions) are unreachable from this network (curl -1).
-// All of the following routes were implemented and tested, with identical
-// outcomes for the stock signed DLL and the community "310.8.SF" patch:
+// VERDICT (see spike/dlss5/README.md for the full write-up):
+// still blocked after the 616.56 driver update, but the wall moved one
+// level deeper. On 610.62 the driver NGX runtime had no feature-18 entry at
+// all (every core-route query -> 0xBAD0000C OutOfDate). On 616.56 the
+// driver runtime (_nvngx.dll, loaded in-process by the NGX glue from the
+// DriverStore) partially knows feature 18:
 //
-//   1. NGX core route (nvsdk_ngx_d glue -> nvngx_dlss.dll -> plugin):
-//      Init succeeds, but CreateFeature1(18) -> 0xBAD0000C (OutOfDate);
-//      nvngx.log: "required feature is not supported by NGX runtime,
-//      please update display driver". The driver core never even probes
-//      nvngx_dlssnr.dll; dlss/dlssg validate fine, so the runtime works -
-//      it just has no feature-18 entry.
+//   - GetFeatureDeviceExtensionRequirements(18): OutOfDate -> Success
+//     (returns the 4 standard NGX Vulkan device extensions)
+//   - GetFeatureRequirements(18):                  OutOfDate -> 0xBAD00012
+//     (NotImplemented)
+//   - GetCapabilityParameters: SuperSampling.Available 0 -> 1
+//   - CreateFeature1(18):     OutOfDate -> 0xBAD0000B
+//     (UnableToInitializeFeature), identical for the stock signed plugin
+//     and the community 310.8.SF build, for all parameter sets
+//
+// However the runtime STILL never loads nvngx_dlssnr.dll: module
+// enumeration plus an IAT spy on _nvngx.dll/nvngx_dlss.dll show zero
+// LoadLibrary/CreateFile/registry activity during CreateFeature1 - the
+// feature-18 initializer fails internally, presumably because the DLSSNR
+// payload (plugin + models) is expected via NGX OTA, which remains
+// unreachable from this network (nvngx_update.exe -api update ->
+// curl status=35 SSL connect error; ProgramData\NVIDIA\NGX\models has no
+// dlssnr payload).
+//
+// Routes (identical outcomes for stock and SF plugin builds):
+//
+//   1. NGX core route (--api glue: nvsdk_ngx_d glue -> driver _nvngx.dll):
+//      see above - blocked at CreateFeature1 with UnableToInitializeFeature
+//      on 616.56 (was OutOfDate on 610.62).
 //   2. Direct plugin route (the renodx-dlss5 recipe: LoadLibrary +
-//      IAT-patch GetModuleFileNameW + direct Init): Vulkan and D3D12
-//      Init/Init_Ext/Init_Ext2/PopulateParameters_Impl all -> 0xBAD00002
-//      (PlatformError). An IAT spy shows Init makes no registry/file/
-//      module calls before failing - the plugin expects in-process runtime
-//      state that only its real host loader (NGX core / Streamline) sets up.
+//      IAT-patch GetModuleFileNameW + direct Init): unchanged on 616.56 -
+//      Vulkan and D3D12 Init/Init_Ext/Init_Ext2/PopulateParameters_Impl all
+//      -> 0xBAD00002 (PlatformError), plain Init -> 0xBAD00001. The plugin
+//      expects in-process runtime state that only its real host loader
+//      (NGX core / Streamline) sets up.
 //   3. Streamline route (sl.interposer + sl.dlss_nr.dll): slInit succeeds,
-//      DLSS NR's sl::Feature id was identified as 1004 (kFeatureDLSS_NR in
-//      sl.log), but sl.dlss_nr's NGX requirements query -> 0xBAD0000C:
-//      "DLSS-NR feature is not supported. Please check if you have a valid
-//      nvngx_dlssnr.dll or your driver supports DLSS-NR."
+//      but sl.dlss_nr's NGX requirements query now returns "not
+//      implemented" (was OutOfDate) and it still reports "DLSS-NR feature
+//      is not supported. Please check if you have a valid nvngx_dlssnr.dll
+//      or your driver supports DLSS-NR."
 //
 // Modes:
 //   --api vulkan   direct-plugin Vulkan spike (default): full pipeline from
 //                  extension negotiation to EvaluateFeature + PNG readback
 //   --api d3d12    direct-plugin D3D12 spike (renodx-dlss5's API surface)
+//   --api glue     official NGX route via the linked nvsdk_ngx_d glue lib:
+//                  glue loads the nvngx_dlss.dll core staged next to the exe,
+//                  the core loads the plugin; full pipeline + PNG readback
 //   --api slprobe  Streamline feature-id probe via sl.interposer
-// Flags: --dll <nvngx_dlssnr.dll> --out <dir> --no-iat-patch --spy
+// Flags: --dll <nvngx_dlssnr.dll> --core <nvngx_dlss.dll> --out <dir>
+//        --no-iat-patch --spy
 //
 // Every NGX call is wrapped in SEH (__try/__except) because the plugin is a
 // beta-quality leaked DLL and may crash instead of returning an error.
@@ -53,6 +74,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <Windows.h>
+#include <TlHelp32.h>
 
 #include <d3d12.h>
 #include <dxgi1_6.h>
@@ -265,6 +287,7 @@ typedef BOOL(WINAPI* PFN_GetModuleHandleExW_)(DWORD, LPCWSTR, HMODULE*);
 typedef FARPROC(WINAPI* PFN_GetProcAddress_)(HMODULE, LPCSTR);
 typedef LSTATUS(WINAPI* PFN_RegOpenKeyExW_)(HKEY, LPCWSTR, DWORD, REGSAM, PHKEY);
 typedef LSTATUS(WINAPI* PFN_RegQueryValueExW_)(HKEY, LPCWSTR, LPDWORD, LPDWORD, LPBYTE, LPDWORD);
+typedef HANDLE(WINAPI* PFN_CreateFileW_)(LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
 
 PFN_LoadLibraryW_ g_realLoadLibraryW = nullptr;
 PFN_LoadLibraryExW_ g_realLoadLibraryExW = nullptr;
@@ -273,6 +296,7 @@ PFN_GetModuleHandleExW_ g_realGetModuleHandleExW = nullptr;
 PFN_GetProcAddress_ g_realGetProcAddress = nullptr;
 PFN_RegOpenKeyExW_ g_realRegOpenKeyExW = nullptr;
 PFN_RegQueryValueExW_ g_realRegQueryValueExW = nullptr;
+PFN_CreateFileW_ g_realCreateFileW = nullptr;
 
 HMODULE WINAPI LoadLibraryW_Spy(LPCWSTR name)
 {
@@ -325,6 +349,15 @@ LSTATUS WINAPI RegQueryValueExW_Spy(HKEY key, LPCWSTR value, LPDWORD res, LPDWOR
         Log("[SPY] RegQueryValueExW(%ls) -> %ld", value ? value : L"(null)", r);
     return r;
 }
+HANDLE WINAPI CreateFileW_Spy(LPCWSTR name, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sa, DWORD disp, DWORD flags, HANDLE tmpl)
+{
+    HANDLE h = g_realCreateFileW(name, access, share, sa, disp, flags, tmpl);
+    // NGX init touches many files; only log the NGX/DLSS-related ones.
+    if (name && (wcsstr(name, L"ngx") || wcsstr(name, L"NGX") || wcsstr(name, L"Ngx") ||
+                 wcsstr(name, L"dlss") || wcsstr(name, L"DLSS") || wcsstr(name, L"NVIDIA")))
+        Log("[SPY] CreateFileW(%ls) -> 0x%p", name, static_cast<void*>(h));
+    return h;
+}
 
 void InstallSpy(HMODULE plugin)
 {
@@ -337,6 +370,7 @@ void InstallSpy(HMODULE plugin)
     g_realGetProcAddress = reinterpret_cast<PFN_GetProcAddress_>(::GetProcAddress(k32, "GetProcAddress"));
     g_realRegOpenKeyExW = reinterpret_cast<PFN_RegOpenKeyExW_>(::GetProcAddress(adv, "RegOpenKeyExW"));
     g_realRegQueryValueExW = reinterpret_cast<PFN_RegQueryValueExW_>(::GetProcAddress(adv, "RegQueryValueExW"));
+    g_realCreateFileW = reinterpret_cast<PFN_CreateFileW_>(::GetProcAddress(k32, "CreateFileW"));
     PatchIatByName(plugin, "LoadLibraryW", reinterpret_cast<void*>(&LoadLibraryW_Spy));
     PatchIatByName(plugin, "LoadLibraryExW", reinterpret_cast<void*>(&LoadLibraryExW_Spy));
     PatchIatByName(plugin, "GetModuleHandleW", reinterpret_cast<void*>(&GetModuleHandleW_Spy));
@@ -344,6 +378,7 @@ void InstallSpy(HMODULE plugin)
     PatchIatByName(plugin, "GetProcAddress", reinterpret_cast<void*>(&GetProcAddress_Spy));
     PatchIatByName(plugin, "RegOpenKeyExW", reinterpret_cast<void*>(&RegOpenKeyExW_Spy));
     PatchIatByName(plugin, "RegQueryValueExW", reinterpret_cast<void*>(&RegQueryValueExW_Spy));
+    PatchIatByName(plugin, "CreateFileW", reinterpret_cast<void*>(&CreateFileW_Spy));
 }
 
 // ---------------------------------------------------------------------------
@@ -1104,6 +1139,533 @@ int Run(const std::string& dllPath, const std::string& outDir, bool iatPatch, bo
 } // namespace d3d12mode
 
 // ===========================================================================
+// NGX glue mode (--api glue)
+//
+// The official NGX route: the spike links nvsdk_ngx_d.lib (the NGX SDK's
+// client glue, not a plain import lib - it performs the client-side init the
+// 310.x snippet ABI expects), which loads the NGX core nvngx_dlss.dll from
+// the application directory; the core in turn loads feature plugins such as
+// nvngx_dlssnr.dll. This is the only route where the plugin gets the
+// in-process runtime state its Init requires (direct Init -> 0xBAD00002).
+//
+//   --dll  <nvngx_dlssnr.dll>  staged next to the exe as nvngx_dlssnr.dll
+//   --core <nvngx_dlss.dll>    optional: staged next to the exe as the core
+//                              (SL 2.13 ships 310.8.0.0; the DLSS SDK has
+//                              dev/rel builds under lib/Windows_x86_64)
+//
+// The NGX core writes nvngx.log into the ApplicationDataPath (= --out dir).
+// ===========================================================================
+#if defined(DLSS5_HAVE_GLUE)
+namespace gluemode
+{
+
+void EnumNgxModules(const char* tag)
+{
+    HANDLE snap = ::CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, 0);
+    if (snap == INVALID_HANDLE_VALUE)
+        return;
+    MODULEENTRY32W me{};
+    me.dwSize = sizeof(me);
+    for (BOOL ok = ::Module32FirstW(snap, &me); ok; ok = ::Module32NextW(snap, &me))
+    {
+        const wchar_t* n = me.szModule;
+        if (wcsstr(n, L"ngx") || wcsstr(n, L"NGX") || wcsstr(n, L"dlss") || wcsstr(n, L"DLSS") ||
+            wcsstr(n, L"sl.") || wcsstr(n, L"nvd"))
+            Log("[GLUE] module[%s]: %ls (%ls)", tag, n, me.szExePath);
+    }
+    ::CloseHandle(snap);
+}
+
+std::string FileVersionString(const std::filesystem::path& p)
+{
+    DWORD size = ::GetFileVersionInfoSizeW(p.c_str(), nullptr);
+    if (!size)
+        return "?";
+    std::vector<uint8_t> buf(size);
+    if (!::GetFileVersionInfoW(p.c_str(), 0, size, buf.data()))
+        return "?";
+    VS_FIXEDFILEINFO* fi = nullptr;
+    UINT len = 0;
+    if (!::VerQueryValueW(buf.data(), L"\\", reinterpret_cast<void**>(&fi), &len) || !fi)
+        return "?";
+    char tmp[64];
+    std::snprintf(tmp, sizeof(tmp), "%u.%u.%u.%u",
+        HIWORD(fi->dwFileVersionMS), LOWORD(fi->dwFileVersionMS),
+        HIWORD(fi->dwFileVersionLS), LOWORD(fi->dwFileVersionLS));
+    return tmp;
+}
+
+bool StageFile(const std::filesystem::path& src, const std::filesystem::path& dst, const char* what)
+{
+    std::error_code ec;
+    if (!std::filesystem::equivalent(src, dst, ec))
+    {
+        std::filesystem::copy_file(src, dst, std::filesystem::copy_options::overwrite_existing, ec);
+        if (ec)
+        {
+            Log("FATAL: cannot stage %s (%s)", what, ec.message().c_str());
+            return false;
+        }
+    }
+    Log("[GLUE] %s staged: %s (version %s)", what, dst.string().c_str(), FileVersionString(dst).c_str());
+    return true;
+}
+
+int Run(const std::string& dllPath, const std::string& corePath, const std::string& outDir, bool spy)
+{
+    // -- Stage plugin (and optionally core) next to the exe --------------------
+    char exeDirBuf[MAX_PATH]{};
+    ::GetModuleFileNameA(nullptr, exeDirBuf, MAX_PATH);
+    const std::filesystem::path exeDir = std::filesystem::path(exeDirBuf).parent_path();
+    if (!StageFile(std::filesystem::absolute(dllPath), exeDir / "nvngx_dlssnr.dll", "plugin"))
+        return 1;
+    if (!corePath.empty() && !StageFile(std::filesystem::absolute(corePath), exeDir / "nvngx_dlss.dll", "core"))
+        return 1;
+    Log("[GLUE] core in use: %s (version %s)", (exeDir / "nvngx_dlss.dll").string().c_str(),
+        FileVersionString(exeDir / "nvngx_dlss.dll").c_str());
+
+    const std::wstring outDirW = ToWide(std::filesystem::absolute(outDir).string());
+
+    NVSDK_NGX_FeatureDiscoveryInfo discovery{};
+    discovery.SDKVersion = NVSDK_NGX_Version_API;
+    discovery.FeatureID = kFeatureId;
+    discovery.Identifier.IdentifierType = NVSDK_NGX_Application_Identifier_Type_Application_Id;
+    discovery.Identifier.v.ApplicationId = kAppId;
+    discovery.ApplicationDataPath = outDirW.c_str();
+    discovery.FeatureInfo = nullptr;
+
+    // -- Required Vulkan extensions (glue -> core) -----------------------------
+    std::vector<std::string> instExtNames;
+    {
+        uint32_t count = 0;
+        VkExtensionProperties* props = nullptr;
+        NVSDK_NGX_Result r = NgxCall("GetFeatureInstanceExtensionRequirements", [&] {
+            return NVSDK_NGX_VULKAN_GetFeatureInstanceExtensionRequirements(&discovery, &count, &props);
+        });
+        if (r == NVSDK_NGX_Result_Success)
+        {
+            Log("[NGX] feature 18 requires %u instance extension(s):", count);
+            for (uint32_t i = 0; i < count; ++i)
+            {
+                Log("      %s (spec %u)", props[i].extensionName, props[i].specVersion);
+                instExtNames.push_back(props[i].extensionName);
+            }
+        }
+    }
+
+    // IAT-spy the core (loaded in-process by the glue on first NGX call) so we
+    // can watch it probe feature plugins such as nvngx_dlssnr.dll during the
+    // remaining requirements queries, Init and CreateFeature1. The glue may
+    // load the driver's NGXCore runtime (_nvngx.dll, registry NGXCore path)
+    // instead of the app-dir nvngx_dlss.dll, so probe several module names.
+    if (spy)
+    {
+        EnumNgxModules("pre-init");
+        for (const char* name : {"nvngx_dlss.dll", "_nvngx.dll", "nvngx.dll"})
+        {
+            HMODULE core = ::GetModuleHandleA(name);
+            if (!core)
+                continue;
+            wchar_t path[MAX_PATH]{};
+            ::GetModuleFileNameW(core, path, MAX_PATH);
+            Log("[GLUE] core module: %ls", path);
+            InstallSpy(core);
+        }
+    }
+
+    VulkanCtx ctx;
+    {
+        uint32_t availCount = 0;
+        vkEnumerateInstanceExtensionProperties(nullptr, &availCount, nullptr);
+        std::vector<VkExtensionProperties> avail(availCount);
+        vkEnumerateInstanceExtensionProperties(nullptr, &availCount, avail.data());
+        std::vector<const char*> enabled;
+        for (const std::string& want : instExtNames)
+        {
+            bool found = false;
+            for (const auto& a : avail)
+                if (want == a.extensionName) { found = true; break; }
+            if (found)
+                enabled.push_back(want.c_str());
+            else
+                Log("[VK] NGX-required instance extension %s NOT available, skipping", want.c_str());
+        }
+        VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
+        app.pApplicationName = "dlss5_spike";
+        app.apiVersion = VK_API_VERSION_1_2;
+        VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
+        ici.pApplicationInfo = &app;
+        ici.enabledExtensionCount = static_cast<uint32_t>(enabled.size());
+        ici.ppEnabledExtensionNames = enabled.data();
+        VkCheck(vkCreateInstance(&ici, nullptr, &ctx.instance), "vkCreateInstance");
+        Log("[VK] instance created with %u extension(s)", static_cast<unsigned>(enabled.size()));
+    }
+
+    {
+        uint32_t n = 0;
+        vkEnumeratePhysicalDevices(ctx.instance, &n, nullptr);
+        std::vector<VkPhysicalDevice> devs(n);
+        vkEnumeratePhysicalDevices(ctx.instance, &n, devs.data());
+        for (VkPhysicalDevice d : devs)
+        {
+            VkPhysicalDeviceProperties p{};
+            vkGetPhysicalDeviceProperties(d, &p);
+            Log("[VK] physical device: %s (vendor 0x%04X)", p.deviceName, p.vendorID);
+            if (p.vendorID == 0x10DE && !ctx.phys)
+                ctx.phys = d;
+        }
+        if (!ctx.phys)
+        {
+            Log("FATAL: no NVIDIA GPU found");
+            return 1;
+        }
+        VkPhysicalDeviceProperties p{};
+        vkGetPhysicalDeviceProperties(ctx.phys, &p);
+        Log("[VK] using: %s (driver %u.%u.%u)", p.deviceName,
+            (p.driverVersion >> 22) & 0x3FF, (p.driverVersion >> 14) & 0xFF, p.driverVersion & 0x3FFF);
+        vkGetPhysicalDeviceMemoryProperties(ctx.phys, &ctx.memProps);
+    }
+
+    std::vector<std::string> devExtNames;
+    {
+        uint32_t count = 0;
+        VkExtensionProperties* props = nullptr;
+        NVSDK_NGX_Result r = NgxCall("GetFeatureDeviceExtensionRequirements", [&] {
+            return NVSDK_NGX_VULKAN_GetFeatureDeviceExtensionRequirements(ctx.instance, ctx.phys, &discovery, &count, &props);
+        });
+        if (r == NVSDK_NGX_Result_Success)
+        {
+            Log("[NGX] feature 18 requires %u device extension(s):", count);
+            for (uint32_t i = 0; i < count; ++i)
+            {
+                Log("      %s (spec %u)", props[i].extensionName, props[i].specVersion);
+                devExtNames.push_back(props[i].extensionName);
+            }
+        }
+        else
+        {
+            Log("[NGX] device extension query failed; falling back to known NGX-required set");
+            devExtNames = {
+                VK_NVX_BINARY_IMPORT_EXTENSION_NAME,
+                VK_NVX_IMAGE_VIEW_HANDLE_EXTENSION_NAME,
+                VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME,
+                VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
+            };
+        }
+    }
+
+    {
+        uint32_t famCount = 0;
+        vkGetPhysicalDeviceQueueFamilyProperties(ctx.phys, &famCount, nullptr);
+        std::vector<VkQueueFamilyProperties> fams(famCount);
+        vkGetPhysicalDeviceQueueFamilyProperties(ctx.phys, &famCount, fams.data());
+        bool found = false;
+        for (uint32_t i = 0; i < famCount; ++i)
+        {
+            if ((fams[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) && (fams[i].queueFlags & VK_QUEUE_COMPUTE_BIT))
+            {
+                ctx.queueFamily = i;
+                found = true;
+                break;
+            }
+        }
+        if (!found)
+        {
+            Log("FATAL: no graphics+compute queue family");
+            return 1;
+        }
+        uint32_t availCount = 0;
+        vkEnumerateDeviceExtensionProperties(ctx.phys, nullptr, &availCount, nullptr);
+        std::vector<VkExtensionProperties> avail(availCount);
+        vkEnumerateDeviceExtensionProperties(ctx.phys, nullptr, &availCount, avail.data());
+        std::vector<const char*> enabled;
+        for (const std::string& want : devExtNames)
+        {
+            bool extFound = false;
+            for (const auto& a : avail)
+                if (want == a.extensionName) { extFound = true; break; }
+            if (extFound)
+                enabled.push_back(want.c_str());
+            else
+                Log("[VK] NGX-required device extension %s NOT available, skipping", want.c_str());
+        }
+        float prio = 1.0f;
+        VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
+        qci.queueFamilyIndex = ctx.queueFamily;
+        qci.queueCount = 1;
+        qci.pQueuePriorities = &prio;
+        VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
+        dci.queueCreateInfoCount = 1;
+        dci.pQueueCreateInfos = &qci;
+        dci.enabledExtensionCount = static_cast<uint32_t>(enabled.size());
+        dci.ppEnabledExtensionNames = enabled.data();
+        VkCheck(vkCreateDevice(ctx.phys, &dci, nullptr, &ctx.device), "vkCreateDevice");
+        vkGetDeviceQueue(ctx.device, ctx.queueFamily, 0, &ctx.queue);
+        Log("[VK] device created with %u extension(s), queue family %u",
+            static_cast<unsigned>(enabled.size()), ctx.queueFamily);
+    }
+
+    {
+        VkCommandPoolCreateInfo cpci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+        cpci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        cpci.queueFamilyIndex = ctx.queueFamily;
+        VkCheck(vkCreateCommandPool(ctx.device, &cpci, nullptr, &ctx.cmdPool), "vkCreateCommandPool");
+        VkCommandBufferAllocateInfo cbai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        cbai.commandPool = ctx.cmdPool;
+        cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cbai.commandBufferCount = 1;
+        VkCheck(vkAllocateCommandBuffers(ctx.device, &cbai, &ctx.cmd), "vkAllocateCommandBuffers");
+        VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        VkCheck(vkCreateFence(ctx.device, &fci, nullptr, &ctx.fence), "vkCreateFence");
+    }
+
+    // -- Requirements + init (glue performs the client-side init) --------------
+    {
+        NVSDK_NGX_FeatureRequirement req{};
+        NVSDK_NGX_Result r = NgxCall("GetFeatureRequirements(feature 18)", [&] {
+            return NVSDK_NGX_VULKAN_GetFeatureRequirements(ctx.instance, ctx.phys, &discovery, &req);
+        });
+        if (r == NVSDK_NGX_Result_Success)
+        {
+            Log("[NGX] feature 18 FeatureSupported = %u (0 = supported)", static_cast<unsigned>(req.FeatureSupported));
+            Log("[NGX] feature 18 MinHWArchitecture = 0x%08X, MinOSVersion = %s",
+                req.MinHWArchitecture, req.MinOSVersion);
+        }
+        else
+        {
+            Log("[NGX] GetFeatureRequirements failed -- likely unsupported on this GPU/DLL combo");
+        }
+    }
+
+    NVSDK_NGX_Result rInit = NgxCall("Init(appId=0x1000000)", [&] {
+        return NVSDK_NGX_VULKAN_Init(kAppId, outDirW.c_str(), ctx.instance, ctx.phys, ctx.device,
+            vkGetInstanceProcAddr, vkGetDeviceProcAddr, nullptr, NVSDK_NGX_Version_API);
+    });
+    if (rInit != NVSDK_NGX_Result_Success)
+    {
+        Log("FATAL: NGX glue init failed");
+        return 1;
+    }
+    if (spy)
+        EnumNgxModules("post-init");
+    if (spy)
+    {
+        // The core only loads during Init; spy it now so CreateFeature1 is
+        // covered (plugin probing, model-file access, registry reads).
+        for (const char* name : {"_nvngx.dll", "nvngx.dll", "nvngx_dlss.dll"})
+        {
+            HMODULE core = ::GetModuleHandleA(name);
+            if (core)
+                InstallSpy(core);
+        }
+    }
+
+    {
+        NVSDK_NGX_Parameter* caps = nullptr;
+        NVSDK_NGX_Result r = NgxCall("GetCapabilityParameters", [&] {
+            return NVSDK_NGX_VULKAN_GetCapabilityParameters(&caps);
+        });
+        if (r == NVSDK_NGX_Result_Success && caps)
+        {
+            unsigned int avail = 0xFFFFFFFFu;
+            if (caps->Get("SuperSampling.Available", &avail) == NVSDK_NGX_Result_Success)
+                Log("[NGX] capability: SuperSampling.Available = %u", avail);
+            NgxCall("DestroyParameters(caps)", [&] {
+                return NVSDK_NGX_VULKAN_DestroyParameters(caps);
+            });
+        }
+    }
+
+    // -- CreateFeature1 with parameter-set candidates --------------------------
+    NVSDK_NGX_Handle* feature = nullptr;
+    const char* groupNames[] = {
+        "base Width/Height/OutWidth/OutHeight",
+        "base + DLSSNR.{Width,Height,Enabled,ScalingRatio}",
+        "DLSSNR.* only",
+        "empty parameters",
+    };
+    for (int group = 0; group < 4 && !feature; ++group)
+    {
+        Log("== CreateFeature1 attempt %d: %s", group, groupNames[group]);
+        NVSDK_NGX_Parameter* params = nullptr;
+        NVSDK_NGX_Result ra = NgxCall("AllocateParameters", [&] {
+            return NVSDK_NGX_VULKAN_AllocateParameters(&params);
+        });
+        if (ra != NVSDK_NGX_Result_Success || !params)
+            continue;
+        if (group == 0 || group == 1)
+        {
+            params->Set("Width", static_cast<unsigned int>(kWidth));
+            params->Set("Height", static_cast<unsigned int>(kHeight));
+            params->Set("OutWidth", static_cast<unsigned int>(kWidth));
+            params->Set("OutHeight", static_cast<unsigned int>(kHeight));
+        }
+        if (group == 1 || group == 2)
+        {
+            params->Set("DLSSNR.Width", static_cast<unsigned int>(kWidth));
+            params->Set("DLSSNR.Height", static_cast<unsigned int>(kHeight));
+            params->Set("DLSSNR.Enabled", 1);
+            params->Set("DLSSNR.ScalingRatio", 1.0f);
+        }
+
+        BeginCmd(ctx);
+        NVSDK_NGX_Result r = NgxCall("CreateFeature1(feature 18)", [&] {
+            return NVSDK_NGX_VULKAN_CreateFeature1(ctx.device, ctx.cmd, kFeatureId, params, &feature);
+        });
+        SubmitWait(ctx);
+        NgxCall("DestroyParameters(create)", [&] {
+            return NVSDK_NGX_VULKAN_DestroyParameters(params);
+        });
+        if (r == NVSDK_NGX_Result_Success && feature)
+            Log("[NGX] feature 18 created with group %d (%s), handle %p",
+                group, groupNames[group], static_cast<void*>(feature));
+        else
+            feature = nullptr;
+    }
+    if (!feature)
+    {
+        Log("FATAL: CreateFeature1 failed for all parameter sets");
+        NgxCall("Shutdown1", [&] { return NVSDK_NGX_VULKAN_Shutdown1(ctx.device); });
+        return 1;
+    }
+
+    // -- Test images ------------------------------------------------------------
+    const VkImageUsageFlags colorUsage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+        VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    GpuImage imgColor = CreateGpuImage(ctx, VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_ASPECT_COLOR_BIT, colorUsage);
+    GpuImage imgBackbuffer = CreateGpuImage(ctx, VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_ASPECT_COLOR_BIT, colorUsage);
+    GpuImage imgOutput = CreateGpuImage(ctx, VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_ASPECT_COLOR_BIT, colorUsage);
+    GpuImage imgMotion = CreateGpuImage(ctx, VK_FORMAT_R16G16_SFLOAT, VK_IMAGE_ASPECT_COLOR_BIT, colorUsage);
+    GpuImage imgDepth = CreateGpuImage(ctx, VK_FORMAT_D32_SFLOAT, VK_IMAGE_ASPECT_DEPTH_BIT,
+        VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_STORAGE_BIT);
+    Log("[VK] test images created (%ux%u)", kWidth, kHeight);
+
+    std::vector<uint16_t> colorPix(static_cast<size_t>(kWidth) * kHeight * 4);
+    FillColorPattern(colorPix);
+    std::vector<float> depthPix(static_cast<size_t>(kWidth) * kHeight, 0.5f);
+    std::vector<uint16_t> motionPix(static_cast<size_t>(kWidth) * kHeight * 2, 0);
+
+    StagingBuffer stColor = CreateStaging(ctx, colorPix.size() * sizeof(uint16_t));
+    StagingBuffer stDepth = CreateStaging(ctx, depthPix.size() * sizeof(float));
+    StagingBuffer stMotion = CreateStaging(ctx, motionPix.size() * sizeof(uint16_t));
+    std::memcpy(stColor.mapped, colorPix.data(), colorPix.size() * sizeof(uint16_t));
+    std::memcpy(stDepth.mapped, depthPix.data(), depthPix.size() * sizeof(float));
+    std::memcpy(stMotion.mapped, motionPix.data(), motionPix.size() * sizeof(uint16_t));
+
+    BeginCmd(ctx);
+    TransitionToGeneral(ctx, imgColor.image, VK_IMAGE_ASPECT_COLOR_BIT);
+    TransitionToGeneral(ctx, imgBackbuffer.image, VK_IMAGE_ASPECT_COLOR_BIT);
+    TransitionToGeneral(ctx, imgOutput.image, VK_IMAGE_ASPECT_COLOR_BIT);
+    TransitionToGeneral(ctx, imgMotion.image, VK_IMAGE_ASPECT_COLOR_BIT);
+    TransitionToGeneral(ctx, imgDepth.image, VK_IMAGE_ASPECT_DEPTH_BIT);
+    CopyBufferToImage(ctx, stColor.buffer, imgColor.image, VK_IMAGE_ASPECT_COLOR_BIT);
+    CopyBufferToImage(ctx, stColor.buffer, imgBackbuffer.image, VK_IMAGE_ASPECT_COLOR_BIT);
+    CopyBufferToImage(ctx, stDepth.buffer, imgDepth.image, VK_IMAGE_ASPECT_DEPTH_BIT);
+    CopyBufferToImage(ctx, stMotion.buffer, imgMotion.image, VK_IMAGE_ASPECT_COLOR_BIT);
+    SubmitWait(ctx);
+    Log("[VK] inputs uploaded, all images in GENERAL");
+
+    WritePng(outDir + "/input_color.png", colorPix);
+    PrintStats("input color", colorPix, nullptr);
+
+    // -- EvaluateFeature ---------------------------------------------------------
+    {
+        NVSDK_NGX_Parameter* params = nullptr;
+        NVSDK_NGX_Result ra = NgxCall("AllocateParameters(eval)", [&] {
+            return NVSDK_NGX_VULKAN_AllocateParameters(&params);
+        });
+        if (ra == NVSDK_NGX_Result_Success && params)
+        {
+            VkImageSubresourceRange colorRange{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            VkImageSubresourceRange depthRange{VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+            NVSDK_NGX_Resource_VK resColor = NVSDK_NGX_Create_ImageView_Resource_VK(
+                imgColor.view, imgColor.image, colorRange, imgColor.format, kWidth, kHeight, false);
+            NVSDK_NGX_Resource_VK resBackbuffer = NVSDK_NGX_Create_ImageView_Resource_VK(
+                imgBackbuffer.view, imgBackbuffer.image, colorRange, imgBackbuffer.format, kWidth, kHeight, false);
+            NVSDK_NGX_Resource_VK resMotion = NVSDK_NGX_Create_ImageView_Resource_VK(
+                imgMotion.view, imgMotion.image, colorRange, imgMotion.format, kWidth, kHeight, false);
+            NVSDK_NGX_Resource_VK resDepth = NVSDK_NGX_Create_ImageView_Resource_VK(
+                imgDepth.view, imgDepth.image, depthRange, imgDepth.format, kWidth, kHeight, false);
+            NVSDK_NGX_Resource_VK resOutput = NVSDK_NGX_Create_ImageView_Resource_VK(
+                imgOutput.view, imgOutput.image, colorRange, imgOutput.format, kWidth, kHeight, true);
+
+            params->Set("DLSSNR.Color", static_cast<void*>(&resColor));
+            params->Set("DLSSNR.Backbuffer", static_cast<void*>(&resBackbuffer));
+            params->Set("DLSSNR.MVec", static_cast<void*>(&resMotion));
+            params->Set("DLSSNR.Depth", static_cast<void*>(&resDepth));
+            params->Set("DLSSNR.Output", static_cast<void*>(&resOutput));
+            params->Set("DLSSNR.Intensity", 1.0f);
+            params->Set("DLSSNR.Reset", 1);
+            params->Set("DLSSNR.Enabled", 1);
+            params->Set("DLSSNR.MVecScaleX", static_cast<float>(kWidth));
+            params->Set("DLSSNR.MVecScaleY", static_cast<float>(kHeight));
+            params->Set("DLSSNR.DepthInverted", 0);
+            params->Set("Width", static_cast<unsigned int>(kWidth));
+            params->Set("Height", static_cast<unsigned int>(kHeight));
+
+            BeginCmd(ctx);
+            NVSDK_NGX_Result r = NgxCall("EvaluateFeature(feature 18)", [&] {
+                return NVSDK_NGX_VULKAN_EvaluateFeature(ctx.cmd, feature, params, nullptr);
+            });
+            SubmitWait(ctx);
+            NgxCall("DestroyParameters(eval)", [&] {
+                return NVSDK_NGX_VULKAN_DestroyParameters(params);
+            });
+            if (r != NVSDK_NGX_Result_Success)
+                Log("[NGX] EvaluateFeature did not succeed -- output may be untouched");
+        }
+    }
+
+    // -- Readback + stats + PNG ----------------------------------------------------
+    std::vector<uint16_t> outPix(static_cast<size_t>(kWidth) * kHeight * 4, 0);
+    {
+        StagingBuffer stRead = CreateStaging(ctx, outPix.size() * sizeof(uint16_t));
+        BeginCmd(ctx);
+        CopyImageToBuffer(ctx, imgOutput.image, VK_IMAGE_ASPECT_COLOR_BIT, stRead.buffer);
+        SubmitWait(ctx);
+        std::memcpy(outPix.data(), stRead.mapped, outPix.size() * sizeof(uint16_t));
+        vkDestroyBuffer(ctx.device, stRead.buffer, nullptr);
+        vkFreeMemory(ctx.device, stRead.memory, nullptr);
+    }
+    PrintStats("DLSSNR output", outPix, &colorPix);
+    const std::string pngPath = outDir + "/dlssnr_output.png";
+    if (WritePng(pngPath, outPix))
+        Log("[OUT] wrote %s", pngPath.c_str());
+    else
+        Log("[OUT] FAILED to write %s", pngPath.c_str());
+
+    // -- Teardown -------------------------------------------------------------------
+    if (spy)
+        EnumNgxModules("post-eval");
+    NgxCall("ReleaseFeature", [&] { return NVSDK_NGX_VULKAN_ReleaseFeature(feature); });
+    NgxCall("Shutdown1", [&] { return NVSDK_NGX_VULKAN_Shutdown1(ctx.device); });
+
+    vkDestroyFence(ctx.device, ctx.fence, nullptr);
+    vkDestroyCommandPool(ctx.device, ctx.cmdPool, nullptr);
+    for (GpuImage* gi : {&imgColor, &imgBackbuffer, &imgOutput, &imgMotion, &imgDepth})
+    {
+        vkDestroyImageView(ctx.device, gi->view, nullptr);
+        vkDestroyImage(ctx.device, gi->image, nullptr);
+        vkFreeMemory(ctx.device, gi->memory, nullptr);
+    }
+    for (StagingBuffer* sb : {&stColor, &stDepth, &stMotion})
+    {
+        vkUnmapMemory(ctx.device, sb->memory);
+        vkDestroyBuffer(ctx.device, sb->buffer, nullptr);
+        vkFreeMemory(ctx.device, sb->memory, nullptr);
+    }
+    vkDestroyDevice(ctx.device, nullptr);
+    vkDestroyInstance(ctx.instance, nullptr);
+
+    Log("== dlss5_spike (glue) done ==");
+    return 0;
+}
+
+} // namespace gluemode
+#endif // DLSS5_HAVE_GLUE
+
+// ===========================================================================
 // Streamline probe mode (--api slprobe)
 //
 // Direct plugin Init fails with 0xBAD00002 in both Vulkan and D3D12 modes:
@@ -1264,6 +1826,7 @@ int Run(const std::string& outDir, const std::string& dllPath)
 int main(int argc, char** argv)
 {
     std::string dllPath = R"(D:\Code\SL 2.13\nvngx_dlssnr.dll)";
+    std::string corePath; // glue mode only: nvngx_dlss.dll to stage as the core
     std::string outDir = "spike_dlss5_out";
     std::string api = "vulkan";
     bool iatPatch = true;
@@ -1272,6 +1835,8 @@ int main(int argc, char** argv)
     {
         if (!std::strcmp(argv[i], "--dll") && i + 1 < argc)
             dllPath = argv[++i];
+        else if (!std::strcmp(argv[i], "--core") && i + 1 < argc)
+            corePath = argv[++i];
         else if (!std::strcmp(argv[i], "--out") && i + 1 < argc)
             outDir = argv[++i];
         else if (!std::strcmp(argv[i], "--api") && i + 1 < argc)
@@ -1284,15 +1849,25 @@ int main(int argc, char** argv)
             Log("unknown argument: %s", argv[i]);
     }
     std::filesystem::create_directories(outDir);
-    Log("== dlss5_spike == api=%s dll=%s out=%s iat-patch=%d spy=%d", api.c_str(), dllPath.c_str(), outDir.c_str(), iatPatch ? 1 : 0, spy ? 1 : 0);
+    Log("== dlss5_spike == api=%s dll=%s core=%s out=%s iat-patch=%d spy=%d", api.c_str(), dllPath.c_str(),
+        corePath.empty() ? "(exe dir)" : corePath.c_str(), outDir.c_str(), iatPatch ? 1 : 0, spy ? 1 : 0);
 
     if (api == "d3d12")
         return d3d12mode::Run(dllPath, outDir, iatPatch, spy);
     if (api == "slprobe")
         return slprobe::Run(outDir, dllPath);
+    if (api == "glue")
+    {
+#if defined(DLSS5_HAVE_GLUE)
+        return gluemode::Run(dllPath, corePath, outDir, spy);
+#else
+        Log("FATAL: --api glue not built in (nvsdk_ngx_d.lib not found at configure time)");
+        return 1;
+#endif
+    }
     if (api != "vulkan")
     {
-        Log("FATAL: unknown --api %s (expected vulkan|d3d12)", api.c_str());
+        Log("FATAL: unknown --api %s (expected vulkan|d3d12|glue|slprobe)", api.c_str());
         return 1;
     }
 
