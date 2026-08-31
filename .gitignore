@@ -3,6 +3,7 @@ build-nss-emu/
 out/
 third_party/*/
 !third_party/.gitkeep
+!third_party/ngx/
 !third_party/vma/
 !third_party/meshoptimizer/
 !third_party/imnodes/
@@ -19,3 +20,8 @@ output/
 captures/
 *.probes
 VISUAL_ACCEPTANCE.md
+
+# dlss5 spike: NGX/streamline runtime DLLs and run outputs must never be committed
+nvngx*.dll
+sl.*.dll
+spike/dlss5/out/

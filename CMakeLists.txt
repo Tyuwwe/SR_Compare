@@ -46,6 +46,7 @@ add_subdirectory(compare)
 add_subdirectory(bench)
 add_subdirectory(gui)
 add_subdirectory(app)
+add_subdirectory(spike/dlss5)
 
 include(CTest)
 if(BUILD_TESTING)
