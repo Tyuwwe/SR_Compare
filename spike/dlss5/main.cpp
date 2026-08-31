@@ -1988,9 +1988,13 @@ int Run(const std::string& dllPath, const std::string& corePath, const std::stri
                     });
                     nrInited = (r == NVSDK_NGX_Result_Success);
                 }
-                if (nrInited && nrCreate && nrEval && nrRelease)
+                // renodx creates via the signed snippet even when its direct
+                // Init fails ("direct Init_Ext failed with 0x" vs "feature 18
+                // created via the signed snippet"), so attempt nrCreate
+                // regardless of nrInited.
+                if (nrCreate && nrEval && nrRelease)
                 {
-                    Log("[SNIPPET] dlssnr plugin initialized via runtime-populated params -- trying its own CreateFeature(18)");
+                    Log("[SNIPPET] trying dlssnr plugin CreateFeature(18) (nrInited=%d)", nrInited ? 1 : 0);
                     const char* nrGroupNames[] = {
                         "base Width/Height/OutWidth/OutHeight",
                         "base + renodx full DLSSNR.* create set",
