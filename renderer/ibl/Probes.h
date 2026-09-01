@@ -3,15 +3,16 @@
 // ReflectionProbes — baked local reflection captures (UE4 reflection-capture
 // style, Phase 4c-2).  Up to kMaxProbes axis-aligned box probes per scene.
 // Offline (--bake-probes, Renderer::bakeProbes) each probe renders the scene
-// into a 128^2 cubemap from its position; the raw cubemaps are written to a
-// .probes file next to the scene.  At load time this class uploads the raw
-// cubes, runs the same irradiance + GGX prefilter compute chain as the global
-// IBL (ibl_irradiance.comp / ibl_prefilter.comp) into two cube-ARRAY textures
-// (layer group i*6..i*6+5 = probe i), and fills a small UBO with the boxes.
-// lighting.frag / ssr_opaque.comp then blend between the best two containing
-// probes (weighted by distance to the box edge) with parallax-corrected box
-// projection, falling back to the global environment outside every box.
-// Without a bake file the probe count stays 0 and rendering is unchanged.
+// into a kBakeSize^2 cubemap from its position; the raw cubemaps are written
+// to a .probes file next to the scene.  At load time this class uploads the
+// raw cubes, runs the same irradiance + GGX prefilter compute chain as the
+// global IBL (ibl_irradiance.comp / ibl_prefilter.comp) into two cube-ARRAY
+// textures (layer group i*6..i*6+5 = probe i), and fills a small UBO with the
+// boxes.  lighting.frag / ssr_opaque.comp then blend between the best two
+// containing probes (weighted by distance to the box edge) with
+// parallax-corrected box projection, falling back to the global environment
+// outside every box.  Without a bake file the probe count stays 0 and
+// rendering is unchanged.
 // ============================================================================
 #include "renderer/core/Vk.h"
 #include "renderer/core/VulkanContext.h"
@@ -56,7 +57,12 @@ static_assert(sizeof(ProbeUBO) == 400, "ProbeUBO std140 size mismatch");
 
 class ReflectionProbes {
 public:
-    static constexpr uint32_t kBakeSize = 128;       // baked cube face resolution
+    // Baked cube face resolution.  512: mirror glass samples ~mip0 through the
+    // parallax projection, so the bake resolution IS the reflection sharpness;
+    // 128 read as mush on the Bistro storefront.  Static cost at this value:
+    // prefilter array 512^2 RGBA16F x 5 mips x kMaxProbes*6 layers ~= 128 MiB
+    // (allocated even with no bake file — acceptable on the target GPUs).
+    static constexpr uint32_t kBakeSize = 512;
     static constexpr uint32_t kPrefilterMips = 5;    // same buckets as IblMaps
     static constexpr uint32_t kIrradianceSize = 32;  // same as IblMaps
     static constexpr float kBlendDistance = 0.75f;   // box-edge fade width (m)

@@ -8,6 +8,15 @@
 
 namespace sr {
 
+namespace {
+// Selected procedural generator variant, set by resolveSceneArg ("" / any
+// non-alias = "boxes").  Read by Scene::loadProcedural so a second built-in
+// scene can be registered without touching the host's load fallback chain.
+std::string g_proceduralVariant = "boxes";
+} // namespace
+
+const std::string& proceduralSceneVariant() { return g_proceduralVariant; }
+
 // Warm low-sun key colour straight from the atmosphere model (Hillaire 2020):
 // transmittance from the ground towards the sun, normalized so the strongest
 // channel stays 1 and sunIntensity keeps its meaning.
@@ -21,6 +30,7 @@ Vec3 atmosphereSunColor(float elevationDeg, float azimuthDeg) {
 std::vector<SceneEntry> listScenes() {
     std::vector<SceneEntry> scenes;
     scenes.push_back({"boxes", "procedural box room (built-in, no assets)", "", true});
+    scenes.push_back({"ssrlab", "SSR mirror test lab (built-in, no assets)", "", true});
     auto addGltf = [&scenes](const char* alias, const char* desc, const char* relPath) {
         // Assets resolve against CWD first, then the exe location (packaged).
         const std::string resolved = resolveAssetPath(relPath);
@@ -35,6 +45,7 @@ std::vector<SceneEntry> listScenes() {
 }
 
 std::string resolveSceneArg(const std::string& arg) {
+    g_proceduralVariant = (arg == "ssrlab") ? "ssrlab" : "boxes";
     for (const SceneEntry& s : listScenes()) {
         if (arg == s.alias) {
             if (!s.available) {
@@ -136,9 +147,19 @@ bool initialCameraPose(const std::string& scenePath, Vec3& pos, Vec3& fwd) {
 std::vector<ReflectionProbe> reflectionProbesForScene(const std::string& scenePath) {
     std::vector<ReflectionProbe> probes;
     if (scenePath.empty()) {
-        // boxes: one probe covering the whole 20x10x20 room (walls at
-        // |x| = 10, z = +-10, floor y = 0; see ProceduralScene.cpp).
-        probes.push_back({{0.f, 2.5f, 0.f}, {-9.5f, 0.05f, -9.5f}, {9.5f, 9.5f, 9.5f}});
+        if (proceduralSceneVariant() == "ssrlab") {
+            // ssrlab mirror room: one probe over the room in front of the
+            // mirror wall (z = -2, x [-8,8], y [0,3]; room shell x +-13,
+            // z [-2.6,12.6]) so the pane's SSR-miss fallback reflects this
+            // room's lamps/benches/colour boxes instead of the boxes bake.
+            // z-min reaches the back wall so the pane pixels sit ~0.6 m
+            // inside the box (near-full influence through the 0.75 m ramp).
+            probes.push_back({{0.f, 2.5f, 3.f}, {-12.5f, 0.05f, -2.55f}, {12.5f, 5.9f, 12.2f}});
+        } else {
+            // boxes: one probe covering the whole 20x10x20 room (walls at
+            // |x| = 10, z = +-10, floor y = 0; see ProceduralScene.cpp).
+            probes.push_back({{0.f, 2.5f, 0.f}, {-9.5f, 0.05f, -9.5f}, {9.5f, 9.5f, 9.5f}});
+        }
     } else if (scenePath.find("Sponza") != std::string::npos) {
         // Sponza atrium: one demo probe over the central aisle.
         probes.push_back({{0.f, 4.f, 0.f}, {-6.f, 0.5f, -2.5f}, {6.f, 10.f, 2.5f}});
@@ -148,13 +169,30 @@ std::vector<ReflectionProbe> reflectionProbesForScene(const std::string& scenePa
         probes.push_back({{-2.f, 2.f, 0.f}, {-6.f, 0.2f, -3.f}, {2.f, 5.5f, 3.f}});
         probes.push_back({{4.f, 2.f, 0.5f}, {2.f, 0.2f, -2.5f}, {7.5f, 5.5f, 3.5f}});
         probes.push_back({{-2.f, 2.f, -1.5f}, {-5.f, 0.2f, -4.5f}, {1.5f, 5.5f, 0.5f}});
+    } else if (scenePath.find("BistroExterior") != std::string::npos) {
+        // Bistro street: four boxes along the two streets.  The corner boxes
+        // cover the cafe storefront mirror glass (glTF material bounds:
+        // MASTER_Glass_Exterior x [-1.8,14.1] z [-16.4,7.6]); the capture
+        // points sit ~1.5 m off the glass line on the street side so the
+        // baked cubes see the reflected street, not the pane plane.  Neighbour
+        // boxes overlap ~2 m so the influence ramps cross-fade instead of
+        // dipping to the global env at a shared face.
+        probes.push_back({{5.f, 3.2f, 4.5f}, {-4.5f, 0.1f, -4.f}, {14.5f, 7.5f, 8.5f}});
+        probes.push_back({{5.f, 3.2f, -8.5f}, {-4.5f, 0.1f, -17.f}, {14.5f, 7.5f, -2.f}});
+        probes.push_back({{-12.f, 3.5f, 4.f}, {-30.f, 0.1f, -6.f}, {-2.5f, 10.f, 12.f}});
+        probes.push_back({{25.f, 3.5f, -1.f}, {13.5f, 0.1f, -12.f}, {45.f, 9.f, 10.f}});
     }
     if (probes.size() > kMaxReflectionProbes) probes.resize(kMaxReflectionProbes);
     return probes;
 }
 
 std::string probeFilePathForScene(const std::string& scenePath) {
-    if (scenePath.empty()) return resolveAssetPath("assets/probes/boxes.probes");
+    // The two procedural scenes share the empty scenePath but need distinct
+    // bakes: a mirror-room capture is wrong content for the box room.
+    if (scenePath.empty())
+        return resolveAssetPath(proceduralSceneVariant() == "ssrlab"
+                                    ? "assets/probes/ssrlab.probes"
+                                    : "assets/probes/boxes.probes");
     return scenePath + ".probes";
 }
 

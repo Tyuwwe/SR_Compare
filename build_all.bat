@@ -7,7 +7,8 @@ set "ROOT=%~dp0"
 call "%ROOT%scripts\find_cmake.bat" || exit /b 1
 if not exist "%ROOT%build\CMakeCache.txt" (
     echo configuring...
-    "%CMAKE%" -S "%ROOT%" -B "%ROOT%build" || exit /b 1
+    rem Trailing backslash in %~dp0 would escape the closing quote; use "%ROOT%." instead.
+    "%CMAKE%" -S "%ROOT%." -B "%ROOT%build" || exit /b 1
 )
 "%CMAKE%" --build "%ROOT%build" --config Release %* || exit /b 1
 echo done: %ROOT%build\app\Release\sr_compare.exe

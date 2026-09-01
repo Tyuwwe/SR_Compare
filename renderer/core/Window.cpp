@@ -55,6 +55,43 @@ bool Window::create(const char* title, int width, int height) {
         std::fprintf(stderr, "window: SDL_CreateWindow failed: %s\n", SDL_GetError());
         return false;
     }
+    // A windowed startup size that covers (nearly) the whole usable display
+    // area — the default output resolution, or a size remembered on a larger
+    // monitor — makes a decorated window indistinguishable from borderless
+    // fullscreen (with an auto-hiding taskbar the work area IS the full
+    // screen, so "fits in usable bounds" is not enough).  When the requested
+    // size covers the work area, scale it down to 85% of it (aspect kept) and
+    // center within the usable bounds.  Fullscreen (applied later) is
+    // unaffected — it ignores the windowed size.
+    SDL_Rect usable{};
+    // SDL_GetDisplayForWindow can fail right after creation (the window is
+    // not yet associated with a display); fall back to the primary display.
+    SDL_DisplayID display = SDL_GetDisplayForWindow(window_);
+    if (display == 0) display = SDL_GetPrimaryDisplay();
+    if (SDL_GetDisplayUsableBounds(display, &usable)) {
+        int top = 0, left = 0, bottom = 0, right = 0;
+        if (!SDL_GetWindowBordersSize(window_, &top, &left, &bottom, &right))
+            top = 31; // failed to query: at least account for a title bar
+        const float maxW = static_cast<float>(usable.w - left - right);
+        const float maxH = static_cast<float>(usable.h - top - bottom);
+        const bool covers = width_ >= maxW * 0.95f && height_ >= maxH * 0.95f;
+        const bool overflows = width_ > maxW || height_ > maxH;
+        if (covers || overflows) {
+            const float s =
+                std::min(0.85f * maxW / static_cast<float>(width_),
+                         0.85f * maxH / static_cast<float>(height_));
+            width_ = static_cast<int>(width_ * s);
+            height_ = static_cast<int>(height_ * s);
+            SDL_SetWindowSize(window_, width_, height_);
+        }
+        // Center within the USABLE bounds (not SDL_WINDOWPOS_CENTERED, which
+        // centers on the full display and can slide an edge under the
+        // taskbar).
+        const int outerW = width_ + left + right;
+        const int outerH = height_ + top + bottom;
+        SDL_SetWindowPosition(window_, usable.x + (usable.w - outerW) / 2,
+                              usable.y + (usable.h - outerH) / 2);
+    }
     SDL_GetWindowSizeInPixels(window_, &pixelWidth_, &pixelHeight_);
     return true;
 }

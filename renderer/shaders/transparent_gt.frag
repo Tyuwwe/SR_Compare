@@ -39,7 +39,7 @@ layout(set = 2, binding = 0) uniform LightingUBO {
     mat4 invViewProj;
     vec4 cameraPos;
     LightGPU lights[16]; // must match kMaxLights in DeferredCore.h
-    vec4 lightCounts; // x = active light count, yzw reserved
+    vec4 lightCounts; // x = active light count, y = glass inline-SSR enabled, zw reserved
     vec4 ambient;
     vec4 iblParams;
     mat4 cascadeVp[4];  // CSM light view-projections (one per cascade layer)
@@ -67,6 +67,13 @@ layout(set = 2, binding = 6) uniform sampler2D ssrColor; // opaque HDR color mip
 layout(set = 2, binding = 7) uniform sampler2D ssrHiZ; // opaque depth pyramid (Hi-Z, R32F)
 // Ray-integrated froxel volume (same as transparent.frag — keep in sync).
 layout(set = 2, binding = 8) uniform sampler3D fogVolume;
+// Baked local reflection probes (same as transparent.frag — keep in sync):
+// the glass inline-SSR miss fallback chains SSR hit -> local probe -> global.
+#define SR_PROBE_SET 2
+#define SR_PROBE_UBO_BINDING 9
+#define SR_PROBE_SPEC_BINDING 10
+#define SR_PROBE_DIFF_BINDING 11
+#include "probes.glsl"
 
 // Fragment-stage push block.  Member offsets in SPIR-V are ABSOLUTE within
 // the pipeline's push-constant memory, so params sits explicitly at byte 208,
@@ -237,9 +244,22 @@ void main() {
     float NdV = max(dot(N, V), 0.0);
     vec3 F = F_SchlickRoughness(NdV, F0, roughness);
     vec3 kd = (vec3(1.0) - F) * (1.0 - metallic);
-    vec3 diffuseIbl = texture(iblIrradiance, N).rgb * albedo * (1.0 + albedo * (0.1159 * roughness));
+    vec3 irradiance = texture(iblIrradiance, N).rgb;
     vec3 R = reflect(-V, N);
     vec3 prefiltered = textureLod(iblPrefilter, R, roughness * lighting.iblParams.y).rgb;
+    // Phase 4c-2 (same as transparent.frag — keep in sync): baked reflection
+    // probes replace the global environment where a probe box contains the
+    // glass fragment; the SSR composite below mixes its hit over this
+    // probe-aware specularIbl (chain: SSR hit -> probe -> global).
+    int pi0, pi1;
+    float pw0, pw1;
+    const float probeW = probeSelect(vWorldPos, pi0, pi1, pw0, pw1);
+    if (probeW > 0.0) {
+        irradiance = mix(irradiance, probeDiffuse(N, pi0, pi1, pw0, pw1), probeW);
+        prefiltered = mix(prefiltered,
+                          probeSpecular(vWorldPos, R, roughness, pi0, pi1, pw0, pw1), probeW);
+    }
+    vec3 diffuseIbl = irradiance * albedo * (1.0 + albedo * (0.1159 * roughness));
     vec2 brdf = texture(iblBrdfLut, vec2(NdV, roughness)).rg;
     vec3 envBrdf = specularIblMultiScatter(F, F0, brdf); // same as transparent.frag
     vec3 specularIbl = prefiltered * envBrdf;
@@ -256,12 +276,35 @@ void main() {
     // colour comes from the colour mip chain at lod = roughness * (mips - 1).
     // Single-frame on purpose: only the opaque path accumulates SSR temporally
     // (Phase 2d) — see the note in transparent.frag.
-    vec4 ssr = traceSsr(ssrColor, textureQueryLevels(ssrColor), ssrHiZ,
-                        textureQueryLevels(ssrHiZ), ubo.viewProj,
-                        lighting.invViewProj, ubo.cameraPos.xyz, vWorldPos, N, R, roughness,
-                        ubo.renderSizeJitter.xy, 4, 2);
-    float ssrHit = clamp(ssr.a, 0.0, 1.0);
-    specSsr = mix(specSsr, ssr.rgb * mix(envBrdf, vec3(1.0), ssrHit * 0.8), ssrHit);
+    // Iteration budget: the near-field lock (cfg.x = 40 m) keeps the march at
+    // mip 0, i.e. 1 px of screen segment per iteration, so the budget must
+    // cover the longest clipped on-screen segment — the render-target
+    // diagonal — plus descent/reject overhead (~1.5x).  A fixed 384 exhausted
+    // mid-screen on long grazing rays; those false misses fell back to the
+    // sky IBL and painted hard-edged white regions into the pane.
+    // Thickness window (cfg.yz, same as transparent.frag — keep in sync):
+    // deliberately tight in the near field.  Terrace furniture reflects at
+    // <3 m, where the loose (0.18 + 0.02·z) window accepted rays landing
+    // 6-18 cm behind silhouette texels — the march had tunneled past the
+    // camera-occluded furniture flank (no depth for it) and the accepted
+    // texel sampled the SUNLIT pavement behind/under the tables, painting
+    // hard-edged bright patches into the reflected tabletop.  Clean bisected
+    // crossings overshoot by <2 cm, so 0.05 + 0.005·z keeps them (and every
+    // far-field case in the regression suite) while rejecting the tunneling
+    // landings.
+    // The inline glass trace follows the same global SSR toggle as the opaque
+    // pass (lightCounts.y, same as transparent.frag — keep in sync): off ->
+    // probe -> global env fallback only, ssrHit stays 0.
+    float ssrHit = 0.0;
+    if (lighting.lightCounts.y > 0.5) {
+        vec4 ssr = traceSsr(ssrColor, textureQueryLevels(ssrColor), ssrHiZ,
+                            textureQueryLevels(ssrHiZ), ubo.viewProj,
+                            lighting.invViewProj, ubo.cameraPos.xyz, vWorldPos, N, R, roughness,
+                            ubo.renderSizeJitter.xy, 1, 1, vec4(40.0, 0.05, 0.005, 0.0),
+                            int(length(ubo.renderSizeJitter.xy) * 1.5) + 8);
+        ssrHit = clamp(ssr.a, 0.0, 1.0);
+        specSsr = mix(specSsr, ssr.rgb * mix(envBrdf, vec3(1.0), ssrHit * 0.8), ssrHit);
+    }
 
     float alpha = clamp(max(base.a, max(Fg.r, ssrHit * 0.88)), 0.0, 1.0);
     if (shopGlass && ssrHit < 0.35)

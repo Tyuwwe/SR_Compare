@@ -706,7 +706,7 @@ bool CompareApp::createDescriptors() {
     sizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     sizes[0].descriptorCount = deferred::kMaxTextures + numColumns * 3 + 2 + numAlgos * 2 +
                                14 * kFramesInFlight * 4 + // lighting sets (GB/GT/SSAA/spatial), shadow + atlas + 2 probe arrays
-                               8 * kFramesInFlight * 4 +  // transparent sets + SSR + fog volume
+                               10 * kFramesInFlight * 4 + // transparent sets + SSR + fog volume + 2 probe arrays
                                11 * kFramesInFlight * 4 + // opaque-SSR trace sets (GB/GT/SSAA/spatial), +2 probe arrays
                                10 * 3 +                   // ssao + temporal + blur samplers (per path)
                                3 * 6 +                    // ssr temporal samplers (GB/GT/SSAA x2 sets)
@@ -720,6 +720,7 @@ bool CompareApp::createDescriptors() {
                                kFramesInFlight * 2 + // lighting UBOs
                                kFramesInFlight * 4 + // lighting probe UBOs
                                kFramesInFlight * 3 +  // transparent UBOs (GB/GT/SSAA)
+                               kFramesInFlight * 4 +  // transparent probe UBOs (GB/GT/SSAA/spatial)
                                kFramesInFlight * 4 +  // opaque-SSR UBOs (GB/GT/SSAA/spatial)
                                kFramesInFlight * 4 +  // opaque-SSR probe UBOs
                                3 * kFramesInFlight +   // spatial scene + lighting + transparent
@@ -1456,6 +1457,8 @@ void CompareApp::updateLightingUBO(void* mapped, const Mat4& viewProj,
     deferred_.fillLightingUBO(ubo, scene_, camera_, viewProj, Mat4::inverse(viewProj),
                               overrideLights, shadow, iblIntensity_);
     ubo.shadowAtlasParams[3] = opts_.contactShadows ? 1.f : 0.f;
+    // Glass inline SSR follows the opaque pass's toggle (see Renderer).
+    ubo.lightCounts[1] = opts_.ssr ? 1.f : 0.f;
     std::memcpy(mapped, &ubo, sizeof(ubo));
 }
 

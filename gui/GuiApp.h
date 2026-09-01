@@ -502,6 +502,9 @@ private:
     UiFrameSync uiFrames_[kFramesInFlight] = {};
     uint32_t uiFrameIndex_ = 0;
     bool stackOk_ = false;
+    // True until init()'s first buildRenderStack returns: beginStackConfig
+    // skips the window-size snap for that build (see the comment there).
+    bool initialStackBuild_ = true;
     uint32_t renderFrameIndex_ = 0; // frames recorded with the current stack
 
     // --- render stack --------------------------------------------------------------
@@ -652,6 +655,9 @@ private:
     // configured output size; the swapchain is recreated through the normal
     // OUT_OF_DATE path on the mode switch.
     bool fullscreenEnabled_ = false;
+    // "copied!" feedback countdown (seconds) for the click-to-copy camera
+    // pose overlay (drawCameraPose); 0 = hidden.
+    float poseCopyFlash_ = 0.f;
     // Windowed client size ([window] width/height in engine.toml): remembered
     // across runs, tracked from resize events while not fullscreen and saved
     // back by the debounced auto-save.  0 = not initialized yet (init seeds

@@ -412,6 +412,7 @@ bool GuiApp::init(const GuiOptions& opts) {
     } else {
         statusLine_ = "deferred core init failed";
     }
+    initialStackBuild_ = false;
     if (!stackOk_) {
         std::fprintf(stderr, "gui: initial render stack failed: %s\n", statusLine_.c_str());
         // Continue anyway: the UI stays up (ImGui-only frames) and shows the
@@ -1012,6 +1013,10 @@ void GuiApp::loadWorkerMain(RenderConfig cfg) {
                 fail("scene load failed (kept previous scene)");
                 return;
             }
+            // Reflection probe placements travel with the scene; the actual
+            // GPU upload (loadProbes) happens in finishAsyncRebuild on the
+            // main thread.
+            scene->probes = reflectionProbesForScene(cfg.scenePath);
         }
 
         const uint32_t rw =
@@ -1129,7 +1134,10 @@ void GuiApp::finishAsyncRebuild() {
         loadResult_.algos.clear();
 
         // The env map is part of the deferred core (IBL maps): rebuild it only
-        // when the path actually changed.  Empty = sky atmosphere.
+        // when the path actually changed.  Empty = sky atmosphere.  A rebuild
+        // drops the baked reflection probes with it, so they are reloaded
+        // below in that case as well.
+        bool deferredRebuilt = false;
         if (active_.envMapPath != envMapActive_) {
             deferred_.destroy(ctx_);
             envMapActive_ = active_.envMapPath;
@@ -1139,6 +1147,15 @@ void GuiApp::finishAsyncRebuild() {
                 stackOk_ = false;
                 return;
             }
+            deferredRebuilt = true;
+        }
+
+        if (loadSceneDirty_ || deferredRebuilt) {
+            // GPU upload point for the worker-collected probe placements (or a
+            // reload after the deferred core was rebuilt).  No matching bake
+            // file -> count 0, rendering unchanged.
+            deferred_.loadProbes(ctx_, scene_.probes,
+                                 probeFilePathForScene(active_.scenePath));
         }
 
         if (loadSceneDirty_) {
@@ -1230,8 +1247,14 @@ bool GuiApp::beginStackConfig() {
         std::max(1u, static_cast<uint32_t>(static_cast<float>(active_.displayH) * active_.renderScale));
 
     // Resize the OS window + swapchain when the output resolution changed.
-    if (window_.width() != static_cast<int>(active_.displayW) ||
-        window_.height() != static_cast<int>(active_.displayH)) {
+    // Skipped for the initial build at startup: Window::create may have
+    // deliberately chosen a smaller windowed size to avoid opening as a
+    // screen-covering window while fullscreen is off (the present copy pass
+    // scales the fixed output-resolution composite to the swapchain anyway).
+    // Explicit Applies still snap the window to the output resolution.
+    if (!initialStackBuild_ &&
+        (window_.width() != static_cast<int>(active_.displayW) ||
+         window_.height() != static_cast<int>(active_.displayH))) {
         window_.setClientSize(static_cast<int>(active_.displayW),
                               static_cast<int>(active_.displayH));
     }
@@ -1254,6 +1277,11 @@ bool GuiApp::buildRenderStack() {
         return false;
     }
     hasTransparency_ = deferred_.sceneHasTransparency(scene_);
+    // Baked reflection probes (Phase 4c-2): placements from the registry; no
+    // matching .probes bake file -> count 0, rendering unchanged (same as the
+    // viewer/compare paths).
+    scene_.probes = reflectionProbesForScene(active_.scenePath);
+    deferred_.loadProbes(ctx_, scene_.probes, probeFilePathForScene(active_.scenePath));
     applyLightingPreset(lightingPresetForScene(active_.scenePath));
     if (opts_.exposure > 0.f) exposure_ = opts_.exposure;
 
@@ -1858,21 +1886,21 @@ bool GuiApp::createDescriptors() {
     sizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     sizes[0].descriptorCount =
         deferred::kMaxTextures + numColumns * 3 + 2 + numAlgos * 8 + 14 * kFramesInFlight * 4 +
-        8 * kFramesInFlight * 4 + 11 * kFramesInFlight * 4 + 10 * 3 + 3 * 6 + hizSets + colorSets +
+        10 * kFramesInFlight * 4 + 11 * kFramesInFlight * 4 + 10 * 3 + 3 * 6 + hizSets + colorSets +
         2 + 14 * fogPaths + 17 * postFxPaths + bloomSets + 3 + 2 + 15;
                            // + 5 debug-tab sets (3 samplers each, patch 0004)
                            // + ssr temporal samplers (GB/GT/SSAA x2 sets); auto-exposure HDR
                            // sources (LR + GT); volfog light/temporal/march/composite samplers;
                            // lighting sets: 14 samplers each (GB/GT/SSAA/spatial), incl. shadow +
-                           // spot atlas + 2 probe arrays; transparent sets: 8 each (incl. the
-                           // froxel fog volume); SSR trace sets: 11 each; post-fx sets; bloom
+                           // spot atlas + 2 probe arrays; transparent sets: 10 each (incl. the
+                           // froxel fog volume + 2 probe arrays); SSR trace sets: 11 each; post-fx sets; bloom
                            // pyramid src taps (Phase 6a);
                            // occlusion cull sets: Hi-Z chains (GB/GT/SSAA, Phase 7a);
                            // reactive mask dilate: src mask + motion
     sizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     sizes[1].descriptorCount = kFramesInFlight * 3 + numColumns + numAlgos + kFramesInFlight * 4 +
                                kFramesInFlight * 4 + kFramesInFlight * 4 + // + opaque-SSR UBOs
-                               kFramesInFlight * 8 + // + probe UBOs (lighting + SSR sets)
+                               kFramesInFlight * 12 + // + probe UBOs (lighting + SSR + transparent sets)
                                kClusterSlots * fogPaths + // volfog light sets
                                5; // + debug-tab sets (text UBO binding, patch 0004)
     sizes[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
@@ -3237,6 +3265,8 @@ void GuiApp::updateLightingUBO(void* mapped, const Mat4& viewProj,
     deferred_.fillLightingUBO(ubo, scene_, camera_, viewProj, Mat4::inverse(viewProj), &lights,
                               shadow, iblIntensity_);
     ubo.shadowAtlasParams[3] = contactShadowsEnabled_ ? 1.f : 0.f;
+    // Glass inline SSR follows the opaque pass's toggle (see Renderer).
+    ubo.lightCounts[1] = ssrEnabled_ ? 1.f : 0.f;
     std::memcpy(mapped, &ubo, sizeof(ubo));
 }
 
@@ -6058,15 +6088,9 @@ void GuiApp::drawViewerTab() {
     ImGui::Checkbox("contact shadows", &contactShadowsEnabled_);
     if (!shadowsEnabled_) ImGui::EndDisabled();
     if (!shadowsActive_) ImGui::EndDisabled();
-    // Opaque SSR: per-frame pass skip (no rebuild), all deferred paths.
-    // CLI/engine.toml-only switch (--ssr / [effects] ssr) — the GUI checkbox
-    // is locked and only displays the current state (kept visible so a
-    // toml/CLI-enabled SSR is not hidden).
-    ImGui::BeginDisabled();
-    ImGui::Checkbox("ssr (opaque)", &ssrEnabled_);
-    ImGui::EndDisabled();
-    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-        ImGui::SetTooltip("CLI only: --ssr (or engine.toml [effects] ssr)");
+    // SSR: per-frame gate, no rebuild.  Controls both the opaque pass (pass
+    // skip) and the transparent pass's inline glass trace (LightingUBO bit).
+    ImGui::Checkbox("ssr", &ssrEnabled_);
     if (!ssrEnabled_) ImGui::BeginDisabled();
     // Global SSR weight: scales the trace-stage hit confidence; below 1 the
     // composite leans on the IBL fallback (rough ground reads less greasy).
@@ -6413,8 +6437,11 @@ void GuiApp::drawReferenceSection() {
 void GuiApp::drawCameraPose() {
     // Bottom-left readout of the camera pose, drawn on top of the render area
     // (after the side panel so the panel does not cover it).  The user reports
-    // repro locations with these numbers.  NoInputs: never eats mouse look.
-    const ImGuiIO& io = ImGui::GetIO();
+    // repro locations with these numbers; left-clicking the overlay copies the
+    // pose as a single-frame camera-path JSON snippet to the clipboard.  The
+    // overlay is tiny, so taking inputs here does not meaningfully get in the
+    // way of mouse look.
+    ImGuiIO& io = ImGui::GetIO();
     const Vec3& p = camera_.position;
     const Vec3& f = camera_.forward;
     const float deg = 57.2957795f;
@@ -6427,12 +6454,36 @@ void GuiApp::drawCameraPose() {
     ImGui::SetNextWindowBgAlpha(0.55f);
     if (ImGui::Begin("##campose", nullptr,
                      ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
-                         ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
+                         ImGuiWindowFlags_NoNav |
                          ImGuiWindowFlags_AlwaysAutoResize |
                          ImGuiWindowFlags_NoFocusOnAppearing)) {
-        ImGui::Text("pos (%.1f, %.1f, %.1f)   yaw %.1f° pitch %.1f°", p.x, p.y, p.z,
-                    yawDeg, pitchDeg);
-        ImGui::Text("fwd (%.3f, %.3f, %.3f)", f.x, f.y, f.z);
+        char line1[128];
+        std::snprintf(line1, sizeof(line1), "pos (%.1f, %.1f, %.1f)   yaw %.1f° pitch %.1f°",
+                      p.x, p.y, p.z, static_cast<double>(yawDeg),
+                      static_cast<double>(pitchDeg));
+        char line2[128];
+        if (poseCopyFlash_ > 0.f) {
+            poseCopyFlash_ -= io.DeltaTime;
+            std::snprintf(line2, sizeof(line2), "fwd (%.3f, %.3f, %.3f)   copied!",
+                          f.x, f.y, f.z);
+        } else {
+            std::snprintf(line2, sizeof(line2), "fwd (%.3f, %.3f, %.3f)", f.x, f.y,
+                          f.z);
+        }
+        // Selectable text: hover highlight shows it is clickable, a click
+        // anywhere on the readout copies the pose.
+        const bool clicked = ImGui::Selectable(line1) || ImGui::Selectable(line2);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("click to copy pose (camera-path JSON)");
+        if (clicked) {
+            char buf[192];
+            std::snprintf(buf, sizeof(buf),
+                          "{\"position\": [%.3f, %.3f, %.3f], \"forward\": [%.3f, %.3f, "
+                          "%.3f], \"up\": [0, 1, 0]}",
+                          p.x, p.y, p.z, f.x, f.y, f.z);
+            ImGui::SetClipboardText(buf);
+            poseCopyFlash_ = 1.5f;
+        }
     }
     ImGui::End();
 }

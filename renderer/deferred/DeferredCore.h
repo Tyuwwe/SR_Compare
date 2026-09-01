@@ -222,7 +222,12 @@ struct LightingUBO {
     float invViewProj[16];
     float cameraPos[4];
     LightGPU lights[kMaxLights];
-    float lightCounts[4]; // x = active light count, yzw reserved
+    float lightCounts[4]; // x = active light count,
+                          // y = glass inline-SSR enabled (hosts set after
+                          //     fillLightingUBO, same pattern as
+                          //     shadowAtlasParams.w; gates the traceSsr call in
+                          //     transparent*.frag — off = probe -> global env),
+                          // zw reserved
     float ambient[4];
     float iblParams[4]; // envIntensity, prefilterMaxLod, skyboxEnabled, unused
     float cascadeVp[kShadowCascadeCount][16];
@@ -681,7 +686,9 @@ struct VolFogVolume {
 //   1. extract (bloom_extract.comp): quadratic soft-knee threshold into mip 0
 //      at half resolution, after a 4-tap prefilter that stabilises sub-texel
 //      emitters (threshold/knee semantics unchanged from the old
-//      single-level bloom);
+//      single-level bloom); the prefilter also NaN-sanitises, clamps negative
+//      (out-of-gamut) taps and Karis-weights isolated single-texel spikes so
+//      one-frame specular fireflies cannot flash a wide halo (see the shader);
 //   2. downsample (bloom_downsample.comp): 13-tap energy-preserving filter,
 //      kBloomMipCount - 1 levels (1080p: 960x540 -> 60x34);
 //   3. upsample (bloom_upsample.comp): 3x3 tent filter of the lower mip

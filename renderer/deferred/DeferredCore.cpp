@@ -374,8 +374,10 @@ bool DeferredCore::createLayouts(const VulkanContext& ctx) {
     // Transparency pass: binding 0 = LightingUBO; 1-3 = IBL; 4 = SSAO;
     // 5 = CSM shadow map; 6 = opaque HDR copy (SSR); 7 = opaque depth pyramid
     // (Hi-Z, R32F, SSR hierarchical march); 8 = ray-integrated froxel volume
-    // (volumetric fog on translucency; unwritten when fog is off).
-    VkDescriptorSetLayoutBinding transparentBindings[9] = {};
+    // (volumetric fog on translucency; unwritten when fog is off);
+    // 9 = reflection ProbeUBO; 10/11 = probe prefiltered specular + irradiance
+    // cube arrays (Phase 4c-2; the glass SSR-miss fallback reuses probes.glsl).
+    VkDescriptorSetLayoutBinding transparentBindings[12] = {};
     transparentBindings[0].binding = 0;
     transparentBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     transparentBindings[0].descriptorCount = 1;
@@ -386,9 +388,19 @@ bool DeferredCore::createLayouts(const VulkanContext& ctx) {
         transparentBindings[i].descriptorCount = 1;
         transparentBindings[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     }
+    transparentBindings[9].binding = 9; // ProbeUBO
+    transparentBindings[9].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    transparentBindings[9].descriptorCount = 1;
+    transparentBindings[9].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    for (uint32_t i = 10; i < 12; ++i) { // probe prefilter / irradiance cube arrays
+        transparentBindings[i].binding = i;
+        transparentBindings[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        transparentBindings[i].descriptorCount = 1;
+        transparentBindings[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    }
     VkDescriptorSetLayoutCreateInfo transparentLayoutCi = {};
     transparentLayoutCi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    transparentLayoutCi.bindingCount = 9;
+    transparentLayoutCi.bindingCount = 12;
     transparentLayoutCi.pBindings = transparentBindings;
     if (vkCreateDescriptorSetLayout(ctx.device, &transparentLayoutCi, nullptr,
                                     &transparentSetLayout_) != VK_SUCCESS)
@@ -2814,7 +2826,22 @@ void DeferredCore::writeTransparentSet(const VulkanContext& ctx, VkDescriptorSet
     fogImg.imageView = fogVolume ? fogVolume : fogFallbackView_;
     fogImg.imageLayout = VK_IMAGE_LAYOUT_GENERAL; // froxel volumes are GENERAL for life
 
-    VkWriteDescriptorSet w[9] = {};
+    // Bindings 9-11: reflection probes (Phase 4c-2), always written — the
+    // empty volume (count 0) keeps probe-less scenes on the global env path,
+    // same contract as the lighting/SSR sets.
+    VkDescriptorBufferInfo probeBuf = {};
+    probeBuf.buffer = probes_.uboBuffer();
+    probeBuf.offset = 0;
+    probeBuf.range = sizeof(ProbeUBO);
+    VkDescriptorImageInfo probeImg[2] = {};
+    probeImg[0].sampler = probes_.sampler();
+    probeImg[0].imageView = probes_.prefilterView();
+    probeImg[0].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    probeImg[1].sampler = probes_.sampler();
+    probeImg[1].imageView = probes_.irradianceView();
+    probeImg[1].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+    VkWriteDescriptorSet w[12] = {};
     w[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     w[0].dstSet = set;
     w[0].dstBinding = 0;
@@ -2858,6 +2885,22 @@ void DeferredCore::writeTransparentSet(const VulkanContext& ctx, VkDescriptorSet
     w[n].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     w[n].pImageInfo = &fogImg;
     ++n;
+    w[n].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    w[n].dstSet = set;
+    w[n].dstBinding = 9;
+    w[n].descriptorCount = 1;
+    w[n].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    w[n].pBufferInfo = &probeBuf;
+    ++n;
+    for (uint32_t k = 0; k < 2; ++k) {
+        w[n].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w[n].dstSet = set;
+        w[n].dstBinding = 10 + k;
+        w[n].descriptorCount = 1;
+        w[n].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        w[n].pImageInfo = &probeImg[k];
+        ++n;
+    }
     vkUpdateDescriptorSets(ctx.device, n, w, 0, nullptr);
 }
 

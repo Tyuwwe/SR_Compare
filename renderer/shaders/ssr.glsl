@@ -62,48 +62,58 @@ float ssrClipToScreen(vec2 startUv, vec2 endUv) {
 // is read at a roughness-driven LOD so one ray approximates the widened GGX
 // lobe (rough reflections average a larger screen footprint).
 // escalateEvery: coarsen one mip per this many in-front advances (1 = classic
-// Hi-Z, one per step).  The max-reduced hull is conservative only for rays
-// whose view-Z grows; rays reflected off camera-facing surfaces (shop
-// windows) travel back TOWARD the camera, and a mixed cell's far max lets
-// the march skip thin near geometry (lamps, mullions, the opposite
-// storefront) hiding inside it.  Coarsening one mip per single step then
-// quantizes the detected hit region to coarse cell blocks — round reflectors
-// read as axis-aligned squares.  The glass callers pass 4 so the near field
-// is searched at fine mips; the temporally-accumulated opaque path keeps 1.
-// maxMipCap caps the coarsest level the march may reach.  Glass passes 2:
-// coarser cells (8px+) mix the thin near-field reflectors with the sky
-// behind them (sky max-reduces to +inf and the march skips the whole cell),
-// so hit/miss at coarse level tiles the mirror with the scene's triangular
-// silhouettes; a 4px ceiling keeps cells small enough to resolve the
-// awning/lamp band, at the price of a shorter maximum march (compensated by
-// the raised kMaxIters below).  The opaque path passes the full chain (long
-// rays across the ground plane need it).
+// Hi-Z, one per step); callers pass 1.  maxMipCap caps the coarsest level the
+// march may reach (glass 1: coarser cells tunnel through thin slatted
+// reflectors; opaque the full chain for long ground rays).
+// cfg packs the per-caller tuning:
+//   x = nearField (m): mip coarsening is additionally gated on the ray's
+//      WORLD distance travelled — a max-reduced cell mixing a thin NEAR
+//      reflector (chair slats, mullions, lamps) with deeper background
+//      reports the background depth, so coarse steps tunnel through the
+//      reflector and the torn hit field stacks into layered bands in the
+//      mirror.  The near field therefore marches at mip 0 where such
+//      reflectors live; 0 restores plain advance-count gating (opaque).
+//   y/z = thickness base / view-Z slope of the hit-acceptance window.
+//   w = grazing widening amount [0..1]: the window is multiplied by
+//      mix(1, 1/max(|R·N|, 0.25), w).  The opaque path keeps the historical
+//      full widening (w = 1, tolerates coarse landings of long ground rays);
+//      glass passes 0 — at grazing the widened window accepts rays passing
+//      metres behind a reflector, and because a view-Z miss of w maps to a
+//      w/|R·N| slide along the mirror, small objects smeared into long
+//      horizontal streaks (the "stretched lamp" artifact).
 vec4 traceSsr(sampler2D colorTex, int colorMipCount, sampler2D hizTex, int hizMipCount,
               mat4 viewProj, mat4 invViewProj, vec3 cameraPos, vec3 worldPos,
               vec3 N, vec3 R, float roughness, vec2 renderSize, int escalateEvery,
-              int maxMipCap) {
-    const int kMaxIters = 256; // hierarchy steps (each descends or advances);
-                               // 256 keeps ~1 Kpx reach now that the glass
-                               // callers cap the coarsest mip (see maxMipCap)
+              int maxMipCap, vec4 cfg, int maxIters) {
+    const int kMaxIters = maxIters; // hierarchy steps (each descends or advances);
     const int kRefine = 8;
     const float kMaxDist = 100.0;
     const float kBias = 0.08;
     const float kNearW = 0.02;
+    const float nearField = cfg.x;
+    const float thickBase = cfg.y;
+    const float thickSlope = cfg.z;
+    const float thickWiden = cfg.w;
 
     vec3 origin = worldPos + N * kBias;
     vec4 startCS = viewProj * vec4(origin, 1.0);
     vec4 endCS = viewProj * vec4(origin + R * kMaxDist, 1.0);
 
     // Clip to the near plane so 1/w stays finite (ray toward / behind camera).
+    // s0/s1 track the ray's world-space distance range through the clips so
+    // the march can gate mip coarsening on distance travelled (see below).
+    float s0 = 0.0, s1 = kMaxDist;
     if (startCS.w < kNearW && endCS.w < kNearW) return vec4(0.0);
     if (endCS.w < kNearW) {
         float tn = (kNearW - startCS.w) / (endCS.w - startCS.w);
         if (tn <= 0.0) return vec4(0.0);
         endCS = mix(startCS, endCS, clamp(tn, 0.0, 1.0));
+        s1 = mix(s0, s1, clamp(tn, 0.0, 1.0));
     }
     if (startCS.w < kNearW) {
         float tn = (kNearW - startCS.w) / (endCS.w - startCS.w);
         startCS = mix(startCS, endCS, clamp(tn, 0.0, 1.0));
+        s0 = mix(s0, s1, clamp(tn, 0.0, 1.0));
     }
 
     vec3 startNdc = startCS.xyz / startCS.w;
@@ -114,25 +124,34 @@ vec4 traceSsr(sampler2D colorTex, int colorMipCount, sampler2D hizTex, int hizMi
         return vec4(0.0);
     startUv = clamp(startUv, vec2(0.0), vec2(1.0));
 
+    // Bail only when the segment misses the screen entirely.  Head-on panes
+    // reflect the ray back toward/behind the camera, so endNdc lands far
+    // off-screen and tClip (relative to the full segment) is tiny even though
+    // the clipped piece still crosses plenty of on-screen geometry — rejecting
+    // on a small tClip kills exactly those reflections.  Truly degenerate
+    // segments are caught by the pixel-length check below.
     float tClip = ssrClipToScreen(startUv, endUv);
-    if (tClip <= 0.02) return vec4(0.0);
+    if (tClip <= 0.0) return vec4(0.0);
     endUv = mix(startUv, endUv, tClip);
     float invW0 = 1.0 / startCS.w;
     float invW1 = mix(invW0, 1.0 / endCS.w, tClip);
+    // World-distance range of the clipped segment: s(t) = mix(sA, sB, t).
+    const float sA = s0;
+    const float sB = mix(s0, s1, tClip);
 
     vec2 startPx = startUv * renderSize;
     vec2 endPx = endUv * renderSize;
     vec2 dPx = endPx - startPx;
     float pixelDist = length(dPx);
-    // Head-on panes project the reflection ray almost onto one pixel (R ≈ V);
-    // still take a few samples so a slight offset can hit on-screen geometry.
+    // A reflection ray that projects to less than a pixel cannot resolve a
+    // hit; miss.
     if (pixelDist < 0.25) return vec4(0.0);
 
     const int maxMip = min(hizMipCount - 1, maxMipCap);
     const ivec2 size0 = ivec2(renderSize);
-    // |R·N|: 1 head-on, ~0 at grazing.  Scales the self-hit radius and the
-    // thickness window below; grazing incidence is where both fixed
-    // thresholds used to kill valid reflections (Bistro shop windows).
+    // |R·N|: 1 head-on, ~0 at grazing.  Scales the self-hit radius below and
+    // (via thickWiden) optionally widens the thickness window for the opaque
+    // caller; the glass LOD term uses it too.
     const float grazing = abs(dot(R, N));
 
     // t parameterises the clipped segment: uv = mix(startUv, endUv, t) and
@@ -167,10 +186,16 @@ vec4 traceSsr(sampler2D colorTex, int colorMipCount, sampler2D hizTex, int hizMi
         if (rayZ <= cellZ) {
             // In front of the farthest surface of this cell: safe to skip it,
             // then coarsen so long empty runs cost one iteration per cell.
+            // Coarsening is additionally gated on world distance travelled:
+            // a max-reduced cell mixing a thin NEAR reflector with deeper
+            // background reports the background depth, so coarse steps tunnel
+            // through slats / mullions / lamps and the hit field tears into
+            // stacked bands.  The near field therefore marches at mip 0
+            // (nearField = 0 restores plain advance-count gating).
             tFront = t;
             t += float(1 << level) / pixelDist;
             ++advances;
-            if (advances % escalateEvery == 0)
+            if (advances % escalateEvery == 0 && mix(sA, sB, t) >= nearField)
                 level = min(level + 1, maxMip);
             continue;
         }
@@ -243,11 +268,14 @@ vec4 traceSsr(sampler2D colorTex, int colorMipCount, sampler2D hizTex, int hizMi
             float hiRayZ = abs(1.0 / mix(invW0, invW1, hi));
             float hiSceneZ = ssrViewZ(viewProj, invViewProj, hiUv, hiDepth);
             float hiOver = hiRayZ - hiSceneZ;
-            // Widen the view-Z window at grazing incidence: the ray's view-Z
-            // then advances slowly, so even after binary refinement the hit
-            // can sit a coarse step past a thin reflector (window frame,
-            // mullion) and the angle-independent window rejected it.
-            float thickness = (0.35 + 0.03 * hiRayZ) / max(grazing, 0.25);
+            // Hit-acceptance window (view-Z overshoot past the front surface).
+            // The opaque path keeps the historical grazing widening (tolerates
+            // coarse landings of long ground rays); glass passes thickWiden=0:
+            // a view-Z miss of w maps to a w/|R·N| slide along the mirror, so
+            // the widened window painted small reflectors into metre-long
+            // horizontal streaks (see the cfg comment above).
+            const float thickness = (thickBase + thickSlope * hiRayZ) *
+                                    mix(1.0, 1.0 / max(grazing, 0.25), thickWiden);
             if (hiOver < 0.0 || hiOver > thickness) reject = true;
         }
         if (!reject) {

@@ -68,6 +68,12 @@ Vec3 atmosphereSunColor(float elevationDeg, float azimuthDeg);
 // All named scenes, procedural first.
 std::vector<SceneEntry> listScenes();
 
+// Which built-in procedural generator Scene::loadProcedural runs ("boxes" by
+// default, "ssrlab" after resolveSceneArg("ssrlab")).  Lets a second built-in
+// scene ride the host's existing empty-path fallback (gltf miss -> procedural)
+// unchanged.
+const std::string& proceduralSceneVariant();
+
 // Resolve a --scene argument: known alias -> its path ("" for procedural);
 // anything else is treated as a glTF path and returned unchanged.
 // Prints a warning to stderr when a known alias's asset is missing.

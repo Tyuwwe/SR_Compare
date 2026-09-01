@@ -617,7 +617,7 @@ bool Renderer::createSceneDescriptors() {
     sizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     sizes[0].descriptorCount = deferred::kMaxTextures + 4 + // texture array + present (image + bloom + dirt + lut)
                                14 * kFramesInFlight * 2 + // lighting sets (GB/GT), shadow + atlas + 2 probe arrays
-                               8 * kFramesInFlight * 2 +  // transparent sets (GB/GT), +SSR+shadow+fog volume
+                               10 * kFramesInFlight * 2 + // transparent sets (GB/GT), +SSR+shadow+fog volume + 2 probe arrays
                                11 * kFramesInFlight * 2 + // opaque-SSR trace sets (GB/GT), +2 probe arrays
                                2 * 2 + 3 * 4 + 1 * 4 +     // ssao + temporal + blur samplers
                                3 * 4 +                     // ssr temporal samplers (GB/GT x2 sets)
@@ -629,7 +629,7 @@ bool Renderer::createSceneDescriptors() {
                                2 +                         // occlusion cull sets: Hi-Z chains (GB/GT, Phase 7a)
                                hizSets + colorSets;
     sizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    sizes[1].descriptorCount = kFramesInFlight * 10 + // scene + lighting(+probe) + 2 transparent + 2 SSR(+probe) UBOs
+    sizes[1].descriptorCount = kFramesInFlight * 12 + // scene + lighting(+probe) + 2 transparent(+probe) + 2 SSR(+probe) UBOs
                                kClusterSlots * fogPaths; // volfog light sets
     sizes[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
     sizes[2].descriptorCount = kFramesInFlight;
@@ -1128,6 +1128,9 @@ void Renderer::updateLightingUBO(uint32_t frameIndex, const Mat4& viewProj,
     deferred_.fillLightingUBO(ubo, scene_, camera_, viewProj, invViewProj, overrideLights, shadow,
                               iblIntensity_);
     ubo.shadowAtlasParams[3] = opts_.contactShadows ? 1.f : 0.f;
+    // The glass inline SSR trace (transparent*.frag) follows the same global
+    // toggle as the opaque SSR pass (off = probe -> global env fallback only).
+    ubo.lightCounts[1] = opts_.ssr ? 1.f : 0.f;
     std::memcpy(fr.lightingUboMapped, &ubo, sizeof(ubo));
     // Full point/spot light set for the clustered pass (same slot rule as the
     // UBO: the slot's fence passed before recording).
@@ -1204,7 +1207,7 @@ bool Renderer::bakeProbes() {
     static const Vec3 kFaceUp[6] = {{0.f, 1.f, 0.f}, {0.f, 1.f, 0.f}, {0.f, 0.f, -1.f},
                                     {0.f, 0.f, 1.f}, {0.f, 1.f, 0.f}, {0.f, 1.f, 0.f}};
 
-    // --- bake-local targets (128^2 GBuffer + HDR + white AO stand-in) ----------
+    // --- bake-local targets (kBakeSize^2 GBuffer + HDR + white AO stand-in) --
     // Phase 6b: the GT GBuffer pipeline now has five attachments, so the bake
     // keeps a (discarded) motion target too.
     ImageResource albedo, normal, material, emissive, depth, hdr, ao, motion;
@@ -1627,6 +1630,11 @@ void Renderer::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     // against LAST frame's pyramid of this path (1-frame latency; skipped on
     // the path's first frame or after a resize -> everything visible).
     const bool cullActive = occlusion_ && cull.prevValid && cullCandidates_ > 0;
+    // Value capture: the record lambda runs at execute() time, after the
+    // bookkeeping below already advanced cull.prevViewProj to THIS frame's
+    // matrix.  The cull must pair the previous pyramid with the previous
+    // matrix (same pattern as aoPrevVp / ssrPrevVp below).
+    const Mat4 cullPrevVp = cull.prevViewProj;
 
     // --- GBuffer pass ---------------------------------------------------------
     // Both paths attach a motion RT (Phase 6b): the GT pass uses the GT
@@ -1650,7 +1658,7 @@ void Renderer::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
             deferred_.recordInstanceUpload(c, slot, instances_, cullCandidates_);
             deferred_.recordCommandUpload(c, slot, cull, cullCandidates_, cullActive);
             if (cullActive)
-                deferred_.recordOcclusionCull(c, cull, cullCandidates_, cull.prevViewProj,
+                deferred_.recordOcclusionCull(c, cull, cullCandidates_, cullPrevVp,
                                               (gbuffer ? gbPyramid_ : gtPyramid_).mipCount, sceneW,
                                               sceneH);
             VkRenderingAttachmentInfo colors[5] = {

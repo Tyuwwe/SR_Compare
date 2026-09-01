@@ -1,7 +1,8 @@
 // Baked local reflection probes (UE4 reflection-capture style, Phase 4c-2).
-// Shared by lighting.frag (IBL split-sum terms) and ssr_opaque.comp (the
+// Shared by lighting.frag (IBL split-sum terms), ssr_opaque.comp (the
 // recomputed specIbl of the composite delta — both MUST use the same fallback
-// chain or the SSR replacement would not cancel lighting's term exactly).
+// chain or the SSR replacement would not cancel lighting's term exactly) and
+// transparent*.frag (the glass inline-SSR miss fallback).
 //
 // Fallback chain: SSR hit -> local probe -> global env.  A pixel inside one or
 // two probe boxes samples the baked cube arrays with parallax-corrected box
@@ -10,22 +11,28 @@
 // count 0 (no bake file) every helper degenerates to the global-env path.
 //
 // The includer defines the binding numbers (they differ between the lighting
-// and the SSR descriptor set layouts):
+// and the SSR descriptor set layouts) and, when its probe descriptors do not
+// live in set 0, SR_PROBE_SET (the transparency pass binds them in set 2):
 //   #define SR_PROBE_UBO_BINDING  / SR_PROBE_SPEC_BINDING / SR_PROBE_DIFF_BINDING
+//   [#define SR_PROBE_SET 2]
 #ifndef SR_PROBES_GLSL
 #define SR_PROBES_GLSL
 
+#ifndef SR_PROBE_SET
+#define SR_PROBE_SET 0
+#endif
+
 const int kMaxProbes = 8; // must match kMaxReflectionProbes (Scene.h)
 
-layout(set = 0, binding = SR_PROBE_UBO_BINDING) uniform ProbeUBO {
+layout(set = SR_PROBE_SET, binding = SR_PROBE_UBO_BINDING) uniform ProbeUBO {
     vec4 info;              // x = active probe count, y = prefilter max lod,
                             // z = box-edge blend distance (m), w unused
     vec4 boxMin[kMaxProbes];
     vec4 boxMax[kMaxProbes];
     vec4 position[kMaxProbes]; // xyz = capture position (parallax pivot)
 } probes;
-layout(set = 0, binding = SR_PROBE_SPEC_BINDING) uniform samplerCubeArray probePrefilter;
-layout(set = 0, binding = SR_PROBE_DIFF_BINDING) uniform samplerCubeArray probeIrradiance;
+layout(set = SR_PROBE_SET, binding = SR_PROBE_SPEC_BINDING) uniform samplerCubeArray probePrefilter;
+layout(set = SR_PROBE_SET, binding = SR_PROBE_DIFF_BINDING) uniform samplerCubeArray probeIrradiance;
 
 // Parallax-corrected sampling direction: intersect the reflection ray with
 // the probe's box and re-aim from the capture position to the hit point.

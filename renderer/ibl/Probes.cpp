@@ -234,6 +234,12 @@ bool ReflectionProbes::create(const VulkanContext& ctx) {
 bool ReflectionProbes::load(const VulkanContext& ctx, const std::vector<ReflectionProbe>& defs,
                             const std::string& filePath) {
     count_ = 0;
+    // The irradiance/prefilter descriptor sets allocated below are transient
+    // (only used by this call's one-shot dispatches, which have completed by
+    // the time we return) but are never freed individually — without a pool
+    // reset, repeated load() calls (GUI scene switches, deferred rebuilds)
+    // would eventually exhaust the fixed-size pool and silently fail allocSet.
+    if (pool_) vkResetDescriptorPool(ctx.device, pool_, 0);
     if (defs.empty()) return true;
     std::vector<uint16_t> rgba;
     if (!loadProbeFile(filePath.c_str(), defs, kBakeSize, rgba)) return true;

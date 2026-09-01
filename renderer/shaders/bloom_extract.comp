@@ -10,6 +10,21 @@
 // across the threshold ("bling").  The wider ~4x4-texel tent footprint makes
 // the extracted energy insensitive to sub-texel phase; threshold/knee and the
 // downsample/upsample chain are unchanged, so halo shape is preserved.
+//
+// Firefly/NaN guard (Karis, SIGGRAPH 2013 "Tone mapping"; UE4 bloom
+// "firefly reduction"): each tap is weighted by 1/(1+luma) before averaging.
+// Spatially coherent bright content (bulbs, sun glints covering several
+// texels) gets near-equal weights, so its halo is preserved; an isolated
+// single-texel HDR spike (a one-frame GGX glint on the Bistro scooter chrome
+// that TAA variance clipping only halves) has its contribution capped at ~1
+// luminance unit instead of flooding the pyramid and flashing a wide halo
+// for exactly one frame.  Non-finite taps are zeroed first: a NaN/Inf from
+// upstream (specular rcp, SSR) would otherwise be smeared across the whole
+// mip chain by the 13-tap downsample and the tent upsample.  And since the
+// extract thresholds LUMA only, an out-of-gamut tap (negative red in a
+// saturated blue sky after the TAA YCoCg round-trip / variance clip) would
+// otherwise pass the knee and SUBTRACT that channel across the whole halo —
+// bloom must be energy-positive, so the filtered color is clamped at zero.
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
@@ -20,6 +35,12 @@ layout(push_constant) uniform Push {
     vec4 params; // x = threshold, y = knee, zw unused
 } pc;
 
+const vec3 kLuma = vec3(0.2126, 0.7152, 0.0722);
+
+vec3 sanitize(vec3 c) {
+    return (any(isnan(c)) || any(isinf(c))) ? vec3(0.0) : c;
+}
+
 void main() {
     ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
     ivec2 size = imageSize(outBright);
@@ -27,12 +48,19 @@ void main() {
 
     const vec2 uv = (vec2(pix) + 0.5) / vec2(size);
     const vec2 t = 1.0 / vec2(textureSize(srcHdr, 0));
-    vec3 c = texture(srcHdr, uv + t * vec2(-1.0, -1.0)).rgb
-           + texture(srcHdr, uv + t * vec2( 1.0, -1.0)).rgb
-           + texture(srcHdr, uv + t * vec2(-1.0,  1.0)).rgb
-           + texture(srcHdr, uv + t * vec2( 1.0,  1.0)).rgb;
-    c *= 0.25;
-    float lum = max(dot(c, vec3(0.2126, 0.7152, 0.0722)), 1e-4);
+    const vec3 s0 = sanitize(texture(srcHdr, uv + t * vec2(-1.0, -1.0)).rgb);
+    const vec3 s1 = sanitize(texture(srcHdr, uv + t * vec2( 1.0, -1.0)).rgb);
+    const vec3 s2 = sanitize(texture(srcHdr, uv + t * vec2(-1.0,  1.0)).rgb);
+    const vec3 s3 = sanitize(texture(srcHdr, uv + t * vec2( 1.0,  1.0)).rgb);
+    // Negative luma can survive the TAA YCoCg round-trip; clamp it out of the
+    // weight so it cannot flip its sign.
+    const float w0 = 1.0 / (1.0 + max(dot(s0, kLuma), 0.0));
+    const float w1 = 1.0 / (1.0 + max(dot(s1, kLuma), 0.0));
+    const float w2 = 1.0 / (1.0 + max(dot(s2, kLuma), 0.0));
+    const float w3 = 1.0 / (1.0 + max(dot(s3, kLuma), 0.0));
+    vec3 c = (s0 * w0 + s1 * w1 + s2 * w2 + s3 * w3) / (w0 + w1 + w2 + w3);
+    c = max(c, vec3(0.0)); // see the energy-positive comment above
+    float lum = max(dot(c, kLuma), 1e-4);
     float threshold = pc.params.x;
     float knee = max(pc.params.y, 1e-4);
     float soft = clamp(lum - threshold + knee, 0.0, 2.0 * knee);

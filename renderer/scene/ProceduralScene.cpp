@@ -4,6 +4,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <string>
 
 namespace sr {
 
@@ -80,6 +81,111 @@ bool Scene::loadProcedural(const VulkanContext& ctx, VkCommandPool pool) {
     if (!uploadMesh(ctx, cubeVerts, cubeIdx, cube, pool)) return false;
     meshes.push_back(cube);
     const uint32_t cubeMesh = 0;
+
+    // ------------------------------------------------------------------
+    // ssrlab: minimal SSR mirror test scene (debug tool, registered as the
+    // "ssrlab" alias; the default "boxes" layout below is untouched).
+    // Replicates the Bistro cafe storefront's grazing-mirror configuration
+    // under controlled geometry: a long mirror wall along X viewed nearly
+    // edge-on, a row of small emissive "lamps" and slatted benches in front
+    // of it, a red awning slab above, and colored boxes across the room as
+    // far-field reflection targets.  SSR artifacts (stretched / multiplied
+    // reflections) are unambiguous here because the true mirror image is
+    // known: three small separate cubes, slatted benches, one red band.
+    // ------------------------------------------------------------------
+    if (proceduralSceneVariant() == "ssrlab") {
+        auto addInstance = [&](const Mat4& model, uint32_t material) {
+            MeshInstance inst;
+            inst.meshIndex = cubeMesh;
+            inst.materialIndex = material;
+            inst.model = model;
+            inst.prevModel = model;
+            instances.push_back(inst);
+        };
+        auto addMaterial = [&](const Vec4& color, float rough, float metal = 0.f) {
+            Material m;
+            m.baseColor = color;
+            m.roughness = rough;
+            m.metallic = metal;
+            materials.push_back(m);
+            return static_cast<uint32_t>(materials.size() - 1);
+        };
+
+        const uint32_t floorMat = addMaterial({0.9f, 0.9f, 0.9f, 1.f}, 0.85f);
+        materials[floorMat].texIndex = 0;
+        const uint32_t wallMat = addMaterial({0.55f, 0.58f, 0.62f, 1.f}, 0.9f);
+        const uint32_t awningMat = addMaterial({0.55f, 0.07f, 0.07f, 1.f}, 0.7f);
+        const uint32_t woodMat = addMaterial({0.35f, 0.22f, 0.10f, 1.f}, 0.6f);
+        const uint32_t poleMat = addMaterial({0.10f, 0.12f, 0.11f, 1.f}, 0.5f, 0.6f);
+        // Emissive lamp cubes (the "hanging globes"): bright enough to stand
+        // out from every background in the mirror.
+        Material lampM;
+        lampM.baseColor = {0.f, 0.f, 0.f, 1.f};
+        lampM.roughness = 0.4f;
+        lampM.emissiveFactor = {7.f, 5.2f, 3.2f};
+        materials.push_back(lampM);
+        const uint32_t lampMat = static_cast<uint32_t>(materials.size() - 1);
+        // Mirror pane: blend routes it to the transparency pass, mirror kills
+        // transmission (same shading path as the Bistro storefront panes).
+        Material mirrorM;
+        mirrorM.baseColor = {0.02f, 0.03f, 0.03f, 0.05f};
+        mirrorM.roughness = 0.02f;
+        mirrorM.blend = true;
+        mirrorM.mirror = true;
+        materials.push_back(mirrorM);
+        const uint32_t mirrorMat = static_cast<uint32_t>(materials.size() - 1);
+        // Far-field colour targets across the room (reflection content for
+        // the near-head-on mirror pixels).
+        const uint32_t redMat = addMaterial({0.8f, 0.15f, 0.12f, 1.f}, 0.4f);
+        const uint32_t blueMat = addMaterial({0.15f, 0.35f, 0.85f, 1.f}, 0.3f);
+        const uint32_t yellowMat = addMaterial({0.9f, 0.75f, 0.15f, 1.f}, 0.35f);
+
+        // Room shell: floor, back wall (behind the mirror), side walls, and a
+        // facing wall behind the default camera so head-on rays hit geometry.
+        addInstance(composeTransform({0.f, -0.1f, 2.f}, 0.f, {26.f, 0.2f, 22.f}), floorMat);
+        addInstance(composeTransform({0.f, 3.f, -2.6f}, 0.f, {26.f, 6.f, 0.2f}), wallMat);
+        addInstance(composeTransform({-13.f, 3.f, 2.f}, 0.f, {0.2f, 6.f, 22.f}), wallMat);
+        addInstance(composeTransform({13.f, 3.f, 2.f}, 0.f, {0.2f, 6.f, 22.f}), wallMat);
+        addInstance(composeTransform({0.f, 3.f, 12.6f}, 0.f, {26.f, 6.f, 0.2f}), wallMat);
+
+        // The mirror wall itself (z = -2 plane, 16 m long, 3 m tall).
+        addInstance(composeTransform({0.f, 1.5f, -2.f}, 0.f, {16.f, 3.f, 0.05f}), mirrorMat);
+
+        // Awning slab above the lamp row (the red band of the cafe look).
+        addInstance(composeTransform({1.f, 2.78f, -0.9f}, 0.f, {16.f, 0.06f, 2.6f}), awningMat);
+
+        // Three hanging lamps 0.7 m in front of the mirror, plus thin poles.
+        const float lampX[3] = {-3.f, 0.5f, 4.f};
+        for (float lx : lampX) {
+            addInstance(composeTransform({lx, 2.2f, -1.3f}, 0.f, {0.14f, 0.14f, 0.14f}), lampMat);
+            addInstance(composeTransform({lx, 2.5f, -1.3f}, 0.f, {0.02f, 0.6f, 0.02f}), poleMat);
+        }
+
+        // Two slatted benches (thin-geometry tunneling test).
+        auto addBench = [&](float bx, float bz) {
+            addInstance(composeTransform({bx, 0.45f, bz}, 0.f, {1.6f, 0.05f, 0.5f}), woodMat);
+            for (int s = 0; s < 3; ++s)
+                addInstance(composeTransform({bx, 0.62f + 0.16f * s, bz - 0.24f}, 0.f,
+                                             {1.6f, 0.07f, 0.03f}), woodMat);
+            addInstance(composeTransform({bx - 0.7f, 0.22f, bz}, 0.f, {0.06f, 0.44f, 0.45f}), poleMat);
+            addInstance(composeTransform({bx + 0.7f, 0.22f, bz}, 0.f, {0.06f, 0.44f, 0.45f}), poleMat);
+        };
+        addBench(1.5f, -0.9f);
+        addBench(5.0f, -0.6f);
+
+        // Far-field colour targets on the camera side of the room.
+        addInstance(composeTransform({5.f, 0.75f, 4.f}, 0.3f, {1.2f, 1.5f, 1.2f}), redMat);
+        addInstance(composeTransform({-1.f, 1.f, 5.5f}, -0.2f, {1.f, 2.f, 1.f}), blueMat);
+        addInstance(composeTransform({-5.5f, 0.6f, 3.5f}, 0.5f, {1.1f, 1.2f, 1.1f}), yellowMat);
+
+        lights = lightsFromPreset(lightingPresetForScene(""));
+
+        updatePrevTransforms();
+        finalizeInstances();
+        buildLodDraws();
+        buildMergedBuffers(ctx, pool);
+        return true;
+    }
 
     // Materials.
     Material floorMat;

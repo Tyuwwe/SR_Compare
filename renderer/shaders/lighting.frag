@@ -39,7 +39,7 @@ layout(set = 0, binding = 0) uniform LightingUBO {
     mat4 invViewProj;   // matches the GBuffer pass (jittered for the low-res path)
     vec4 cameraPos;
     LightGPU lights[16]; // must match kMaxLights in DeferredCore.h
-    vec4 lightCounts;   // x = active light count, yzw reserved
+    vec4 lightCounts;   // x = active light count, y = glass inline-SSR enabled, zw reserved
     vec4 ambient;       // unused when IBL is active (kept for reference)
     vec4 iblParams;     // x = env intensity, y = prefilter max lod, z = skybox enabled, w = unused
     mat4 cascadeVp[4];  // CSM light view-projections (one per cascade layer)
@@ -231,10 +231,19 @@ float spotShadow(int tile, vec3 worldPos) {
 // model: a step counts when the ray point sits behind the visible surface
 // inside a distance-scaled thickness window; the darkening is strongest at
 // the contact and fades to fully lit at the ray end so the length cutoff
-// does not pop.
+// does not pop.  The coarse steps alone quantize every crossing to the step
+// lattice — the shadow edge stair-steps into periodic sawteeth (one tooth
+// per step, plainly visible along box/curb contacts) and the per-step
+// attenuation stacks into layered bands.  Two cheap de-quantizers, both
+// deterministic (static per pixel, no frame jitter): the lattice is offset
+// by an interleaved-gradient-noise phase per pixel so the band edges
+// interleave into fine grain instead of structured teeth, and the first
+// accepted sample is refined by bisection against the last rejected one so
+// the darkening uses the continuous crossing t, not the lattice step.
 const float kContactMaxLen = 2.0; // world metres (UE ContactShadowLength)
 const float kContactBias = 0.03;  // origin offset along N, self-hit guard
 const int kContactSteps = 12;
+const int kContactRefineSteps = 4; // bisection on the first hit: step/2^4 t error
 // Upper half of the acceptance window (view Z, metres).  The depth buffer
 // only stores the front-most surface, so "ray point behind it" is ambiguous:
 // the point may sit inside the occluder volume (a real shadow) or metres
@@ -245,27 +254,70 @@ const int kContactSteps = 12;
 // large occluders this rejects.
 const float kContactThickness = 0.5; // +2% of ray distance, below
 
+// One march sample at ray parameter t (0..1 over kContactMaxLen): projects
+// the ray point, fetches the opaque depth, applies the thickness window.
+// Outputs the screen UV (edge fade) and the signed view-Z gap (refinement).
+bool contactSample(vec3 origin, vec3 L, float t, vec2 renderSize,
+                   out vec2 suv, out float over) {
+    const vec4 clip = u.viewProj * vec4(origin + L * (kContactMaxLen * t), 1.0);
+    if (clip.w < 0.02) { suv = vec2(-1.0); over = -1.0; return false; } // behind near
+    suv = clip.xy / clip.w * 0.5 + 0.5;
+    if (any(lessThan(suv, vec2(0.0))) || any(greaterThan(suv, vec2(1.0)))) {
+        over = -1.0;
+        return false;
+    }
+    const ivec2 spix = clamp(ivec2(suv * renderSize), ivec2(0), ivec2(renderSize) - 1);
+    const float bufDepth = texelFetch(gbDepth, spix, 0).r;
+    if (bufDepth >= 0.9999) { over = -1.0; return false; } // sky: no occluder
+    // View-Z of the visible surface at that pixel (the SSR marcher's
+    // helper; both matrices come from this path's lighting UBO).
+    const vec2 cuv = (vec2(spix) + 0.5) / renderSize;
+    const float bufZ = ssrViewZ(u.viewProj, u.invViewProj, cuv, bufDepth);
+    const float rayZ = abs(clip.w);
+    over = rayZ - bufZ; // >0: ray point behind the visible surface
+    return over > 0.02 + 0.01 * bufZ && over < kContactThickness + 0.02 * rayZ;
+}
+
+// Interleaved gradient noise (Jimenez 2014): static per-pixel phase in
+// [0,1).  Offsets the march lattice so neighbouring pixels probe different
+// sub-step positions; a crossing narrower than one step is then detected by
+// a dithered subset of pixels (fine grain, TAA-convergent) instead of
+// producing a coherent sawtooth edge.
+float contactDither() {
+    return fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
+}
+
 float contactShadow(vec3 worldPos, vec3 N, vec3 L) {
     const vec2 renderSize = vec2(textureSize(gbDepth, 0));
     const vec3 origin = worldPos + N * kContactBias;
+    const float dither = contactDither();
     float shadow = 1.0;
+    float tPrev = 0.0;   // last rejected sample's t (bisection lower bound)
+    bool refined = false;
     for (int i = 1; i <= kContactSteps; ++i) {
-        const float t = float(i) / float(kContactSteps);
-        const vec4 clip = u.viewProj * vec4(origin + L * (kContactMaxLen * t), 1.0);
-        if (clip.w < 0.02) break; // crossed the near plane; later steps too
-        const vec2 suv = clip.xy / clip.w * 0.5 + 0.5;
-        if (any(lessThan(suv, vec2(0.0))) || any(greaterThan(suv, vec2(1.0)))) continue;
-        const ivec2 spix = clamp(ivec2(suv * renderSize), ivec2(0), ivec2(renderSize) - 1);
-        const float bufDepth = texelFetch(gbDepth, spix, 0).r;
-        if (bufDepth >= 0.9999) continue; // sky: no occluder
-        // View-Z of the visible surface at that pixel (the SSR marcher's
-        // helper; both matrices come from this path's lighting UBO).
-        const vec2 cuv = (vec2(spix) + 0.5) / renderSize;
-        const float bufZ = ssrViewZ(u.viewProj, u.invViewProj, cuv, bufDepth);
-        const float rayZ = abs(clip.w);
-        const float over = rayZ - bufZ; // >0: ray point behind the visible surface
-        if (over <= 0.02 + 0.01 * bufZ || over >= kContactThickness + 0.02 * rayZ)
+        const float t = (float(i) - dither) / float(kContactSteps);
+        vec2 suv;
+        float over;
+        if (!contactSample(origin, L, t, renderSize, suv, over)) {
+            tPrev = t;
             continue;
+        }
+        float tHit = t;
+        if (!refined) {
+            // Sub-step position of the first crossing; without it the shadow
+            // edge advances one 16 cm step at a time (sawtooth banding).
+            refined = true;
+            float lo = tPrev, hi = t;
+            for (int b = 0; b < kContactRefineSteps; ++b) {
+                const float tm = 0.5 * (lo + hi);
+                vec2 sm;
+                float om;
+                if (contactSample(origin, L, tm, renderSize, sm, om)) hi = tm; else lo = tm;
+            }
+            tHit = hi;
+            // Re-sample at the refined t so the edge fade matches the hit.
+            contactSample(origin, L, tHit, renderSize, suv, over);
+        }
         // Attenuation grows with hit distance along the ray: strongest at the
         // contact, fully lit at the length cutoff, so the cutoff does not pop.
         // (The phase-4c-1 code had this inverted — 1 - smoothstep(0.75,1,t) —
@@ -276,7 +328,8 @@ float contactShadow(vec3 worldPos, vec3 N, vec3 L) {
         const float edge = smoothstep(0.0, 0.05, suv.x) * smoothstep(0.0, 0.05, suv.y) *
                            smoothstep(0.0, 0.05, 1.0 - suv.x) *
                            smoothstep(0.0, 0.05, 1.0 - suv.y);
-        shadow = min(shadow, mix(1.0, smoothstep(0.0, 1.0, t), edge));
+        shadow = min(shadow, mix(1.0, smoothstep(0.0, 1.0, tHit), edge));
+        tPrev = t;
     }
     return shadow;
 }
