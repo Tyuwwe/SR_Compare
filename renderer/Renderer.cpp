@@ -7,6 +7,7 @@
 #include "renderer/core/PathUtil.h"
 #include "renderer/core/VkUtil.h"
 #include "renderer/core/Vma.h"
+#include "renderer/ibl/ProbeBaker.h"
 #include "renderer/scene/SceneRegistry.h"
 #include "upscalers/UpscalerFactory.h"
 
@@ -1177,310 +1178,31 @@ void Renderer::saveScreenshot(const std::string& path) {
 }
 
 // --- Offline reflection-probe baking (--bake-probes, Phase 4c-2) --------------
-// For each registry-placed probe the scene is rendered from the probe position
-// into the six cube faces at kBakeSize^2, reusing the real GBuffer + deferred
-// lighting pipeline (GT variant: no motion/reactive attachments) at 90 deg
-// FOV — so the bake sees the same punctual lights, materials, emissive and the
-// global-env skybox the viewer shades with.  Documented quality
-// simplifications: no shadow maps, no SSAO (constant 1), no SSR/transparency,
-// and the source cube keeps a single mip (the prefilter shaders clamp their
-// LOD).  The bake is an offline command: nothing here runs during bench.
-//
-// Face conventions: each face renders with a lookAt along kFaceDir (up from
-// kFaceUp); the raster image is then mirrored horizontally vs the Vulkan
-// cube-face layout the IBL shaders sample (cubeDir() in ibl_*.comp), so the
-// readback flips X before writing the face.
+// Thin wrapper over the shared ProbeBaker (renderer/ibl/ProbeBaker.h), which
+// the GUI's bake button uses too; the bake itself is documented there.  Slot
+// 0's UBO/staging is safe to reuse here: init() has not started the frame
+// loop and shutdown() follows immediately (app/main.cpp).
 bool Renderer::bakeProbes() {
-    const std::vector<ReflectionProbe>& defs = scene_.probes;
-    const std::string outPath = probeFilePathForScene(opts_.scenePath);
-    if (defs.empty()) {
-        std::fprintf(stderr, "bake-probes: scene has no probe placements\n");
-        return true;
-    }
-    constexpr uint32_t S = ReflectionProbes::kBakeSize;
-    std::fprintf(stderr, "bake-probes: %zu probe(s), %ux%u per face -> %s\n", defs.size(), S, S,
-                 outPath.c_str());
-
-    // Cube face capture orientations (see the comment above; readback flips X).
-    static const Vec3 kFaceDir[6] = {{1.f, 0.f, 0.f}, {-1.f, 0.f, 0.f}, {0.f, 1.f, 0.f},
-                                     {0.f, -1.f, 0.f}, {0.f, 0.f, 1.f},  {0.f, 0.f, -1.f}};
-    static const Vec3 kFaceUp[6] = {{0.f, 1.f, 0.f}, {0.f, 1.f, 0.f}, {0.f, 0.f, -1.f},
-                                    {0.f, 0.f, 1.f}, {0.f, 1.f, 0.f}, {0.f, 1.f, 0.f}};
-
-    // --- bake-local targets (kBakeSize^2 GBuffer + HDR + white AO stand-in) --
-    // Phase 6b: the GT GBuffer pipeline now has five attachments, so the bake
-    // keeps a (discarded) motion target too.
-    ImageResource albedo, normal, material, emissive, depth, hdr, ao, motion;
-    auto createRT = [&](ImageResource& rt, VkFormat format, VkImageUsageFlags usage,
-                        VkImageAspectFlags aspect) {
-        rt.width = S;
-        rt.height = S;
-        rt.format = format;
-        if (createImage(ctx_, S, S, format, usage, rt.image, rt.memory) != VK_SUCCESS)
-            return false;
-        rt.view = createImageView(ctx_, rt.image, format, aspect);
-        return rt.view != VK_NULL_HANDLE;
-    };
-    const VkImageUsageFlags gbUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-    const bool targetsOk =
-        createRT(albedo, deferred::kAlbedoFormat, gbUsage, VK_IMAGE_ASPECT_COLOR_BIT) &&
-        createRT(normal, deferred::kNormalFormat, gbUsage, VK_IMAGE_ASPECT_COLOR_BIT) &&
-        createRT(material, deferred::kMaterialFormat, gbUsage, VK_IMAGE_ASPECT_COLOR_BIT) &&
-        createRT(emissive, deferred::kEmissiveFormat, gbUsage, VK_IMAGE_ASPECT_COLOR_BIT) &&
-        createRT(motion, deferred::kMotionFormat, gbUsage, VK_IMAGE_ASPECT_COLOR_BIT) &&
-        createRT(depth, deferred::kDepthFormat,
-                 VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-                 VK_IMAGE_ASPECT_DEPTH_BIT) &&
-        createRT(hdr, deferred::kHdrColorFormat,
-                 VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
-                 VK_IMAGE_ASPECT_COLOR_BIT) &&
-        createRT(ao, VK_FORMAT_R16_SFLOAT,
-                 VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                 VK_IMAGE_ASPECT_COLOR_BIT);
-    if (!targetsOk) return false;
-    // White AO (the bake skips the GTAO chain; AO=1 keeps the env term intact).
-    submitOneShot(ctx_, [&](VkCommandBuffer cmd) {
-        imageBarrier(cmd, ao.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                     VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE, VK_PIPELINE_STAGE_2_CLEAR_BIT,
-                     VK_ACCESS_2_TRANSFER_WRITE_BIT);
-        const VkClearColorValue white = {{1.f, 1.f, 1.f, 1.f}};
-        const VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-        vkCmdClearColorImage(cmd, ao.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &white, 1,
-                             &range);
-        imageBarrier(cmd, ao.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_CLEAR_BIT,
-                     VK_ACCESS_2_TRANSFER_WRITE_BIT, sync::kFragment, sync::kSampled);
-    });
-    ao.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-
-    // --- bake-local descriptors (lighting set + cluster grid at 128^2) ---------
-    VkDescriptorPoolSize sizes[3] = {};
-    sizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    sizes[0].descriptorCount = 14; // lighting set image bindings
-    sizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    sizes[1].descriptorCount = 2; // lighting UBO + probe UBO
-    sizes[2].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    sizes[2].descriptorCount = 2 + 2 * kClusterSlots; // lighting SSBOs + cluster assign sets
-    VkDescriptorPoolCreateInfo poolCi = {};
-    poolCi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    poolCi.maxSets = 1 + kClusterSlots;
-    poolCi.poolSizeCount = 3;
-    poolCi.pPoolSizes = sizes;
-    VkDescriptorPool pool = VK_NULL_HANDLE;
-    if (vkCreateDescriptorPool(ctx_.device, &poolCi, nullptr, &pool) != VK_SUCCESS) return false;
-
-    ClusterGrid cluster;
-    bool bakeOk = deferred_.createClusterGrid(ctx_, S, S, cluster) &&
-                  deferred_.writeClusterGridSets(ctx_, pool, cluster);
-
-    VkBuffer lightingUbo = VK_NULL_HANDLE;
-    VmaAllocation lightingUboMemory = VK_NULL_HANDLE;
-    void* lightingUboMapped = nullptr;
-    if (bakeOk &&
-        createBuffer(ctx_, sizeof(LightingUBO), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                     lightingUbo, lightingUboMemory) == VK_SUCCESS) {
-        vmaMapMemory(ctx_.allocator, lightingUboMemory, &lightingUboMapped);
-    } else {
-        bakeOk = false;
-    }
-
-    VkDescriptorSet lightingSet = VK_NULL_HANDLE;
-    if (bakeOk) {
-        VkDescriptorSetAllocateInfo alloc = {};
-        alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-        alloc.descriptorPool = pool;
-        alloc.descriptorSetCount = 1;
-        const VkDescriptorSetLayout layout = deferred_.lightingSetLayout();
-        alloc.pSetLayouts = &layout;
-        bakeOk = vkAllocateDescriptorSets(ctx_.device, &alloc, &lightingSet) == VK_SUCCESS;
-    }
-    if (bakeOk) {
-        deferred_.writeLightingSet(ctx_, lightingSet, lightingUbo, albedo.view, normal.view,
-                                   material.view, emissive.view, depth.view, ao.view,
-                                   shadowsActive_ ? shadow_.arrayView : VK_NULL_HANDLE,
-                                   spotAtlasActive_ ? spotAtlas_.view : VK_NULL_HANDLE,
-                                   cluster.lightsBuffer[0], cluster.gridBuffer[0]);
-    }
-
-    // Readback staging for one face (RGBA16F 128^2).
-    const VkDeviceSize faceBytes = static_cast<VkDeviceSize>(S) * S * 8;
-    VkBuffer staging = VK_NULL_HANDLE;
-    VmaAllocation stagingMemory = VK_NULL_HANDLE;
-    void* stagingMapped = nullptr;
-    if (bakeOk &&
-        createBuffer(ctx_, faceBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                     staging, stagingMemory) == VK_SUCCESS) {
-        vmaMapMemory(ctx_.allocator, stagingMemory, &stagingMapped);
-    } else {
-        bakeOk = false;
-    }
-
-    std::vector<uint16_t> all; // probe-major, face-major RGBA16F
-    if (bakeOk)
-        all.resize(static_cast<size_t>(defs.size()) * 6 * S * S * 4);
-
-    auto transition = [&](VkCommandBuffer cmd, ImageResource& rt, VkImageLayout target,
-                          VkPipelineStageFlags2 srcStage, VkAccessFlags2 srcAccess,
-                          VkPipelineStageFlags2 dstStage, VkAccessFlags2 dstAccess,
-                          VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT) {
-        imageBarrier(cmd, rt.image, rt.layout, target, srcStage, srcAccess, dstStage, dstAccess,
-                     aspect);
-        rt.layout = target;
-    };
-
-    for (uint32_t pi = 0; bakeOk && pi < defs.size(); ++pi) {
-        for (uint32_t face = 0; face < 6; ++face) {
-            Camera cam;
-            cam.position = defs[pi].position;
-            cam.forward = kFaceDir[face];
-            cam.up = kFaceUp[face];
-            cam.fovY = 1.5707963f; // 90 deg, square face
-            cam.nearPlane = camera_.nearPlane;
-            cam.farPlane = camera_.farPlane;
-            const Mat4 view = cam.view();
-            const Mat4 proj = cam.proj(1.f);
-            const Mat4 viewProj = Mat4::multiply(proj, view);
-
-            scene_.advanceToFrame(0);
-            scene_.updateLodSelection(cam.position, cam.fovY, lodEnabledByDefault());
-            SceneUBO subo;
-            deferred_.fillSceneUBO(subo, scene_, cam, view, proj, proj, Mat4::identity(), S, S,
-                                   0.f, 0.f, false);
-            std::memcpy(frames_[0].uboMapped, &subo, sizeof(subo));
-            LightingUBO lubo;
-            deferred_.fillLightingUBO(lubo, scene_, cam, viewProj, Mat4::inverse(viewProj),
-                                      nullptr, nullptr, iblIntensity_);
-            std::memcpy(lightingUboMapped, &lubo, sizeof(lubo));
-            deferred_.fillClusterLights(cluster.lightsMapped[0],
-                                        DeferredCore::effectiveLights(scene_, nullptr));
-
-            submitOneShot(ctx_, [&](VkCommandBuffer cmd) {
-                transition(cmd, albedo, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                           sync::kSampleStages, sync::kSampled, sync::kColorAttach,
-                           sync::kColorWrite);
-                transition(cmd, normal, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                           sync::kSampleStages, sync::kSampled, sync::kColorAttach,
-                           sync::kColorWrite);
-                transition(cmd, material, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                           sync::kSampleStages, sync::kSampled, sync::kColorAttach,
-                           sync::kColorWrite);
-                transition(cmd, emissive, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                           sync::kSampleStages, sync::kSampled, sync::kColorAttach,
-                           sync::kColorWrite);
-                transition(cmd, depth, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-                           sync::kSampleStages, sync::kSampled, sync::kDepthTests,
-                           sync::kDepthReadWrite, VK_IMAGE_ASPECT_DEPTH_BIT);
-                transition(cmd, motion, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                           sync::kSampleStages, sync::kSampled, sync::kColorAttach,
-                           sync::kColorWrite);
-                {
-                    // The bake shares the indirect GBuffer path (no cull pass;
-                    // every candidate visible).  Slot 0 staging is safe here:
-                    // each face renders in its own one-shot submit.
-                    const uint32_t candidates = deferred_.buildInstanceList(
-                        scene_, viewProj, instances_.capacity, cullInstCpu_.data(),
-                        cullCmdCpu_.data(), cullRuns_);
-                    if (candidates > 0) {
-                        std::memcpy(instances_.stagingMapped[0], cullInstCpu_.data(),
-                                    static_cast<size_t>(candidates) * sizeof(GpuInstance));
-                        std::memcpy(gtCull_.cmdStagingMapped[0], cullCmdCpu_.data(),
-                                    static_cast<size_t>(candidates) *
-                                        sizeof(VkDrawIndexedIndirectCommand));
-                    }
-                    deferred_.recordInstanceUpload(cmd, 0, instances_, candidates);
-                    deferred_.recordCommandUpload(cmd, 0, gtCull_, candidates, /*culled=*/false);
-                    VkRenderingAttachmentInfo colors[5] = {
-                        makeColorAttachment(albedo.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                                            VK_ATTACHMENT_LOAD_OP_CLEAR),
-                        makeColorAttachment(normal.view, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                                            VK_ATTACHMENT_LOAD_OP_CLEAR, 0.f, 0.f, 1.f),
-                        makeColorAttachment(material.view,
-                                            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                                            VK_ATTACHMENT_LOAD_OP_CLEAR),
-                        makeColorAttachment(emissive.view,
-                                            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                                            VK_ATTACHMENT_LOAD_OP_CLEAR),
-                        makeColorAttachment(motion.view,
-                                            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                                            VK_ATTACHMENT_LOAD_OP_CLEAR)};
-                    VkRenderingAttachmentInfo depthAtt = makeDepthAttachment(
-                        depth.view, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-                        VK_ATTACHMENT_LOAD_OP_CLEAR);
-                    beginRendering(cmd, S, S, 5, colors, &depthAtt);
-                    // GT pipeline variant (five attachments incl. motion; the
-                    // bake discards motion — prevViewProj is identity anyway).
-                    deferred_.recordGBufferDraws(cmd, scene_, /*gtPass=*/true,
-                                                 frames_[0].sceneSet, textureSet_, materialStride_,
-                                                 S, S, viewProj, gtCull_, cullRuns_.data(),
-                                                 static_cast<uint32_t>(cullRuns_.size()));
-                    vkCmdEndRendering(cmd);
-                }
-                transition(cmd, motion, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                           sync::kColorAttach, sync::kColorWrite, sync::kFragment, sync::kSampled);
-                transition(cmd, albedo, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                           sync::kColorAttach, sync::kColorWrite, sync::kFragment, sync::kSampled);
-                transition(cmd, normal, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                           sync::kColorAttach, sync::kColorWrite, sync::kFragment, sync::kSampled);
-                transition(cmd, material, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                           sync::kColorAttach, sync::kColorWrite, sync::kFragment, sync::kSampled);
-                transition(cmd, emissive, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                           sync::kColorAttach, sync::kColorWrite, sync::kFragment, sync::kSampled);
-                transition(cmd, depth, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                           sync::kDepthTests, sync::kDepthWrite, sync::kFragment, sync::kSampled,
-                           VK_IMAGE_ASPECT_DEPTH_BIT);
-                transition(cmd, hdr, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, sync::kCopy,
-                           sync::kTransferRead, sync::kColorAttach, sync::kColorWrite);
-                deferred_.recordLightingPass(cmd, lightingSet, cluster, 0, view, proj, hdr.view,
-                                             S, S);
-                transition(cmd, hdr, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, sync::kColorAttach,
-                           sync::kColorWrite, sync::kCopy, sync::kTransferRead);
-                VkBufferImageCopy region = {};
-                region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-                region.imageExtent = {S, S, 1};
-                vkCmdCopyImageToBuffer(cmd, hdr.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                                       staging, 1, &region);
-            });
-
-            // Readback + horizontal flip (raster face -> Vulkan cube face).
-            const uint16_t* srcPx = static_cast<const uint16_t*>(stagingMapped);
-            uint16_t* dstPx =
-                all.data() + (static_cast<size_t>(pi) * 6 + face) * S * S * 4;
-            for (uint32_t y = 0; y < S; ++y)
-                for (uint32_t x = 0; x < S; ++x)
-                    for (uint32_t c = 0; c < 4; ++c)
-                        dstPx[(static_cast<size_t>(y) * S + x) * 4 + c] =
-                            srcPx[(static_cast<size_t>(y) * S + (S - 1 - x)) * 4 + c];
-        }
-        std::fprintf(stderr, "bake-probes: probe %u done\n", pi);
-    }
-
-    if (bakeOk && !saveProbeFile(outPath.c_str(), defs, S, all)) {
-        std::fprintf(stderr, "bake-probes: failed to write %s\n", outPath.c_str());
-        bakeOk = false;
-    }
-
-    // --- cleanup ---------------------------------------------------------------
-    if (staging) {
-        if (stagingMapped) vmaUnmapMemory(ctx_.allocator, stagingMemory);
-        vmaDestroyBuffer(ctx_.allocator, staging, stagingMemory);
-    }
-    deferred_.destroyClusterGrid(ctx_, cluster);
-    if (lightingUbo) {
-        if (lightingUboMapped) vmaUnmapMemory(ctx_.allocator, lightingUboMemory);
-        vmaDestroyBuffer(ctx_.allocator, lightingUbo, lightingUboMemory);
-    }
-    if (pool) vkDestroyDescriptorPool(ctx_.device, pool, nullptr);
-    albedo.destroy(ctx_);
-    normal.destroy(ctx_);
-    material.destroy(ctx_);
-    emissive.destroy(ctx_);
-    motion.destroy(ctx_);
-    depth.destroy(ctx_);
-    hdr.destroy(ctx_);
-    ao.destroy(ctx_);
-    return bakeOk;
+    ProbeBakeParams p;
+    p.ctx = &ctx_;
+    p.deferred = &deferred_;
+    p.scene = &scene_;
+    p.sceneUboMapped = frames_[0].uboMapped;
+    p.sceneSet = frames_[0].sceneSet;
+    p.textureSet = textureSet_;
+    p.materialStride = materialStride_;
+    p.instances = &instances_;
+    p.cull = &gtCull_;
+    p.cullInstCpu = &cullInstCpu_;
+    p.cullCmdCpu = &cullCmdCpu_;
+    p.cullRuns = &cullRuns_;
+    p.shadowArrayView = shadowsActive_ ? shadow_.arrayView : VK_NULL_HANDLE;
+    p.spotAtlasView = spotAtlasActive_ ? spotAtlas_.view : VK_NULL_HANDLE;
+    p.iblIntensity = iblIntensity_;
+    p.nearPlane = camera_.nearPlane;
+    p.farPlane = camera_.farPlane;
+    p.outPath = probeFilePathForScene(opts_.scenePath);
+    return bakeReflectionProbes(p);
 }
 
 void Renderer::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {

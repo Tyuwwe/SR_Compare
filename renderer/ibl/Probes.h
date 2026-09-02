@@ -2,7 +2,8 @@
 // ============================================================================
 // ReflectionProbes — baked local reflection captures (UE4 reflection-capture
 // style, Phase 4c-2).  Up to kMaxProbes axis-aligned box probes per scene.
-// Offline (--bake-probes, Renderer::bakeProbes) each probe renders the scene
+// Offline (CLI --bake-probes or the GUI's bake button; both go through
+// renderer/ibl/ProbeBaker.h) each probe renders the scene
 // into a kBakeSize^2 cubemap from its position; the raw cubemaps are written
 // to a .probes file next to the scene.  At load time this class uploads the
 // raw cubes, runs the same irradiance + GGX prefilter compute chain as the
@@ -73,7 +74,9 @@ public:
     bool create(const VulkanContext& ctx);
     // Uploads + prefilters the baked probes matching `defs` (see
     // loadProbeFile).  No-op (count stays 0) when the bake file is missing or
-    // stale.  Safe to call after create(); not reloadable (host restarts).
+    // stale.  Safe to call after create(); reloadable — the transient
+    // irradiance/prefilter descriptor sets are reclaimed by a pool reset at
+    // the top of each call (GUI scene switches, re-bakes, deferred rebuilds).
     bool load(const VulkanContext& ctx, const std::vector<ReflectionProbe>& defs,
               const std::string& filePath);
     void destroy(const VulkanContext& ctx);

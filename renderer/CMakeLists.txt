@@ -22,6 +22,7 @@ add_library(renderer STATIC
     scene/SceneRegistry.cpp
     ibl/Ibl.cpp
     ibl/Probes.cpp
+    ibl/ProbeBaker.cpp
     ibl/SkyAtmosphere.cpp
     deferred/DeferredCore.cpp
     ColorGrading.cpp

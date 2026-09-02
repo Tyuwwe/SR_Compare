@@ -354,6 +354,12 @@ private:
     // Re-renders the sky-atmosphere env + IBL maps from the current sun
     // sliders (no-op in static-env mode or while a load is in flight).
     void updateSkyFromUiSun();
+    // Viewer-tab "bake reflection probes" button: synchronous offline bake of
+    // scene_.probes through the shared ProbeBaker (renderer/ibl/ProbeBaker.h,
+    // same code as CLI --bake-probes), then a probe reload so the fresh
+    // captures take effect without a stack rebuild.  Blocks the render thread
+    // for the bake duration; refused while a load or bench is in flight.
+    void bakeReflectionProbesFromUi();
     void updateCamera(float dt);
     void recordFrame(uint32_t frameIndex, uint32_t swapchainIndex);
     // Compose columns into composeImage_ and copy to the swapchain with ImGui.

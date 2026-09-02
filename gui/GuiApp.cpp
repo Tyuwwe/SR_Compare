@@ -10,6 +10,7 @@
 #include "renderer/core/PathUtil.h"
 #include "renderer/core/VkUtil.h"
 #include "renderer/core/Vma.h"
+#include "renderer/ibl/ProbeBaker.h"
 #include "renderer/scene/SceneRegistry.h"
 #include "upscalers/UpscalerFactory.h"
 #include "upscalers/dlss/SlContext.h"
@@ -3259,6 +3260,50 @@ void GuiApp::updateSkyFromUiSun() {
         ctx_, sunDirectionFromElevAzimuth(sunElevationDeg_, sunAzimuthDeg_));
 }
 
+void GuiApp::bakeReflectionProbesFromUi() {
+    // Same guards as the button's disabled state (the button is the only
+    // caller, but keep them: a stale click during an Apply would race the
+    // worker's scene).
+    if (!stackOk_ || scene_.probes.empty()) return;
+    if (loadPhase_.load(std::memory_order_acquire) == LoadPhase::Loading) return;
+    if (bench_.running()) return;
+    statusLine_ = "baking reflection probes...";
+    // The bake reuses slot-0 per-frame resources (scene UBO, instance/command
+    // staging) — no frame may still be executing on the GPU.
+    vkDeviceWaitIdle(ctx_.device);
+    ProbeBakeParams p;
+    p.ctx = &ctx_;
+    p.deferred = &deferred_;
+    p.scene = &scene_;
+    // GT-path slot 0 (unjittered), matching the CLI bake's scene UBO usage.
+    p.sceneUboMapped = frames_[0].uboGtMapped;
+    p.sceneSet = frames_[0].sceneSetGt;
+    p.textureSet = textureSet_;
+    p.materialStride = materialStride_;
+    p.instances = &instances_;
+    p.cull = &gtCull_;
+    p.cullInstCpu = &cullInstCpu_;
+    p.cullCmdCpu = &cullCmdCpu_;
+    p.cullRuns = &cullRuns_;
+    p.shadowArrayView = shadowsActive_ ? shadow_.arrayView : VK_NULL_HANDLE;
+    p.spotAtlasView = spotAtlasActive_ ? spotAtlas_.view : VK_NULL_HANDLE;
+    p.iblIntensity = iblIntensity_;
+    p.nearPlane = camera_.nearPlane;
+    p.farPlane = camera_.farPlane;
+    p.outPath = probeFilePathForScene(active_.scenePath);
+    if (!bakeReflectionProbes(p)) {
+        statusLine_ = "probe bake failed (see console)";
+        return;
+    }
+    // ReflectionProbes::load resets its descriptor pool on entry, so a straight
+    // reload is safe — the fresh bake takes effect without a stack rebuild.
+    deferred_.loadProbes(ctx_, scene_.probes, p.outPath);
+    char buf[400];
+    std::snprintf(buf, sizeof(buf), "baked %zu reflection probe(s) -> %s", scene_.probes.size(),
+                  p.outPath.c_str());
+    statusLine_ = buf;
+}
+
 void GuiApp::updateLightingUBO(void* mapped, const Mat4& viewProj,
                                const std::vector<Light>& lights, const ShadowFrame* shadow) {
     LightingUBO ubo;
@@ -6096,6 +6141,19 @@ void GuiApp::drawViewerTab() {
     // composite leans on the IBL fallback (rough ground reads less greasy).
     ImGui::SliderFloat("ssr strength", &ssrStrength_, 0.f, 1.f, "%.2f");
     if (!ssrEnabled_) ImGui::EndDisabled();
+    // Baked reflection probes (Phase 4c-2): synchronous offline bake of the
+    // scene's registry placements through the shared ProbeBaker (same code as
+    // CLI --bake-probes), then a reload so the fresh captures take effect
+    // immediately.  Blocks the render thread for the bake duration; refused
+    // while a scene load or bench is in flight.
+    {
+        const bool hasProbes = !scene_.probes.empty();
+        const bool bakeBlocked = loadInFlight || bench_.running() || !stackOk_;
+        if (!hasProbes || bakeBlocked) ImGui::BeginDisabled();
+        if (ImGui::Button("bake reflection probes")) bakeReflectionProbesFromUi();
+        if (!hasProbes || bakeBlocked) ImGui::EndDisabled();
+        if (!hasProbes) ImGui::TextDisabled("(scene has no probe placements)");
+    }
     // Froxel volumetric fog: per-frame pass skip; re-enabling restarts the
     // temporal history so stale frames do not bleed in.
     if (!fogParams_.enabled || gbFog_.injectImage == VK_NULL_HANDLE) ImGui::BeginDisabled();
