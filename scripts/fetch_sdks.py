@@ -31,7 +31,7 @@ TMP = THIRD_PARTY / ".tmp"
 
 UA = {"User-Agent": "sr_compare-fetch-sdks/1.0 (python-urllib)"}
 
-ALL_TASKS = ["fsr", "xess", "streamline", "sgsr", "nss", "sponza", "sdl3"]
+ALL_TASKS = ["fsr", "xess", "streamline", "sgsr", "nss", "sponza", "sdl3", "imgui", "cgltf", "stb"]
 
 # --------------------------------------------------------------------------- #
 # pinned versions
@@ -58,6 +58,20 @@ NSS_MODELS_REF = "3dd6c4f054827a3d018330d5dfcd0b92e7d37974"
 NSS_EMULATION_REF = "00e9d81f8545bd6a4c3662909e42370708adfac1"
 #   SDL3_TAG          libsdl-org/SDL release tag (windowing/input layer).
 SDL3_TAG = "release-3.4.14"
+#   IMGUI_REF         ocornut/imgui docking-branch commit (.git/shallow of the
+#                     existing third_party/imgui clone: HEAD == origin/docking).
+#   CGLTF_REF         jkuhlmann/cgltf master commit whose cgltf.h is
+#                     byte-identical to the existing third_party/cgltf/cgltf.h.
+#                     The header self-reports "Version: 1.15", but the v1.15
+#                     tag is older; this is the last commit touching cgltf.h
+#                     (adds KHR_meshopt_compression parsing).
+#   STB_REF           nothings/stb commit whose stb_image.h (v2.30) and
+#                     stb_image_write.h (v1.16) are byte-identical to the
+#                     existing third_party/stb/ files; last commit touching
+#                     stb_image.h (commits API, path=stb_image.h).
+IMGUI_REF = "83f668625ad45364de71d385aeb6a5dd04bee02e"
+CGLTF_REF = "de9828bc6419064c302546313ce8ff5eac6cd703"
+STB_REF = "013ac3beddff3dbffafd5177e7972067cd2b5083"
 
 
 # --------------------------------------------------------------------------- #
@@ -571,6 +585,63 @@ def task_sponza(force: bool = False) -> dict:
     return _done("sponza", dest, "Khronos glTF-Sample-Assets main", "ok")
 
 
+def task_imgui(force: bool = False) -> dict:
+    dest = THIRD_PARTY / "imgui"
+    if dest.exists() and any(dest.iterdir()) and not force:
+        log("[imgui] already present, skip")
+        return _done("imgui", dest, f"git {IMGUI_REF[:8]}", "skipped (present)")
+    log("[imgui] git clone (shallow) ocornut/imgui (docking branch)")
+    git_clone(
+        "https://github.com/ocornut/imgui",
+        dest,
+        ref=IMGUI_REF,
+    )
+    sha = _git_head(dest)
+    report_verify(
+        "imgui",
+        dest,
+        [
+            "imgui.h",
+            "imgui.cpp",
+            "backends/imgui_impl_sdl3.cpp",
+            "backends/imgui_impl_vulkan.cpp",
+            "LICENSE.txt",
+        ],
+    )
+    return _done("imgui", dest, f"git {sha[:8] if sha else IMGUI_REF[:8]}", "ok")
+
+
+def task_cgltf(force: bool = False) -> dict:
+    dest = THIRD_PARTY / "cgltf"
+    marker = dest / "cgltf.h"
+    if marker.exists() and not force:
+        log("[cgltf] already present, skip")
+        return _done("cgltf", dest, f"git {CGLTF_REF[:8]}", "skipped (present)")
+    log(f"[cgltf] downloading cgltf.h from jkuhlmann/cgltf {CGLTF_REF[:8]}")
+    download(
+        f"https://raw.githubusercontent.com/jkuhlmann/cgltf/{CGLTF_REF}/cgltf.h",
+        marker,
+    )
+    report_verify("cgltf", dest, ["cgltf.h"])
+    return _done("cgltf", dest, f"git {CGLTF_REF[:8]}", "ok", n_files=1)
+
+
+def task_stb(force: bool = False) -> dict:
+    dest = THIRD_PARTY / "stb"
+    headers = ["stb_image.h", "stb_image_write.h"]
+    if all((dest / h).exists() for h in headers) and not force:
+        log("[stb] already present, skip")
+        return _done("stb", dest, f"git {STB_REF[:8]}", "skipped (present)")
+    for h in headers:
+        log(f"[stb] downloading {h} from nothings/stb {STB_REF[:8]}")
+        download(
+            f"https://raw.githubusercontent.com/nothings/stb/{STB_REF}/{h}",
+            dest / h,
+        )
+    report_verify("stb", dest, headers)
+    return _done("stb", dest, f"git {STB_REF[:8]}", "ok", n_files=len(headers))
+
+
 def _git_head(path: Path) -> str:
     try:
         out = subprocess.run(
@@ -635,6 +706,9 @@ def main() -> int:
                 "nss": task_nss,
                 "sponza": task_sponza,
                 "sdl3": task_sdl3,
+                "imgui": task_imgui,
+                "cgltf": task_cgltf,
+                "stb": task_stb,
             }[name]
             results.append(fn(force=args.force))
         except Exception as exc:  # noqa: BLE001 - keep going on other tasks

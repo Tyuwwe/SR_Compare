@@ -217,19 +217,60 @@ metallicRoughness + occlusion、自发光、MASK 镂空。随后
 BLEND 的不透明材质改回 OPAQUE。结果是 `assets/bistro/BistroExterior.gltf` 与
 `BistroInterior.gltf`。
 
-## 构建
+## 从全新克隆构建
 
-```bat
-build_all.bat          :: 一键 configure + Release 构建
-```
+1. **环境要求**：Windows 11；Visual Studio（C++ 工作负载，由 vswhere
+   自动发现）；CMake ≥ 3.24（PATH 或 VS 自带均可）；Vulkan SDK 1.4+
+   （`VULKAN_SDK` 环境变量提供 glslangValidator，用于编译着色器）；
+   Python 3.10+ 与 git（供抓取脚本使用）。
 
-依赖：Windows 11、Visual Studio（C++ 工作负载，vswhere 自动发现）、CMake ≥ 3.24
-（PATH 或 VS 自带均可）、Vulkan SDK 1.4+（`VULKAN_SDK` 提供 glslangValidator）、
-Python 3.10+（仅 `scripts/fetch_sdks.py` 与 `metrics/` 用）。窗口/输入库 SDL3 由
-`python scripts/fetch_sdks.py --only sdl3` 获取（预编译 VC x64 包，落到
-`third_party/sdl3/`；构建时自动把 `SDL3.dll` 拷到 exe 旁）。
+2. **抓取 SDK**——把全部第三方 SDK 下载进 `third_party/`（不入库）：
+   FidelityFX、XeSS、Streamline、SGSR、Arm NSS、SDL3、ImGui（docking
+   分支）、cgltf、stb。
 
-DLSS 需要 NVIDIA Developer 账号申请 applicationId（免费），环境变量 `SR_DLSS_APP_ID`。
+   ```bat
+   python scripts/fetch_sdks.py
+   ```
+
+   `--only a,b` 只抓子集，`--force` 强制重抓已有项。此步不可省略：
+   `third_party/cgltf`、`stb`、`imgui` 是所有构建目标的硬性依赖，
+   SDL3 缺失会在 CMake configure 时直接 FATAL_ERROR。CMake 选项
+   `SR_WITH_FSR/SGSR/XESS/DLSS/NSS`（默认全部 ON）置 OFF 可去掉对应
+   超分 SDK。
+
+3. **构建**：
+
+   ```bat
+   build_all.bat          :: 一键 configure + Release 构建
+   ```
+
+   exe 生成于 `build/app/Release/sr_compare.exe`。
+
+4. **可选 —— Arm NSS PC 模拟层**（PC 上运行 `--upscaler nss` / NFRU
+   帧生成所需）：
+
+   ```bat
+   scripts\nss_emu_fetch_deps.bat   :: 需 git + 网络；克隆依赖并打补丁到 build-nss-emu\deps
+   scripts\nss_emu_configure.bat    :: 需 Ninja + Python 3 + VS 开发环境
+   scripts\nss_emu_build.bat
+   ```
+
+   主构建只有在 **CMake configure 时刻**检测到
+   `build-nss-emu/build/graph/VkLayer_Graph.dll` 存在，才会把模拟层打包到
+   exe 旁（`build/app/Release/nss-emu/`）——因此要么在首次
+   `build_all.bat` 之前先构建模拟层，要么事后删除 `build/CMakeCache.txt`
+   再重跑 `build_all.bat`。没有模拟层时，请求 nss 的运行会在
+   vkCreateInstance 失败（GUI 无条件注入这些层，所以没有模拟层 GUI
+   无法启动）；其它超分算法不受影响。
+
+5. **场景资产**不参与构建，仅在运行对应场景时需要（内置 `boxes`
+   场景无需任何资产）：`sponza` 由抓取脚本获取
+   （`python scripts/fetch_sdks.py --only sponza`，见上文 Sponza 小节）；
+   Bistro 需手动下载 ORCA 包并经 Blender 转换（见上文 Bistro 小节）。
+
+6. **运行时说明**：DLSS 需要 NVIDIA Developer 账号申请 applicationId
+   （免费），环境变量 `SR_DLSS_APP_ID`；目标机器需要支持 Vulkan 1.3
+   的驱动。
 
 ### 换机器/整目录拷贝
 
@@ -238,7 +279,9 @@ DLSS 需要 NVIDIA Developer 账号申请 applicationId（免费），环境变�
 唯一例外：`build-nss-emu/` 内有 NSS 模拟层的依赖（含已打补丁的 git 克隆）。若已
 删除，运行 `scripts\nss_emu_fetch_deps.bat`（git + 网络），再
 `scripts\nss_emu_configure.bat` + `scripts\nss_emu_build.bat`（另需 Ninja +
-Python 3）。缺失时主工程照常编译，NSS 插件自动禁用。
+Python 3 + VS 开发环境）。缺失时主工程仍能编译，但 `--upscaler nss` / NFRU 会在
+vkCreateInstance 失败，GUI（无条件注入模拟层）也无法启动；补齐模拟层后需删除
+`build/CMakeCache.txt` 并重跑 `build_all.bat`，让它打包到 exe 旁。
 
 ## 打包分发
 
@@ -259,7 +302,7 @@ Python 3）。缺失时主工程照常编译，NSS 插件自动禁用。
 - `upscalers/` — 统一超分插件层（`IUpscaler.h` 为契约，各算法一个子目录）
 - `compare/`、`bench/`、`gui/`、`app/` — 各前端与入口
 - `metrics/` — Python 离线指标复核与 Markdown 报告生成
-- `scripts/` — SDK 下载、Bistro 转换、NSS 模拟层构建
+- `scripts/` — SDK/资产下载、Bistro 转换、贴图转码、NSS 模拟层构建
 - `third_party/` — 各 SDK（脚本下载，不入库）
 
 ## 许可证

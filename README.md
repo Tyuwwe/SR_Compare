@@ -251,20 +251,61 @@ alpha-mode mistakes: uniform-zero MASK → OPAQUE, real glass → BLEND with a
 constant alpha, and false BLEND (opaque FBX flags) → OPAQUE. The result is
 `assets/bistro/BistroExterior.gltf` and `BistroInterior.gltf`.
 
-## Building
+## Building from a fresh clone
 
-```bat
-build_all.bat          :: one-click configure + Release build
-```
+1. **Requirements**: Windows 11; Visual Studio (C++ workload, discovered via
+   vswhere); CMake >= 3.24 (on PATH or the VS-bundled one); Vulkan SDK 1.4+
+   (the `VULKAN_SDK` env var provides glslangValidator, used to compile the
+   shaders); Python 3.10+ and git (for the fetch script).
 
-Requirements: Windows 11, Visual Studio (C++ workload; discovered via
-vswhere), CMake >= 3.24 (on PATH or the VS-bundled one), Vulkan SDK 1.4+
-(`VULKAN_SDK` provides glslangValidator), Python 3.10+ (only for
-`scripts/fetch_sdks.py` and `metrics/`). The SDL3 windowing library comes
-from `python scripts/fetch_sdks.py --only sdl3` (prebuilt VC x64 package
-staged into `third_party/sdl3/`; the build copies `SDL3.dll` next to the exe).
+2. **Fetch the SDKs** — downloads all third-party SDKs into `third_party/`
+   (gitignored): FidelityFX, XeSS, Streamline, SGSR, Arm NSS, SDL3, ImGui
+   (docking branch), cgltf, stb.
 
-DLSS needs a free NVIDIA Developer applicationId (env `SR_DLSS_APP_ID`).
+   ```bat
+   python scripts/fetch_sdks.py
+   ```
+
+   `--only a,b` fetches a subset, `--force` re-fetches what is already
+   present. This step is not optional: `third_party/cgltf`, `stb` and
+   `imgui` are hard requirements for every target, and a missing SDL3 is a
+   configure-time FATAL_ERROR. The CMake options
+   `SR_WITH_FSR/SGSR/XESS/DLSS/NSS` (all ON by default) can drop individual
+   upscaler SDKs.
+
+3. **Build**:
+
+   ```bat
+   build_all.bat          :: configure + Release build
+   ```
+
+   The exe lands in `build/app/Release/sr_compare.exe`.
+
+4. **Optional — Arm NSS PC emulation layer** (needed for `--upscaler nss` /
+   NFRU frame gen on PC):
+
+   ```bat
+   scripts\nss_emu_fetch_deps.bat   :: git + network; clones + patches deps into build-nss-emu\deps
+   scripts\nss_emu_configure.bat    :: needs Ninja + Python 3 + a VS dev environment
+   scripts\nss_emu_build.bat
+   ```
+
+   The main build only packages the emulation layers next to the exe
+   (`build/app/Release/nss-emu/`) if `build-nss-emu/build/graph/VkLayer_Graph.dll`
+   exists **at CMake configure time** — so either build the emu layer before
+   the first `build_all.bat`, or delete `build/CMakeCache.txt` and re-run
+   `build_all.bat` afterwards. Without the layers, runs that request nss
+   fail vkCreateInstance (the GUI injects these layers unconditionally, so
+   the GUI will not start without them); other upscalers are unaffected.
+
+5. **Scene assets** are not required to build, only to run those scenes
+   (the built-in `boxes` scene needs no assets): `sponza` comes from the
+   fetch script (`python scripts/fetch_sdks.py --only sponza`, see
+   [Sponza](#sponza)); Bistro needs a manual ORCA download + Blender
+   conversion (see [Bistro](#bistro)).
+
+6. **Runtime notes**: DLSS needs a free NVIDIA Developer applicationId
+   (env `SR_DLSS_APP_ID`); the target machine needs a Vulkan 1.3 driver.
 
 ### Moving the tree to another machine
 
@@ -275,8 +316,11 @@ can be deleted, with one exception: `build-nss-emu/` holds the NSS emulation
 layer's dependencies (git clones with applied patches). If it was deleted,
 run `scripts\nss_emu_fetch_deps.bat` (git + network), then
 `scripts\nss_emu_configure.bat` and `scripts\nss_emu_build.bat`
-(also needs Ninja + Python 3). Without it the main build still works; the NSS
-plugin simply disables itself.
+(also needs Ninja + Python 3 + a VS dev environment). The main build still
+compiles without it, but `--upscaler nss` / NFRU fail at vkCreateInstance
+and the GUI (which injects the emulation layers unconditionally) does not
+start; after rebuilding the layer, delete `build/CMakeCache.txt` and re-run
+`build_all.bat` so it gets packaged next to the exe.
 
 ## Packaging
 
@@ -299,7 +343,8 @@ an RTX 20+ GPU (other algorithms are unaffected without one).
   one subdirectory per algorithm)
 - `compare/`, `bench/`, `gui/`, `app/` — front ends and entry point
 - `metrics/` — offline metric verification + Markdown reports (Python)
-- `scripts/` — SDK download, Bistro conversion, NSS emu layer builds
+- `scripts/` — SDK/asset download, Bistro conversion, texture transcoding,
+  NSS emu layer builds
 - `third_party/` — SDKs (fetched by script, not committed)
 
 ## License

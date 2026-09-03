@@ -1,8 +1,9 @@
 # third_party/ — SDK 说明
 
 本目录大部分由 `scripts/fetch_sdks.py` 生成（不入 git，见仓库根 `.gitignore` 的
-`third_party/*/`）；例外：`vma/` 与 `meshoptimizer/` 为随源码 vendor 的精简拷贝，
-已入 git；`compressonator/` 由 `scripts/transcode_textures.py` 首次运行时下载。
+`third_party/*/`）；例外：`vma/`、`meshoptimizer/`、`imnodes/`、`tomlplusplus/`
+为随源码 vendor 的精简拷贝，已入 git（`.gitignore` 中以 `!third_party/...` 例外
+跟踪）；`compressonator/` 由 `scripts/transcode_textures.py` 首次运行时下载。
 下表为每个 SDK 的版本、来源与许可证。
 
 | 子目录 | 名称 | 实际版本 | 许可证 |
@@ -13,6 +14,9 @@
 | `streamline/` | NVIDIA Streamline SDK（框架 + DLSS DLL） | **v2.12.0**（latest） | 框架 MIT + `nvngx_dlss.dll` NVIDIA RTX SDKs LICENSE |
 | `snapdragon-gsr/` | Snapdragon SGSR 1/2（shader 源码） | git `d926f07`（main，浅克隆） | BSD-3-Clause |
 | `arm-nss/` | Arm Neural Super Sampling（SDK + 模型 + Vulkan ML 模拟层） | 见下 | SDK MIT + 模型 Arm AI Model Community License |
+| `imgui/` | Dear ImGui（docking 分支，gui 目标全部界面用；含 backends `imgui_impl_sdl3` + `imgui_impl_vulkan`） | git `83f6686`（docking，浅克隆，1.93.0 WIP） | MIT |
+| `cgltf/` | jkuhlmann cgltf（glTF 解析单头 `cgltf.h`，`renderer/scene/GltfLoader.cpp` 用） | git `de9828bc`（自报 v1.15） | MIT |
+| `stb/` | nothings stb（`stb_image.h` 贴图/HDR 加载 + `stb_image_write.h` 截图落盘） | `stb_image.h` **v2.30** + `stb_image_write.h` **v1.16** | public domain / MIT 双许可 |
 | `meshoptimizer/` | zeux meshoptimizer（仅 `meshoptimizer.h` + `simplifier.cpp` + `allocator.cpp`，LOD 简化用） | **v0.25** | MIT |
 | `vma/` | GPUOpen Vulkan Memory Allocator（仅 `vk_mem_alloc.h` 单头文件） | **v3.4.0** | MIT |
 | `imnodes/` | Nelarius imnodes（Dear ImGui 节点编辑器，GUI "Render Graph" 窗口用；`imnodes.h/.cpp` + `imnodes_internal.h`） | git `eb36902`（master） | MIT |
@@ -160,6 +164,50 @@
 - 版本：git commit `00e9d81`
 - 头文件以 `.hpp` 为主：`common/include/mlel/*.hpp` 等
 - 用于在 PC 上经 Vulkan 软件模拟推理（性能不代表真机）。
+
+---
+
+## Dear ImGui — `imgui/`
+
+- 来源：https://github.com/ocornut/imgui（docking 分支，浅克隆 `--depth 1`）
+- 版本：git commit `83f668625ad45364de71d385aeb6a5dd04bee02e`
+  （`imgui.h` 内 `IMGUI_VERSION` = "1.93.0 WIP"）
+- 许可证：MIT（见 `imgui/LICENSE.txt`）
+- 用途：gui 目标的全部界面；`gui/CMakeLists.txt` 将 `imgui.cpp` 等核心源码连同
+  backends `imgui_impl_sdl3`、`imgui_impl_vulkan` 编成静态库 `imgui`
+  （第三方代码，编译警告以 /W0 静音）。imnodes 节点编辑器叠加在其上。
+- 获取：`python scripts/fetch_sdks.py --only imgui`
+
+关键路径：
+
+- 核心：`imgui.h`、`imgui.cpp`、`imgui_draw.cpp`、`imgui_tables.cpp`、
+  `imgui_widgets.cpp`、`imgui_demo.cpp`
+- 后端：`backends/imgui_impl_sdl3.{h,cpp}`、`backends/imgui_impl_vulkan.{h,cpp}`
+
+---
+
+## cgltf — `cgltf/`
+
+- 来源：https://github.com/jkuhlmann/cgltf
+- 版本：git `de9828bc`（master；头文件自报 "Version: 1.15"，但实际内容晚于
+  v1.15 tag，此为最后改动 `cgltf.h` 的提交），只保留单头 `cgltf.h`
+- 许可证：MIT
+- 用途：glTF 场景解析，`renderer/scene/GltfLoader.cpp` 以
+  `#define CGLTF_IMPLEMENTATION` 包含之。
+- 获取：`python scripts/fetch_sdks.py --only cgltf`
+
+---
+
+## stb — `stb/`
+
+- 来源：https://github.com/nothings/stb
+- 版本：`stb_image.h` **v2.30**、`stb_image_write.h` **v1.16**（版本号见各头文件首行）
+- 许可证：public domain / MIT 双许可（见各头文件尾部）
+- 用途：
+  - `stb_image.h`：贴图/HDR 图像加载（`renderer/scene/GltfLoader.cpp`、
+    `renderer/ibl/Ibl.cpp`；implementation 宏在 GltfLoader.cpp）
+  - `stb_image_write.h`：截图 PNG 落盘（`renderer/Screenshot.cpp`）
+- 获取：`python scripts/fetch_sdks.py --only stb`
 
 ---
 
