@@ -18,6 +18,18 @@ add_custom_command(TARGET sr_compare POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory
         "${SR_SHADER_OUT_DIR}" "${SR_EXE_DIR}/shaders")
 
+# On-demand asset packaging (NOT part of the default build: assets/ is ~3.3 GB
+# with the Bistro set).  `build_all.bat --target package` mirrors assets/ next
+# to the exe via robocopy (incremental: unchanged files are skipped), making
+# build/app/Release self-contained.  Without it the dev tree still works —
+# resolveAssetPath walks up from the exe dir to the repo-root assets/.
+add_custom_target(package
+    COMMAND ${CMAKE_COMMAND}
+        -D "SRC=${CMAKE_SOURCE_DIR}/assets" -D "DST=${SR_EXE_DIR}/assets"
+        -P "${CMAKE_SOURCE_DIR}/cmake/PackageAssets.cmake"
+    DEPENDS sr_compare
+    COMMENT "staging assets/ next to the exe (incremental mirror)")
+
 # One-click GUI launcher next to the exe (packaged as sr_run_gui.bat).
 add_custom_command(TARGET sr_compare POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different

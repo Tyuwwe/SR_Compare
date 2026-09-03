@@ -324,12 +324,20 @@ start; after rebuilding the layer, delete `build/CMakeCache.txt` and re-run
 
 ## Packaging
 
-`build/app/Release/` is self-contained after a build — copy it anywhere and
-run (no source or build tools needed):
+A plain build leaves `assets/` out of the exe folder (the dev tree finds the
+repo-root `assets/` by walking up from the exe dir).  To make
+`build/app/Release/` self-contained — copy it anywhere and run, no source or
+build tools needed — stage the assets once:
+
+```bat
+build_all.bat --target package   :: incremental robocopy mirror of assets/ (~3.3 GB)
+```
+
+The package then contains:
 
 - `sr_compare.exe` + all runtime DLLs (SDL3, XeSS / Streamline / DLSS / NSS, CRT)
 - `sr_run_gui.bat` (one-click GUI)
-- `shaders/`, `assets/` (Bistro full-PBR ≈ 1.3 GB, trim as needed), `nss-emu/`
+- `shaders/`, `nss-emu/`, `assets/` (Bistro full-PBR ≈ 3 GB, trim as needed)
 
 Assets and shaders resolve relative to the exe, so the package works from any
 working directory. Target machine: a Vulkan 1.3 capable driver; DLSS requires

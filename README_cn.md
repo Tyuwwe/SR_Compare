@@ -285,11 +285,19 @@ vkCreateInstance 失败，GUI（无条件注入模拟层）也无法启动；补
 
 ## 打包分发
 
-`build/app/Release/` 构建后即为自包含目录，整体复制即可运行（无需源码与构建环境）：
+普通构建不会把 `assets/` 拷进 exe 目录（开发机上 exe 会向上查找到仓库根的
+`assets/`）。要让 `build/app/Release/` 成为自包含目录——整体复制即可运行，
+无需源码与构建环境——先执行一次资产打包：
+
+```bat
+build_all.bat --target package   :: robocopy 增量镜像 assets/（约 3.3GB）
+```
+
+打包后的内容：
 
 - `sr_compare.exe` + 全部运行时 DLL（SDL3、XeSS/Streamline/DLSS/NSS、CRT）
 - `sr_run_gui.bat`（一键启动 GUI）
-- `shaders/`、`assets/`（Bistro 全 PBR 约 1.3GB 可裁剪）、`nss-emu/`
+- `shaders/`、`nss-emu/`、`assets/`（Bistro 全 PBR 约 3GB，可裁剪）
 
 着色器/资产按 exe 相对路径解析，打包目录从任何工作目录启动都能工作。目标机器
 要求：支持 Vulkan 1.3 的显卡驱动；DLSS 需要 RTX 20+（无 RTX 时 DLSS 自动不可用，
