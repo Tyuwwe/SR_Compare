@@ -61,6 +61,7 @@ inline constexpr uint64_t kGradingTint = 1ull << 20;
 inline constexpr uint64_t kGradingContrast = 1ull << 21;
 inline constexpr uint64_t kGradingSat = 1ull << 22;
 inline constexpr uint64_t kOutput = 1ull << 23;
+inline constexpr uint64_t kPlanarReflections = 1ull << 24;
 } // namespace cli
 
 // Parsed engine.toml content.  Absent keys stay empty optionals; the apply
@@ -87,6 +88,7 @@ struct EngineConfig {
     std::optional<bool> bloom;
     std::optional<bool> motionBlur;
     std::optional<bool> lensFx;            // master switch (viewer/compare)
+    std::optional<bool> planarReflections; // planar mirror reflections (scenes with mirror glass)
     // [lens_fx] — per-effect sub-items (GUI compose chain)
     std::optional<bool> lensCa;
     std::optional<bool> lensVignette;

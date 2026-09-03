@@ -14,6 +14,10 @@ layout(set = 0, binding = 0) uniform SceneUBO {
     vec4 cameraPos;
     vec4 ambient;          // unused here; lights live in LightingUBO
     vec4 renderSizeJitter;
+    vec4 clipPlane;    // planar mirror plane (xyz normal toward the camera, w offset)
+    mat4 reflViewProj; // mirrored-view view-projection (main view, reflParams.x = 1)
+    vec4 reflParams;   // x = reflection image available, y = clip behind clipPlane,
+                       // zw = mirrored proj m[10]/m[14] (viewZ = w / (depth + z))
 } ubo;
 
 layout(set = 0, binding = 1) uniform MaterialUBO {
@@ -74,6 +78,12 @@ layout(set = 2, binding = 8) uniform sampler3D fogVolume;
 #define SR_PROBE_SPEC_BINDING 10
 #define SR_PROBE_DIFF_BINDING 11
 #include "probes.glsl"
+// Planar mirror reflection of the frame's active mirror plane
+// (PlanarReflection.h): the mirrored view's HDR radiance + depth, sampled at
+// this fragment's projection through SceneUBO.reflViewProj.  Stand-in 1x1
+// images on paths without the pass (never sampled: reflParams.x = 0).
+layout(set = SR_PROBE_SET, binding = 12) uniform sampler2D reflColor;
+layout(set = SR_PROBE_SET, binding = 13) uniform sampler2D reflDepth;
 
 // Fragment-stage push block.  Member offsets in SPIR-V are ABSOLUTE within
 // the pipeline's push-constant memory, so params sits explicitly at byte 208,
@@ -220,7 +230,16 @@ void main() {
     const bool mirror = material.emissive.w > 0.5;
     if (mirror) {
         roughness = min(roughness, 0.04);
-        F0 = vec3(0.30);
+        // Plain (uncoated) glass: F0 = 0.04 with Schlick Fresnel.  The old
+        // 0.30 coating (plus the EnvBRDF->1 boost below) reflected ~85% of
+        // the scene radiance, so the panes read as a bright duplicate of the
+        // terrace instead of a dark tinted mirror; the reference render
+        // (path traced) shows the reflected street at ~6% of its direct
+        // brightness at this incidence, exactly the dielectric Fresnel curve.
+#ifndef SR_MIRROR_F0
+#define SR_MIRROR_F0 0.04
+#endif
+        F0 = vec3(SR_MIRROR_F0);
     }
 
     vec3 lightDiffuse = vec3(0.0);
@@ -296,14 +315,56 @@ void main() {
     // pass (lightCounts.y, same as transparent.frag — keep in sync): off ->
     // probe -> global env fallback only, ssrHit stays 0.
     float ssrHit = 0.0;
-    if (lighting.lightCounts.y > 0.5) {
-        vec4 ssr = traceSsr(ssrColor, textureQueryLevels(ssrColor), ssrHiZ,
-                            textureQueryLevels(ssrHiZ), ubo.viewProj,
-                            lighting.invViewProj, ubo.cameraPos.xyz, vWorldPos, N, R, roughness,
-                            ubo.renderSizeJitter.xy, 1, 1, vec4(40.0, 0.05, 0.005, 0.0),
-                            int(length(ubo.renderSizeJitter.xy) * 1.5) + 8);
+    float ssrHitDist = 0.0; // unused: the GT path has no motion target
+    bool planar = false;
+    // Planar mirror reflection: a mirror fragment lying on the frame's active
+    // plane samples the mirrored view at its own projection — exact for a
+    // planar reflector (back faces, off-screen content), no depth guesswork.
+    // The reflected depth gives the virtual image point for the motion
+    // vectors below.  Panes on other planes keep the SSR fallback.
+    if (mirror && ubo.reflParams.x > 0.5) {
+        const vec3 pn = ubo.clipPlane.xyz;
+        const float pd = dot(pn, vWorldPos) + ubo.clipPlane.w;
+        if (abs(pd) < 0.05 && dot(N, pn) > 0.95) {
+            const vec4 rc = ubo.reflViewProj * vec4(vWorldPos, 1.0);
+            if (rc.w > 0.0) {
+                const vec2 ruv = rc.xy / rc.w * 0.5 + 0.5;
+                if (all(greaterThanEqual(ruv, vec2(0.0))) && all(lessThanEqual(ruv, vec2(1.0)))) {
+                    planar = true;
+                    const vec3 rcol = textureLod(reflColor, ruv, 0.0).rgb;
+                    specSsr = rcol * envBrdf; // EnvBRDF-weighted, like an SSR hit
+                    ssrHit = 1.0;
+                    // Reflected point: view Z from the mirrored camera along
+                    // the ray through this fragment, minus the leg to the pane.
+                    const float rd = textureLod(reflDepth, ruv, 0.0).r;
+                    const float rz = ubo.reflParams.w / (rd + ubo.reflParams.z);
+                    const vec3 camM = ubo.cameraPos.xyz -
+                                      pn * (2.0 * (dot(pn, ubo.cameraPos.xyz) + ubo.clipPlane.w));
+                    const vec3 fwdM = normalize(lighting.viewForward.xyz -
+                                                pn * (2.0 * dot(pn, lighting.viewForward.xyz)));
+                    const vec3 toP = vWorldPos - camM;
+                    const float distR = rz / max(dot(normalize(toP), fwdM), 1e-3);
+                    ssrHitDist = max(distR - length(toP), 0.0);
+                }
+            }
+        }
+    }
+    if (!planar && lighting.lightCounts.y > 0.5) {
+#ifndef SR_SSR_EXTENT_K
+#define SR_SSR_EXTENT_K 1.0
+#endif
+        vec4 ssr = traceSsrEx(ssrColor, textureQueryLevels(ssrColor), ssrHiZ,
+                              textureQueryLevels(ssrHiZ), ubo.viewProj,
+                              lighting.invViewProj, ubo.cameraPos.xyz, vWorldPos, N, R, roughness,
+                              ubo.renderSizeJitter.xy, 1, 1, vec4(40.0, 0.05, 0.005, 0.0),
+                              int(length(ubo.renderSizeJitter.xy) * 1.5) + 8, SR_SSR_EXTENT_K,
+                              ssrHitDist);
         ssrHit = clamp(ssr.a, 0.0, 1.0);
-        specSsr = mix(specSsr, ssr.rgb * mix(envBrdf, vec3(1.0), ssrHit * 0.8), ssrHit);
+        // Mirror panes keep the physically based EnvBRDF weight (hit radiance
+        // times the Fresnel/geometry term, UE composite); the boost stays for
+        // the legacy transmissive shop-glass look only.
+        const vec3 hitWeight = mirror ? envBrdf : mix(envBrdf, vec3(1.0), ssrHit * 0.8);
+        specSsr = mix(specSsr, ssr.rgb * hitWeight, ssrHit);
     }
 
     float alpha = clamp(max(base.a, max(Fg.r, ssrHit * 0.88)), 0.0, 1.0);

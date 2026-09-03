@@ -48,6 +48,7 @@
 #include "renderer/core/VulkanContext.h"
 #include "renderer/core/Window.h"
 #include "renderer/deferred/DeferredCore.h"
+#include "renderer/deferred/PlanarReflection.h"
 #include "renderer/scene/Camera.h"
 #include "renderer/scene/CameraPath.h"
 #include "renderer/scene/Scene.h"
@@ -318,6 +319,7 @@ private:
     bool loadShader(const char* name, VkShaderModule& out);
     bool createShaders();
     bool createDescriptors();
+    bool createPlanarReflections();
     // Auto-exposure channels + sets (needs the descriptor pool; called from
     // createDescriptors once it exists).
     bool createAutoExposureResources();
@@ -602,6 +604,10 @@ private:
     bool ssrEnabled_ = false;
     // Global SSR weight scale (trace-stage confidence multiplier, 0..1).
     float ssrStrength_ = 0.6f;
+    // Planar mirror reflections (per-frame pass skip, no rebuild; the
+    // resources exist whenever the scene has mirror glass).  Off = the
+    // mirror panes fall back to the inline glass SSR trace.
+    bool planarEnabled_ = true;
     // Froxel volumetric fog (per-frame pass skip; params from the scene
     // lighting preset, toggling resets the temporal history).
     bool volFogEnabled_ = true;
@@ -805,6 +811,11 @@ private:
     ImageResource fontAtlas_;
 
     DeferredCore deferred_;        // shared deferred PBR + IBL (once per env map)
+    // Planar mirror reflection passes (LR / GT paths; the spatial-LR and
+    // SSAA variants keep the SSR fallback).  Rebuilt with the stack.
+    PlanarReflection gbPlanar_;
+    PlanarReflection gtPlanar_;
+    const PlanarReflection* activePlanar_ = nullptr; // patches the SceneUBO being filled
     std::string envMapActive_;     // env map deferred_ was built with
     // CSM shadow map (fixed 2048^2 x 4, resolution- and env-independent):
     // created once next to deferred_, survives scene/config rebuilds, and is

@@ -14,6 +14,10 @@ layout(set = 0, binding = 0) uniform SceneUBO {
     vec4 cameraPos;
     vec4 ambient;         // unused here; lights live in LightingUBO
     vec4 renderSizeJitter; // xy = render size (pixels), zw = jitter (pixels)
+    vec4 clipPlane;    // planar mirror plane (xyz normal toward the camera, w offset)
+    mat4 reflViewProj; // mirrored-view view-projection (main view, reflParams.x = 1)
+    vec4 reflParams;   // x = reflection image available, y = clip behind clipPlane,
+                       // zw = mirrored proj m[10]/m[14] (viewZ = w / (depth + z))
 } ubo;
 
 layout(push_constant) uniform Push {

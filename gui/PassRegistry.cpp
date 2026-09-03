@@ -50,9 +50,15 @@ const std::vector<PassNode>& passTable() {
          {"gbuffer", "hiz", "hdr color"}, {"color pyramid", "hdr color"},
          "color pyramid + trace + temporal composite — CLI/engine.toml only "
          "(--ssr); this node's checkbox is locked in the GUI"},
+        {"planar reflection", "planar", PassToggle::PlanarReflection,
+         PassToggle::None,
+         {"shadow map"}, {"reflection color"},
+         "mirrored-view GBuffer + lighting for the nearest mirror plane in view; "
+         "recorded only for scenes with mirror glass (Bistro storefront), off = "
+         "the panes fall back to the screen-space trace"},
         {"transparent", "transparent", PassToggle::None,
          PassToggle::None,
-         {"hdr color", "depth", "color pyramid", "fog volume"},
+         {"hdr color", "depth", "color pyramid", "fog volume", "reflection color"},
          {"hdr color", "reactive mask"},
          "recorded only when the scene has alpha-blend materials"},
         {"bloom", "bloom", PassToggle::Bloom,

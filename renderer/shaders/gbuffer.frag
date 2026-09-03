@@ -27,6 +27,10 @@ layout(set = 0, binding = 0) uniform SceneUBO {
     vec4 cameraPos;
     vec4 ambient;
     vec4 renderSizeJitter;
+    vec4 clipPlane;    // planar mirror plane (xyz normal toward the camera, w offset)
+    mat4 reflViewProj; // mirrored-view view-projection (main view, reflParams.x = 1)
+    vec4 reflParams;   // x = reflection image available, y = clip behind clipPlane,
+                       // zw = mirrored proj m[10]/m[14] (viewZ = w / (depth + z))
 } scene;
 
 layout(location = 0) in vec3 vWorldPos;
@@ -52,6 +56,11 @@ void main() {
 
     // alphaMode MASK (alpha cutout: foliage, fences).
     if (material.factors.w > 0.0 && base.a < material.factors.w) discard;
+    // Planar-reflection view (PlanarReflection.h): the mirrored camera sits
+    // behind the pane, so everything on the far side of the mirror plane
+    // (the shop interior) must not occlude the reflected street.
+    if (scene.reflParams.y > 0.5 &&
+        dot(scene.clipPlane.xyz, vWorldPos) + scene.clipPlane.w < -0.02) discard;
 
     float metallic = material.factors.x;
     float roughness = material.factors.y;

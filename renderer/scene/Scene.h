@@ -373,6 +373,17 @@ public:
     // Reflection probe placements (see above); populated by the hosts from the
     // scene registry after load.  Capped at kMaxReflectionProbes on use.
     std::vector<ReflectionProbe> probes;
+    // Planar mirror surfaces (Material::mirror) grouped by plane at load
+    // time: unit normal + offset (n·p + d = 0; orientation is canonical, the
+    // hosts flip it toward the camera) and the world bounds of the mirror
+    // geometry on that plane.  PlanarReflection picks one per frame.
+    struct MirrorPlane {
+        Vec3 normal{0.f, 0.f, 1.f};
+        float d = 0.f;
+        Vec3 aabbMin{0.f, 0.f, 0.f};
+        Vec3 aabbMax{0.f, 0.f, 0.f};
+    };
+    std::vector<MirrorPlane> mirrorPlanes;
 
     // Scene-wide merged vertex/index buffers.  The viewer binds these once per
     // pass and draws with per-mesh firstIndex/vertexOffset, which avoids the

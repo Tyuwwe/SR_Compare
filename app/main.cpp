@@ -57,6 +57,8 @@ void printUsage() {
                  "  --ssr-strength <0..1>            global SSR weight scale (default 0.6)\n"
                  "  --no-contact-shadows             disable screen-space contact shadows (sun)\n"
                  "  --no-volfog                      disable froxel volumetric fog\n"
+                 "  --no-planar-reflections          disable planar mirror reflections (mirror glass\n"
+                 "                                 then uses the screen-space fallback)\n"
                  "  --motion-blur                    enable HDR motion blur (McGuire 2012 tile-max gather;\n"
                  "                                 default off; --no-motion-blur accepted for compatibility)\n"
                  "  --dof                            enable depth of field (default off; --no-dof accepted\n"
@@ -177,6 +179,9 @@ int runViewer(int argc, char** argv) {
         } else if (a == "--no-volfog") {
             opts.volFog = false;
             cliMask |= sr::cli::kVolFog;
+        } else if (a == "--no-planar-reflections") {
+            opts.planarReflections = false;
+            cliMask |= sr::cli::kPlanarReflections;
         } else if (a == "--motion-blur") {
             opts.motionBlur = true;
             cliMask |= sr::cli::kMotionBlur;

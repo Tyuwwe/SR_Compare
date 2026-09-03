@@ -199,6 +199,50 @@ void decomposeMatrix(const cgltf_float m[16], Vec3& t, Vec4& q, Vec3& s) {
 
 } // namespace
 
+// Groups the triangles of Material::mirror instances by world plane (see
+// Scene::mirrorPlanes).  Uses the CPU vertex copies kept for LOD generation,
+// so it must run before they are consumed.
+void buildMirrorPlanes(Scene& scene, const std::vector<LodSourceMesh>& sources) {
+    scene.mirrorPlanes.clear();
+    for (const MeshInstance& inst : scene.instances) {
+        if (inst.skinIndex >= 0) continue;
+        if (!scene.materials[inst.materialIndex].mirror) continue;
+        const LodSourceMesh* src = nullptr;
+        for (const LodSourceMesh& l : sources)
+            if (l.meshIndex == inst.meshIndex) { src = &l; break; }
+        if (!src) continue;
+        for (size_t t = 0; t + 2 < src->indices.size(); t += 3) {
+            const Vec3 p0 = transformPoint(inst.model, src->verts[src->indices[t]].position);
+            const Vec3 p1 = transformPoint(inst.model, src->verts[src->indices[t + 1]].position);
+            const Vec3 p2 = transformPoint(inst.model, src->verts[src->indices[t + 2]].position);
+            const Vec3 c = cross(p1 - p0, p2 - p0);
+            const float area2 = length(c);
+            if (area2 < 1e-5f) continue;
+            Vec3 n = c / area2;
+            float d = -dot(n, p0);
+            // Canonical orientation (two-sided panes carry both windings).
+            if (n.x + 0.5f * n.y + 0.25f * n.z < 0.f) { n = n * -1.f; d = -d; }
+            const Vec3 mn{std::min(p0.x, std::min(p1.x, p2.x)), std::min(p0.y, std::min(p1.y, p2.y)),
+                          std::min(p0.z, std::min(p1.z, p2.z))};
+            const Vec3 mx{std::max(p0.x, std::max(p1.x, p2.x)), std::max(p0.y, std::max(p1.y, p2.y)),
+                          std::max(p0.z, std::max(p1.z, p2.z))};
+            Scene::MirrorPlane* hit = nullptr;
+            for (Scene::MirrorPlane& mp : scene.mirrorPlanes)
+                if (dot(mp.normal, n) > 0.998f && std::fabs(mp.d - d) < 0.05f) { hit = &mp; break; }
+            if (!hit) {
+                scene.mirrorPlanes.push_back({n, d, mn, mx});
+                continue;
+            }
+            hit->aabbMin = {std::min(hit->aabbMin.x, mn.x), std::min(hit->aabbMin.y, mn.y),
+                            std::min(hit->aabbMin.z, mn.z)};
+            hit->aabbMax = {std::max(hit->aabbMax.x, mx.x), std::max(hit->aabbMax.y, mx.y),
+                            std::max(hit->aabbMax.z, mx.z)};
+        }
+    }
+    if (!scene.mirrorPlanes.empty())
+        std::fprintf(stderr, "scene: %zu planar mirror plane(s)\n", scene.mirrorPlanes.size());
+}
+
 bool Scene::loadGltf(const VulkanContext& ctx, const char* path, VkCommandPool pool,
                      const LoadProgressFn& progress) {
     destroy(ctx);
@@ -778,6 +822,7 @@ bool Scene::loadGltf(const VulkanContext& ctx, const char* path, VkCommandPool p
     report(LoadStage::Finalize, 0, 0); // indeterminate
     updatePrevTransforms();
     finalizeInstances();
+    buildMirrorPlanes(*this, lodSources);
     if (keepNodes) computeAnimatedBounds();
     // Runtime LOD generation (cached next to the glTF) + per-instance draw
     // tables; must run after the merged index accumulation is complete and

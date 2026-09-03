@@ -26,6 +26,41 @@
 #ifndef SR_SSR_GLSL
 #define SR_SSR_GLSL
 
+// Optional trace telemetry (compile with -DSR_SSR_DEBUG=<mode>; the release
+// build never defines it, so the statements below vanish).  Filled by the
+// last traceSsr call of the invocation; transparent.frag maps it to colours.
+#ifdef SR_SSR_DEBUG
+struct SsrDebug {
+    int rejThick;   // crossings rejected by the thickness window
+    int rejBack;    // crossings rejected as back-side (-N) hits
+    int rejSelf;    // crossings rejected as self-hits
+    int rejSky;     // crossings that bisected onto a sky texel
+    int iters;      // hierarchy iterations consumed
+    int endState;   // 0 none, 1 hit, 2 early-out, 3 left screen, 4 ray end, 5 budget exhausted
+    float lastOver; // view-Z overshoot of the last thickness-rejected crossing
+    float lastThick;// window that rejected it
+    float hitDist;  // world distance of the accepted hit
+    vec2 hitUv;
+    int exitTests;  // exit bisections evaluated
+    float exitOver; // behind-side overshoot of the last exit test
+    float exitUnder;// in-front-side undershoot of the last exit test
+    int exitSky;    // exit tests skipped because a side was sky
+    int runs;       // behind-runs started
+    float rimZ;     // rim depth of the last run
+    float maxBulge; // largest front bulge seen in any run
+    float minOver;  // smallest overshoot seen in any run
+    float minOverBulge; // 2*bulge at the sample with the smallest overshoot
+    float overAtMaxBulge; // overshoot at the sample with the largest bulge
+    float uvAtMaxBulge;   // screen u of that sample
+    float rimAtMaxBulge;  // rim depth of that run
+    float sceneAtMaxBulge;// front depth at that sample
+};
+SsrDebug gSsrDbg;
+#define SSR_DBG(stmt) stmt
+#else
+#define SSR_DBG(stmt)
+#endif
+
 float ssrViewZ(mat4 viewProj, mat4 invViewProj, vec2 uv, float depth) {
     vec4 w = invViewProj * vec4(uv * 2.0 - 1.0, depth, 1.0);
     w /= w.w;
@@ -81,11 +116,49 @@ float ssrClipToScreen(vec2 startUv, vec2 endUv) {
 //      metres behind a reflector, and because a view-Z miss of w maps to a
 //      w/|R·N| slide along the mirror, small objects smeared into long
 //      horizontal streaks (the "stretched lamp" artifact).
-vec4 traceSsr(sampler2D colorTex, int colorMipCount, sampler2D hizTex, int hizMipCount,
-              mat4 viewProj, mat4 invViewProj, vec3 cameraPos, vec3 worldPos,
-              vec3 N, vec3 R, float roughness, vec2 renderSize, int escalateEvery,
-              int maxMipCap, vec4 cfg, int maxIters) {
+// extentK: solid-occluder handling (0 = off, legacy behaviour).  The base
+//   window alone tunnels through anything thicker than a few centimetres
+//   (hanging lamps read as crescents, chairs and awnings tear into stripes
+//   of far background / fallback).  With extentK > 0 a crossing whose
+//   overshoot exceeds the window starts a BEHIND-RUN instead of being final;
+//   how the run resolves depends on which way the ray travels in view Z:
+//   - Ray moving TOWARD the camera (view Z decreasing): when it re-emerges
+//     in front of the depth surface the exit is bisected.  A CONTINUOUS
+//     back-to-front crossing (both sides of the boundary within the window)
+//     means the ray passed through the occluder's front surface from inside,
+//     i.e. for a convex solid it had to enter through the back face the
+//     depth buffer cannot hold — a hit at the exit texel.  A jump to the
+//     background means the projection merely left the silhouette: the ray
+//     passed behind a thin object and continues.  Exact for convex solids,
+//     never extrudes anything.
+//   - Any direction, sample by sample: a convex occluder is symmetric about
+//     its silhouette, so its unseen back face bulges away from the camera
+//     by as much as its visible front face bulges toward it.  The run
+//     remembers the depth of the silhouette it entered (the rim: for a
+//     convex object the front and back faces meet there) and accepts the
+//     first sample whose overshoot past the front fits under twice the
+//     front bulge (rimZ - frontZ) at that texel — i.e. the ray is inside
+//     the object.  This is local: the ray's projection can run on behind a
+//     second surface (the hanging lamp sits under the awning) without the
+//     first object's size leaking into the second, because the run restarts
+//     whenever the front depth jumps or drops behind the rim.  Rays that
+//     pass behind an object by more than its own thickness, and behind
+//     wires / slats (no bulge), keep marching.  (Toward-camera rays get the
+//     exit test as well; the two agree on convex solids.)
+//   - A run still open when the march ends (screen edge, ray end, budget)
+//     is scored by a chord model instead — its screen length in world metres
+//     (capped at kExtentCap) against its mid-run overshoot — so walls /
+//     awnings / ground beyond the screen edge block rays.
+// outHitDist: world distance from worldPos to the accepted hit (0 on miss);
+//   the glass pass reprojects the reflection through the mirror image of
+//   the hit point.
+vec4 traceSsrEx(sampler2D colorTex, int colorMipCount, sampler2D hizTex, int hizMipCount,
+                mat4 viewProj, mat4 invViewProj, vec3 cameraPos, vec3 worldPos,
+                vec3 N, vec3 R, float roughness, vec2 renderSize, int escalateEvery,
+                int maxMipCap, vec4 cfg, int maxIters, float extentK, out float outHitDist) {
+    outHitDist = 0.0;
     const int kMaxIters = maxIters; // hierarchy steps (each descends or advances);
+    const float kExtentCap = 0.35;  // m; largest occluder thickness the open-run chord model assumes
     const int kRefine = 8;
     const float kMaxDist = 100.0;
     const float kBias = 0.08;
@@ -94,6 +167,11 @@ vec4 traceSsr(sampler2D colorTex, int colorMipCount, sampler2D hizTex, int hizMi
     const float thickBase = cfg.y;
     const float thickSlope = cfg.z;
     const float thickWiden = cfg.w;
+    SSR_DBG(gSsrDbg.rejThick = 0; gSsrDbg.rejBack = 0; gSsrDbg.rejSelf = 0; gSsrDbg.rejSky = 0;
+            gSsrDbg.iters = 0; gSsrDbg.endState = 2; gSsrDbg.lastOver = 0.0;
+            gSsrDbg.lastThick = 0.0; gSsrDbg.hitDist = 0.0; gSsrDbg.hitUv = vec2(0.0);
+            gSsrDbg.exitTests = 0; gSsrDbg.exitOver = -1.0; gSsrDbg.exitUnder = -1.0; gSsrDbg.exitSky = 0;
+            gSsrDbg.runs = 0; gSsrDbg.rimZ = 0.0; gSsrDbg.maxBulge = 0.0; gSsrDbg.minOver = 1e9; gSsrDbg.minOverBulge = 0.0;)
 
     vec3 origin = worldPos + N * kBias;
     vec4 startCS = viewProj * vec4(origin, 1.0);
@@ -153,6 +231,17 @@ vec4 traceSsr(sampler2D colorTex, int colorMipCount, sampler2D hizTex, int hizMi
     // (via thickWiden) optionally widens the thickness window for the opaque
     // caller; the glass LOD term uses it too.
     const float grazing = abs(dot(R, N));
+    // Self-hit rejection.  Legacy (opaque) callers keep the historical
+    // Euclidean radius around the ray origin: 0.22 m head-on, shrinking with
+    // |R·N| so grazing rays may still strike nearby frames and walls.  The
+    // solid-occluder (glass) callers use plane clearance instead: a hit is
+    // "the reflector itself" only when its surface point lies on the pane
+    // plane (frame seam, coplanar decals).  The radius discarded everything
+    // hugging the glass — the café lantern's back hangs 0.16 m off the pane,
+    // and the half of its mirror image nearest the glass was rejected as a
+    // self hit (the crescent-shaped lamp reflection).
+    const float selfRadius = extentK > 0.0 ? kBias : kBias + 0.14 * grazing;
+    const float selfPlane = extentK > 0.0 ? 0.02 : -1.0e30;
 
     // t parameterises the clipped segment: uv = mix(startUv, endUv, t) and
     // 1/w = mix(invW0, invW1, t), so every sample stays perspective-correct.
@@ -164,11 +253,36 @@ vec4 traceSsr(sampler2D colorTex, int colorMipCount, sampler2D hizTex, int hizMi
     vec2 hitUv = endUv;
     float hitDist = kMaxDist;
     float hitSide = 0.0;
+    // Estimated (back-face) hits: confidence fades with the acceptance margin
+    // and the colour comes from one mip coarser, so the reflection of a solid
+    // occluder's unseen side reads as a smooth body instead of a ragged patch
+    // of its front-face texture.
+    float hitSoft = 1.0;
+    float hitLodBias = 0.0;
+    // Silhouette-extent candidate (see extentK above).
+    bool candValid = false;
+    vec2 candUv = vec2(0.0);
+    float candDist = 0.0;
+    float candOver = 0.0;    // overshoot at the run's first crossing
+    float candOverLast = 0.0;// overshoot at the run's latest behind sample
+    vec2 candUvLast = vec2(0.0);
+    float candDistLast = 0.0;
+    float candT = 0.0;       // segment parameter where the run started
+    float candTBehind = 0.0; // last sample known to be behind the surface
+    float candPxWorld = 0.0; // world metres per screen pixel at the candidate depth
+    float candRimZ = 0.0;    // front depth at the silhouette the run entered
+    float candSceneZLast = 0.0; // front depth at the run's latest sample
+    // View Z decreases along the segment when 1/w grows (ray toward the camera).
+    const bool towardCamera = invW1 > invW0;
+    // Direction of one screen pixel along the march, in UV units.
+    const vec2 pxStepUv = (dPx / max(pixelDist, 1e-6)) / renderSize;
 
+    SSR_DBG(gSsrDbg.endState = 5;)
     for (int it = 0; it < kMaxIters && t <= 1.0; ++it) {
+        SSR_DBG(gSsrDbg.iters = it + 1; if (t > 1.0) gSsrDbg.endState = 4;)
         vec2 px = startPx + dPx * t;
         vec2 uv = px / renderSize;
-        if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) break;
+        if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) { SSR_DBG(gSsrDbg.endState = 3;) break; }
 
         ivec2 mipSize = max(size0 >> level, ivec2(1));
         ivec2 ip = clamp(ivec2(px) >> level, ivec2(0), mipSize - 1);
@@ -184,6 +298,65 @@ vec4 traceSsr(sampler2D colorTex, int colorMipCount, sampler2D hizTex, int hizMi
                                          : 3.0e38;
 
         if (rayZ <= cellZ) {
+            // Ray moving away from the camera: the bulge test below already
+            // had every sample of the run; re-emerging means it passed
+            // behind the occluder.
+            if (candValid && !towardCamera) candValid = false;
+            if (candValid) {
+                // Ray moving toward the camera: bisect the exit between the
+                // last behind sample and this in-front sample on mip 0 and
+                // classify it (see extentK above).
+                float lo = candTBehind; // behind side
+                float hi = t;           // in-front side
+                vec2 loUv = mix(startUv, endUv, lo);
+                vec2 hiUv2 = uv;
+                for (int r = 0; r < kRefine; ++r) {
+                    const float mid = 0.5 * (lo + hi);
+                    const vec2 mUv = mix(startUv, endUv, mid);
+                    const float mDepth = texelFetch(hizTex, ivec2(clamp(mUv * renderSize, vec2(0.0),
+                                                                          renderSize - 1.0)), 0).r;
+                    const float mRayZ = abs(1.0 / mix(invW0, invW1, mid));
+                    const bool behind = mDepth < 0.9999 &&
+                                        mRayZ > ssrViewZ(viewProj, invViewProj, mUv, mDepth);
+                    if (behind) { lo = mid; loUv = mUv; } else { hi = mid; hiUv2 = mUv; }
+                }
+                const float loDepth = texelFetch(hizTex, ivec2(clamp(loUv * renderSize, vec2(0.0),
+                                                                     renderSize - 1.0)), 0).r;
+                const float hiDepth2 = texelFetch(hizTex, ivec2(clamp(hiUv2 * renderSize, vec2(0.0),
+                                                                      renderSize - 1.0)), 0).r;
+                bool exitHit = false;
+                SSR_DBG(++gSsrDbg.exitTests; if (!(loDepth < 0.9999 && hiDepth2 < 0.9999)) ++gSsrDbg.exitSky;)
+                if (loDepth < 0.9999 && hiDepth2 < 0.9999) {
+                    const float loRayZ = abs(1.0 / mix(invW0, invW1, lo));
+                    const float loSceneZ = ssrViewZ(viewProj, invViewProj, loUv, loDepth);
+                    const float hiRayZ = abs(1.0 / mix(invW0, invW1, hi));
+                    const float hiSceneZ = ssrViewZ(viewProj, invViewProj, hiUv2, hiDepth2);
+                    // Continuous crossing: the surface sits within the window
+                    // on BOTH sides of the texel boundary (a silhouette exit
+                    // leaves the in-front side metres in front of the
+                    // background).  Twice the entry window: curved surfaces
+                    // change depth faster per texel near their rims.
+                    const float win = 2.0 * (thickBase + thickSlope * loRayZ);
+                    SSR_DBG(gSsrDbg.exitOver = loRayZ - loSceneZ; gSsrDbg.exitUnder = hiSceneZ - hiRayZ;)
+                    if (loRayZ - loSceneZ <= win && hiSceneZ - hiRayZ <= win) {
+                        vec4 hw = invViewProj * vec4(loUv * 2.0 - 1.0, loDepth, 1.0);
+                        hw /= hw.w;
+                        const float d = length(hw.xyz - worldPos);
+                        const float side = dot(hw.xyz - worldPos, N);
+                        if (side >= -0.02 && d >= selfRadius && side >= selfPlane) {
+                            hit = true;
+                            hitUv = loUv;
+                            hitDist = d;
+                            exitHit = true;
+                        }
+                    }
+                }
+                if (exitHit) {
+                    SSR_DBG(gSsrDbg.endState = 1; gSsrDbg.hitDist = hitDist; gSsrDbg.hitUv = hitUv;)
+                    break;
+                }
+                candValid = false;
+            }
             // In front of the farthest surface of this cell: safe to skip it,
             // then coarsen so long empty runs cost one iteration per cell.
             // Coarsening is additionally gated on world distance travelled:
@@ -263,11 +436,15 @@ vec4 traceSsr(sampler2D colorTex, int colorMipCount, sampler2D hizTex, int hizMi
         float hiDepth = texelFetch(hizTex, ivec2(clamp(hiUv * renderSize, vec2(0.0),
                                                         renderSize - 1.0)), 0).r;
         bool reject = hiDepth >= 0.9999;
+        SSR_DBG(if (reject) ++gSsrDbg.rejSky;)
         float dist = kMaxDist;
+        float hiOver = 0.0;
+        float hiSceneZ = 0.0;
+        bool thickReject = false;
         if (!reject) {
             float hiRayZ = abs(1.0 / mix(invW0, invW1, hi));
-            float hiSceneZ = ssrViewZ(viewProj, invViewProj, hiUv, hiDepth);
-            float hiOver = hiRayZ - hiSceneZ;
+            hiSceneZ = ssrViewZ(viewProj, invViewProj, hiUv, hiDepth);
+            hiOver = hiRayZ - hiSceneZ;
             // Hit-acceptance window (view-Z overshoot past the front surface).
             // The opaque path keeps the historical grazing widening (tolerates
             // coarse landings of long ground rays); glass passes thickWiden=0:
@@ -276,13 +453,84 @@ vec4 traceSsr(sampler2D colorTex, int colorMipCount, sampler2D hizTex, int hizMi
             // horizontal streaks (see the cfg comment above).
             const float thickness = (thickBase + thickSlope * hiRayZ) *
                                     mix(1.0, 1.0 / max(grazing, 0.25), thickWiden);
-            if (hiOver < 0.0 || hiOver > thickness) reject = true;
+            if (hiOver < 0.0 || hiOver > thickness) {
+                reject = true;
+                thickReject = extentK > 0.0 && hiOver > 0.0;
+                SSR_DBG(++gSsrDbg.rejThick; gSsrDbg.lastOver = hiOver; gSsrDbg.lastThick = thickness;)
+            }
         }
-        if (!reject) {
+        if (!reject || thickReject) {
             vec4 hw = invViewProj * vec4(hiUv * 2.0 - 1.0, hiDepth, 1.0);
             hw /= hw.w;
             dist = length(hw.xyz - worldPos);
             hitSide = dot(hw.xyz - worldPos, N);
+            if (thickReject) {
+                // Candidate bookkeeping (front side, off the reflector itself).
+                if (hitSide >= -0.02 && dist >= selfRadius && hitSide >= selfPlane) {
+                    // A new object starts where the front depth jumps, or
+                    // where it falls clearly behind the rim this run entered
+                    // at (past the far rim of a convex occluder).  The rim
+                    // tolerance absorbs intra-object depth noise: the café
+                    // lanterns are alpha-masked cages around an emissive
+                    // bulb, so texels inside the silhouette alternate between
+                    // the cage front and the bulb 0.1-0.15 m deeper through
+                    // the holes; restarting the run on those texels reset
+                    // the rim to the bulb depth and the cage's bulge no
+                    // longer covered the back-face hits (the lamp lost the
+                    // third of its mirror image nearest the glass).
+                    if (candValid) {
+                        const bool jump = abs(hiSceneZ - candSceneZLast) > 0.35 + 0.02 * hiSceneZ;
+                        const bool pastRim = hiSceneZ > candRimZ + 0.2;
+                        if (jump || pastRim) candValid = false;
+                    }
+                    if (!candValid) {
+                        candValid = true;
+                        candT = hi;
+                        candOver = hiOver;
+                        candUv = hiUv;
+                        candDist = dist;
+                        candRimZ = hiSceneZ;
+                        SSR_DBG(++gSsrDbg.runs; gSsrDbg.rimZ = hiSceneZ;)
+                        vec4 hw2 = invViewProj * vec4((hiUv + pxStepUv) * 2.0 - 1.0, hiDepth, 1.0);
+                        hw2 /= hw2.w;
+                        candPxWorld = length(hw2.xyz - hw.xyz);
+                    }
+                    candTBehind = hi;
+                    candOverLast = hiOver;
+                    candUvLast = hiUv;
+                    candDistLast = dist;
+                    candSceneZLast = hiSceneZ;
+                    // The rim is the deepest front texel of the run: a run
+                    // often starts behind a nearer flat object in front of
+                    // the occluder (the window mullion in front of the
+                    // lantern), and the silhouette texel is the deepest one
+                    // of the occluder itself.
+                    candRimZ = max(candRimZ, hiSceneZ);
+                    // Symmetric convex occluder: the back face at this texel
+                    // lies as far behind the rim as the front face lies in
+                    // front of it.  Inside -> hit here, at this texel.
+                    // kRimSlack: a curved silhouette is depth-vertical, so
+                    // the deepest texel the march can sample sits inside
+                    // the true rim (~sqrt(2 r tau) for a sphere: 0.07 m for
+                    // the 0.26 m café lantern at half-res texels) and the
+                    // symmetric estimate is short by twice that.
+                    const float kRimSlack = 0.1;
+                    const float bulge = max(candRimZ - hiSceneZ, 0.0);
+                    SSR_DBG(if (bulge > gSsrDbg.maxBulge) { gSsrDbg.overAtMaxBulge = hiOver; gSsrDbg.uvAtMaxBulge = hiUv.x; gSsrDbg.rimAtMaxBulge = candRimZ; gSsrDbg.sceneAtMaxBulge = hiSceneZ; }
+                            gSsrDbg.maxBulge = max(gSsrDbg.maxBulge, bulge);
+                            if (hiOver < gSsrDbg.minOver) { gSsrDbg.minOver = hiOver; gSsrDbg.minOverBulge = 2.0 * bulge; })
+                    const float margin = extentK * (2.0 * bulge + kRimSlack) + thickBase - hiOver;
+                    if (bulge > 0.0 && margin >= 0.0) {
+                        hit = true;
+                        hitUv = hiUv;
+                        hitDist = dist;
+                        hitSoft = smoothstep(0.0, 0.12, margin);
+                        hitLodBias = 1.0;
+                    }
+                }
+            }
+        }
+        if (!reject) {
             // A reflection can only show what sits on the reflector's FRONT
             // (+N) side.  Glass writes no depth, so a ray marched from a shop
             // window crosses the pane's own screen region and meets the
@@ -293,7 +541,7 @@ vec4 traceSsr(sampler2D colorTex, int colorMipCount, sampler2D hizTex, int hizMi
             // march then resumes and can still find real front-side content
             // (street, awning, the hanging lamp).  Valid opaque-path hits are
             // on the front side as well, so the test is safe for both callers.
-            if (hitSide < -0.02) reject = true;
+            if (hitSide < -0.02) { reject = true; SSR_DBG(++gSsrDbg.rejBack;) }
             // Reject hits on the reflecting surface itself, not hits that are
             // simply closer to the camera (street furniture in front of a
             // shop window is a valid mirror image).  The fixed 0.22 m radius
@@ -302,7 +550,11 @@ vec4 traceSsr(sampler2D colorTex, int colorMipCount, sampler2D hizTex, int hizMi
             // within a few tens of centimetres.  Scale the radius by the
             // clearance rate |R·N| — 0.22 m head-on (old behaviour), down to
             // the origin bias at exact grazing — and keep probing on reject.
-            if (dist < kBias + 0.14 * grazing) reject = true;
+            if (dist < selfRadius || hitSide < selfPlane) { reject = true; SSR_DBG(++gSsrDbg.rejSelf;) }
+        }
+        if (hit) {
+            SSR_DBG(gSsrDbg.endState = 1; gSsrDbg.hitDist = hitDist; gSsrDbg.hitUv = hitUv;)
+            break;
         }
         if (reject) {
             // Same contract as Phase 1a's lastDiff reset: a rejected crossing
@@ -317,10 +569,25 @@ vec4 traceSsr(sampler2D colorTex, int colorMipCount, sampler2D hizTex, int hizMi
         hit = true;
         hitUv = hiUv;
         hitDist = dist;
+        SSR_DBG(gSsrDbg.endState = 1; gSsrDbg.hitDist = dist; gSsrDbg.hitUv = hiUv;)
         break;
+    }
+    SSR_DBG(if (!hit && gSsrDbg.endState == 5 && t > 1.0) gSsrDbg.endState = 4;)
+    if (!hit && candValid) {
+        // March ended (screen edge / ray end / budget) still behind the
+        // occluder: score the open run with the chord model.
+        const float runPx = max((min(t, 1.0) - candT) * pixelDist, 1.0);
+        const float chord = min(runPx * candPxWorld, kExtentCap);
+        if (0.5 * (candOver + candOverLast) <= extentK * chord + thickBase) {
+            hit = true;
+            hitUv = 0.5 * (candUv + candUvLast);
+            hitDist = 0.5 * (candDist + candDistLast);
+            SSR_DBG(gSsrDbg.endState = 1; gSsrDbg.hitDist = hitDist; gSsrDbg.hitUv = hitUv;)
+        }
     }
 
     if (!hit) return vec4(0.0);
+    outHitDist = hitDist;
 
     // Roughness → mip LOD: each chain level doubles the footprint of the 2x2
     // box average, approximating a reflection cone whose aperture grows with
@@ -345,7 +612,7 @@ vec4 traceSsr(sampler2D colorTex, int colorMipCount, sampler2D hizTex, int hizMi
     // the blocky chain tail either.
     const float maxLod = float(max(colorMipCount - 3, 1));
     const float graze = 1.0 - grazing;
-    const float lod = min(roughness * roughness * maxLod + graze * graze, maxLod);
+    const float lod = min(roughness * roughness * maxLod + graze * graze + hitLodBias, maxLod);
     vec3 col = textureLod(colorTex, hitUv, lod).rgb;
     // UE tames fireflies with rcp(1+lum) because SSSR is stochastic; this
     // path is a single ray and the mip chain already averages out the hot
@@ -358,8 +625,20 @@ vec4 traceSsr(sampler2D colorTex, int colorMipCount, sampler2D hizTex, int hizMi
     // so 1 - hitT² faded exactly the far-field reflections this pass exists
     // to keep, reading as "reflection lost" on shop windows.
     float distFade = 1.0 - smoothstep(0.4 * kMaxDist, 0.9 * kMaxDist, hitDist);
-    float conf = edge.x * edge.y * distFade;
+    float conf = edge.x * edge.y * distFade * hitSoft;
     return vec4(col, conf);
+}
+
+// Legacy entry point (extent heuristic off): bit-identical to the pre-extent
+// tracer; the opaque pass keeps using it.
+vec4 traceSsr(sampler2D colorTex, int colorMipCount, sampler2D hizTex, int hizMipCount,
+              mat4 viewProj, mat4 invViewProj, vec3 cameraPos, vec3 worldPos,
+              vec3 N, vec3 R, float roughness, vec2 renderSize, int escalateEvery,
+              int maxMipCap, vec4 cfg, int maxIters) {
+    float unusedDist;
+    return traceSsrEx(colorTex, colorMipCount, hizTex, hizMipCount, viewProj, invViewProj,
+                      cameraPos, worldPos, N, R, roughness, renderSize, escalateEvery,
+                      maxMipCap, cfg, maxIters, 0.0, unusedDist);
 }
 
 #endif

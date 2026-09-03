@@ -30,6 +30,10 @@ layout(set = 0, binding = 0) uniform SceneUBO {
     vec4 cameraPos;
     vec4 ambient;          // unused here; lights live in LightingUBO
     vec4 renderSizeJitter;
+    vec4 clipPlane;    // planar mirror plane (xyz normal toward the camera, w offset)
+    mat4 reflViewProj; // mirrored-view view-projection (main view, reflParams.x = 1)
+    vec4 reflParams;   // x = reflection image available, y = clip behind clipPlane,
+                       // zw = mirrored proj m[10]/m[14] (viewZ = w / (depth + z))
 } ubo;
 
 layout(set = 0, binding = 1) uniform MaterialUBO {
@@ -98,6 +102,12 @@ layout(set = 2, binding = 8) uniform sampler3D fogVolume;
 #define SR_PROBE_SPEC_BINDING 10
 #define SR_PROBE_DIFF_BINDING 11
 #include "probes.glsl"
+// Planar mirror reflection of the frame's active mirror plane
+// (PlanarReflection.h): the mirrored view's HDR radiance + depth, sampled at
+// this fragment's projection through SceneUBO.reflViewProj.  Stand-in 1x1
+// images on paths without the pass (never sampled: reflParams.x = 0).
+layout(set = SR_PROBE_SET, binding = 12) uniform sampler2D reflColor;
+layout(set = SR_PROBE_SET, binding = 13) uniform sampler2D reflDepth;
 
 // Fragment-stage push block.  Member offsets in SPIR-V are ABSOLUTE within
 // the pipeline's push-constant memory, so params sits explicitly at byte 208,
@@ -256,7 +266,16 @@ void main() {
     const bool mirror = material.emissive.w > 0.5;
     if (mirror) {
         roughness = min(roughness, 0.04);
-        F0 = vec3(0.30);
+        // Plain (uncoated) glass: F0 = 0.04 with Schlick Fresnel.  The old
+        // 0.30 coating (plus the EnvBRDF->1 boost below) reflected ~85% of
+        // the scene radiance, so the panes read as a bright duplicate of the
+        // terrace instead of a dark tinted mirror; the reference render
+        // (path traced) shows the reflected street at ~6% of its direct
+        // brightness at this incidence, exactly the dielectric Fresnel curve.
+#ifndef SR_MIRROR_F0
+#define SR_MIRROR_F0 0.04
+#endif
+        F0 = vec3(SR_MIRROR_F0);
     }
 
     vec3 lightDiffuse = vec3(0.0);
@@ -351,17 +370,59 @@ void main() {
     // fallback chain only and ssrHit stays 0, i.e. a "miss everywhere" for the
     // alpha/transmit logic below.
     float ssrHit = 0.0;
-    if (lighting.lightCounts.y > 0.5) {
-        vec4 ssr = traceSsr(ssrColor, textureQueryLevels(ssrColor), ssrHiZ,
-                            textureQueryLevels(ssrHiZ), ubo.viewProj,
-                            lighting.invViewProj, ubo.cameraPos.xyz, vWorldPos, N, R, roughness,
-                            ubo.renderSizeJitter.xy, 1, 1, vec4(40.0, 0.05, 0.005, 0.0),
-                            int(length(ubo.renderSizeJitter.xy) * 1.5) + 8);
+    float ssrHitDist = 0.0;
+    bool planar = false;
+    // Planar mirror reflection: a mirror fragment lying on the frame's active
+    // plane samples the mirrored view at its own projection — exact for a
+    // planar reflector (back faces, off-screen content), no depth guesswork.
+    // The reflected depth gives the virtual image point for the motion
+    // vectors below.  Panes on other planes keep the SSR fallback.
+    if (mirror && ubo.reflParams.x > 0.5) {
+        const vec3 pn = ubo.clipPlane.xyz;
+        const float pd = dot(pn, vWorldPos) + ubo.clipPlane.w;
+        if (abs(pd) < 0.05 && dot(N, pn) > 0.95) {
+            const vec4 rc = ubo.reflViewProj * vec4(vWorldPos, 1.0);
+            if (rc.w > 0.0) {
+                const vec2 ruv = rc.xy / rc.w * 0.5 + 0.5;
+                if (all(greaterThanEqual(ruv, vec2(0.0))) && all(lessThanEqual(ruv, vec2(1.0)))) {
+                    planar = true;
+                    const vec3 rcol = textureLod(reflColor, ruv, 0.0).rgb;
+                    specSsr = rcol * envBrdf; // EnvBRDF-weighted, like an SSR hit
+                    ssrHit = 1.0;
+                    // Reflected point: view Z from the mirrored camera along
+                    // the ray through this fragment, minus the leg to the pane.
+                    const float rd = textureLod(reflDepth, ruv, 0.0).r;
+                    const float rz = ubo.reflParams.w / (rd + ubo.reflParams.z);
+                    const vec3 camM = ubo.cameraPos.xyz -
+                                      pn * (2.0 * (dot(pn, ubo.cameraPos.xyz) + ubo.clipPlane.w));
+                    const vec3 fwdM = normalize(lighting.viewForward.xyz -
+                                                pn * (2.0 * dot(pn, lighting.viewForward.xyz)));
+                    const vec3 toP = vWorldPos - camM;
+                    const float distR = rz / max(dot(normalize(toP), fwdM), 1e-3);
+                    ssrHitDist = max(distR - length(toP), 0.0);
+                }
+            }
+        }
+    }
+    if (!planar && lighting.lightCounts.y > 0.5) {
+#ifndef SR_SSR_EXTENT_K
+#define SR_SSR_EXTENT_K 1.0
+#endif
+        vec4 ssr = traceSsrEx(ssrColor, textureQueryLevels(ssrColor), ssrHiZ,
+                              textureQueryLevels(ssrHiZ), ubo.viewProj,
+                              lighting.invViewProj, ubo.cameraPos.xyz, vWorldPos, N, R, roughness,
+                              ubo.renderSizeJitter.xy, 1, 1, vec4(40.0, 0.05, 0.005, 0.0),
+                              int(length(ubo.renderSizeJitter.xy) * 1.5) + 8, SR_SSR_EXTENT_K,
+                              ssrHitDist);
         ssrHit = clamp(ssr.a, 0.0, 1.0);
         // UE applies EnvBRDF on the hit (not D*G*F).  Shop glass is a
         // coated mirror: lerp EnvBRDF toward 1 with hit confidence so a
         // solid trace is not crushed back to F0 (~0.22).
-        specSsr = mix(specSsr, ssr.rgb * mix(envBrdf, vec3(1.0), ssrHit * 0.8), ssrHit);
+        // Mirror panes keep the physically based EnvBRDF weight (hit radiance
+        // times the Fresnel/geometry term, UE composite); the boost stays for
+        // the legacy transmissive shop-glass look only.
+        const vec3 hitWeight = mirror ? envBrdf : mix(envBrdf, vec3(1.0), ssrHit * 0.8);
+        specSsr = mix(specSsr, ssr.rgb * hitWeight, ssrHit);
     }
 
     // Hide the dark interior: SSR confidence and Fresnel both raise opacity.
@@ -397,8 +458,106 @@ void main() {
     }
 
     outColor = vec4(glassColor, alpha);
+#ifdef SR_SSR_DEBUG
+    // Trace telemetry views (see ssr.glsl SsrDebug); mirror panes only so the
+    // opaque scene stays readable around them.
+    if (mirror) {
+        vec3 dbg = vec3(0.0);
+#if SR_SSR_DEBUG == 1
+        // End state: white hit, cyan left screen, blue ray end, red budget
+        // exhausted, magenta early-out.
+        if (gSsrDbg.endState == 1) dbg = vec3(1.0);
+        else if (gSsrDbg.endState == 3) dbg = vec3(0.0, 1.0, 1.0);
+        else if (gSsrDbg.endState == 4) dbg = vec3(0.0, 0.0, 1.0);
+        else if (gSsrDbg.endState == 5) dbg = vec3(1.0, 0.0, 0.0);
+        else dbg = vec3(1.0, 0.0, 1.0);
+#elif SR_SSR_DEBUG == 2
+        // Reject counts: R thickness, G back-side, B self+sky (x0.25 each).
+        dbg = vec3(float(gSsrDbg.rejThick), float(gSsrDbg.rejBack),
+                   float(gSsrDbg.rejSelf + gSsrDbg.rejSky)) * 0.25;
+#elif SR_SSR_DEBUG == 3
+        // Raw hit colour (linear HDR) or magenta miss.
+        dbg = ssrHit > 0.0 ? specSsr / max(ssrHit, 1e-3) : vec3(1.0, 0.0, 1.0);
+#elif SR_SSR_DEBUG == 4
+        // Last thickness-reject overshoot in metres: 0 -> black, 0.5 -> red, >1 -> yellow.
+        float o = gSsrDbg.lastOver;
+        dbg = vec3(clamp(o * 2.0, 0.0, 1.0), clamp(o - 1.0, 0.0, 1.0), gSsrDbg.rejThick > 0 ? 0.0 : 0.3);
+#elif SR_SSR_DEBUG == 5
+        // Iterations used / 512.
+        dbg = vec3(float(gSsrDbg.iters) / 512.0);
+#elif SR_SSR_DEBUG == 6
+        // Hit distance / 20 m (miss magenta).
+        dbg = gSsrDbg.endState == 1 ? vec3(gSsrDbg.hitDist / 20.0) : vec3(1.0, 0.0, 1.0);
+#elif SR_SSR_DEBUG == 7
+        // Hit UV (r = u, g = v); miss magenta.
+        dbg = gSsrDbg.endState == 1 ? vec3(gSsrDbg.hitUv, 0.0) : vec3(1.0, 0.0, 1.0);
+#elif SR_SSR_DEBUG == 8
+        // Sharp (mip 0) colour at the hit UV; miss magenta.
+        dbg = gSsrDbg.endState == 1 ? textureLod(ssrColor, gSsrDbg.hitUv, 0.0).rgb : vec3(1.0, 0.0, 1.0);
+#elif SR_SSR_DEBUG == 9
+        // Probe/env fallback radiance only (what a miss shows before EnvBRDF).
+        dbg = prefiltered;
+#elif SR_SSR_DEBUG == 10
+        // EnvBRDF weight (reflectance) x4.
+        dbg = envBrdf * 4.0;
+#elif SR_SSR_DEBUG == 11
+        // Exit test: blue = never exit-tested, magenta = sky side, else
+        // r = over (x4), g = under (x4) of the last exit test.
+        if (gSsrDbg.exitTests == 0) dbg = vec3(0.0, 0.0, 0.5);
+        else if (gSsrDbg.exitOver < 0.0) dbg = vec3(1.0, 0.0, 1.0);
+        else dbg = vec3(clamp(gSsrDbg.exitOver * 4.0, 0.0, 1.0), clamp(gSsrDbg.exitUnder * 4.0, 0.0, 1.0), 0.0);
+#elif SR_SSR_DEBUG == 12
+        // Exit-test count / 8.
+        dbg = vec3(float(gSsrDbg.exitTests) / 8.0);
+#elif SR_SSR_DEBUG == 13
+        // Shading normal (after normal map + flip) as colour.
+        dbg = N * 0.5 + 0.5;
+#elif SR_SSR_DEBUG == 14
+        // Interpolated geometric normal (flipped toward V) as colour.
+        vec3 gn = normalize(vNormal);
+        if (dot(gn, V) < 0.0) gn = -gn;
+        dbg = gn * 0.5 + 0.5;
+#elif SR_SSR_DEBUG == 15
+        // Reflected direction R as colour.
+        dbg = R * 0.5 + 0.5;
+#elif SR_SSR_DEBUG == 20
+        // Scalar probe: grey = SR_DBG_VALUE (decode through the display
+        // transform offline).
+        dbg = vec3(clamp(float(SR_DBG_VALUE), 0.0, 1.0));
+#endif
+        outColor = vec4(dbg, 1.0);
+    }
+#endif
     vec2 currentUV = vCurrentClip.xy / vCurrentClip.w * 0.5 + 0.5;
     vec2 previousUV = vPreviousClip.xy / vPreviousClip.w * 0.5 + 0.5;
-    outMotion = previousUV - currentUV;
     outMask = alpha; // accumulated additively across layers
+#ifndef SR_MIRROR_VIRTUAL_MV
+#define SR_MIRROR_VIRTUAL_MV 1
+#endif
+    if (mirror && SR_MIRROR_VIRTUAL_MV != 0) {
+        // Planar-mirror reprojection.  What the pane shows is the mirror
+        // image of the hit point, which for a planar reflector lies on the
+        // camera->fragment line BEHIND the pane at the hit distance (the
+        // mirrored reflection ray is -V).  Reprojecting that virtual point
+        // with the previous view-projection gives the motion the reflected
+        // content really has under camera motion, so the temporal upscalers
+        // accumulate the (jittered, single-ray) trace into a stable,
+        // anti-aliased reflection.  The pane's own surface motion — what a
+        // translucent layer writes — smears the reflection instead, and the
+        // reactive mask that was written to compensate dropped the history
+        // altogether, which is what read as the reflection flickering and
+        // breaking up whenever the camera moved.  Misses reproject a far
+        // virtual point (the probe/env fallback is street-distance content).
+        // The mask stays 0: the history now reprojects correctly.
+        const float vdist = ssrHit > 0.0 ? ssrHitDist : 20.0;
+        const vec3 virt = vWorldPos - V * vdist;
+        const vec4 pc = ubo.prevViewProj * vec4(virt, 1.0);
+        const vec4 cc = ubo.viewProjNoJitter * vec4(virt, 1.0);
+        if (pc.w > 0.0 && cc.w > 0.0) {
+            previousUV = pc.xy / pc.w * 0.5 + 0.5;
+            currentUV = cc.xy / cc.w * 0.5 + 0.5;
+        }
+        outMask = 0.0;
+    }
+    outMotion = previousUV - currentUV;
 }

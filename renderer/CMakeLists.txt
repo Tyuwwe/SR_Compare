@@ -25,6 +25,7 @@ add_library(renderer STATIC
     ibl/ProbeBaker.cpp
     ibl/SkyAtmosphere.cpp
     deferred/DeferredCore.cpp
+    deferred/PlanarReflection.cpp
     ColorGrading.cpp
     Renderer.cpp
     Screenshot.cpp

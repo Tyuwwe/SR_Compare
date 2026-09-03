@@ -5,6 +5,7 @@
 // packaged exe can be launched from anywhere (build/app/Release, another
 // drive, a shortcut).
 // ============================================================================
+#include <cstdlib>
 #include <string>
 #include <sys/stat.h>
 #ifndef WIN32_LEAN_AND_MEAN
@@ -71,6 +72,23 @@ inline std::string resolveOutputPath(const std::string& path) {
 //   2. <exe dir>/shaders/name   (packaged layout)
 //   3. <exe dir>/../../shaders/name etc. (exe inside build/app/<cfg>)
 inline std::string resolveShaderPath(const std::string& bakedDir, const std::string& name) {
+    // Diagnostics: SR_SHADER_DIR=<dir> overrides every lookup (shader A/B
+    // experiments against an unmodified build; the dir must hold the full
+    // .spv set).  _dupenv_s: plain getenv trips C4996 under /W4.
+    {
+        char* ov = nullptr;
+        size_t ovLen = 0;
+        if (_dupenv_s(&ov, &ovLen, "SR_SHADER_DIR") == 0 && ov != nullptr) {
+            std::string dir(ov);
+            std::free(ov);
+            if (!dir.empty()) {
+                const char last = dir.back();
+                if (last != '/' && last != '\\') dir += '/';
+                const std::string candidate = dir + name;
+                if (assetFileExists(candidate)) return candidate;
+            }
+        }
+    }
     const std::string baked = bakedDir + name;
     if (assetFileExists(baked)) return baked;
     std::string dir = exeDir();

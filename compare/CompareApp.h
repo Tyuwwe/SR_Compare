@@ -16,6 +16,7 @@
 #include "renderer/core/VulkanContext.h"
 #include "renderer/core/Window.h"
 #include "renderer/deferred/DeferredCore.h"
+#include "renderer/deferred/PlanarReflection.h"
 #include "renderer/scene/Camera.h"
 #include "renderer/scene/CameraPath.h"
 #include "renderer/scene/Scene.h"
@@ -59,6 +60,7 @@ struct CompareOptions {
     // needs shadows on (rides the CSM sun selection).
     bool contactShadows = true;
     bool volFog = true;                 // froxel volumetric fog (CLI: --no-volfog)
+    bool planarReflections = true;      // planar mirror reflections (CLI: --no-planar-reflections)
     // Motion blur + depth of field (Phase 6b), HDR domain on every path (LR
     // at render res before upscale, GT at native res, GT-SSAA at 2x before
     // the downsample) with identical algorithm + parameters; CLI:
@@ -332,6 +334,11 @@ private:
 
     // Shared deferred pipeline (shaders/layouts/pipelines/samplers + IBL maps).
     DeferredCore deferred_;
+    // Planar mirror reflection passes (LR / GT paths; the spatial-LR and
+    // SSAA variants keep the SSR fallback).
+    PlanarReflection gbPlanar_;
+    PlanarReflection gtPlanar_;
+    const PlanarReflection* activePlanar_ = nullptr; // patches the SceneUBO being filled
     // CSM shadow map (fixed 2048^2 x 4, resolution-independent): created in
     // init, shared by the GB/GT/SSAA lighting paths; shadowsActive_ = false
     // degrades to no shadows (bindings stay unwritten, sampling stays off).
@@ -440,6 +447,7 @@ private:
     bool createRenderTargets();
     bool createShaders();
     bool createDescriptors();
+    bool createPlanarReflections();
     bool createPipelines();
     bool createSyncResources();
     bool recreateRenderFinishedSemaphores();

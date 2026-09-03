@@ -56,8 +56,18 @@ struct SceneUBO {
     float cameraPos[4];
     float ambient[4];
     float renderSizeJitter[4];
+    // Planar mirror reflection (PlanarReflection.h).  clipPlane = the active
+    // mirror plane (xyz = unit normal toward the camera, w = offset).  In the
+    // mirrored view reflParams.y = 1 makes the GBuffer shaders discard
+    // geometry behind that plane; in the main view reflParams.x = 1 tells
+    // the transparency pass a reflection image exists, reflViewProj is the
+    // mirrored view-projection and reflParams.zw its depth unpack
+    // (viewZ = w / (depth + z)).  fillSceneUBO zeroes all three.
+    float clipPlane[4];
+    float reflViewProj[16];
+    float reflParams[4];
 };
-static_assert(sizeof(SceneUBO) == 240, "SceneUBO std140 size mismatch");
+static_assert(sizeof(SceneUBO) == 336, "SceneUBO std140 size mismatch");
 
 // std140, matches the MaterialUBO block in gbuffer.frag / gbuffer_gt.frag.
 struct MaterialUBO {
@@ -1119,7 +1129,9 @@ public:
     void writeTransparentSet(const VulkanContext& ctx, VkDescriptorSet set,
                              VkBuffer lightingUbo, VkImageView ssao, VkImageView shadow,
                              VkImageView ssrColor, VkImageView depthPyramid,
-                             VkImageView fogVolume) const;
+                             VkImageView fogVolume,
+                             VkImageView reflColor = VK_NULL_HANDLE,
+                             VkImageView reflDepth = VK_NULL_HANDLE) const;
     // Draws all BLEND-material instances back-to-front over the lit scene.
     // LR path (gtPass=false): 3 attachments = color (alpha blend) + motion
     // (overwrite) + reactive mask (additive).  GT path: color only.  The
@@ -1664,6 +1676,14 @@ private:
     VkImage fogFallbackImage_ = VK_NULL_HANDLE;
     VmaAllocation fogFallbackMemory_ = VK_NULL_HANDLE;
     VkImageView fogFallbackView_ = VK_NULL_HANDLE;
+    // 1x1 stand-ins for the planar-reflection colour (black) / depth (far)
+    // bindings of transparent sets whose path has no reflection pass.
+    VkImage reflFallbackColorImage_ = VK_NULL_HANDLE;
+    VmaAllocation reflFallbackColorMemory_ = VK_NULL_HANDLE;
+    VkImageView reflFallbackColorView_ = VK_NULL_HANDLE;
+    VkImage reflFallbackDepthImage_ = VK_NULL_HANDLE;
+    VmaAllocation reflFallbackDepthMemory_ = VK_NULL_HANDLE;
+    VkImageView reflFallbackDepthView_ = VK_NULL_HANDLE;
 };
 
 } // namespace sr

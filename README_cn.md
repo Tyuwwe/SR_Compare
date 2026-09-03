@@ -53,7 +53,15 @@ Arm NSS 在 PC 上经 Vulkan ML Emulation Layer 软件模拟推理，性能数�
 - 显示变换：Stephen Hill fitted ACES + gamma 2.2（present / compare compose /
   GPU 指标 / CPU 截图共用同一套）
 - 前向透明 pass（lighting 之后、upscale 之前）：电介质橱窗模型（镀膜菲涅尔、
-  McGuire clip-space DDA SSR，合成时乘 EnvBRDF）、后往前排序、写相机运动矢量与
+  McGuire clip-space DDA SSR，合成时乘 EnvBRDF）；Bistro 镜面橱窗改用普通玻璃
+  菲涅尔（F0 0.04）并使用**平面反射**：每帧选取视野内最近的镜面平面，用镜像相机
+  额外渲染一遍不透明 GBuffer + 光照（GBuffer 着色器裁剪平面、AO 置白、无雾无透明；
+  `--no-planar-reflections`、engine.toml `[effects] planar_reflections` 或 GUI
+  复选框可关闭），橱窗按自身投影采样该图像——对平面反射体精确，含屏幕外内容
+  与贴近玻璃物体的背面。其它平面上的橱窗仍走 Hi-Z SSR 回退（已加入实体遮挡处理：
+  光线穿到遮挡物背后时按可见前表面凸起推断对称凸体判定命中，朝向相机的光线用精确
+  穿出测试），并写平面镜运动矢量（反射内容按虚像点重投影、mask 置 0），
+  时域超分在镜头移动时可稳定累积反射；后往前排序、写相机运动矢量与
   半透明覆盖度 mask
 - 覆盖度 mask 接入了所有官方支持的接口：TAA（历史权重）、FSR2/FSR3（reactive + T&C
   mask）、DLSS（bias-current-color / reactive / transparency hint）、XeSS（responsive
@@ -106,6 +114,8 @@ sr_compare viewer --list-upscalers
                      打开不透明 SSR（所有模式默认关；--no-ssr 保留兼容旧脚本）
                      并缩放其强度（默认 0.6）
 --no-volfog          关闭 froxel 体积雾
+--no-planar-reflections
+                     关闭平面镜面反射（镜面玻璃退回屏幕空间步进）
 --bloom / --no-lens-fx
                      打开 HDR bloom（默认关；--no-bloom 保留兼容旧脚本）/
                      关闭镜头链
@@ -136,7 +146,7 @@ compare 另有 `--upscalers a,b,...`、`--gt-ssaa`、`--zoom <f>`、
 分节：`[window]`（fullscreen——无边框桌面全屏，仅 GUI）、`[renderer]`
 （render_scale、hdr、env_map）、`[exposure]`（手动曝光
 + 自动曝光 EV 范围）、`[effects]`（ssr/ssr_strength、shadows、
-contact_shadows、volfog、bloom、motion_blur、lens_fx）、`[lens_fx]`
+contact_shadows、volfog、planar_reflections、bloom、motion_blur、lens_fx）、`[lens_fx]`
 （GUI 子项）、`[culling]`（occlusion、lod，GUI）、`[dof]`、
 `[grading]`（temperature/tint/contrast/saturation/lut）、`[sun]`
 （elevation/azimuth）。bench 派生的 viewer 子进程读同一文件，因此同一

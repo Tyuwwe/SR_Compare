@@ -68,7 +68,21 @@ its performance numbers are not representative of real hardware.
 - Forward transparency pass (after lighting, before upscaling): dielectric
   shop-window model (coated Fresnel, clip-space SSR / McGuire DDA against the
   opaque HDR, EnvBRDF composite), back-to-front sorted, writes camera motion
-  and a translucent coverage mask
+  and a translucent coverage mask.  Bistro's storefront mirror panes use
+  plain-glass Fresnel (F0 0.04) and **planar reflections**: each frame the
+  nearest mirror plane in view gets a second opaque GBuffer + lighting pass
+  from the camera mirrored across it (clip plane in the GBuffer shaders,
+  white AO, no fog/transparency; `--no-planar-reflections`, engine.toml
+  `[effects] planar_reflections` or the GUI checkbox turn it off), and the pane
+  samples that image at its own projection — exact for a planar reflector,
+  off-screen content and the back faces of objects hugging the glass
+  included.  Panes on other planes keep the Hi-Z SSR fallback, which now
+  handles solid occluders (a ray behind an occluder is accepted where it fits
+  inside a symmetric convex body inferred from the visible front bulge, with
+  an exact exit test for rays heading toward the camera) and writes
+  planar-mirror motion vectors (the reflection reprojects through the
+  virtual image point, mask 0) so the temporal upscalers accumulate a
+  stable reflection under camera motion
 - The coverage mask is wired into every upscaler interface that officially
   supports it: TAA (history weight), FSR2/FSR3 (reactive + T&C mask), DLSS
   (bias-current-color / reactive / transparency hints), XeSS (responsive
@@ -132,6 +146,9 @@ full text):
                      mode; --no-ssr accepted for compatibility) and scale their
                      weight (default 0.6)
 --no-volfog          disable froxel volumetric fog
+--no-planar-reflections
+                     disable planar mirror reflections (mirror glass falls back
+                     to the screen-space trace)
 --bloom / --no-lens-fx
                      enable HDR bloom (default off; --no-bloom accepted for
                      compatibility) / disable the lens chain
@@ -164,7 +181,8 @@ Sections: `[window]` (fullscreen — borderless desktop fullscreen, GUI only),
 `[renderer]` (render_scale, hdr, env_map), `[exposure]` (manual
 exposure + auto-exposure EV range), `[effects]` (ssr/ssr_strength — the GUI
 counts as CLI side here, hot reload applies them but the panel checkbox stays
-locked —, shadows, contact_shadows, volfog, bloom, motion_blur, lens_fx),
+locked —, shadows, contact_shadows, volfog, planar_reflections, bloom,
+motion_blur, lens_fx),
 `[lens_fx]` (GUI sub-items), `[culling]` (occlusion, lod — GUI), `[dof]`,
 `[grading]` (temperature/tint/contrast/saturation/lut), `[sun]`
 (elevation/azimuth).

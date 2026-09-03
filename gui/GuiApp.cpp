@@ -686,6 +686,8 @@ void GuiApp::applyEngineConfigHot(const EngineConfig& cfg, EngineConfigLog& log)
     takeToggle(rg::PassToggle::ContactShadows, cfg.contactShadows, cli::kContactShadows,
                "contact_shadows");
     takeToggle(rg::PassToggle::Ssr, cfg.ssr, cli::kSsr, "ssr");
+    takeToggle(rg::PassToggle::PlanarReflection, cfg.planarReflections, cli::kPlanarReflections,
+               "planar_reflections");
     takeToggle(rg::PassToggle::VolFog, cfg.volFog, cli::kVolFog, "volfog");
     takeToggle(rg::PassToggle::Occlusion, cfg.occlusion, cli::kNone, "occlusion");
     takeToggle(rg::PassToggle::Bloom, cfg.bloom, cli::kBloom, "bloom");
@@ -811,6 +813,7 @@ EngineConfig GuiApp::currentEngineConfig() const {
     c.exposureMaxEV = exposureMaxEV_;
     c.ssr = ssrEnabled_;
     c.ssrStrength = ssrStrength_;
+    c.planarReflections = planarEnabled_;
     c.shadows = shadowsEnabled_;
     c.contactShadows = contactShadowsEnabled_;
     c.volFog = volFogEnabled_;
@@ -877,6 +880,7 @@ void GuiApp::resetEngineConfigDefaults() {
     applyPassToggle(rg::PassToggle::Shadows, true);
     applyPassToggle(rg::PassToggle::ContactShadows, true);
     applyPassToggle(rg::PassToggle::Ssr, false);
+    applyPassToggle(rg::PassToggle::PlanarReflection, true);
     applyPassToggle(rg::PassToggle::VolFog, volFogEnabled_); // preset value + history reset
     applyPassToggle(rg::PassToggle::Occlusion, occlusionEnabledByDefault());
     applyPassToggle(rg::PassToggle::Bloom, false);
@@ -1809,6 +1813,28 @@ bool GuiApp::createShaders() {
            loadShader("compare_metrics_reduce.comp.spv", metricReduceComp_);
 }
 
+bool GuiApp::createPlanarReflections() {
+    gbPlanar_.destroy(ctx_, deferred_);
+    gtPlanar_.destroy(ctx_, deferred_);
+    if (scene_.mirrorPlanes.empty() || !PlanarReflection::enabledByEnv()) return true;
+    const uint32_t dw = active_.displayW;
+    const uint32_t dh = active_.displayH;
+    const uint32_t gtW = active_.gtApplyScale ? renderWidth_ : dw;
+    const uint32_t gtH = active_.gtApplyScale ? renderHeight_ : dh;
+    const VkImageView shadowView = shadowsActive_ ? shadow_.arrayView : VK_NULL_HANDLE;
+    const VkImageView atlasView = spotAtlasActive_ ? spotAtlas_.view : VK_NULL_HANDLE;
+    if (!gbPlanar_.create(ctx_, deferred_, scene_, renderWidth_, renderHeight_, kFramesInFlight,
+                          materialUbo_, shadowView, atlasView) ||
+        !gtPlanar_.create(ctx_, deferred_, scene_, gtW, gtH, kFramesInFlight, materialUbo_,
+                          shadowView, atlasView)) {
+        std::fprintf(stderr, "planar reflections: resource creation failed\n");
+        return false;
+    }
+    std::fprintf(stderr, "planar reflections: %zu mirror plane(s), LR %ux%u / GT %ux%u\n",
+                 scene_.mirrorPlanes.size(), renderWidth_, renderHeight_, gtW, gtH);
+    return true;
+}
+
 bool GuiApp::createDescriptors() {
     // Scene/texture/lighting set layouts are owned by DeferredCore.
     VkDescriptorSetLayoutBinding composeBindings[4] = {};
@@ -2013,6 +2039,8 @@ bool GuiApp::createDescriptors() {
     if (!deferred_.createMaterialUbo(ctx_, scene_, materialUbo_, materialUboMemory_,
                                      materialStride_))
         return false;
+    // Planar mirror reflection passes (the transparent sets below bind them).
+    if (!createPlanarReflections()) return false;
 
     // --- packed overlay text UBO ---------------------------------------------------
     const VkDeviceSize textSize = kMaxColumns * kTextCharsPerColumn * 4;
@@ -2694,13 +2722,15 @@ bool GuiApp::createSyncResources() {
         // per-frame checkbox gate lives in the record-side push constant.
         deferred_.writeTransparentSet(ctx_, fr.transparentSetGb, fr.lightingUboGb, gbAo_.view,
                                       shadowView, gbColorPyramid_.chainView,
-                                      gbPyramid_.chainView, gbFog_.intView);
+                                      gbPyramid_.chainView, gbFog_.intView,
+                                      gbPlanar_.hdrView(), gbPlanar_.depthView());
         deferred_.writeTransparentSet(ctx_, fr.transparentSetGbSpatial, fr.lightingUboGbSpatial,
                                       gbAo_.view, shadowView, gbColorPyramid_.chainView,
                                       gbPyramid_.chainView, gbFog_.intView);
         deferred_.writeTransparentSet(ctx_, fr.transparentSetGt, fr.lightingUboGt, gtAo_.view,
                                       shadowView, gtColorPyramid_.chainView,
-                                      gtPyramid_.chainView, gtFog_.intView);
+                                      gtPyramid_.chainView, gtFog_.intView,
+                                      gtPlanar_.hdrView(), gtPlanar_.depthView());
         if (active_.gtSsaa) {
             deferred_.writeTransparentSet(ctx_, fr.transparentSetSsaa, fr.lightingUboGt,
                                           gtSsaaAo_.view, shadowView,
@@ -2850,6 +2880,8 @@ void GuiApp::destroyStackResources() {
     if (!ctx_.device) return;
     vkDeviceWaitIdle(ctx_.device);
 
+    gbPlanar_.destroy(ctx_, deferred_);
+    gtPlanar_.destroy(ctx_, deferred_);
     timestamps_.destroy(ctx_);
     profiler_.destroy(ctx_);
 
@@ -3182,6 +3214,7 @@ void GuiApp::updateSceneUBO(void* mapped, bool jitter, uint32_t renderW, uint32_
     SceneUBO ubo;
     deferred_.fillSceneUBO(ubo, scene_, camera_, view, proj, projJittered, prevViewProj,
                            renderW, renderH, jitterX_, jitterY_, jitter);
+    if (activePlanar_) activePlanar_->patchMainSceneUbo(ubo);
     std::memcpy(mapped, &ubo, sizeof(ubo));
 }
 
@@ -3654,15 +3687,23 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     projJittered.m[8] -= jitterX_ * 2.f / static_cast<float>(renderWidth_);
     projJittered.m[9] -= jitterY_ * 2.f / static_cast<float>(renderHeight_);
 
+    // Planar mirror reflections: pick each path's plane before its SceneUBO
+    // is filled so the transparency pass knows about the mirrored view.
+    const bool planarGb = gbuffer && planarEnabled_ && gbPlanar_.selectPlane(scene_, camera_, aspect);
+    activePlanar_ = planarGb ? &gbPlanar_ : nullptr;
     updateSceneUBO(fr.uboGbMapped, temporal, renderWidth_, renderHeight_, view, proj, projJittered,
                    prevViewProj_);
+    activePlanar_ = nullptr;
     if (mixedSpatial) {
         updateSceneUBO(fr.uboGbSpatialMapped, false, renderWidth_, renderHeight_, view, proj, proj,
                        prevViewProj_);
     }
     const uint32_t gtW = active_.gtSsaa ? dw * 2 : (active_.gtApplyScale ? renderWidth_ : dw);
     const uint32_t gtH = active_.gtSsaa ? dh * 2 : (active_.gtApplyScale ? renderHeight_ : dh);
+    const bool planarGt = gtActive_ && planarEnabled_ && gtPlanar_.selectPlane(scene_, gtCam, aspect);
+    activePlanar_ = planarGt ? &gtPlanar_ : nullptr;
     updateSceneUBO(fr.uboGtMapped, false, gtW, gtH, viewGt, projGt, projGt, prevViewProj_);
+    activePlanar_ = nullptr;
 
     // CSM sun shadows: the shadowed sun is picked from the same override
     // light list that fills the LightingUBO, so lightIndex refers to the
@@ -3705,6 +3746,12 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     updateLightingUBO(fr.lightingUboGtMapped, Mat4::multiply(projGt, viewGt),
                       lights, shadow);
     updateClusterLights(frameIndex, lights);
+    if (planarGb)
+        gbPlanar_.prepare(slot, deferred_, scene_,
+                          *static_cast<const LightingUBO*>(fr.lightingUboGbMapped), lights);
+    if (planarGt)
+        gtPlanar_.prepare(slot, deferred_, scene_,
+                          *static_cast<const LightingUBO*>(fr.lightingUboGtMapped), lights);
 
     auto transition = [&](VkImage image, VkImageLayout& current, VkImageLayout target,
                           VkPipelineStageFlags2 srcStage, VkAccessFlags2 srcAccess,
@@ -3807,6 +3854,18 @@ void GuiApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                      VK_IMAGE_ASPECT_DEPTH_BIT);
         spotAtlas_.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         }
+    }
+
+    // --- Planar mirror reflections (mirrored-view GBuffer + lighting per path) --
+    // After the shadow maps (sampled by the pass), before any transparency
+    // draw (which samples the pass's HDR + depth).
+    if (planarGb) {
+        SR_GPU_ZONE(profiler_, cmd, "planar");
+        gbPlanar_.record(cmd, slot, deferred_, scene_, textureSet_, materialStride_);
+    }
+    if (planarGt) {
+        SR_GPU_ZONE(profiler_, cmd, "planar");
+        gtPlanar_.record(cmd, slot, deferred_, scene_, textureSet_, materialStride_);
     }
 
     // --- 1) low-resolution GBuffer (jittered for temporal; extra unjittered
@@ -5363,6 +5422,7 @@ void GuiApp::pumpInputFile() {
             if (name == "shadows") t = rg::PassToggle::Shadows;
             else if (name == "contact") t = rg::PassToggle::ContactShadows;
             else if (name == "ssr") t = rg::PassToggle::Ssr;
+            else if (name == "planar") t = rg::PassToggle::PlanarReflection;
             else if (name == "volfog") t = rg::PassToggle::VolFog;
             else if (name == "occlusion") t = rg::PassToggle::Occlusion;
             else if (name == "bloom") t = rg::PassToggle::Bloom;
@@ -6141,6 +6201,20 @@ void GuiApp::drawViewerTab() {
     // composite leans on the IBL fallback (rough ground reads less greasy).
     ImGui::SliderFloat("ssr strength", &ssrStrength_, 0.f, 1.f, "%.2f");
     if (!ssrEnabled_) ImGui::EndDisabled();
+    // Planar mirror reflections: per-frame pass skip, no rebuild.  Only
+    // scenes with mirror glass have the pass; elsewhere the box is greyed.
+    {
+        const bool hasMirrors = gbPlanar_.valid() || gtPlanar_.valid();
+        if (!hasMirrors) ImGui::BeginDisabled();
+        ImGui::Checkbox("planar reflections", &planarEnabled_);
+        if (!hasMirrors) ImGui::EndDisabled();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Mirrored-view render for the nearest mirror plane in view\n"
+                              "(Bistro storefront glass).  Off: the panes use the\n"
+                              "screen-space trace instead.  engine.toml: [effects]\n"
+                              "planar_reflections; CLI: --no-planar-reflections.");
+        if (!hasMirrors) ImGui::TextDisabled("(scene has no mirror glass)");
+    }
     // Baked reflection probes (Phase 4c-2): synchronous offline bake of the
     // scene's registry placements through the shared ProbeBaker (same code as
     // CLI --bake-probes), then a reload so the fresh captures take effect
@@ -6551,6 +6625,7 @@ bool GuiApp::passToggleValue(rg::PassToggle t) const {
     case rg::PassToggle::Shadows: return shadowsEnabled_;
     case rg::PassToggle::ContactShadows: return contactShadowsEnabled_;
     case rg::PassToggle::Ssr: return ssrEnabled_;
+    case rg::PassToggle::PlanarReflection: return planarEnabled_;
     case rg::PassToggle::VolFog: return volFogEnabled_;
     case rg::PassToggle::Occlusion: return occlusionEnabled_;
     case rg::PassToggle::Bloom: return bloomEnabled_;
@@ -6570,6 +6645,7 @@ void GuiApp::applyPassToggle(rg::PassToggle t, bool value) {
     case rg::PassToggle::Shadows: shadowsEnabled_ = value; break;
     case rg::PassToggle::ContactShadows: contactShadowsEnabled_ = value; break;
     case rg::PassToggle::Ssr: ssrEnabled_ = value; break;
+    case rg::PassToggle::PlanarReflection: planarEnabled_ = value; break;
     case rg::PassToggle::VolFog:
         volFogEnabled_ = value;
         // Same side effect as the panel checkbox: restart the temporal

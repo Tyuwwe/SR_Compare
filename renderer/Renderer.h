@@ -13,6 +13,7 @@
 #include "renderer/core/VulkanContext.h"
 #include "renderer/core/Window.h"
 #include "renderer/deferred/DeferredCore.h"
+#include "renderer/deferred/PlanarReflection.h"
 #include "renderer/scene/Camera.h"
 #include "renderer/scene/CameraPath.h"
 #include "renderer/scene/Scene.h"
@@ -76,6 +77,10 @@ struct RendererOptions {
     // Froxel volumetric fog (Phase 5a, CLI: --no-volfog); the scene lighting
     // preset carries the media parameters (VolFogParams::enabled gates too).
     bool volFog = true;
+    // Planar mirror reflections for Material::mirror panes (mirrored-view
+    // GBuffer + lighting per frame; CLI: --no-planar-reflections).  Only
+    // scenes with mirror glass pay for it; off falls back to the glass SSR.
+    bool planarReflections = true;
     // Motion blur (Phase 6b, McGuire 2012 tile-max gather) in the HDR domain,
     // after bloom and before upscale/present, applied to the LR and GT paths
     // with identical algorithm + parameters (CLI: --motion-blur to enable;
@@ -313,6 +318,14 @@ private:
 
     // Shared deferred pipeline (shaders/layouts/pipelines/samplers + IBL maps).
     DeferredCore deferred_;
+    // Planar mirror reflection pass, one per path (created only for scenes
+    // with Material::mirror geometry; see PlanarReflection.h).  activePlanar_
+    // points at the path's pass while its frame is being recorded so
+    // updateSceneUBO can patch the main-view reflection fields.
+    PlanarReflection gbPlanar_;
+    PlanarReflection gtPlanar_;
+    const PlanarReflection* activePlanar_ = nullptr;
+    LightingUBO lastLightingUbo_ = {}; // CPU copy of this frame's lighting UBO
 
     // CSM sun shadow targets (fixed 2048^2 x 4, resolution-independent).
     // Created unconditionally (the descriptor binding must stay written);
@@ -377,6 +390,7 @@ private:
     bool createPipelines();
     bool createSyncResources();
     bool createScreenshotStaging();
+    bool createPlanarReflections();
     // Auto-exposure buffers + descriptor set (needs the descriptor pool, so
     // runs after createSceneDescriptors).
     bool createAutoExposureResources();

@@ -190,6 +190,45 @@ bool DeferredCore::init(const VulkanContext& ctx, const char* envMapPath, const 
         vmaDestroyBuffer(ctx.allocator, staging, stagingMemory);
     }
 
+    // Planar-reflection stand-ins (see the member comment): 1x1 RGBA16F
+    // black + 1x1 R32F far depth, SHADER_READ_ONLY for life.
+    {
+        if (createImage(ctx, 1, 1, deferred::kHdrColorFormat,
+                        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                        reflFallbackColorImage_, reflFallbackColorMemory_) != VK_SUCCESS)
+            return false;
+        reflFallbackColorView_ = createImageView(ctx, reflFallbackColorImage_,
+                                                 deferred::kHdrColorFormat, VK_IMAGE_ASPECT_COLOR_BIT);
+        if (createImage(ctx, 1, 1, VK_FORMAT_R32_SFLOAT,
+                        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                        reflFallbackDepthImage_, reflFallbackDepthMemory_) != VK_SUCCESS)
+            return false;
+        reflFallbackDepthView_ = createImageView(ctx, reflFallbackDepthImage_, VK_FORMAT_R32_SFLOAT,
+                                                 VK_IMAGE_ASPECT_COLOR_BIT);
+        if (!reflFallbackColorView_ || !reflFallbackDepthView_) return false;
+        submitOneShot(ctx, [&](VkCommandBuffer cmd) {
+            const VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            imageBarrier(cmd, reflFallbackColorImage_, VK_IMAGE_LAYOUT_UNDEFINED,
+                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_NONE,
+                         VK_ACCESS_2_NONE, VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+            imageBarrier(cmd, reflFallbackDepthImage_, VK_IMAGE_LAYOUT_UNDEFINED,
+                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_NONE,
+                         VK_ACCESS_2_NONE, VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+            const VkClearColorValue black = {{0.f, 0.f, 0.f, 1.f}};
+            const VkClearColorValue farDepth = {{1.f, 1.f, 1.f, 1.f}}; // ('far' is a Windows macro)
+            vkCmdClearColorImage(cmd, reflFallbackColorImage_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                 &black, 1, &range);
+            vkCmdClearColorImage(cmd, reflFallbackDepthImage_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                 &farDepth, 1, &range);
+            imageBarrier(cmd, reflFallbackColorImage_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_CLEAR_BIT,
+                         VK_ACCESS_2_TRANSFER_WRITE_BIT, sync::kFragment, sync::kSampled);
+            imageBarrier(cmd, reflFallbackDepthImage_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_CLEAR_BIT,
+                         VK_ACCESS_2_TRANSFER_WRITE_BIT, sync::kFragment, sync::kSampled);
+        });
+    }
+
     // Depth comparison sampler for the CSM shadow map.  CLAMP_TO_BORDER with
     // an opaque-white border makes off-map reads compare as "lit" (beyond the
     // last cascade the sun is unshadowed).
@@ -376,8 +415,9 @@ bool DeferredCore::createLayouts(const VulkanContext& ctx) {
     // (Hi-Z, R32F, SSR hierarchical march); 8 = ray-integrated froxel volume
     // (volumetric fog on translucency; unwritten when fog is off);
     // 9 = reflection ProbeUBO; 10/11 = probe prefiltered specular + irradiance
-    // cube arrays (Phase 4c-2; the glass SSR-miss fallback reuses probes.glsl).
-    VkDescriptorSetLayoutBinding transparentBindings[12] = {};
+    // cube arrays (Phase 4c-2; the glass SSR-miss fallback reuses probes.glsl);
+    // 12/13 = planar mirror reflection colour + depth (PlanarReflection.h).
+    VkDescriptorSetLayoutBinding transparentBindings[14] = {};
     transparentBindings[0].binding = 0;
     transparentBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     transparentBindings[0].descriptorCount = 1;
@@ -392,7 +432,7 @@ bool DeferredCore::createLayouts(const VulkanContext& ctx) {
     transparentBindings[9].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     transparentBindings[9].descriptorCount = 1;
     transparentBindings[9].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-    for (uint32_t i = 10; i < 12; ++i) { // probe prefilter / irradiance cube arrays
+    for (uint32_t i = 10; i < 14; ++i) { // probe cube arrays, planar reflection colour + depth
         transparentBindings[i].binding = i;
         transparentBindings[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         transparentBindings[i].descriptorCount = 1;
@@ -400,7 +440,7 @@ bool DeferredCore::createLayouts(const VulkanContext& ctx) {
     }
     VkDescriptorSetLayoutCreateInfo transparentLayoutCi = {};
     transparentLayoutCi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    transparentLayoutCi.bindingCount = 12;
+    transparentLayoutCi.bindingCount = 14;
     transparentLayoutCi.pBindings = transparentBindings;
     if (vkCreateDescriptorSetLayout(ctx.device, &transparentLayoutCi, nullptr,
                                     &transparentSetLayout_) != VK_SUCCESS)
@@ -1829,6 +1869,10 @@ void DeferredCore::destroy(const VulkanContext& ctx) {
     if (shadowSampler_) { vkDestroySampler(ctx.device, shadowSampler_, nullptr); shadowSampler_ = VK_NULL_HANDLE; }
     if (hizSampler_) { vkDestroySampler(ctx.device, hizSampler_, nullptr); hizSampler_ = VK_NULL_HANDLE; }
     if (colorPyramidSampler_) { vkDestroySampler(ctx.device, colorPyramidSampler_, nullptr); colorPyramidSampler_ = VK_NULL_HANDLE; }
+    if (reflFallbackColorView_) { vkDestroyImageView(ctx.device, reflFallbackColorView_, nullptr); reflFallbackColorView_ = VK_NULL_HANDLE; }
+    if (reflFallbackColorImage_) { vmaDestroyImage(ctx.allocator, reflFallbackColorImage_, reflFallbackColorMemory_); reflFallbackColorImage_ = VK_NULL_HANDLE; reflFallbackColorMemory_ = VK_NULL_HANDLE; }
+    if (reflFallbackDepthView_) { vkDestroyImageView(ctx.device, reflFallbackDepthView_, nullptr); reflFallbackDepthView_ = VK_NULL_HANDLE; }
+    if (reflFallbackDepthImage_) { vmaDestroyImage(ctx.allocator, reflFallbackDepthImage_, reflFallbackDepthMemory_); reflFallbackDepthImage_ = VK_NULL_HANDLE; reflFallbackDepthMemory_ = VK_NULL_HANDLE; }
     if (fogFallbackView_) { vkDestroyImageView(ctx.device, fogFallbackView_, nullptr); fogFallbackView_ = VK_NULL_HANDLE; }
     if (fogFallbackImage_) { vmaDestroyImage(ctx.allocator, fogFallbackImage_, fogFallbackMemory_); fogFallbackImage_ = VK_NULL_HANDLE; fogFallbackMemory_ = VK_NULL_HANDLE; }
     ibl_.destroy(ctx);
@@ -1865,6 +1909,10 @@ void DeferredCore::fillSceneUBO(SceneUBO& out, const Scene& scene, const Camera&
     out.renderSizeJitter[1] = static_cast<float>(renderH);
     out.renderSizeJitter[2] = jitter ? jitterX : 0.f;
     out.renderSizeJitter[3] = jitter ? jitterY : 0.f;
+    // Planar reflection fields: off unless a host patches them in.
+    std::memset(out.clipPlane, 0, sizeof(out.clipPlane));
+    std::memset(out.reflViewProj, 0, sizeof(out.reflViewProj));
+    std::memset(out.reflParams, 0, sizeof(out.reflParams));
 }
 
 void DeferredCore::fillLightingUBO(LightingUBO& out, const Scene& scene, const Camera& camera,
@@ -2791,7 +2839,8 @@ bool DeferredCore::sceneHasTransparency(const Scene& scene) const {
 void DeferredCore::writeTransparentSet(const VulkanContext& ctx, VkDescriptorSet set,
                                        VkBuffer lightingUbo, VkImageView ssao,
                                        VkImageView shadow, VkImageView ssrColor,
-                                       VkImageView depthPyramid, VkImageView fogVolume) const {
+                                       VkImageView depthPyramid, VkImageView fogVolume,
+                                       VkImageView reflColor, VkImageView reflDepth) const {
     VkDescriptorBufferInfo lightBuf = {};
     lightBuf.buffer = lightingUbo;
     lightBuf.offset = 0;
@@ -2841,7 +2890,18 @@ void DeferredCore::writeTransparentSet(const VulkanContext& ctx, VkDescriptorSet
     probeImg[1].imageView = probes_.irradianceView();
     probeImg[1].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
-    VkWriteDescriptorSet w[12] = {};
+    // Bindings 12/13: planar mirror reflection colour + depth, or the 1x1
+    // black / far stand-ins for paths without a reflection pass (the shader
+    // only samples them behind the SceneUBO reflParams.x gate).
+    VkDescriptorImageInfo reflImg[2] = {};
+    reflImg[0].sampler = gbufferSampler_;
+    reflImg[0].imageView = reflColor ? reflColor : reflFallbackColorView_;
+    reflImg[0].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    reflImg[1].sampler = gbufferSampler_;
+    reflImg[1].imageView = reflDepth ? reflDepth : reflFallbackDepthView_;
+    reflImg[1].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+    VkWriteDescriptorSet w[14] = {};
     w[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     w[0].dstSet = set;
     w[0].dstBinding = 0;
@@ -2899,6 +2959,15 @@ void DeferredCore::writeTransparentSet(const VulkanContext& ctx, VkDescriptorSet
         w[n].descriptorCount = 1;
         w[n].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         w[n].pImageInfo = &probeImg[k];
+        ++n;
+    }
+    for (uint32_t k = 0; k < 2; ++k) {
+        w[n].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w[n].dstSet = set;
+        w[n].dstBinding = 12 + k;
+        w[n].descriptorCount = 1;
+        w[n].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        w[n].pImageInfo = &reflImg[k];
         ++n;
     }
     vkUpdateDescriptorSets(ctx.device, n, w, 0, nullptr);

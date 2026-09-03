@@ -177,7 +177,14 @@ std::vector<ReflectionProbe> reflectionProbesForScene(const std::string& scenePa
         // baked cubes see the reflected street, not the pane plane.  Neighbour
         // boxes overlap ~2 m so the influence ramps cross-fade instead of
         // dipping to the global env at a shared face.
-        probes.push_back({{5.f, 3.2f, 4.5f}, {-4.5f, 0.1f, -4.f}, {14.5f, 7.5f, 8.5f}});
+        // Box 0 reaches across the street to the opposite facade (the
+        // paris_building_11 wall at z ~19): the storefront panes' SSR misses
+        // are exactly the rays heading that way (the facade is behind the
+        // camera), and the parallax box projection re-aims them onto the
+        // face they hit — with the old z-max of 8.5 they landed on the +X
+        // side face and every miss read as a flat grey wall instead of the
+        // building across the street.
+        probes.push_back({{5.f, 3.2f, 4.5f}, {-4.5f, 0.1f, -4.f}, {14.5f, 7.5f, 19.f}});
         probes.push_back({{5.f, 3.2f, -8.5f}, {-4.5f, 0.1f, -17.f}, {14.5f, 7.5f, -2.f}});
         probes.push_back({{-12.f, 3.5f, 4.f}, {-30.f, 0.1f, -6.f}, {-2.5f, 10.f, 12.f}});
         probes.push_back({{25.f, 3.5f, -1.f}, {13.5f, 0.1f, -12.f}, {45.f, 9.f, 10.f}});

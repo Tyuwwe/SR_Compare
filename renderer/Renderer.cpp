@@ -742,6 +742,29 @@ bool Renderer::createSceneDescriptors() {
     return true;
 }
 
+bool Renderer::createPlanarReflections() {
+    // Only scenes with planar mirror geometry pay for the pass; SR_PLANAR=0
+    // opts out (the panes then keep the SSR path).
+    if (scene_.mirrorPlanes.empty() || !opts_.planarReflections) return true;
+    if (!PlanarReflection::enabledByEnv()) {
+        std::fprintf(stderr, "planar reflections: disabled by SR_PLANAR=0\n");
+        return true;
+    }
+    const VkImageView shadowView = shadowsActive_ ? shadow_.arrayView : VK_NULL_HANDLE;
+    const VkImageView atlasView = spotAtlasActive_ ? spotAtlas_.view : VK_NULL_HANDLE;
+    if (!gbPlanar_.create(ctx_, deferred_, scene_, renderWidth_, renderHeight_, kFramesInFlight,
+                          materialUbo_, shadowView, atlasView) ||
+        !gtPlanar_.create(ctx_, deferred_, scene_, opts_.displayWidth, opts_.displayHeight,
+                          kFramesInFlight, materialUbo_, shadowView, atlasView)) {
+        std::fprintf(stderr, "planar reflections: resource creation failed\n");
+        return false;
+    }
+    std::fprintf(stderr, "planar reflections: %zu mirror plane(s), LR %ux%u / GT %ux%u\n",
+                 scene_.mirrorPlanes.size(), renderWidth_, renderHeight_, opts_.displayWidth,
+                 opts_.displayHeight);
+    return true;
+}
+
 bool Renderer::createCullResources() {
     // Phase 7a: the instance SSBO upper bound is the full instance list (the
     // candidate build skips blend/skinned/frustum-culled entries); one cull
@@ -957,6 +980,9 @@ bool Renderer::createSyncResources() {
                                    gtEmissive_.view, gtDepth_.view, gtAo_.view, shadowView,
                                    spotAtlasView, gtCluster_.lightsBuffer[i], gtCluster_.gridBuffer[i]);
 
+        // Planar reflection passes (once; the transparent sets below bind
+        // their images).  Needs the material UBO + shadow views from above.
+        if (i == 0 && !createPlanarReflections()) return false;
         // Per-path transparent sets (each binds its own path's SSAO texture).
         const VkDescriptorSetLayout transparentLayout = deferred_.transparentSetLayout();
         VkDescriptorSetAllocateInfo transparentAlloc = {};
@@ -973,11 +999,13 @@ bool Renderer::createSyncResources() {
         deferred_.writeTransparentSet(ctx_, frames_[i].transparentSetGb, frames_[i].lightingUbo,
                                       gbAo_.view, shadowView, gbColorPyramid_.chainView,
                                       gbPyramid_.chainView,
-                                      volFogActive_ ? gbFog_.intView : VK_NULL_HANDLE);
+                                      volFogActive_ ? gbFog_.intView : VK_NULL_HANDLE,
+                                      gbPlanar_.hdrView(), gbPlanar_.depthView());
         deferred_.writeTransparentSet(ctx_, frames_[i].transparentSetGt, frames_[i].lightingUbo,
                                       gtAo_.view, shadowView, gtColorPyramid_.chainView,
                                       gtPyramid_.chainView,
-                                      volFogActive_ ? gtFog_.intView : VK_NULL_HANDLE);
+                                      volFogActive_ ? gtFog_.intView : VK_NULL_HANDLE,
+                                      gtPlanar_.hdrView(), gtPlanar_.depthView());
 
         // Per-path opaque-SSR sets (binding 0 reuses this frame's lighting UBO).
         const VkDescriptorSetLayout ssrLayout = deferred_.ssrSetLayout();
@@ -1118,6 +1146,7 @@ void Renderer::updateSceneUBO(uint32_t frameIndex, bool jitter, uint32_t renderW
     SceneUBO ubo;
     deferred_.fillSceneUBO(ubo, scene_, camera_, view, proj, projJittered, prevViewProj,
                            renderW, renderH, jitterX_, jitterY_, jitter);
+    if (activePlanar_) activePlanar_->patchMainSceneUbo(ubo);
     std::memcpy(fr.uboMapped, &ubo, sizeof(ubo));
 }
 
@@ -1133,6 +1162,7 @@ void Renderer::updateLightingUBO(uint32_t frameIndex, const Mat4& viewProj,
     // toggle as the opaque SSR pass (off = probe -> global env fallback only).
     ubo.lightCounts[1] = opts_.ssr ? 1.f : 0.f;
     std::memcpy(fr.lightingUboMapped, &ubo, sizeof(ubo));
+    lastLightingUbo_ = ubo;
     // Full point/spot light set for the clustered pass (same slot rule as the
     // UBO: the slot's fence passed before recording).
     const uint32_t slot = frameIndex % kFramesInFlight;
@@ -1257,7 +1287,13 @@ void Renderer::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     // the GT motion-vector scale.
     const uint32_t sceneUBOW = gbuffer ? renderWidth_ : opts_.displayWidth;
     const uint32_t sceneUBOH = gbuffer ? renderHeight_ : opts_.displayHeight;
+    // Planar mirror reflection: pick this frame's plane first so the main
+    // SceneUBO advertises the mirrored view to the transparency pass.
+    PlanarReflection& planar = gbuffer ? gbPlanar_ : gtPlanar_;
+    const bool planarOn = planar.selectPlane(scene_, camera_, aspect);
+    activePlanar_ = planarOn ? &planar : nullptr;
     updateSceneUBO(frameIndex, jitter, sceneUBOW, sceneUBOH, view, proj, projJittered, prevViewProj_);
+    activePlanar_ = nullptr;
 
     // Lighting reconstructs world positions with the inverse of the exact
     // view-projection used for this pass (jittered for the low-res path).
@@ -1318,6 +1354,9 @@ void Renderer::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     }
     const Mat4 invViewProjUsed = Mat4::inverse(viewProjUsed);
     updateLightingUBO(frameIndex, viewProjUsed, invViewProjUsed, shadow, lightsOverride);
+    if (planarOn)
+        planar.prepare(slot, deferred_, scene_, lastLightingUbo_,
+                       DeferredCore::effectiveLights(scene_, lightsOverride));
 
     ImageResource& tgtAlbedo = gbuffer ? gbAlbedo_ : gtAlbedo_;
     ImageResource& tgtNormal = gbuffer ? gbNormal_ : gtNormal_;
@@ -1438,6 +1477,23 @@ void Renderer::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
         rg_.addPass("SpotAtlasResolve")
             .access(spotAtlas_.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kFragment,
                     sync::kSampled, VK_IMAGE_ASPECT_DEPTH_BIT);
+    }
+
+    // --- Planar mirror reflection (mirrored-view GBuffer + lighting) -----------
+    // After the shadow maps (the pass samples them), before the transparency
+    // pass (which samples its HDR + depth).  The pass barriers its own images;
+    // only the shared shadow reads are declared.
+    if (planarOn) {
+        RenderGraph::Pass& p = rg_.addPass("PlanarReflection");
+        if (shadow && shadow->lightIndex >= 0)
+            p.access(shadow_.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kFragment,
+                     sync::kSampled, VK_IMAGE_ASPECT_DEPTH_BIT, 0, kShadowCascadeCount);
+        if (shadow && shadow->atlasTileCount > 0)
+            p.access(spotAtlas_.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, sync::kFragment,
+                     sync::kSampled, VK_IMAGE_ASPECT_DEPTH_BIT);
+        p.record = [&](VkCommandBuffer c) {
+            planar.record(c, slot, deferred_, scene_, textureSet_, materialStride_);
+        };
     }
 
     // --- Hi-Z + GTAO (between the GBuffer and the lighting pass) ---------------
@@ -2161,6 +2217,8 @@ void Renderer::shutdown() {
     gtAoSsrArena_.destroy(ctx_);
     finalImage_.destroy(ctx_);
 
+    gbPlanar_.destroy(ctx_, deferred_);
+    gtPlanar_.destroy(ctx_, deferred_);
     if (shadowsActive_) { deferred_.destroyShadowTargets(ctx_, shadow_); shadowsActive_ = false; }
     if (spotAtlasActive_) { deferred_.destroyShadowAtlas(ctx_, spotAtlas_); spotAtlasActive_ = false; }
 

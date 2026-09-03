@@ -163,6 +163,7 @@ bool loadEngineConfig(const std::string& path, EngineConfig& out) {
         out.bloom = getBool(*t, "bloom");
         out.motionBlur = getBool(*t, "motion_blur");
         out.lensFx = getBool(*t, "lens_fx");
+        out.planarReflections = getBool(*t, "planar_reflections");
     }
     if (const toml::table* t = section(root, "lens_fx")) {
         out.lensCa = getBool(*t, "chromatic_aberration");
@@ -217,6 +218,8 @@ void applyEngineConfig(RendererOptions& opts, const EngineConfig& cfg, uint64_t 
     cfgTake(opts.bloom, cfg.bloom, cliMask, cli::kBloom, "bloom", log);
     cfgTake(opts.motionBlur, cfg.motionBlur, cliMask, cli::kMotionBlur, "motion_blur", log);
     cfgTake(opts.lensFx, cfg.lensFx, cliMask, cli::kLensFx, "lens_fx", log);
+    cfgTake(opts.planarReflections, cfg.planarReflections, cliMask, cli::kPlanarReflections,
+            "planar_reflections", log);
     cfgTake(opts.dof, cfg.dof, cliMask, cli::kDof, "dof", log);
     cfgTake(opts.dofFocus, cfg.dofFocus, cliMask, cli::kDofFocus, "dof_focus", log);
     cfgTake(opts.dofFstop, cfg.dofFstop, cliMask, cli::kDofFstop, "dof_fstop", log);
@@ -298,6 +301,7 @@ std::string engineConfigToToml(const EngineConfig& cfg) {
     if (cfg.bloom) putBool(out, "bloom", *cfg.bloom);
     if (cfg.motionBlur) putBool(out, "motion_blur", *cfg.motionBlur);
     if (cfg.lensFx) putBool(out, "lens_fx", *cfg.lensFx);
+    if (cfg.planarReflections) putBool(out, "planar_reflections", *cfg.planarReflections);
     out += "\n[lens_fx]\n";
     if (cfg.lensCa) putBool(out, "chromatic_aberration", *cfg.lensCa);
     if (cfg.lensVignette) putBool(out, "vignette", *cfg.lensVignette);

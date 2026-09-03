@@ -23,6 +23,7 @@ enum class PassToggle {
     Shadows,
     ContactShadows, // not a pass: a screen-space ray march inside lighting
     Ssr,            // CLI/engine.toml-only: locked in the panel and here
+    PlanarReflection, // mirrored-view GBuffer + lighting for mirror glass (per-frame skip)
     VolFog,
     Occlusion,
     Bloom,

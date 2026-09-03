@@ -66,6 +66,11 @@
 # contact_shadows = true
 # Froxel volumetric fog (CLI: --no-volfog).
 # volfog = true
+# Planar mirror reflections for scenes with mirror glass (Bistro storefront):
+# a mirrored-view render of the nearest mirror plane each frame (CLI:
+# --no-planar-reflections; GUI checkbox).  Off = the panes use the
+# screen-space trace instead.
+# planar_reflections = true
 # HDR bloom pyramid (default off; CLI: --bloom, --no-bloom accepted for
 # compatibility).
 # bloom = false

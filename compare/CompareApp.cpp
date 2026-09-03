@@ -642,6 +642,22 @@ bool CompareApp::createShaders() {
            loadShader("compare_metrics_reduce.comp.spv", metricReduceComp_);
 }
 
+bool CompareApp::createPlanarReflections() {
+    if (scene_.mirrorPlanes.empty() || !opts_.planarReflections ||
+        !PlanarReflection::enabledByEnv())
+        return true;
+    const VkImageView shadowView = shadowsActive_ ? shadow_.arrayView : VK_NULL_HANDLE;
+    const VkImageView atlasView = spotAtlasActive_ ? spotAtlas_.view : VK_NULL_HANDLE;
+    if (!gbPlanar_.create(ctx_, deferred_, scene_, renderWidth_, renderHeight_, kFramesInFlight,
+                          materialUbo_, shadowView, atlasView) ||
+        !gtPlanar_.create(ctx_, deferred_, scene_, opts_.displayWidth, opts_.displayHeight,
+                          kFramesInFlight, materialUbo_, shadowView, atlasView)) {
+        std::fprintf(stderr, "planar reflections: resource creation failed\n");
+        return false;
+    }
+    return true;
+}
+
 bool CompareApp::createDescriptors() {
     // Scene/texture/lighting set layouts live in DeferredCore (shared with the
     // viewer); only the compare-specific layouts are created here.
@@ -812,6 +828,8 @@ bool CompareApp::createDescriptors() {
     if (!deferred_.createMaterialUbo(ctx_, scene_, materialUbo_, materialUboMemory_,
                                      materialStride_))
         return false;
+    // Planar mirror reflection passes (the transparent sets below bind them).
+    if (!createPlanarReflections()) return false;
 
     // --- packed overlay text UBO (shared by all compose sets) ----------------
     const VkDeviceSize textSize = kMaxColumns * kTextCharsPerColumn * 4;
@@ -1346,7 +1364,8 @@ bool CompareApp::createSyncResources() {
         deferred_.writeTransparentSet(ctx_, fr.transparentSetGb, fr.lightingUboGb, gbAo_.view,
                                       shadowView, gbColorPyramid_.chainView,
                                       gbPyramid_.chainView,
-                                      volFogActive_ ? gbFog_.intView : VK_NULL_HANDLE);
+                                      volFogActive_ ? gbFog_.intView : VK_NULL_HANDLE,
+                                      gbPlanar_.hdrView(), gbPlanar_.depthView());
         deferred_.writeTransparentSet(ctx_, fr.transparentSetGbSpatial, fr.lightingUboGbSpatial,
                                       gbAo_.view, shadowView, gbColorPyramid_.chainView,
                                       gbPyramid_.chainView,
@@ -1354,7 +1373,8 @@ bool CompareApp::createSyncResources() {
         deferred_.writeTransparentSet(ctx_, fr.transparentSetGt, fr.lightingUboGt, gtAo_.view,
                                       shadowView, gtColorPyramid_.chainView,
                                       gtPyramid_.chainView,
-                                      volFogActive_ ? gtFog_.intView : VK_NULL_HANDLE);
+                                      volFogActive_ ? gtFog_.intView : VK_NULL_HANDLE,
+                                      gtPlanar_.hdrView(), gtPlanar_.depthView());
         if (opts_.gtSsaa) {
             deferred_.writeTransparentSet(ctx_, fr.transparentSetSsaa, fr.lightingUboGt,
                                           gtSsaaAo_.view, shadowView,
@@ -1447,6 +1467,7 @@ void CompareApp::updateSceneUBO(void* mapped, bool jitter, uint32_t renderW, uin
     SceneUBO ubo;
     deferred_.fillSceneUBO(ubo, scene_, camera_, view, proj, projJittered, prevViewProj,
                            renderW, renderH, jitterX_, jitterY_, jitter);
+    if (activePlanar_) activePlanar_->patchMainSceneUbo(ubo);
     std::memcpy(mapped, &ubo, sizeof(ubo));
 }
 
@@ -1613,11 +1634,18 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     projJittered.m[8] -= jitterX_ * 2.f / static_cast<float>(renderWidth_);
     projJittered.m[9] -= jitterY_ * 2.f / static_cast<float>(renderHeight_);
 
+    // Planar mirror reflections: pick each path's plane before its SceneUBO
+    // is filled so the transparency pass knows about the mirrored view.
+    const bool planarGb = gbPlanar_.selectPlane(scene_, camera_, aspect);
+    activePlanar_ = planarGb ? &gbPlanar_ : nullptr;
     updateSceneUBO(fr.uboGbMapped, temporal, renderWidth_, renderHeight_, view, proj, projJittered,
                    prevViewProj_);
     const uint32_t gtW = opts_.gtSsaa ? dw * 2 : dw;
     const uint32_t gtH = opts_.gtSsaa ? dh * 2 : dh;
+    const bool planarGt = gtPlanar_.selectPlane(scene_, camera_, aspect);
+    activePlanar_ = planarGt ? &gtPlanar_ : nullptr;
     updateSceneUBO(fr.uboGtMapped, false, gtW, gtH, view, proj, proj, prevViewProj_);
+    activePlanar_ = nullptr;
 
     // Shadows (Phase 4b): CSM sun cascades (first shadow-casting directional,
     // same selection rule as fillLightingUBO) plus the spot shadow atlas —
@@ -1666,6 +1694,14 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
     updateLightingUBO(fr.lightingUboGtMapped, Mat4::multiply(proj, view), shadow,
                       lightsOverride);
     updateClusterLights(frameIndex, DeferredCore::effectiveLights(scene_, lightsOverride));
+    if (planarGb)
+        gbPlanar_.prepare(slot, deferred_, scene_,
+                          *static_cast<const LightingUBO*>(fr.lightingUboGbMapped),
+                          DeferredCore::effectiveLights(scene_, lightsOverride));
+    if (planarGt)
+        gtPlanar_.prepare(slot, deferred_, scene_,
+                          *static_cast<const LightingUBO*>(fr.lightingUboGtMapped),
+                          DeferredCore::effectiveLights(scene_, lightsOverride));
     if (mixed) {
         updateSceneUBO(fr.uboGbSpatialMapped, false, renderWidth_, renderHeight_, view, proj, proj,
                        prevViewProj_);
@@ -1993,6 +2029,11 @@ void CompareApp::recordFrame(uint32_t frameIndex, uint32_t swapchainIndex) {
                      sync::kFragment, sync::kSampled, VK_IMAGE_ASPECT_DEPTH_BIT);
         spotAtlas_.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     }
+
+    // --- Planar mirror reflections (mirrored-view GBuffer + lighting per path) --
+    // After the shadow maps, before any transparency draw.
+    if (planarGb) gbPlanar_.record(cmd, slot, deferred_, scene_, textureSet_, materialStride_);
+    if (planarGt) gtPlanar_.record(cmd, slot, deferred_, scene_, textureSet_, materialStride_);
 
     if (mixed) {
         recordLrLighting(fr.sceneSetGbSpatial, fr.lightingSetGbSpatial, fr.transparentSetGbSpatial,
@@ -3010,6 +3051,8 @@ void CompareApp::shutdown() {
 
     if (shadowsActive_) { deferred_.destroyShadowTargets(ctx_, shadow_); shadowsActive_ = false; }
     if (spotAtlasActive_) { deferred_.destroyShadowAtlas(ctx_, spotAtlas_); spotAtlasActive_ = false; }
+    gbPlanar_.destroy(ctx_, deferred_);
+    gtPlanar_.destroy(ctx_, deferred_);
     deferred_.destroy(ctx_);
     scene_.destroy(ctx_);
     swapchain_.destroy(ctx_);

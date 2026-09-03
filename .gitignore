@@ -19,3 +19,4 @@ output/
 captures/
 *.probes
 VISUAL_ACCEPTANCE.md
+build2/

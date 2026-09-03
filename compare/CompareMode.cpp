@@ -33,6 +33,7 @@ void printCompareUsage() {
                  "  --ssr-strength <0..1>          global SSR weight scale (default 0.6)\n"
                  "  --no-contact-shadows           disable screen-space contact shadows (sun)\n"
                  "  --no-volfog                    disable froxel volumetric fog\n"
+                 "  --no-planar-reflections        disable planar mirror reflections\n"
                  "  --motion-blur                  enable motion blur (default off, all paths;\n"
                  "                               --no-motion-blur accepted for compatibility)\n"
                  "  --dof                          enable depth of field (default off, all paths;\n"
@@ -113,6 +114,9 @@ int runCompareMode(int argc, char** argv) {
         } else if (a == "--no-volfog") {
             opts.volFog = false;
             cliMask |= cli::kVolFog;
+        } else if (a == "--no-planar-reflections") {
+            opts.planarReflections = false;
+            cliMask |= cli::kPlanarReflections;
         } else if (a == "--motion-blur") {
             opts.motionBlur = true;
             cliMask |= cli::kMotionBlur;
@@ -192,6 +196,8 @@ int runCompareMode(int argc, char** argv) {
             cfgTake(opts.contactShadows, cfg.contactShadows, cliMask, cli::kContactShadows,
                     "contact_shadows", log);
             cfgTake(opts.volFog, cfg.volFog, cliMask, cli::kVolFog, "volfog", log);
+            cfgTake(opts.planarReflections, cfg.planarReflections, cliMask,
+                    cli::kPlanarReflections, "planar_reflections", log);
             cfgTake(opts.bloom, cfg.bloom, cliMask, cli::kBloom, "bloom", log);
             cfgTake(opts.motionBlur, cfg.motionBlur, cliMask, cli::kMotionBlur, "motion_blur",
                     log);
