@@ -1,0 +1,99 @@
+--- a/graph/graph_layer.cpp
++++ b/graph/graph_layer.cpp
+@@ -128,35 +128,73 @@
+     }
+ 
+     void update(const VkWriteDescriptorSet &set) {
+-        [[maybe_unused]] const auto &bindingInfo = descriptorSetLayout->bindings.at(set.dstBinding);
+-
+-        assert(bindingInfo.descriptorType == set.descriptorType);
+-        assert(bindingInfo.descriptorCount >= set.dstArrayElement + set.descriptorCount);
+-
+-        switch (set.descriptorType) {
+-        case VK_DESCRIPTOR_TYPE_TENSOR_ARM: {
+-            const auto *tensorInfo =
++        // A single VkWriteDescriptorSet may span consecutive bindings: when
++        // descriptorCount exceeds the remaining array elements of dstBinding,
++        // the remainder continues into dstBinding+1, +2, ... (bindings with
++        // descriptorCount == 0 are skipped), each starting at array element 0.
++        const VkWriteDescriptorSetTensorARM *tensorInfo = nullptr;
++        if (set.descriptorType == VK_DESCRIPTOR_TYPE_TENSOR_ARM) {
++            tensorInfo =
+                 findType<VkWriteDescriptorSetTensorARM>(set.pNext, VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_TENSOR_ARM);
+             assert(tensorInfo);
+             assert(tensorInfo->tensorViewCount == set.descriptorCount);
++        }
++
++        uint32_t binding = set.dstBinding;
++        uint32_t arrayElement = set.dstArrayElement;
++        uint32_t srcIndex = 0;
++        uint32_t remaining = set.descriptorCount;
+ 
+-            for (uint32_t i = 0; i < set.descriptorCount; i++) {
+-                tensorViews[set.dstBinding][set.dstArrayElement + i] = tensorInfo->pTensorViews[i];
++        while (remaining > 0) {
++            const auto bindingIt = descriptorSetLayout->bindings.find(binding);
++            if (bindingIt == descriptorSetLayout->bindings.end()) {
++                assert(false); // write spills into a binding the layout does not declare
++                break;
+             }
+-            break;
+-        }
+-        case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+-        case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+-        case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE: {
+-            for (uint32_t i = 0; i < set.descriptorCount; i++) {
+-                // Only grab image view since we get image layout from connectivity map and we don't care about the
+-                // sampler
+-                imageViews[set.dstBinding][set.dstArrayElement + i] = set.pImageInfo[i].imageView;
++            const auto &bindingInfo = bindingIt->second;
++
++            // With VK_EXT_mutable_descriptor_type the layout binding type is
++            // VK_DESCRIPTOR_TYPE_MUTABLE_EXT while writes carry the concrete type.
++            assert(bindingInfo.descriptorType == set.descriptorType ||
++                   bindingInfo.descriptorType == VK_DESCRIPTOR_TYPE_MUTABLE_EXT);
++            assert(arrayElement <= bindingInfo.descriptorCount);
++
++            const uint32_t chunk = std::min(remaining, bindingInfo.descriptorCount - arrayElement);
++
++            switch (set.descriptorType) {
++            case VK_DESCRIPTOR_TYPE_TENSOR_ARM: {
++                for (uint32_t i = 0; i < chunk; i++) {
++                    tensorViews[binding][arrayElement + i] = tensorInfo->pTensorViews[srcIndex + i];
++                }
++                break;
++            }
++            case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
++            case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
++            case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE: {
++                for (uint32_t i = 0; i < chunk; i++) {
++                    // Only grab image view since we get image layout from connectivity map and we don't care about the
++                    // sampler
++                    imageViews[binding][arrayElement + i] = set.pImageInfo[srcIndex + i].imageView;
++                }
++                break;
++            }
++            default:
++                break;
++            }
++
++            remaining -= chunk;
++            srcIndex += chunk;
++            arrayElement = 0;
++            // Advance to the next non-empty consecutive binding.
++            while (remaining > 0) {
++                binding++;
++                const auto it = descriptorSetLayout->bindings.find(binding);
++                if (it == descriptorSetLayout->bindings.end()) {
++                    assert(false);
++                    return;
++                }
++                if (it->second.descriptorCount > 0) break;
+             }
+-            break;
+-        }
+-        default:
+-            break;
+         }
+     }
+ 

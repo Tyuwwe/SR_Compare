@@ -26,6 +26,28 @@ Apply with `git -C third_party/arm-nss/emulation-layer apply <this file>`.
 Keep these applied: the try/catch wrappers are load-bearing for stability,
 the logging is opt-in via env vars.
 
+## emulation-layer-descriptor-spillover.patch
+
+Target: `third_party/arm-nss/emulation-layer` (git revision 00e9d81), applied
+on top of `emulation-layer-diagnostics.patch`.
+
+- `graph/graph_layer.cpp`
+  - `DataGraphDescriptorSet::update` now implements the Vulkan
+    consecutive-binding spillover rule for `VkWriteDescriptorSet`: when
+    `descriptorCount` exceeds the remaining array elements of `dstBinding`,
+    the remainder continues into `dstBinding+1`, `+2`, ... (empty bindings
+    are skipped), each starting at array element 0.
+
+Upstream only handled writes that fit inside a single binding and asserted
+`bindingInfo.descriptorCount >= dstArrayElement + descriptorCount`.  The
+layer intercepts every `vkUpdateDescriptorSets` on the device — not just
+data-graph sets — so any legal app-side spillover write (e.g. the renderer's
+present set, `renderer/Renderer.cpp` writing 4 combined image samplers
+across bindings 0..3) tripped the assert, and in NDEBUG builds became an
+out-of-bounds heap write into the layer's `imageViews`/`tensorViews`
+bookkeeping.  Symptom on screen: periodic vertical line artifacts in the
+NSS output.
+
 ## spirv-tools-tensorarm-constants.patch
 
 Target: `build-nss-emu/deps/SPIRV-Tools` (KhronosGroup/SPIRV-Tools @0539c81).

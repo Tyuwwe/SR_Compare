@@ -35,6 +35,15 @@ if %errorlevel%==0 (
     echo emulation-layer patch already applied or not applicable, skipping
 )
 
+rem Descriptor spillover fix: applies on top of the diagnostics patch.
+git -C "%ROOT%\third_party\arm-nss\emulation-layer" apply --check "%PATCHES%\emulation-layer-descriptor-spillover.patch" >nul 2>&1
+if %errorlevel%==0 (
+    git -C "%ROOT%\third_party\arm-nss\emulation-layer" apply "%PATCHES%\emulation-layer-descriptor-spillover.patch" || goto :fail
+    echo applied emulation-layer-descriptor-spillover.patch
+) else (
+    echo descriptor-spillover patch already applied or not applicable, skipping
+)
+
 echo deps ready in %DEPS%
 exit /b 0
 

@@ -300,6 +300,8 @@ struct NssUpscaler::Impl {
 
     Image   nssColor;   // render resolution,  R11G11B10 (SDK color input)
     Image   nssOutput;  // display resolution, R11G11B10 (SDK output)
+    Image   nssDebug;   // display resolution, R11G11B10 (SR_NSS_DEBUG_VIEW tile grid)
+    int     debugViewMode = -1;  // -1 = off; 0 = 4x4 grid, 1..16 = single tile
     uint64_t memoryBytes = 0;
 
     // Neural Graphics SDK runtime (dll + context).
@@ -390,6 +392,9 @@ bool NssUpscaler::init(const VulkanEnv& env, const UpscalerDesc& desc) {
     impl_->desc = desc;
 
     // --- internal images ----------------------------------------------------
+    // NOTE: tested with VK_IMAGE_USAGE_TENSOR_ALIASING_BIT_ARM on these images
+    // (the SDK wraps them in image-aliased tensor views) — no quality change
+    // under the emulation layer, so we keep plain OPTIMAL storage images.
     if (!createImage2D(env, desc.renderWidth, desc.renderHeight, kNssColorFormat,
                        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT, impl_->nssColor)) {
         shutdown();
@@ -401,6 +406,19 @@ bool NssUpscaler::init(const VulkanEnv& env, const UpscalerDesc& desc) {
         return false;
     }
     impl_->memoryBytes += impl_->nssColor.allocationSize + impl_->nssOutput.allocationSize;
+
+    // Diagnostic: SR_NSS_DEBUG_VIEW=<0..16> routes the SDK debug tile grid
+    // (0) or a single tile (1..16, see ffx_nss_private.h) to the output.
+    if (const char* dbg = std::getenv("SR_NSS_DEBUG_VIEW")) {
+        impl_->debugViewMode = std::atoi(dbg);
+        if (!createImage2D(env, desc.displayWidth, desc.displayHeight, kNssColorFormat,
+                           VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT, impl_->nssDebug)) {
+            shutdown();
+            return false;
+        }
+        impl_->memoryBytes += impl_->nssDebug.allocationSize;
+        std::fprintf(stderr, "NSS: SR_NSS_DEBUG_VIEW=%d\n", impl_->debugViewMode);
+    }
 
     // --- conversion pipelines ------------------------------------------------
     {
@@ -603,7 +621,9 @@ void NssUpscaler::dispatch(VkCommandBuffer cmd, const UpscalerResources& res, co
 
     // 2) Run NSS.  The SDK manages layout transitions for registered resources
     //    and history ping-pong (FFX_API_NSS_CONTEXT_FLAG_MANAGE_HISTORY).
+    const bool debugView = impl->debugViewMode >= 0;
     transitionImage(cmd, impl->nssOutput, VK_IMAGE_LAYOUT_GENERAL);
+    if (debugView) transitionImage(cmd, impl->nssDebug, VK_IMAGE_LAYOUT_GENERAL);
     {
         ffxApiDispatchDescNss desc = {};
         desc.header.type = FFX_API_DISPATCH_DESC_TYPE_NSS;
@@ -652,6 +672,13 @@ void NssUpscaler::dispatch(VkCommandBuffer cmd, const UpscalerResources& res, co
         if (desc.frameTimeDelta < 1.f) desc.frameTimeDelta = 1.f;
         desc.reset = frame.resetHistory;
         desc.flags = 0;
+        if (debugView) {
+            desc.flags |= FFX_API_NSS_DISPATCH_FLAG_DRAW_DEBUG_VIEW;
+            desc.debugViews = wrapImage(impl->nssDebug.image, kNssColorFormat, impl->desc.displayWidth,
+                                        impl->desc.displayHeight, FFX_API_RESOURCE_USAGE_UAV,
+                                        FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
+            desc.debugViewMode = static_cast<uint32_t>(impl->debugViewMode);
+        }
 
         const ffxReturnCode_t rc = impl->ffxDispatchFn(&impl->context, &desc.header);
         if (rc != FFX_API_RETURN_OK)
@@ -659,11 +686,13 @@ void NssUpscaler::dispatch(VkCommandBuffer cmd, const UpscalerResources& res, co
     }
 
     // 3) Convert the R11G11B10 upscaled result back into the renderer output.
+    Image& srcImage = debugView ? impl->nssDebug : impl->nssOutput;
     transitionImage(cmd, impl->nssOutput, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    if (debugView) transitionImage(cmd, impl->nssDebug, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     {
         VkDescriptorImageInfo infos[2] = {};
         infos[0].sampler     = impl->sampler;
-        infos[0].imageView   = impl->nssOutput.view;
+        infos[0].imageView   = srcImage.view;
         infos[0].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         infos[1].imageView   = res.outputView;
         infos[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -702,6 +731,7 @@ void NssUpscaler::shutdown() {
         if (impl->sampler) vkDestroySampler(device, impl->sampler, nullptr);
         destroyImage(device, impl->nssColor);
         destroyImage(device, impl->nssOutput);
+        destroyImage(device, impl->nssDebug);
     }
     if (impl->sdkModule) {
         FreeLibrary(impl->sdkModule);
